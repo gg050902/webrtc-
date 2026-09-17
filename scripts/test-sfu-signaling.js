@@ -438,6 +438,12 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   const capNoRoom = await httpReq('GET', 'http://localhost:3001/api/captions');
   ok('09-17e GET 缺 room 参数被拒（400）', capNoRoom.code === 400);
 
+  // --- ★ 09-18：/metrics Prometheus 文本格式（G7 可观测性，零依赖）---
+  const met = await httpReq('GET', 'http://localhost:3001/metrics');
+  ok('09-18 /metrics 返回 Prometheus 文本（含 rooms/members 与 bytes 计数）',
+     met.code === 200 && met.text.includes('# TYPE sfu_rooms_total gauge') &&
+     met.text.includes('sfu_producer_bytes_total') && /sfu_members_total \d+/.test(met.text));
+
   // --- D1：对不存在的 Consumer 切层 → 走错误路径而不是崩服务 ---
   let layerErr = null;
   try { await request(F.s, 'set-preferred-layers', { consumerId: 'fake-consumer', spatialLayer: 1 }); }

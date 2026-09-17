@@ -5,7 +5,7 @@
   <link rel="icon" href="data:," /><!-- 占位图标：消掉 favicon.ico 404 噪音 -->
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>简易腾讯会议 Demo · SFU 版（mediasoup）</title>
-  <link rel="stylesheet" href="style.css?v=20260917e" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存 -->
+  <link rel="stylesheet" href="style.css?v=20260918" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存 -->
 </head>
 <body>
   <!-- ★ F3 升级（2026-09-12）：加入前预览页 —— "进会先把设备检查好"（腾讯会议同款流程）。
@@ -176,6 +176,8 @@
                过夜值守的"夜里发生了什么"就浓缩在这一行 -->
           <span id="capSentryStats" class="cap-h-sentry"
                 title="值守统计：时长 · 累计条数 · 识别器重启次数 · 已归档到服务器的条数"></span>
+          <!-- ★ 09-18 值守日报（第 31 步，C1）：零 LLM 的结构化日报——时长/说话人占比/每小时分布 -->
+          <button id="capReportBtn" class="btn mini" title="生成值守日报（markdown：时长/说话人占比/每小时分布，零 LLM 本地统计）">📋 日报</button>
           <button id="capHistoryCloseBtn" class="btn mini" title="收起">✕</button>
         </div>
         <div id="capHistoryList" class="cap-h-list"></div>

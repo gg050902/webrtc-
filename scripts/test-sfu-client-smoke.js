@@ -721,11 +721,21 @@ const emit = (ev, payload) => {
   ok('值守：导出前拉取了服务器全档（GET /api/captions?...format=txt）',
     rec.fetchCalls.some((c) => c.method === 'GET' && c.url.includes('/api/captions') && c.url.includes('format=txt')));
 
+  // ⑤ ★ 09-18 值守日报（第 31 步，C1）：点「📋 日报」→ 拉归档(format=json)合并全档 → markdown 下载
+  guard('值守：生成日报', () => documentStub.getElementById('capReportBtn').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 60));
+  ok('值守：日报拉取服务器归档（format=json）且生成路径无异常',
+    rec.fetchCalls.some((c) => c.method === 'GET' && c.url.includes('/api/captions') && c.url.includes('format=json')));
+
   /* ---- ③h4 ★ 09-18 演讲人交接迟滞（"谁说话谁上大画面"的防抖）：
    *   audio-levels 每 400ms 一报，抢话/呼吸间隙会让 top 不停易主——
    *   新候选人必须连续坐稳 SPEAKER_HOLD_MS（桩里 30ms）才交接大画面；
    *   高亮（speaking）仍然即时。 ---- */
-  const peerMainBox = createdEls.find((e) => String(e.className || '').includes('video-box')); // PEER 的主画面格（唯一的 tile）
+  // ★ 前置：D6 重连段的 resetMediaState 已把 tiles 清空——createdEls 里留下的旧格子是"死"的，
+  //   迟滞交接永远落不到它身上（实修踩坑）。这里补订一路活的 PEER 摄像头，再取"最新"一格做断言。
+  emit('new-producer', { producerId: 'up-cam-hys', kind: 'video', appData: { source: 'camera' }, from: PEER });
+  await new Promise((r) => setTimeout(r, 120)); // 等订阅 + 建主画面格（异步 consume-data 应答）
+  const peerMainBox = createdEls.filter((e) => String(e.className || '').includes('video-box')).pop(); // 最新 = 活的那格
   emit('room-state', {
     roomNumber: '123456',
     members: [
@@ -747,8 +757,10 @@ const emit = (ev, payload) => {
     !peerMainBox.classList.contains('tile-main'));
   await new Promise((r) => setTimeout(r, 50)); // 超过桩里的 30ms 坐稳阈值
   guard('迟滞：PEER 开口第 2 拍（同一候选人）', () => emit('audio-levels', { levels: [{ id: PEER, volume: -20 }], top: PEER }));
-  console.log('DBG-video-boxes:', createdEls.filter((e) => String(e.className || '').includes('video-box')).map((e) => e.className));
-  console.log('DBG-peerMainBox:', peerMainBox && peerMainBox.className);
+  /* 探针打印移至测试末尾 */
+  console.log('DBG-boxes-detail:', createdEls.filter((e) => String(e.className || '').includes('video-box')).map((e) => ({
+    cls: e.className, inGrid: videoGridEl.children.includes(e), label: (() => { const l = e.children && e.children.find ? e.children.find((c) => String(c.className || '').includes('video-label')) : null; return l ? l.textContent : ''; })(),
+  })));
   ok('迟滞：坐稳后大画面交接给他（tile-main 落在 PEER 的格子）',
     peerMainBox.classList.contains('tile-main'));
 
@@ -892,6 +904,7 @@ const emit = (ev, payload) => {
   await new Promise((r) => setTimeout(r, 300));
   ok('D6 断线重连流程不抛错（resetMediaState → initSFU → publishTracks）', true);
 
+  console.log('DBG-reconnect:', (documentStub.getElementById('log').textContent || '').split('\n').filter((l) => l.includes('[DBG] disc') || l.includes('[DBG] rm') || l.includes('[DBG] layout')).join(' | '));
   if (problems.length) {
     console.log(`\n⚠️ 捕获到 ${problems.length} 个运行时异常：`);
     problems.forEach((p, i) => console.log(`\n--- 异常 ${i + 1} ---\n${p}`));

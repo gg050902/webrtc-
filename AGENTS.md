@@ -265,6 +265,31 @@
 > soak 压缩跑 **PASS**；坑：test-sfu-signaling.js 顶部 `const URL` 遮蔽全局 URL 构造器
 > （新断言里别用 new URL）；⚠️ 待人工验证：真 7h 过夜（0.2 节清单：电源永不睡眠+
 > 标签页前台，早上对账值守统计与 jsonl 行数）、真机断网 5 分钟后字幕自愈。
+>
+> **09-18 过夜全面升级（前端 v3 + 演讲人视图 + 日报 + /metrics + 清理）**——
+> ① **前端美学 v3**：style.css 整份重写（选择器零丢失已 diff 校验）——全站冷蓝灰残留
+>   （rgba(26,26,40,…) 族/#12151f/#2b3550/#9fb0cd 等）全部换成暖墨系 token（--glass 族）；
+>   演讲者视图重构=大画面独占第一行（1fr）+其余压成底部胶片条（16:9、≤150px）；
+>   说话人=鎏金呼吸金环；卡片/画面格入场动画 + prefers-reduced-motion 降级；
+>   成员行 CSS 伪元素头像圆片；宫格/演讲者布局语义修正（tile-main 的全宽规则圈定在
+>   演讲者视图，宫格恢复"所有人一样大"，tile-main 只剩金环标记）；
+>   index.html 版本参数 v=20260918；**真浏览器截图验证**：登录卡/预览页/房间/演讲者全过；
+> ② **演讲人交接迟滞补完**（并行规划的半成品收尾）：audio-levels 防抖已在（SPEAKER_HOLD_MS
+>   坐稳 1.5s 才交接、含安静回退），本次修好冒烟断言的"死元素"问题（D6 段 tiles 已被
+>   resetMediaState 清空，断言前要补订活格子——实修写入注释）；**顺带挖出真 bug**：
+>   attachRemoteMedia 复用分支按 key 前缀抓格子会抓到屏幕格并把 source 改写成 camera
+>   （元数据腐蚀，"关摄像头再开"必踩）——已改为按 box 匹配（坑 32）；
+> ③ **C1 值守日报（第 31 步）**：字幕历史抽屉「📋 日报」→ 服务器归档(format=json)+内存窗口
+>   合并全档 → 纯本地统计出 markdown 日报（时长/说话人占比条形/每小时活跃/值守健康），
+>   Blob 下载 report-<房间>-<ts>.md；零 LLM 永远可用，与 N2（LLM 纪要）互为兜底；
+> ④ **G7 /metrics 落地（零依赖版）**：GET /metrics 用 snapshotRooms() 手拼 Prometheus 文本
+>   （rooms/members/producers/consumers/producer_bytes_total/recordings/uptime/rss）；
+> ⑤ **dashboard.html 暖化**（冷蓝 → 暖墨 + 鎏金曲线）；
+> ⑥ **项目清理**：git rm 9 个 config.json.bak-* 与 .reasonix/工具数据（已入基线可找回）、
+>   删 SELFTEST 录制与运行时产物、.gitignore 补 bak/reasonix 条目、**修 start-lan.bat 路径 bug**
+>   （cd /d "%~dp0.." 会跳到上级目录）；
+> **回归（本次实测）**：信令 **73/73**（+1 /metrics）+ 冒烟 **91/91**（+4：日报、迟滞两拍、
+> 回退）+ 浏览器截图四屏全过；坑 32 入册。
 
 ---
 
@@ -370,6 +395,7 @@ webrtc/
 ├── package.json           # scripts: start/start:sfu/start:demo/start:lan/test/test:sfu/test:smoke/
 │                          #          test:record/test:turn/bench/build:sfu-vendor（含 doctor）
 ├── scripts/
+│   ├── soak.js                 #   服务器耐久自测（C3-N1，默认 7h/可压缩）
 │   ├── test-signaling.js        # Mesh 信令回归（33 项，需先起 3000）
 │   ├── test-sfu-signaling.js    # SFU 信令回归（67 项，需先起 3001）
 │   ├── test-sfu-client-smoke.js # 前端无头冒烟（76 项，零依赖不用起服务器）
@@ -400,7 +426,7 @@ npm run start:lan      # 局域网交付：探 IP → 生成 sfu/config.json（H
 npm run build:sfu-vendor  # 一次性：打包 mediasoup-client → sfu/public/vendor/（改依赖后重跑）
 npm test               # Mesh 版信令回归（必须先起 3000）★ 2026-09-17 实测 33/33
 npm run test:sfu       # SFU 版信令回归（必须先起 3001）★ 2026-09-17 实测 67/67
-npm run test:smoke     # SFU 版**前端**无头冒烟（假 DOM/假 mediasoup，零依赖不用起服务器）★ 76/76
+npm run test:smoke     # SFU 版**前端**无头冒烟（假 DOM/假 mediasoup，零依赖不用起服务器）★ 91/91
 npm run test:record    # D+2 服务器侧录制端到端自测（需已装 ffmpeg；产物落 sfu/recordings/）
 npm run test:turn      # ICE 可达性实测（对 config 每个 STUN/TURN 手搓 STUN Binding，3s 超时）
 npm run soak          # C3-N1 服务器耐久自测（默认 7 小时过夜；--minutes 2 压缩自测；结束对账"一条不丢"）
@@ -594,6 +620,14 @@ node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU �
     （本次实测就是这样：旧进程是 09-16 起的，测试照过）。**纪律：起服务器后先确认
     `HasExited=False` 且端口属于自己那个 PID**（`Get-NetTCPConnection -LocalPort 3001`），
     再跑回归；关的时候只关自己起的 PID。
+32. **attachRemoteMedia 的"复用已有主画面格"分支别按 key 前缀抓格子**（09-18 实修，
+    冒烟迟滞断言抓出来的真 bug）：camera 重订阅（关摄像头再开 = 新 producerId）走复用分支时，
+    原写法 `tiles.get(keys.find(k => k.startsWith(from::)))` 会抓到该成员**先订阅的屏幕格**
+    并把 tile.source 改写成 camera——元数据腐蚀，选层器/换层通知从此指错格子。
+    修法：按 box 匹配（`tiles.values().find(t => t.box === main.box)`），box 才是稳定锚点
+    （key 里的 producerId 会变）。测试侧同源教训：冒烟断言引用的"死元素"（D6 reset 后
+    createdEls 里残留的旧格子）永远不会被标记，断言前要补订活格子。
+
 
 ---
 

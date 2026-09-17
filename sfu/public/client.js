@@ -654,7 +654,11 @@ function attachRemoteMedia(from, source, kind, consumer, key) {
       main = { video: tile.video, stream: new MediaStream(), box: tile.box };
       peerMains.set(from, main);
     } else {
-      tile = tiles.get([...tiles.keys()].find((k) => k.startsWith(`${from}::`))) || { box: main.box, video: main.video };
+      /* ★ 09-18 实修：复用分支必须按 box 找回"这个成员的主画面格"。
+       *   原写法按 key 前缀抓第一格——若他还有屏幕共享格（先订阅），会抓到屏幕格
+       *   并把它的 tile.source 改写成 camera（元数据腐蚀：选层/换层通知全部指错格子，
+       *   "关摄像头再开"场景必踩）。key 里的 producerId 会变，box 才是稳定锚点。 */
+      tile = [...tiles.values()].find((t) => t.box === main.box) || { box: main.box, video: main.video };
     }
     main.stream.addTrack(track);        // 把轨道并进这个成员的总流
     main.video.srcObject = main.stream; // 重新赋一次让浏览器播放
@@ -4727,6 +4731,7 @@ capHistoryCloseBtn.addEventListener('click', () => toggleCapHistory(false));
  *   （N2「定时纪要」等 key 到位再做，见 AI部分功能计划.md 第 3.6 节）。
  * ════════════════════════════════════════════════════════════════════ */
 const capSentryStats = $('capSentryStats'); // 字幕历史抽屉头部的值守统计一行
+const capReportBtn = $('capReportBtn');   // ★ 第 31 步：值守日报按钮（字幕历史抽屉头部）
 
 // 值守状态：挂在 cap 上与第 29 步的开关/账本同居一个对象，看一眼就懂全貌
 cap.sentry = {
@@ -4843,6 +4848,82 @@ setInterval(() => {
       `重启 ${s.restarts} 次 · 已归档 ${s.archived} 条 · 滞留 ${s.batch.length} 条` +
       (s.drops ? ` · 丢 ${s.drops}` : ''));
 }, CAP_HB_MS);
+
+/* ──────────────────────────────────────────────────────────────
+ * 第 31 步 ★ 09-18 离线值守日报（AI 线 C1：零 LLM 的结构化纪要）
+ * ▎是什么：点「📋 日报」把这场会/这一夜的字幕合成一份 markdown 报告——
+ *   值守时长、累计条数、说话人占比 Top、每小时活跃分布、识别器健康（重启次数）。
+ * ▎为什么零 LLM 也有价值：N2（LLM 纪要）要 key、要花钱、断网就瘫；
+ *   日报是**纯本地统计**，永远可用——真产品的"会议摘要"也是先算统计再谈理解。
+ *   它和 N2 的关系：日报给出结构骨架，LLM 负责"读懂内容"，两层互为兜底。
+ * ▎数据口径：服务器归档（format=json，溢出的旧账）+ 内存热窗口（最近 500 条）
+ *   = 全档；两边按设计不重叠（归档的都是已从内存剪掉的）。
+ * ▎产物：Blob 下载 report-<房间号>-<日期>.md（同字幕导出的下载路径）。
+ * ────────────────────────────────────────────────────────────── */
+capReportBtn.addEventListener('click', async () => {
+  // ① 合并全档：先拉服务器归档（没进房/拉失败就只用内存窗口，日报照样能出）
+  let all = cap.log.slice();
+  if (myRoom && typeof fetch === 'function') {
+    try {
+      const res = await fetch(`/api/captions?room=${encodeURIComponent(String(myRoom))}&format=json`);
+      if (res.ok) all = (await res.json()).concat(cap.log);
+    } catch (err) { /* 服务器不可达：用内存窗口出简版 */ }
+  }
+  if (!all.length) {
+    showToast('还没有字幕记录，出不了日报', 'error');
+    return;
+  }
+  all.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+
+  // ② 统计：时间范围 / 说话人占比 / 每小时分布
+  const first = all[0].ts, last = all[all.length - 1].ts;
+  const durMin = Math.max(1, Math.round((last - first) / 60000));
+  const bySpeaker = new Map();
+  const byHour = new Map();
+  for (const e of all) {
+    const name = e.name || '未知';
+    bySpeaker.set(name, (bySpeaker.get(name) || 0) + 1);
+    const hourKey = new Date(e.ts).toLocaleTimeString('zh-CN', { hour: '2-digit', hour12: false }) + ':00';
+    byHour.set(hourKey, (byHour.get(hourKey) || 0) + 1);
+  }
+  const speakers = [...bySpeaker.entries()].sort((a, b) => b[1] - a[1]);
+  const hours = [...byHour.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  const maxHour = Math.max(...hours.map(([, n]) => n));
+
+  // ③ 拼 markdown（全 textContent 安全字符，Blob 下载同字幕导出）
+  const s = cap.sentry;
+  const lines = [];
+  lines.push(`# 值守日报 · 房间 ${myRoom || '(未知)'}`);
+  lines.push('');
+  lines.push(`- 生成时间：${new Date().toLocaleString()}`);
+  lines.push(`- 首条字幕：${new Date(first).toLocaleTimeString()} · 末条：${new Date(last).toLocaleTimeString()}（跨度约 ${durMin} 分钟）`);
+  lines.push(`- 字幕总数：${all.length} 条 · 说话人 ${speakers.length} 人`);
+  if (s.startedAt) lines.push(`- 值守健康：时长 ${Math.floor((Date.now() - s.startedAt) / 3600000)}h${Math.floor(((Date.now() - s.startedAt) / 60000) % 60)}m · 识别器重启 ${s.restarts} 次 · 已归档 ${s.archived} 条${s.drops ? ` · 丢弃 ${s.drops} 条` : ''}`);
+  lines.push('');
+  lines.push('## 说话人占比');
+  for (const [name, n] of speakers.slice(0, 10)) {
+    const pct = Math.round((n / all.length) * 100);
+    const bar = '█'.repeat(Math.max(1, Math.round(pct / 4)));
+    lines.push(`- ${name}：${n} 条（${pct}%）${bar}`);
+  }
+  lines.push('');
+  lines.push('## 每小时活跃度');
+  for (const [hour, n] of hours) {
+    const bar = '▁▂▃▄▅▆▇█'[Math.min(7, Math.floor((n / maxHour) * 7.99))];
+    lines.push(`- ${hour}　${bar} ${n} 条`);
+  }
+  lines.push('');
+  lines.push('> 由简易腾讯会议第 31 步本地生成（零 LLM）；要"读懂内容"的版本等 N2 接上 LLM。');
+  lines.push('');
+  const blob = new Blob([lines.join('\n')], { type: 'text/markdown' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `report-${myRoom || 'local'}-${Date.now()}.md`;
+  if (typeof a.click === 'function') a.click();
+  URL.revokeObjectURL(url);
+  log(`📋 已生成值守日报（${all.length} 条 · ${speakers.length} 位说话人 · 跨度 ${durMin} 分钟）`);
+});
 
 
 /* ──────────────────────────────────────────────────────────────

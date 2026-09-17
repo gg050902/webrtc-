@@ -29,54 +29,54 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
-      background: linear-gradient(160deg, #0d1017 0%, #12151b 100%);
-      color: #e8eaf0; min-height: 100vh; padding: 20px;
+      font-family: "Noto Serif SC", "Segoe UI", "PingFang SC", "Microsoft YaHei", serif;
+      background: linear-gradient(160deg, #14100a 0%, #1c1710 100%);
+      color: #ece5d8; min-height: 100vh; padding: 20px;
     }
     h1 { font-size: 20px; display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
-    h1 .dot { width: 9px; height: 9px; border-radius: 50%; background: #34d97b; box-shadow: 0 0 8px #34d97b; }
-    .sub { color: #8b93a5; font-size: 12px; margin-bottom: 18px; }
-    .sub b { color: #b9c2d4; }
+    h1 .dot { width: 9px; height: 9px; border-radius: 50%; background: #9ecf7a; box-shadow: 0 0 8px #9ecf7a; }
+    .sub { color: #8a8070; font-size: 12px; margin-bottom: 18px; }
+    .sub b { color: #d8cdb8; }
 
     /* 概览行 */
     .overview { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
     .stat {
-      background: #161b24; border: 1px solid #232b3a; border-radius: 12px;
+      background: #1c1710; border: 1px solid #3a3226; border-radius: 12px;
       padding: 12px 18px; min-width: 130px;
     }
-    .stat .num { font-size: 26px; font-weight: 700; color: #6fdc9b; font-variant-numeric: tabular-nums; }
-    .stat .lbl { font-size: 12px; color: #8b93a5; margin-top: 2px; }
+    .stat .num { font-size: 26px; font-weight: 700; color: #d8b36a; font-variant-numeric: tabular-nums; }
+    .stat .lbl { font-size: 12px; color: #8a8070; margin-top: 2px; }
 
     /* 房间卡 */
     .room-card {
-      background: #141922; border: 1px solid #232b3a; border-radius: 14px;
+      background: #1c1710; border: 1px solid #3a3226; border-radius: 14px;
       padding: 16px 18px; margin-bottom: 16px;
       box-shadow: 0 8px 24px rgba(0,0,0,.35);
     }
     .room-head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 12px; flex-wrap: wrap; }
     .room-head .rn { font-size: 17px; font-weight: 700; }
     .room-head .rn::before { content: "🎛️ "; }
-    .room-head .meta { font-size: 12px; color: #8b93a5; }
+    .room-head .meta { font-size: 12px; color: #8a8070; }
     .pill {
       font-size: 12px; padding: 3px 10px; border-radius: 99px;
-      background: #1d2532; border: 1px solid #2c3648; color: #b9c2d4;
+      background: #262017; border: 1px solid #3a3226; color: #d8cdb8;
     }
-    .pill.green { color: #6fdc9b; border-color: #2f9e5f; }
+    .pill.green { color: #d8b36a; border-color: #2f9e5f; }
     .pill.red   { color: #ff8f8f; border-color: #a04a4a; }
 
     table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 12px; }
-    th { text-align: left; color: #8b93a5; font-weight: 500; font-size: 12px; padding: 5px 8px; border-bottom: 1px solid #232b3a; }
-    td { padding: 6px 8px; border-bottom: 1px solid #1b212c; font-variant-numeric: tabular-nums; }
+    th { text-align: left; color: #8a8070; font-weight: 500; font-size: 12px; padding: 5px 8px; border-bottom: 1px solid #3a3226; }
+    td { padding: 6px 8px; border-bottom: 1px solid #2a2318; font-variant-numeric: tabular-nums; }
     tr:last-child td { border-bottom: none; }
 
-    .bar { position: relative; height: 8px; background: #10141c; border-radius: 5px; overflow: hidden; min-width: 90px; }
-    .bar i { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, #2f9e5f, #6fdc9b); border-radius: 5px; }
+    .bar { position: relative; height: 8px; background: #14100a; border-radius: 5px; overflow: hidden; min-width: 90px; }
+    .bar i { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, #b8933f, #d8b36a); border-radius: 5px; }
 
-    .score-10 { color: #6fdc9b; } .score-mid { color: #ffcf6f; } .score-low { color: #ff8f8f; }
+    .score-10 { color: #d8b36a; } .score-mid { color: #ffcf6f; } .score-low { color: #ff8f8f; }
 
-    canvas.spark { width: 100%; height: 64px; display: block; background: #10141c; border-radius: 8px; border: 1px solid #1b212c; }
+    canvas.spark { width: 100%; height: 64px; display: block; background: #14100a; border-radius: 8px; border: 1px solid #2a2318; }
 
-    .empty { color: #5d6575; font-size: 14px; text-align: center; padding: 60px 0; }
+    .empty { color: #8a8070; font-size: 14px; text-align: center; padding: 60px 0; }
     .empty .big { font-size: 40px; margin-bottom: 10px; }
   </style>
 </head>
@@ -85,7 +85,7 @@
   <div class="sub">数据每 2 秒刷新一次，来自服务器 <b>GET /api/rooms</b> · 码率 = 两次采样字节差 ÷ 时间差（和浏览器 getStats 同一个算法）</div>
 
   <div class="overview" id="overview"></div>
-  <div id="rooms"><div class="empty"><div class="big">📡</div>还没有任何房间——先去 <a href="/" style="color:#6fdc9b">会议页</a> 创建一个</div></div>
+  <div id="rooms"><div class="empty"><div class="big">📡</div>还没有任何房间——先去 <a href="/" style="color:#d8b36a">会议页</a> 创建一个</div></div>
 
 <script>
 'use strict';
@@ -117,7 +117,7 @@ function render(data) {
     <div class="stat"><div class="num">${totalProducers}</div><div class="lbl">上传媒体路数</div></div>
     <div class="stat"><div class="num">${totalConsumers}</div><div class="lbl">转发中 Consumer</div></div>
     <div class="stat"><div class="num">${data.worker.pid ?? '--'}</div><div class="lbl">mediasoup Worker PID</div></div>
-    <div class="stat"><div class="num" style="${data.recordingCount ? '' : 'color:#5d6575'}">⏺ ${data.recordingCount}</div><div class="lbl">服务器录制中（D+2）</div></div>`;
+    <div class="stat"><div class="num" style="${data.recordingCount ? '' : 'color:#8a8070'}">⏺ ${data.recordingCount}</div><div class="lbl">服务器录制中（D+2）</div></div>`;
 
   /* ② 房间卡 */
   const roomsEl = document.getElementById('rooms');
@@ -198,7 +198,7 @@ function render(data) {
       </table>
       <table>
         <tr><th>媒体</th><th>归属</th><th>累计流量</th><th>码率</th><th>健康分</th><th>编码层数</th></tr>
-        ${mediaRows || '<tr><td colspan="6" style="color:#5d6575">（还没有媒体上传）</td></tr>'}
+        ${mediaRows || '<tr><td colspan="6" style="color:#8a8070">（还没有媒体上传）</td></tr>'}
       </table>
       <canvas class="spark" id="spark-${room.roomNumber}" width="800" height="64"></canvas>
       <div class="meta" style="margin-top:4px">房间总码率曲线（近 ${HISTORY_MAX} 次采样 · kbps）</div>`;
@@ -236,13 +236,13 @@ function drawSpark(id, bytesArr, now) {
     points.push(Math.max(0, (bytesArr[i] - bytesArr[i - 1]) * 8 / dt / 1000));
   }
   if (points.length < 2) {
-    ctx.fillStyle = '#5d6575';
+    ctx.fillStyle = '#8a8070';
     ctx.font = '12px sans-serif';
     ctx.fillText('正在积累采样点…', 12, H / 2);
     return;
   }
   const max = Math.max(...points, 1);
-  ctx.strokeStyle = '#6fdc9b';
+  ctx.strokeStyle = '#d8b36a';
   ctx.lineWidth = 2;
   ctx.beginPath();
   points.forEach((p, i) => {
@@ -252,7 +252,7 @@ function drawSpark(id, bytesArr, now) {
   });
   ctx.stroke();
   // 当前值标在右上角
-  ctx.fillStyle = '#6fdc9b';
+  ctx.fillStyle = '#d8b36a';
   ctx.font = '12px sans-serif';
   ctx.fillText(points[points.length - 1].toFixed(1) + ' kbps', W - 90, 16);
 }

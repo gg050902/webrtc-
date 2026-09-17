@@ -3,6 +3,9 @@ node_modules/
 
 # 运行时产物（不入库：每人自己的数据与录制）
 sfu/recordings/
+sfu/config.json.bak-*
+.reasonix/
+reasonix.toml
 sfu/captions/
 sfu/logs/
 sfu/users.json

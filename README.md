@@ -66,6 +66,8 @@
 | 📊 压力基准数字 | 三档（4/8/16 路）媒体转发实测：16 发 16 收 8263 kbps、单核仅占 6%、零丢包 | scripts/bench.js（ffmpeg 合成源 → PlainTransport → mediasoup 转发 → dgram 真收包统计）；数据表见《性能测试报告.md》（E4，`npm run bench`） |
 | 💬 实时字幕（AI 线 L1） | 说话内容实时转字幕：本地字幕条半句跳动、整句定稿广播全房；字幕账本（时间戳/说话人/文本）一键导出 txt——即 AI 会议纪要/问答（C2）的输入 | Web Speech API（浏览器内置，零依赖零费用）；只广播 final 不广播 interim、不做信令兜底（可靠性按内容价值定价）；字幕历史抽屉（最近 100 条回看、自动滚底）；开关状态进房间状态机（成员列表 💬 徽标）；Chrome 60s 自动断 onend 续命（09-17，SFU 主版本） |
 | 🌙 过夜值守（AI 线 C3-N1） | 睡前开字幕挂一夜（≥7 小时），零人工干预：字幕账本溢出自动归档到服务器（jsonl，一条不丢）、识别器网络故障指数退避自愈 + 看门狗、值守统计（时长/条数/重启/已归档）与心跳日志、导出 txt 自动合并服务器全档 | 规划见《AI部分功能计划.md》第 3.6 节；client.js 第 30 步 + `/api/captions` + `npm run soak`（服务器耐久自测，默认 7h 可压缩）；零依赖零费用，不需要 LLM key（09-17e，SFU 主版本） |
+| 📋 值守日报（AI 线 C1） | 字幕历史抽屉「📋 日报」一键生成 markdown 日报：时长/说话人占比条形图/每小时活跃分布/值守健康（识别器重启次数）——服务器归档+内存窗口合并全档，纯本地统计 | 零 LLM 零费用永远可用，与 N2（LLM 纪要）互为兜底；client.js 第 31 步（09-18，SFU 主版本） |
+| 📈 Prometheus 指标端点 | `GET /metrics` 输出 Prometheus 文本格式：房间/成员/Producer/Consumer 总数、每路媒体累计字节、录制数、进程 uptime/rss——Grafana 直接可抓 | 复用观测面板同一份 snapshotRooms() 数据源，零依赖手拼（G7 首刀，09-18，SFU 主版本） |
 
 > **本表最后一栏的字母 = 升级编号**（A3/A4/A6 = 远程协助深化；D1~D6 = 会议本体 + SFU 深究；
 > D+1~D+4 = SFU 深水区；E1/E2/E4/E5 = 工程化与可交付；F1~F7 = 对齐商业产品的产品体验，
@@ -95,7 +97,7 @@ Socket.IO 收发"信令消息"，媒体在 SFU 版由服务器转发、在 Mesh 
 | | 前端（浏览器） | 后端（Node.js 服务器） |
 |---|---|---|
 | **跑在哪** | 每位参会者自己的浏览器标签页里 | 一台常驻的电脑/云服务器（你本机即可演示） |
-| **代码位置（SFU 主版本）** | `sfu/public/`：`index.html` + `style.css` + `client.js`（**第 1~30 步**，26b/26c/26d = 回应举手/批注/白板，28 = 滤镜虚拟背景，29 = 实时字幕，30 = 过夜值守）+ `dashboard.html`（观测面板）+ `vendor/` | `sfu/server.js`（分区 A~E）+ `protocol.js` + `config.json`（可选配置） |
+| **代码位置（SFU 主版本）** | `sfu/public/`：`index.html` + `style.css` + `client.js`（**第 1~31 步**，28 = 滤镜，29 = 实时字幕，30 = 过夜值守，31 = 值守日报）+ `dashboard.html`（观测面板）+ `vendor/` | `sfu/server.js`（分区 A~E）+ `protocol.js` + `config.json`（可选配置） |
 | **对应 Mesh 对照版** | `public/`：`client.js`（第 1~16 步 + 第 19~25 步 = A/D 档同步升级） | `server.js`（根目录，信令邮局） |
 | **职责：采集** | `getUserMedia` 开摄像头/麦克风、`getDisplayMedia` 抓屏幕 | 不采集，只收浏览器送上来的媒体 |
 | **职责：信令** | 发 create-room / join-room / produce / consume 等事件 | Socket.IO 接收转发：房间号生成、密码校验、协商撮合 |
@@ -330,6 +332,7 @@ npm run bench      # E4 压力基准（4/8/16 路，约 1 分钟，独立 Worker
 | 25 | **滤镜与虚拟背景（F6，主版本独有）** | canvas 三站流水线：GPU ctx.filter 滤镜（原图/自然/冷白/暖阳/水墨）→ 1/4 画布低清模糊放大=磨皮 → 色键（绿幕/蓝幕）逐像素抠像换背景（墨/绢/鎏金/图片）；captureStream(24) 出轨后 replaceTrack 上行，处理后轨顶替进 localStream（publishTracks/关摄像头/D6 重连零改动）；每帧 EMA 耗时徽标="CPU 账"可视化；纯前端零依赖、不引 ML 模型（教学导读 LEARN.md 5.18） |
 | 26 | **实时字幕（AI 线 L1，主版本独有）** | Web Speech API 识别自己麦克风（每端识别自己=省带宽/隐私/语言跟人走）；interim 半句只本地跳动、final 成稿经 SCTP chat 频道广播（不做信令兜底——字幕容忍丢、聊天不容忍，可靠性按内容价值定价）；字幕账本 cap.log（时间戳/说话人/文本，500 条环形）= C2 会议纪要/问答的 LLM 输入，⬇ 一键导出 txt；历史抽屉（cap.log 滚动视图）+ member-state.caption 进房间状态机（成员行 💬 徽标）；onend 自动续命 + network 明确降级（教学导读 LEARN.md 5.19） |
 | 27 | **过夜值守（AI 线 C3-N1，主版本独有）** | 目标="睡前启动、无人值守跑 ≥7 小时、早上拿全档字幕+值守日志"：账本溢出归档（内存 500 条热窗口 + 服务器 jsonl 权威副本）、network 3 次永久停改指数退避（约 45 分钟才放弃）+ 30s 看门狗巡检自愈、值守统计与 30 分钟心跳、导出合并服务器全档；`npm run soak` 服务器耐久自测（默认 7h、--minutes 压缩、对账"一条不丢"）；零依赖零费用不需要 key（教学导读 LEARN.md 5.19.5） |
+| 28 | **过夜全面升级（09-18）** | 前端美学 v3（全站暖墨统一/演讲者视图=大画面+胶片条/说话人金环呼吸/入场动效+reduced-motion 降级，真浏览器截图四屏验证）；宫格布局语义修正（tile-main 全宽圈定演讲者视图）；演讲人交接迟滞收尾+attachRemoteMedia 元数据腐蚀真 bug 修复（坑 32）；C1 值守日报（第 31 步）；G7 /metrics 首刀；dashboard 暖化；项目清理（config 备份×9/工具会话数据/运行时产物）+ start-lan.bat 路径修复 |
 
 **下一步方向**（`后续升级方向.md` 是唯一权威）：
 - ✅ **A 档（A1~A7）与 D 档（D1~D6）已全部完成**（2026-09-11，SFU 主版本）；

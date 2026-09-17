@@ -118,6 +118,12 @@ async function requestHandler(req, res) {
     return;
   }
 
+  // ★ 09-18 G7 可观测性：Prometheus 文本格式的指标端点（/dashboard 的"机器读"版）
+  if (pathname === '/metrics') {
+    handleApiMetrics(res);
+    return;
+  }
+
   // ★ 09-13 可达性：把 ICE 服务器配置下发给浏览器（客户端 fetch 后建 Transport 用）
   if (pathname === '/config.json') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -273,6 +279,52 @@ async function snapshotRooms() {
     recordingCount: recordSessions.size, // ★ D+2：全服务器进行中的录制数
     rooms: list,
   };
+}
+
+/* ★ 09-18 G7 可观测性：GET /metrics —— Prometheus 文本格式（零依赖手拼字符串）
+ * ▎数据源就是现成的 snapshotRooms()（面板吃它，监控也吃它——"同一份真相"）；
+ *   再补进程自身的 rss / 运行时长。Grafana / 任何 Prometheus 兼容抓取端直接认。
+ * ▎格式纪律：# HELP/# TYPE 注释 + key{label} value 行；字节/秒数一律累计值（counter）。
+ */
+const PROCESS_START = Date.now();
+function buildMetrics(snap) {
+  const L = [];
+  const help = (k, t, d) => L.push(`# HELP ${k} ${d}`, `# TYPE ${k} ${t}`);
+  const rooms = snap.rooms || [];
+  help('sfu_rooms_total', 'gauge', 'Number of rooms currently known to the SFU');
+  L.push(`sfu_rooms_total ${rooms.length}`);
+  help('sfu_members_total', 'gauge', 'Total members across all rooms');
+  const membersTotal = rooms.reduce((a, r) => a + r.counts.members, 0);
+  L.push(`sfu_members_total ${membersTotal}`);
+  help('sfu_producers_total', 'gauge', 'Total producers (published media tracks)');
+  L.push(`sfu_producers_total ${rooms.reduce((a, r) => a + r.counts.producers, 0)}`);
+  help('sfu_consumers_total', 'gauge', 'Total consumers (server-side subscriptions)');
+  L.push(`sfu_consumers_total ${rooms.reduce((a, r) => a + r.counts.consumers, 0)}`);
+  help('sfu_room_members', 'gauge', 'Members per room');
+  for (const r of rooms) L.push(`sfu_room_members{room="${r.roomNumber}"} ${r.counts.members}`);
+  help('sfu_producer_bytes_total', 'counter', 'Cumulative bytes forwarded per producer');
+  for (const r of rooms) {
+    for (const m of r.media) {
+      L.push(`sfu_producer_bytes_total{room="${r.roomNumber}",kind="${m.kind}",source="${m.source}"} ${m.byteCount}`);
+    }
+  }
+  help('sfu_recordings_active', 'gauge', 'Server-side recordings currently running');
+  L.push(`sfu_recordings_active ${snap.recordingCount || 0}`);
+  help('sfu_process_uptime_seconds', 'gauge', 'SFU server process uptime in seconds');
+  L.push(`sfu_process_uptime_seconds ${Math.round((Date.now() - PROCESS_START) / 1000)}`);
+  help('sfu_process_resident_memory_bytes', 'gauge', 'SFU server process RSS in bytes');
+  L.push(`sfu_process_resident_memory_bytes ${process.memoryUsage().rss}`);
+  return L.join('\n') + '\n';
+}
+async function handleApiMetrics(res) {
+  try {
+    const body = buildMetrics(await snapshotRooms());
+    res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(body);
+  } catch (err) {
+    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(`metrics error: ${err.message}`);
+  }
 }
 
 // /api/rooms 的 HTTP 收尾：JSON 输出 + 出错别把进程带崩
