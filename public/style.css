@@ -1,0 +1,1081 @@
+/* 简易腾讯会议 Demo（多人 Mesh 版）—— 简洁深色 UI */
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+  background: #1a1d24;
+  color: #e8eaf0;
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  padding: 24px 16px;
+}
+
+/* 两列布局：左主区伸缩 + 右侧聊天栏固定宽度 */
+.container {
+  width: 100%;
+  max-width: 1280px;
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+.main-col {
+  flex: 1;
+  min-width: 0; /* 避免 flex 子项被内容撑爆 */
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+header h1 { font-size: 20px; font-weight: 600; }
+
+/* 顶上一排小徽标（房间号 / 人数 / 连接状态） */
+.badges { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+.badge {
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.badge.idle       { background: #3a3f4b; color: #9aa3b2; }
+.badge.connected  { background: #2b4a3b; color: #6fdc9b; }
+.badge.active     { background: #2b4a3b; color: #6fdc9b; }
+/* 网络质量三色（client.js 第 16 步 getStats 监控切换用） */
+.badge.good       { background: #2b4a3b; color: #6fdc9b; } /* 良好：绿 */
+.badge.medium     { background: #5e4b2b; color: #ffcf6f; } /* 一般：黄 */
+.badge.poor       { background: #5e2b2b; color: #ff8f8f; } /* 较差：红 */
+
+/* 房间号徽标：进房后显示，点一下复制邀请链接 */
+.badge.room {
+  background: #2b3a5e;
+  color: #8ab8ff;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 13px;
+  cursor: pointer;
+}
+.badge.room:hover { filter: brightness(1.2); }
+
+/* 通用隐藏工具类 */
+.hidden { display: none; }
+
+/* ---- 房间面板（创建房间 / 凭号加入） ---- */
+.room-panel {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.room-sep { color: #6b7280; font-size: 13px; }
+
+/* 房间号输入框：等宽字体 + 字距拉开，数字好念好核对 */
+.room-input {
+  width: 190px;
+  padding: 10px 14px;
+  border: 1px solid #2a2f3a;
+  border-radius: 8px;
+  background: #101318;
+  color: #e8eaf0;
+  font-size: 16px;
+  letter-spacing: 4px;
+  font-family: Consolas, "Courier New", monospace;
+}
+.room-input:focus { outline: none; border-color: #2f9e5f; }
+.room-input:disabled { opacity: .4; }
+
+/* 房间密码输入框：比房间号窄一些，且不要拉大字距（密码不是拿来念的数字） */
+.room-input.pwd {
+  width: 150px;
+  letter-spacing: 0;
+  font-family: inherit;
+}
+
+/* ---- 视频网格（多人版核心布局） ---- */
+.video-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);   /* 每行最多 2 格 */
+  gap: 12px;
+}
+
+.video-box {
+  position: relative;
+  background: #000;
+  border-radius: 12px;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+}
+
+.video-box video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.video-box .video-label {
+  position: absolute;
+  left: 10px;
+  bottom: 8px;
+  font-size: 12px;
+  background: rgba(0,0,0,.55);
+  padding: 3px 10px;
+  border-radius: 999px;
+}
+
+/* 请求控制按钮（H5 远程桌面 Phase 1 占位）：悬浮在远端视频框右上角 */
+.remote-ctl-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  font-size: 12px;
+  padding: 4px 10px;
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  background: rgba(20,22,28,.75);
+  color: #8ab8ff;
+  opacity: 0;
+  transition: opacity .2s, filter .15s;
+}
+.video-box:hover .remote-ctl-btn { opacity: 1; }  /* 鼠标移到视频上才显示，不挡画面 */
+.remote-ctl-btn:hover { filter: brightness(1.4); }
+
+/* ---- 控制按钮 ---- */
+.controls {
+  display: flex;
+  gap: 10px;
+  margin: 16px 0;
+  flex-wrap: wrap;
+}
+
+.btn {
+  padding: 10px 22px;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  cursor: pointer;
+  background: #3a3f4b;
+  color: #e8eaf0;
+  transition: filter .15s;
+}
+.btn:hover:not(:disabled) { filter: brightness(1.15); }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+
+.btn.primary { background: #2f9e5f; color: #fff; }
+.btn.danger  { background: #c93b3b; color: #fff; }
+
+/* ---- 日志面板 ---- */
+.log-panel {
+  background: #101318;
+  border: 1px solid #2a2f3a;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.log-title {
+  padding: 10px 14px;
+  font-size: 13px;
+  color: #9aa3b2;
+  background: #171b22;
+  border-bottom: 1px solid #2a2f3a;
+}
+
+#log {
+  padding: 12px 14px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: #b8c2d0;
+  height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ---- 聊天侧边栏 ---- */
+.chat-sidebar {
+  width: 300px;
+  flex-shrink: 0;
+  background: #101318;
+  border: 1px solid #2a2f3a;
+  border-radius: 12px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 130px);
+  position: sticky;
+  top: 24px;
+}
+
+.chat-title {
+  padding: 10px 14px;
+  font-size: 14px;
+  color: #9aa3b2;
+  background: #171b22;
+  border-bottom: 1px solid #2a2f3a;
+}
+
+/* 消息列表：可滚动 */
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 单条消息 */
+.msg {
+  display: flex;
+  flex-direction: column;
+  max-width: 85%;
+}
+/* 我发的靠右，别人靠左 */
+.msg.me   { align-self: flex-end; align-items: flex-end; }
+.msg.other{ align-self: flex-start; align-items: flex-start; }
+
+.msg-name { font-size: 11px; color: #9aa3b2; margin-bottom: 3px; }
+.msg-text {
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.msg.me   .msg-text { background: #2f9e5f; color: #fff; }
+.msg.other .msg-text { background: #2a2f3a; color: #e8eaf0; }
+
+/* 系统消息（无成员时不显示发送者等细节）—— 居中灰色小字 */
+.msg.system {
+  align-self: center;
+  align-items: center;
+  text-align: center;
+}
+.msg.system .msg-name { display: none; }
+.msg.system .msg-text {
+  background: transparent;
+  color: #6b7280;
+  font-size: 12px;
+  padding: 2px 0;
+}
+
+.msg-time { font-size: 10px; color: #6b7280; margin-top: 3px; }
+
+/* 输入区 */
+.chat-input-bar {
+  display: flex;
+  gap: 8px;
+  padding: 10px;
+  border-top: 1px solid #2a2f3a;
+}
+.chat-input-bar textarea {
+  flex: 1;
+  resize: none;
+  background: #1a1d24;
+  color: #e8eaf0;
+  border: 1px solid #2a2f3a;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.chat-input-bar textarea:focus { outline: none; border-color: #2f9e5f; }
+.chat-input-bar .btn.send {
+  padding: 8px 14px;
+  align-self: stretch;
+  background: #2f9e5f;
+  color: #fff;
+}
+
+/* 窄屏时聊天栏折叠到下方 */
+@media (max-width: 860px) {
+  .container { flex-direction: column; }
+  .chat-sidebar { width: 100%; height: 360px; position: static; }
+}
+
+/* ---- H5 远程桌面（Phase 1）：授权卡片 + toast ---- */
+/* 授权卡片：悬浮在页面中央的"允许/拒绝"弹层（替代原生 confirm，浏览器压不住） */
+.remote-ask {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 999;
+  background: #22262f;
+  border: 1px solid #3a4150;
+  border-radius: 14px;
+  padding: 22px 26px;
+  min-width: 320px;
+  text-align: center;
+  box-shadow: 0 12px 40px rgba(0,0,0,.5);
+}
+.remote-ask-text {
+  font-size: 15px;
+  margin-bottom: 16px;
+  line-height: 1.5;
+}
+.remote-ask-btns {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+}
+
+/* toast：右上角一次性轻提示，3 秒自动消失 */
+.toast {
+  position: fixed;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+  background: #2f9e5f;
+  color: #fff;
+  padding: 10px 22px;
+  border-radius: 999px;
+  font-size: 14px;
+  box-shadow: 0 6px 20px rgba(0,0,0,.4);
+  animation: toastIn .25s ease;
+}
+.toast.error { background: #c93b3b; }
+.toast.info  { background: #2b3a5e; }
+@keyframes toastIn {
+  from { opacity: 0; transform: translate(-50%, -10px); }
+  to   { opacity: 1; transform: translate(-50%, 0); }
+}
+
+/* ══════════ H5 远程桌面（Phase 2~5）══════════ */
+
+/* 「允许远程协助」开关：默认灰边框，开启后变黄色高亮（一眼看出"协助开着"） */
+.btn.assist { border: 1px solid #5e4b2b; }
+.btn.assist.on { background: #5e4b2b; color: #ffcf6f; }
+
+/* ---- 工作台模式（被控端）----
+ * 打开「允许远程协助」后 body 加 workbench-mode：
+ * 藏起会议主界面（视频网格/控制区/日志），让工作台 iframe 铺满视口——
+ * 它就是被共享出去的"桌面"，画面主体大才好演示。
+ * 聊天侧边栏保留：被控时 A 依然能聊天。 */
+body.workbench-mode { padding: 12px 16px; }
+body.workbench-mode .video-grid,
+body.workbench-mode .controls,
+body.workbench-mode .log-panel { display: none; }
+
+.workbench-area {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: calc(100vh - 80px);
+}
+.workbench-area.hidden { display: none; } /* 显式写，防止被上面的 display:flex 覆盖 */
+
+/* 工作台工具条：状态文字 + 三个操作按钮 */
+.wb-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: #101318;
+  border: 1px solid #2a2f3a;
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #9aa3b2;
+  flex-wrap: wrap;
+}
+.wb-toolbar-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+.wb-toolbar .btn { padding: 6px 14px; font-size: 13px; }
+
+/* 工作台 iframe：铺满剩余高度（同源页面，事件重放目标） */
+#workbenchFrame {
+  flex: 1;
+  width: 100%;
+  border: 1px solid #2a2f3a;
+  border-radius: 12px;
+  background: #12151b;
+}
+
+/* ---- 控制端：控制层（盖在被控端视频框上的透明操作面）---- */
+.ctrl-layer {
+  position: absolute;
+  inset: 0;                 /* 铺满整个 video-box */
+  z-index: 5;
+  cursor: crosshair;        /* 暗示"这里的鼠标会作用到对方屏幕" */
+  background: transparent;
+}
+/* 顶部提示条：接通中 / 正在控制 + 释放按钮 */
+.ctrl-tip {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(20,22,28,.88);
+  border: 1px solid #5e4b2b;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  color: #ffcf6f;
+  white-space: nowrap;
+}
+.ctrl-tip .ctl-release { padding: 3px 10px; font-size: 12px; border-radius: 999px; }
+
+/* 正在控制中的视频框：黄色描边高亮 */
+.video-box.rc-controlling { outline: 2px solid #ffcf6f; outline-offset: -2px; }
+
+/* 视频框左上角状态角标（remote-state 广播驱动，全房可见"谁控谁"） */
+.video-box.rc-host::after,
+.video-box.rc-ctrl::after {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 4;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.video-box.rc-host::after { content: '🖱️ 被控制中'; background: rgba(94,43,43,.85); color: #ff8f8f; }
+.video-box.rc-ctrl::after { content: '🖱️ 控制中';   background: rgba(94,75,43,.85); color: #ffcf6f; }
+
+/* 被控端的"远程光标"：控制端鼠标的化身（合成事件不动系统光标，自己画一颗） */
+.remote-cursor {
+  position: fixed;
+  z-index: 1001;
+  font-size: 22px;
+  transform: translate(-50%, -50%); /* 图标中心对准坐标点 */
+  pointer-events: none;             /* 永不挡真实点击 */
+  filter: drop-shadow(0 2px 6px rgba(0,0,0,.6));
+}
+
+/* ★ 09-12 补：远程控制的"点击涟漪"（被控端可见反馈）。
+ * 控制端每次按下鼠标，被控端在按下位置画一圈扩散的绿环——光标只证明"在动"，
+ * 涟漪证明"在点"。动画播完由 JS 删掉节点（见两版 client.js 的 spawnCtlRipple）。 */
+.ctl-ripple {
+  position: fixed;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;   /* 中心对准坐标点（和 .remote-cursor 同款手法） */
+  border: 2px solid #6fdc9b;
+  border-radius: 50%;
+  pointer-events: none;    /* 永不挡真实点击 */
+  z-index: 1002;
+  animation: ctlRipple .55s ease-out forwards;
+}
+@keyframes ctlRipple {
+  from { transform: scale(.35); opacity: .95; }
+  to   { transform: scale(2.8); opacity: 0; }
+}
+
+
+/* ---- A2 中文输入法：控制端的 IME 捕获框 ----
+ * 看不见的 textarea（1×1px + 全透明），挂在页面左上角：
+ * 中文组合输入必须发生在"可编辑元素"上，控制层是普通 div 组合不起来，
+ * 所以控制期间把键盘焦点钉在这个靶子上，compositionend 从它取整段中文。 */
+.ctl-ime-capture {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  border: none;
+  resize: none;
+  overflow: hidden;
+  padding: 0;
+  z-index: -1;        /* 视觉上彻底退场，但仍是可聚焦元素 */
+  pointer-events: none; /* 鼠标点不到它，只有代码 focus() 能驾驭 */
+}
+
+/* ══════════ 升级 A3/A4/A6/A7/D2/D3 追加样式 ══════════ */
+
+/* ---- A7 触屏支持：控制层必须吃掉所有触摸手势 ----
+ * 不加这句的后果：单指按住拖动 = 浏览器默认的"滚动页面"，
+ * pointermove 序列会被浏览器"抢走"（触发 pointercancel），远程拖拽直接失效。
+ * touch-action: none = "这块区域的触摸手势全部交给我写的 JS 处理"。 */
+.ctrl-layer { touch-action: none; }
+
+/* 控制层顶部工具条里的小按钮（📸 截图 / 📁 发文件 / 📋 剪贴板）*/
+.ctl-tools { display: flex; gap: 6px; align-items: center; }
+.ctl-tools .btn { padding: 3px 9px; font-size: 12px; border-radius: 999px; }
+
+/* A6 限时授权倒计时（控制端控制层 + 被控端工作台工具条共用） */
+.ctl-expire { color: #ffcf6f; font-weight: 600; }
+
+/* ---- D2 说话人指示器 ----
+ * .speaking 加在 .video-box 上：绿色发光边框 + 轻微放大，一眼看出谁在说话。
+ * 音量条 .vol-bar 贴在格子底部（宽度随音量实时变化）。 */
+.video-box.speaking {
+  outline: 2px solid #3ee08a;
+  outline-offset: -2px;
+  box-shadow: 0 0 14px rgba(62, 224, 138, .55);
+}
+.vol-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 4px;
+  background: rgba(255, 255, 255, .08);
+  overflow: hidden;
+}
+.vol-bar > i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #2f9e5f, #3ee08a);
+  transition: width .1s linear;
+}
+.video-box.speaking .vol-bar > i { background: linear-gradient(90deg, #3ee08a, #9dffcb); }
+
+/* ---- 成员列表（轻量版）：聊天侧边栏顶部 ---- */
+.member-panel {
+  border-bottom: 1px solid #2a2f3a;
+  background: #171b22;
+  max-height: 168px;
+  display: flex;
+  flex-direction: column;
+}
+.member-title {
+  padding: 8px 14px 6px;
+  font-size: 13px;
+  color: #9aa3b2;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.member-count { font-size: 11px; color: #6b7280; }
+.member-list { overflow-y: auto; padding: 0 10px 8px; display: flex; flex-direction: column; gap: 4px; }
+.member-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  padding: 5px 9px;
+  border-radius: 999px;
+  background: #1f242d;
+  color: #c8d0dc;
+  border: 1px solid transparent;
+}
+.member-item .m-id { font-family: Consolas, "Courier New", monospace; flex: 1; }
+.member-item .m-role { font-size: 10.5px; color: #6b7280; }
+/* 说话高亮：与 D2 的音量分析联动（同一个 speaking 判定） */
+.member-item.speaking { border-color: #3ee08a; color: #9dffcb; background: #1c2a22; }
+.member-item.me .m-id { color: #8ab8ff; }
+
+/* ---- D3 设备切换下拉框 ---- */
+.dev-label { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; color: #9aa3b2; }
+.dev-select {
+  max-width: 150px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #2a2f3a;
+  background: #101318;
+  color: #e8eaf0;
+  font-size: 13px;
+}
+.dev-select:disabled { opacity: .4; }
+
+/* ---- A6 授权卡片的时长选择 ---- */
+.remote-ask-dur { margin-bottom: 14px; font-size: 13px; color: #9aa3b2; }
+.remote-ask-dur select {
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid #2a2f3a;
+  background: #101318;
+  color: #e8eaf0;
+  font-size: 13px;
+}
+.remote-ask-btns { flex-wrap: wrap; }
+
+/* ---- A6 审计日志面板（被控端本地） ---- */
+.audit-panel {
+  position: fixed;
+  right: 20px;
+  top: 20px;
+  bottom: 20px;
+  width: 460px;
+  max-width: 92vw;
+  z-index: 998;
+  background: #171b22;
+  border: 1px solid #3a4150;
+  border-radius: 14px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.55);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.audit-panel.hidden { display: none; }
+.audit-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  background: #101318;
+  border-bottom: 1px solid #2a2f3a;
+  flex-wrap: wrap;
+}
+.audit-title { font-size: 13px; color: #9aa3b2; }
+.audit-btns { display: flex; gap: 6px; }
+.audit-btns .btn { padding: 5px 12px; font-size: 12px; }
+.audit-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.65;
+  color: #b8c2d0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.audit-foot { padding: 8px 12px; font-size: 12px; color: #6b7280; border-top: 1px solid #2a2f3a; }
+
+/* ---- A4 文件传输：进度面板 + 收到的文件下载区 ---- */
+.file-panel {
+  position: fixed;
+  right: 20px;
+  top: 76px;
+  width: 320px;
+  z-index: 997;
+  background: #171b22;
+  border: 1px solid #3a4150;
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.5);
+}
+.file-panel.hidden { display: none; }
+.file-item { font-size: 12.5px; color: #c8d0dc; display: flex; flex-direction: column; gap: 4px; }
+.file-item .fi-name { word-break: break-all; }
+.file-item .fi-bar { height: 5px; border-radius: 3px; background: #2a2f3a; overflow: hidden; }
+.file-item .fi-bar > i { display: block; height: 100%; width: 0%; background: #2f9e5f; transition: width .1s linear; }
+.file-item .fi-meta { font-size: 11px; color: #6b7280; }
+.file-item a { color: #8ab8ff; text-decoration: underline; cursor: pointer; }
+
+/* ══════════════════════════════════════════════════════════════
+   ★ 09-13 主题翻新层（UI 现代化，参考 Linear/Zoom 类产品的深色质感）
+   ▎原则：只做"覆盖式精修"——所有类名/结构不变（HTML/JS 零改动），
+     靠 CSS 变量 + 渐变 + 阴影 + 过渡把整体质感拉起来。
+     本层写在文件末尾，同等特异性下天然压过上面的老规则。
+   ══════════════════════════════════════════════════════════════ */
+
+:root {
+  --accent: #34d97b;            /* 主强调色（绿） */
+  --accent-2: #6d5dfc;          /* 次强调色（紫，渐变搭子） */
+  --accent-soft: rgba(52, 217, 123, .14);
+  --panel: #161b24;
+  --panel-2: #1b2230;
+  --line: #262f40;
+  --radius: 12px;
+  --shadow: 0 10px 30px rgba(0, 0, 0, .35);
+}
+
+/* —— 全局底色与滚动条 —— */
+body {
+  background:
+    radial-gradient(ellipse at 15% 0%, rgba(109, 93, 252, .10), transparent 50%),
+    radial-gradient(ellipse at 90% 100%, rgba(52, 217, 123, .08), transparent 50%),
+    linear-gradient(165deg, #12151c 0%, #0e1118 100%);
+  background-attachment: fixed;
+}
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: #2c3648; border-radius: 99px; border: 2px solid #12151c; }
+::-webkit-scrollbar-thumb:hover { background: #3a465c; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* —— 按钮：统一质感（渐变描边 + 悬浮上移 + 按压回弹）—— */
+.btn {
+  border: 1px solid var(--line);
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  border-radius: 10px;
+  padding: 8px 14px;
+  font-size: 13px;
+  transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease, filter .12s ease;
+}
+.btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  border-color: #3a465c;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, .35);
+}
+.btn:active:not(:disabled) { transform: translateY(0); filter: brightness(1.15); }
+.btn:disabled { opacity: .38; cursor: not-allowed; }
+.btn.primary {
+  background: linear-gradient(135deg, var(--accent-2) 0%, #46a8c2 100%);
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(109, 93, 252, .30);
+}
+.btn.danger {
+  background: linear-gradient(135deg, #a04343, #7d2f2f);
+  border-color: transparent;
+}
+.btn.assist { border-color: rgba(52, 217, 123, .45); color: var(--accent); }
+.btn.active { /* ★ 09-13：举手等"开关型"按钮的激活态 */
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+:focus-visible { outline: 2px solid rgba(52, 217, 123, .55); outline-offset: 2px; }
+
+/* —— 输入框 —— */
+.room-input, input[type="text"], input[type="password"] {
+  background: #10141c;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 12px;
+  color: #e8eaf0;
+  transition: border-color .12s ease, box-shadow .12s ease;
+}
+.room-input:focus, input:focus {
+  outline: none;
+  border-color: rgba(52, 217, 123, .55);
+  box-shadow: 0 0 0 3px rgba(52, 217, 123, .12);
+}
+
+/* —— 徽标：玻璃感 —— */
+.badge {
+  background: rgba(27, 34, 48, .72);
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  backdrop-filter: blur(6px);
+}
+.badge.connected { border-color: rgba(52, 217, 123, .4); }
+.badge.room { cursor: pointer; transition: border-color .12s; }
+.badge.room:hover { border-color: var(--accent); }
+
+/* —— 视频格 —— */
+.video-box {
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid #1f2735;
+  box-shadow: var(--shadow);
+  transition: transform .15s ease, border-color .15s ease;
+}
+.video-box:hover { border-color: #34405a; }
+.video-box.speaking { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft), var(--shadow); }
+.video-label {
+  background: linear-gradient(180deg, transparent, rgba(10, 12, 18, .85));
+}
+
+/* —— 聊天气泡 —— */
+.msg { border-radius: 12px; }
+.msg.me { background: var(--accent-soft); border: 1px solid rgba(52, 217, 123, .25); }
+.msg.other { background: var(--panel); border: 1px solid var(--line); }
+.msg.system { color: #8b93a5; }
+.msg .msg-name { color: var(--accent); font-weight: 600; }
+
+/* —— 成员行（SFU 版有；Mesh 版选择器不匹配自动忽略）—— */
+.member-row { border-radius: 10px; transition: background .12s; }
+.member-row:hover { background: rgba(255, 255, 255, .04); }
+.member-row.speaking { background: var(--accent-soft); }
+
+/* ★ 09-13 新组件样式（JS 会动态创建，样式放这层方便集中管理） */
+
+/* 发言占比条：成员行底部一根 4px 细条 */
+.m-talk {
+  display: block;
+  width: 100%;
+  height: 4px;
+  margin-top: 4px;
+  background: #10141c;
+  border-radius: 3px;
+  overflow: hidden;
+}
+.m-talk i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent-2), var(--accent));
+  border-radius: 3px;
+  transition: width .6s ease;
+}
+
+/* 表情回应栏：控制区里的胶囊小条 */
+.react-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 6px;
+  background: rgba(27, 34, 48, .72);
+  border: 1px solid var(--line);
+  border-radius: 99px;
+}
+.react-btn {
+  border: none;
+  background: transparent;
+  font-size: 17px;
+  padding: 4px 6px;
+  border-radius: 8px;
+  cursor: pointer;
+  line-height: 1;
+  transition: transform .12s ease, background .12s ease;
+}
+.react-btn:hover { background: rgba(255, 255, 255, .08); transform: scale(1.18) rotate(-6deg); }
+.react-btn:active { transform: scale(.92); }
+
+/* 表情飞屏：从屏幕底部飘上去（JS 生成 span.react-fly，2.4s 后自删） */
+.react-fly {
+  position: fixed;
+  bottom: -48px;
+  z-index: 1200;
+  font-size: 38px;
+  pointer-events: none;
+  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, .5));
+  animation: reactFly 2.3s ease-out forwards;
+}
+@keyframes reactFly {
+  0%   { transform: translateY(0) scale(.7); opacity: 0; }
+  12%  { opacity: 1; transform: translateY(-8vh) scale(1.15); }
+  30%  { transform: translateY(-22vh) scale(1); }
+  100% { transform: translateY(-62vh) scale(.9) rotate(8deg); opacity: 0; }
+}
+
+/* —— 预览页（SFU 版 F3；Mesh 无此元素自动忽略）—— */
+.prejoin { background: rgba(10, 13, 19, .92); backdrop-filter: blur(10px); }
+.prejoin-card {
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   ★ 09-14 主题层 v2（设计方法论：Radix Colors 的"12 级层次" + GitHub Primer
+   的"fg/bg/border × emphasis/muted"语义 token——学自两家公开设计系统）
+   ▎本层只覆盖视觉，不改任何类名/结构（HTML/JS 零改动，测试全绿的前提）。
+   ══════════════════════════════════════════════════════════════ */
+
+:root {
+  /* 背景 4 级层次（Radix：步骤 1-2 背景 / 3-5 交互件 / 6-8 边框 / 9 实心强调） */
+  --bg0: #0b0e14;               /* 页面画布（最深） */
+  --bg1: #12151d;               /* 面板 */
+  --bg2: #1a2130;               /* 抬升件（输入框/悬浮条） */
+  --bg3: #232c3f;               /* 悬停态 */
+  /* 前景三级（Primer：default / muted / onEmphasis） */
+  --fg: #e9edf5;
+  --fg-muted: #97a1b4;
+  --fg-faint: #6b7486;
+  /* 边框两级（Primer：默认 / 强调；强调再加 40% 透明度做 muted） */
+  --border: #262f42;
+  --border-strong: #39445c;
+  /* 强调色：accent + 实心 + 弱化底（大面积提示用 muted，不用实心） */
+  --accent: #3fd68c;
+  --accent-emphasis: #1fa566;
+  --accent-muted: rgba(63, 214, 140, .13);
+  --accent-border: rgba(63, 214, 140, .42);
+  --violet: #8b7bff;
+  --radius: 12px;
+  --shadow-1: 0 2px 8px rgba(0, 0, 0, .28);
+  --shadow-2: 0 12px 32px rgba(0, 0, 0, .42);
+  --ease: cubic-bezier(.2, .7, .3, 1);
+}
+
+/* —— 全局：字型系统 + 画布 —— */
+body {
+  font-family: "Segoe UI Variable Text", "Segoe UI", -apple-system, "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  letter-spacing: .1px;
+  background:
+    radial-gradient(ellipse 80% 50% at 12% -8%, rgba(139, 123, 255, .13), transparent 60%),
+    radial-gradient(ellipse 70% 45% at 95% 105%, rgba(63, 214, 140, .09), transparent 60%),
+    linear-gradient(172deg, var(--bg1) 0%, var(--bg0) 100%);
+  background-attachment: fixed;
+  color: var(--fg);
+}
+h1 { font-size: 17px; font-weight: 650; letter-spacing: -.015em; }
+.badge, .msg-time, .stat .num, #clock { font-variant-numeric: tabular-nums; }
+
+/* —— 徽标 v2：半透明玻璃 + 细描边（层级 bg2）—— */
+.badge {
+  background: color-mix(in srgb, var(--bg2) 78%, transparent);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(10px);
+  color: var(--fg);
+  transition: border-color .15s var(--ease), background .15s var(--ease);
+}
+.badge.idle { color: var(--fg-muted); }
+.badge.connected { border-color: var(--accent-border); color: var(--accent); }
+.badge.room { border-color: var(--accent-border); background: var(--accent-muted); color: var(--accent); }
+.badge.room:hover { border-color: var(--accent); }
+#connType { color: var(--violet); border-color: rgba(139, 123, 255, .45); }
+
+/* —— 按钮微调（v1 基础上换 token、加过渡曲线）—— */
+.btn {
+  background: linear-gradient(180deg, var(--bg2), #171d2a);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 10px;
+  transition: transform .14s var(--ease), box-shadow .14s var(--ease), border-color .14s var(--ease);
+}
+.btn:hover:not(:disabled) { border-color: var(--border-strong); box-shadow: var(--shadow-1); }
+.btn.primary {
+  background: linear-gradient(135deg, var(--violet) 0%, #5f7bdc 100%);
+  box-shadow: 0 4px 16px rgba(139, 123, 255, .28);
+}
+.btn.primary:hover:not(:disabled) { box-shadow: 0 6px 20px rgba(139, 123, 255, .4); }
+.btn.danger { background: linear-gradient(135deg, #b04a4a, #7c2e2e); }
+.btn.active { background: var(--accent-muted); border-color: var(--accent-border); color: var(--accent); }
+
+/* —— 输入框 v2 —— */
+.room-input, .pwd {
+  background: var(--bg0);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--fg);
+  transition: border-color .15s var(--ease), box-shadow .15s var(--ease);
+}
+.room-input::placeholder { color: var(--fg-faint); }
+.room-input:focus {
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 3px var(--accent-muted);
+}
+
+/* —— 房间面板：玻璃卡片居中，主按钮更重 —— */
+.room-panel {
+  padding: 14px 16px;
+  background: color-mix(in srgb, var(--bg1) 72%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  backdrop-filter: blur(14px);
+  box-shadow: var(--shadow-2);
+}
+
+/* —— 视频格 v2：16:9 网格 + 悬停描边 + 说话光圈 —— */
+.video-grid { gap: 12px; }
+.video-box {
+  border-radius: var(--radius);
+  border: 1px solid #202a3c;
+  background: #0d1017;
+  box-shadow: var(--shadow-1);
+}
+.video-box:hover { border-color: var(--border-strong); }
+.video-box.speaking {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-muted), var(--shadow-1);
+}
+.video-label {
+  font-size: 12px;
+  padding: 18px 10px 8px;
+  background: linear-gradient(180deg, transparent, rgba(6, 8, 12, .88));
+}
+
+/* —— 控制条 v2：悬浮玻璃胶囊 —— */
+.controls {
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--bg1) 68%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  backdrop-filter: blur(14px);
+  box-shadow: var(--shadow-2);
+}
+
+/* —— 表情回应栏 v2 —— */
+.react-bar {
+  background: color-mix(in srgb, var(--bg2) 82%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  backdrop-filter: blur(8px);
+}
+.react-btn:hover { background: rgba(255, 255, 255, .09); }
+
+/* —— 聊天侧栏 v2：玻璃面板 + 气泡分层 —— */
+.chat-side, #chatList {
+  scrollbar-width: thin;
+  scrollbar-color: #333f56 transparent;
+}
+.msg { margin-bottom: 10px; }
+.msg.me {
+  background: linear-gradient(135deg, rgba(139, 123, 255, .16), rgba(63, 214, 140, .10));
+  border: 1px solid rgba(139, 123, 255, .30);
+}
+.msg.other { background: var(--bg1); border: 1px solid var(--border); }
+.msg .msg-name { color: var(--accent); font-weight: 600; font-size: 12px; }
+.msg .msg-time { color: var(--fg-faint); font-size: 11px; }
+/* 路径徽标：🛰️ = SCTP 数据通道路（09-14） */
+.msg-via { font-size: 11px; margin-left: 4px; opacity: .9; }
+
+/* —— 成员列表 v2 —— */
+.member-row:hover { background: rgba(255, 255, 255, .045); }
+.member-row.speaking { background: var(--accent-muted); }
+
+/* —— 视图切换条 v2：分段控件感 —— */
+.view-bar {
+  background: color-mix(in srgb, var(--bg2) 75%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  backdrop-filter: blur(10px);
+}
+.view-btn.active {
+  background: var(--accent-muted);
+  color: var(--accent);
+  border-color: var(--accent-border);
+}
+
+/* —— 预览页 v2（SFU）—— */
+.prejoin-card {
+  background: color-mix(in srgb, var(--bg1) 88%, transparent);
+  backdrop-filter: blur(18px);
+  border: 1px solid var(--border-strong);
+}
+
+/* ══════════ 09-14 新组件：协作批注（F5）══════════ */
+
+/* 批注画布：盖在屏幕画面上；默认不接鼠标（点 ✏️ 后才进入画图模式） */
+.annot-canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  cursor: crosshair;
+}
+.annot-canvas.annot-on { pointer-events: auto; }
+
+/* 批注工具条：屏幕格右上角的小浮条（画笔开关/颜色/撤销/清空） */
+.annot-bar {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 5px;
+  background: color-mix(in srgb, var(--bg0) 78%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  backdrop-filter: blur(8px);
+  opacity: .35;
+  transition: opacity .15s var(--ease);
+}
+.video-box:hover .annot-bar, .annot-bar:focus-within { opacity: 1; }
+.annot-btn, .annot-dot {
+  width: 24px;
+  height: 24px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  transition: background .12s, border-color .12s, transform .12s;
+}
+.annot-btn:hover { background: rgba(255, 255, 255, .09); color: var(--fg); }
+.annot-btn.active { background: var(--accent-muted); border-color: var(--accent-border); color: var(--accent); }
+.annot-dot { border-radius: 50%; }
+.annot-dot:hover { transform: scale(1.18); }
+.annot-dot.active { border-color: #fff; box-shadow: 0 0 0 2px rgba(255, 255, 255, .35); }

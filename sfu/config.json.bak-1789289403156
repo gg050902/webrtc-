@@ -1,0 +1,35 @@
+{
+  "port": 3001,
+  "maxMembers": 8,
+  "listenIp": "0.0.0.0",
+  "announcedIp": "192.168.165.194",
+  "rtcMinPort": 40000,
+  "rtcMaxPort": 49999,
+  "roomTtlSec": 60,
+  "videoSvc": false,
+  "iceServers": [
+    {
+      "urls": "stun:stun.l.google.com:19302"
+    },
+    {
+      "urls": "turn:openrelay.metered.ca:80",
+      "username": "openrelayproject",
+      "credential": "openrelayproject"
+    },
+    {
+      "urls": "turn:openrelay.metered.ca:443",
+      "username": "openrelayproject",
+      "credential": "openrelayproject"
+    },
+    {
+      "urls": "turn:openrelay.metered.ca:443?transport=tcp",
+      "username": "openrelayproject",
+      "credential": "openrelayproject"
+    }
+  ],
+  "https": {
+    "enabled": true,
+    "port": 3443,
+    "autoSelfSigned": true
+  }
+}

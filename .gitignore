@@ -1,0 +1,19 @@
+# 依赖
+node_modules/
+
+# 运行时产物（不入库：每人自己的数据与录制）
+sfu/recordings/
+sfu/captions/
+sfu/logs/
+sfu/users.json
+sfu/config.json
+sfu/tls/
+*.log
+public/vendor/          # 由 npm run build:sfu-vendor 重新生成
+sfu/public/vendor/
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

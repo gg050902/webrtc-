@@ -1,0 +1,2 @@
+[permissions]
+allow = ["Bash=cd \"C:/Users/27418/Desktop/webrtc\" && curl -s -o /dev/null -w \"首页端口3000 -> %{http_code}\\n\" --max-time 3 http://localhost:3000/ 2>&1; echo \"exit=$?\"; netstat -ano 2>/dev/null | grep -i \":3000\" | head -5"]

@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" href="data:," /><!-- 占位图标：消掉 favicon.ico 404 噪音 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>简易腾讯会议 Demo · SFU 版（mediasoup）</title>
+  <link rel="stylesheet" href="style.css?v=20260917e" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存 -->
+</head>
+<body>
+  <!-- ★ F3 升级（2026-09-12）：加入前预览页 —— "进会先把设备检查好"（腾讯会议同款流程）。
+       页面一打开它就盖在最上面：本地预览 + 选设备 + 麦克风试音条 + 预静音勾选。
+       预览和会议用的是**同一条 localStream**（不多开一路摄像头），
+       点「进入会议」才关掉预览页、真正入房 —— 实现见 client.js 第 25 步。 -->
+  <!-- ★ 09-16 基础功能补全：登录/注册（游客可直接进入）。z 110 盖在预览页(100)之上；
+       登录成功后昵称贯通成员列表/聊天气泡（见 client.js 第 2.5 步） -->
+  <div id="authOverlay" class="auth-overlay">
+    <div class="auth-card">
+      <div class="auth-caps">Simple Meeting over Mediasoup</div>
+      <div class="auth-title">简易腾讯会议</div>
+      <div class="auth-sub">登录后昵称会显示给全房间；也可以游客进入，随时可注册</div>
+      <input id="authUser" class="room-input auth-input" placeholder="用户名（2~16 位，中英文/数字/下划线）" maxlength="16" />
+      <input id="authPass" class="room-input auth-input" type="password" placeholder="密码（至少 6 位）" maxlength="32" />
+      <input id="authName" class="room-input auth-input" placeholder="昵称（可选，注册时保存）" maxlength="16" />
+      <div class="auth-btns">
+        <button id="authLoginBtn" class="btn primary">登 录</button>
+        <button id="authRegisterBtn" class="btn">注 册</button>
+      </div>
+      <button id="authGuestBtn" class="auth-guest">游客进入（不登录）→</button>
+      <div id="authMsg" class="auth-msg"></div>
+    </div>
+  </div>
+
+  <div id="prejoin" class="prejoin">
+    <div class="prejoin-card">
+      <div class="prejoin-title">
+        <span class="prejoin-logo">會</span>
+        <div>
+          <div class="prejoin-caps">Device Check</div>
+          <div class="prejoin-heading">准备加入会议</div>
+          <div class="prejoin-sub">先检查设备，再进会 —— 摄像头/麦克风只在预览里授权这一次</div>
+        </div>
+      </div>
+      <div class="prejoin-main">
+        <div class="prejoin-video-wrap">
+          <video id="preVideo" autoplay playsinline muted></video>
+          <div id="preVideoHint" class="prejoin-video-hint hidden">
+            摄像头不可用或未授权<br />可直接进入会议（不发布自己的画面）
+          </div>
+        </div>
+        <div class="prejoin-side">
+          <label class="pj-row">摄像头
+            <select id="pjCamSelect" class="dev-select" title="选择摄像头"></select>
+          </label>
+          <label class="pj-row">麦克风
+            <select id="pjMicSelect" class="dev-select" title="选择麦克风"></select>
+          </label>
+          <div class="pj-row">试音
+            <!-- 对麦克风说话，绿条会动：WebAudio AnalyserNode 实时量能量（见第 25 步） -->
+            <div class="pj-meter" title="对麦克风说话，绿条会动"><i id="pjMeterBar"></i></div>
+          </div>
+          <label class="pj-check"><input type="checkbox" id="pjMuteChk" /> 入会时静音麦克风</label>
+          <label class="pj-check"><input type="checkbox" id="pjCamChk" /> 入会时关闭摄像头</label>
+          <!-- ★ F6：预览页也能开滤镜（与会内共用同一块面板；预览里调好，进会后推的就是处理后的画面） -->
+          <button id="pjFxBtn" class="btn pj-fx-btn" title="滤镜/磨皮/虚拟背景（预览即所见即所得）">✨ 滤镜 / 虚拟背景</button>
+          <button id="pjEnterBtn" class="btn primary pj-enter">进入会议 →</button>
+          <div id="pjStatus" class="pj-status">正在打开摄像头…</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ════════ 应用壳：顶栏 / 舞台 / 侧栏 / 日志 ════════ -->
+  <div class="app">
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-logo" title="简易腾讯会议">會</span>
+        <div class="brand-text">
+          <div class="brand-name">简易腾讯会议</div>
+          <div class="brand-sub">SFU · Mediasoup · 8 人</div>
+        </div>
+      </div>
+      <div class="badges">
+        <span id="roomBadge" class="badge room hidden" title="点击复制邀请链接">🏠 房间号 ------</span>
+        <span id="memberCount" class="badge idle">👥 1 人</span>
+        <span id="connBadge" class="badge idle">未连接服务器</span>
+        <!-- 网络质量徽标：SFU 版读 Transport 统计（client.js 第 13 步） -->
+        <span id="netBadge" class="badge idle">📶 网络 --</span>
+        <!-- ★ 09-13 可达性：到服务器的连接方式（host=直连 / srflx=STUN穿墙 / relay=TURN中继），
+             让"网络可达性"这个硬边界看得见（client.js 第 13 步从 getStats 候选里读） -->
+        <span id="connType" class="badge idle hidden">🔗 --</span>
+      </div>
+    </header>
+
+    <!-- 舞台：房间卡（进房前）→ 视图切换 + 视频网格 + 底部控制坞 -->
+    <main class="stage">
+      <!-- 房间面板：没进房间时显示（创建/加入 + 可选密码）。进房后 JS 加 .hidden 整卡消失 -->
+      <div class="room-panel" id="roomPanel">
+        <div class="room-hero">
+          <div class="room-hero-caps">Simple Meeting over Mediasoup</div>
+          <div class="room-hero-title">加入一场会议</div>
+          <div class="room-hero-sub">创建一个新房间，或输入 6 位房间号加入（可带密码）</div>
+          <div class="room-hero-actions">
+            <div class="room-hero-create">
+              <button id="createBtn" class="btn primary btn-lg" disabled>🎬 创建房间</button>
+              <span class="room-sep">—— 或 ——</span>
+            </div>
+            <div class="room-hero-join">
+              <input id="roomInput" class="room-input" inputmode="numeric" maxlength="6"
+                     placeholder="输入 6 位房间号" disabled />
+              <input id="roomPasswordInput" class="room-input pwd" maxlength="20"
+                     placeholder="密码（可选）" disabled />
+              <button id="joinRoomBtn" class="btn btn-lg" disabled>加入 →</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ★ F1 升级（2026-09-12）：视图切换条 —— 宫格（所有人一样大）/ 演讲者（大画面 + 小格）。
+           双击任意画面可全屏；演讲者视图里每个画面左上角有 📌 钉选按钮。
+           大画面的优先级：钉选的人 > 正在共享屏幕的人 > 正在说话的人 > 我自己（见 client.js 第 26 步） -->
+      <div class="view-bar" id="viewBar">
+        <button id="viewGalleryBtn" class="view-btn active" title="宫格视图：所有人一样大">▦ 宫格</button>
+        <button id="viewSpeakerBtn" class="view-btn" title="演讲者视图：大画面跟随说话人/共享者">▢ 演讲者</button>
+        <span class="view-tip">双击画面全屏 · 演讲者视图可 📌 钉选</span>
+      </div>
+
+      <!-- 视频网格：自己的画面固定在第一格，其他人由 JS 动态插入 -->
+      <div class="video-grid" id="videoGrid">
+        <div class="video-box self">
+          <video id="localVideo" autoplay playsinline muted></video>
+          <div class="video-label">我（本地预览）</div>
+        </div>
+      </div>
+
+      <!-- ★ 09-17 实时字幕条（第 29 步）：悬浮在网格与控制坞之间，显示"最近说话的人"的字幕；
+           半透明 = 识别中的半句（interim，只本地跳动），实色 = 成稿（已广播全房）；
+           ⌃ 历史抽屉 / ⬇ 导出整场字幕记录（txt）——这本账就是将来 AI 纪要/问答（C2）的输入 -->
+      <div id="captionBar" class="caption-bar hidden">
+        <button id="capHistoryBtn" class="btn mini" title="回看字幕历史（最近 100 条）">⌃ 历史</button>
+        <!-- ★ 09-17c 自检徽标：把"为什么没字幕"摊开给用户看（安全上下文/权限/识别服务三段） -->
+        <span id="capStatus" class="cap-status" title="字幕自检：点击查看详细诊断">💬 未开启</span>
+        <span id="captionText" class="caption-text"></span>
+        <!-- ★ 09-17c 手动字幕兜底：浏览器云端识别不可用时，也能用打字的方式把内容发成字幕 -->
+        <input id="capManualInput" class="cap-manual" maxlength="120"
+               placeholder="识别不可用？在这里打字回车 = 手动字幕" />
+        <button id="capManualSend" class="btn mini" title="把输入框内容作为一条字幕广播给全房">发送</button>
+        <button id="capExportBtn" class="btn mini" title="导出字幕记录（txt，含时间戳与说话人）">⬇ 记录</button>
+      </div>
+
+      <!-- ★ 09-17c 字幕诊断卡：自检失败的每一条都给出"具体原因 + 怎么修"，
+           而不是只弹一句"不可用"（用户的真实困惑是"为什么/怎么办"） -->
+      <div id="capDiagBox" class="cap-diag hidden">
+        <div class="cap-diag-head">
+          <span>💬 实时字幕自检</span>
+          <button id="capDiagCloseBtn" class="btn mini" title="关闭">✕</button>
+        </div>
+        <div id="capDiagList" class="cap-diag-list"></div>
+        <div class="cap-diag-tip">
+          提示：Chrome/Edge 的语音识别会把音频送到**浏览器厂商的云端服务**，因此
+          ① 必须能访问该服务（受限网络会报 <code>network</code>）；
+          ② 页面必须是**安全上下文**（<code>https://</code> 或 <code>localhost</code>，纯 IP 的 http 会被拦）；
+          ③ 需要麦克风权限。
+          以上任一不满足时，可先用下面的「手动字幕」兜底。
+        </div>
+      </div>
+
+      <!-- ★ 09-17b 字幕历史抽屉：cap.log 的滚动视图（最近 100 条，新字幕自动滚底）；
+           渲染全走 createElement + textContent（字幕是远端输入，XSS 纪律同聊天） -->
+      <div id="capHistoryPanel" class="cap-history hidden">
+        <div class="cap-h-head">
+          <span class="cap-h-title">📜 字幕历史</span>
+          <span class="cap-h-caps">Transcript</span>
+          <!-- ★ 09-17e 值守统计（第 30 步，C3-N1）：时长 · 累计条数 · 识别器重启 · 已归档——
+               过夜值守的"夜里发生了什么"就浓缩在这一行 -->
+          <span id="capSentryStats" class="cap-h-sentry"
+                title="值守统计：时长 · 累计条数 · 识别器重启次数 · 已归档到服务器的条数"></span>
+          <button id="capHistoryCloseBtn" class="btn mini" title="收起">✕</button>
+        </div>
+        <div id="capHistoryList" class="cap-h-list"></div>
+      </div>
+
+      <!-- 控制坞：底部悬浮的玻璃胶囊（离开/共享/协助/静音/摄像头/设备/录制/举手/回应） -->
+      <div class="controls">
+        <button id="leaveBtn" class="btn danger" disabled>离开房间</button>
+        <button id="shareBtn" class="btn" disabled>共享屏幕</button>
+        <!-- ★ 远程协助（A1）：允许远程协助开关（被控端用）。
+             只在"正在共享屏幕"时出现；打开 = 页面切到工作台模式（见 workbenchArea） -->
+        <button id="assistBtn" class="btn assist hidden" disabled>🖱️ 允许远程协助</button>
+        <button id="muteBtn" class="btn" disabled>静音</button>
+        <button id="camBtn" class="btn" disabled>关摄像头</button>
+        <!-- ★ D3 升级：设备切换（enumerateDevices + replaceTrack，不用重连） -->
+        <select id="camSelect" class="dev-select" disabled title="切换摄像头（replaceTrack，不重连）"></select>
+        <select id="micSelect" class="dev-select" disabled title="切换麦克风（replaceTrack，不重连）"></select>
+        <!-- ★ D5 升级：录制（MediaRecorder 录"合成的会议画面 + 混合音频"） -->
+        <button id="recordBtn" class="btn" disabled>⏺ 录制会议</button>
+        <!-- ★ 09-13 F4：举手（member-state 带 hand 字段，全房成员列表显示 ✋） -->
+        <button id="handBtn" class="btn" disabled title="举手让大家看见你要发言">✋ 举手</button>
+        <!-- ★ 09-15 F7：独立协作白板（第三条 SCTP 频道 'board'，全场共享一块画布） -->
+        <button id="boardBtn" class="btn" disabled title="打开全场共享白板（人人可画）">🖌️ 白板</button>
+        <!-- ★ 09-14 F6：滤镜与虚拟背景（canvas 逐帧处理 + replaceTrack，纯前端零依赖） -->
+        <button id="fxBtn" class="btn" disabled title="滤镜/磨皮/虚拟背景（绿幕抠像，经 replaceTrack 上行）">✨ 滤镜</button>
+        <!-- ★ 09-17 实时字幕（第 29 步，AI 线 L1）：Web Speech API 识别自己的麦克风，成稿经 SCTP 广播全房 -->
+        <button id="capBtn" class="btn" disabled title="实时字幕：识别自己的麦克风转文字并广播（Web Speech API）">💬 字幕</button>
+        <!-- ★ 09-13 F4：表情回应（走 D+1 SCTP 数据通道广播，全房表情飞屏） -->
+        <div class="react-bar" id="reactBar" title="表情回应：经 SFU 数据通道广播给全房">
+          <button class="react-btn" data-emoji="👍" title="赞">👍</button>
+          <button class="react-btn" data-emoji="❤️" title="喜欢">❤️</button>
+          <button class="react-btn" data-emoji="😂" title="笑">😂</button>
+          <button class="react-btn" data-emoji="🎉" title="庆祝">🎉</button>
+          <button class="react-btn" data-emoji="👏" title="鼓掌">👏</button>
+          <button class="react-btn" data-emoji="🤔" title="想想">🤔</button>
+        </div>
+      </div>
+
+      <!-- ★ 09-15 F7：全场共享白板覆盖层（月白底 + 深色笔；事件经 'board' SCTP 频道同步） -->
+      <div id="boardOverlay" class="board-overlay hidden">
+        <div class="board-head">
+          <span class="board-title">🖌️ 共享白板</span>
+          <span class="board-caps">Everyone draws together</span>
+          <span class="board-bar">
+            <span id="boardColors" class="board-colors"></span>
+            <button id="boardUndoBtn" class="btn mini" title="撤销我的最后一笔">↶</button>
+            <button id="boardClearBtn" class="btn mini" title="清空整块白板（全房同步）">🗑</button>
+            <button id="boardCloseBtn" class="btn mini" title="关闭白板">✕</button>
+          </span>
+        </div>
+        <canvas id="boardCanvas" class="board-canvas"></canvas>
+      </div>
+
+      <!-- ★ 09-14 F6：滤镜与虚拟背景浮层（预览页 pjFxBtn 与会内 fxBtn 共用；纯 canvas 管线 + replaceTrack）。
+           面板显示 ≠ 启动管线：选档位/开绿幕那一刻才起管线（syncFxPipeline 统一出口）。
+           徽标 fxCost 是"每帧 CPU 账"——路线图 F6 明确要求会算这笔账 -->
+      <div id="fxPanel" class="fx-panel hidden">
+        <div class="fx-head">
+          <span class="fx-title">✨ 滤镜与虚拟背景</span>
+          <span class="fx-caps">Canvas FX · replaceTrack</span>
+          <button id="fxCloseBtn" class="btn mini" title="收起">✕</button>
+        </div>
+        <div class="fx-sec">
+          <div class="fx-label">滤镜</div>
+          <div id="fxPresets" class="fx-chips">
+            <button class="fx-chip active" data-preset="none">原图</button>
+            <button class="fx-chip" data-preset="natural">自然</button>
+            <button class="fx-chip" data-preset="cool">冷白</button>
+            <button class="fx-chip" data-preset="warm">暖阳</button>
+            <button class="fx-chip" data-preset="mono">水墨</button>
+          </div>
+          <div class="fx-label">磨皮 <span class="fx-val" id="fxSmoothVal">0</span></div>
+          <input type="range" id="fxSmooth" min="0" max="100" value="0" title="低清模糊放大混合，不依赖人像分割" />
+        </div>
+        <div class="fx-sec">
+          <div class="fx-label">虚拟背景（色键抠像）</div>
+          <label class="fx-check"><input type="checkbox" id="fxChromaChk" /> 开启抠像（坐在纯色幕布/墙前效果最佳）</label>
+          <div id="fxKeys" class="fx-chips">
+            <button class="fx-chip active" data-key="green" title="键色=绿">🟩 绿幕</button>
+            <button class="fx-chip" data-key="blue" title="键色=蓝">🟦 蓝幕</button>
+          </div>
+          <div class="fx-label">阈值 <span class="fx-val" id="fxChromaTolVal">60</span></div>
+          <input type="range" id="fxChromaTol" min="20" max="140" value="60" title="色距小于阈值判为背景；边缘自动羽化" />
+          <div class="fx-label">替换为</div>
+          <div id="fxBgs" class="fx-chips">
+            <button class="fx-chip active" data-bg="ink">墨色</button>
+            <button class="fx-chip" data-bg="silk">绢色</button>
+            <button class="fx-chip" data-bg="gold">鎏金</button>
+            <button class="fx-chip" data-bg="image">🖼️ 图片</button>
+          </div>
+          <input type="file" id="fxBgFile" accept="image/*" class="hidden" />
+        </div>
+        <div class="fx-foot">
+          <span id="fxCost" class="fx-cost" title="每帧处理耗时（EMA 平滑）：GPU 滤镜应 <2ms，CPU 抠像 +2~5ms">⚙️ -- ms/帧</span>
+          <span class="fx-tip">画面经 canvas 处理后 replaceTrack 上行 —— 观众看到的与你一致</span>
+        </div>
+      </div>
+
+      <!-- ★ 远程协助（A1）：被控端工作台容器。
+           打开「允许远程协助」后进入"工作台模式"（body.workbench-mode）：
+           盖满全屏 —— 里面的 iframe(workbench.html) 就是被共享出去的"可被遥控桌面"。 -->
+      <div id="workbenchArea" class="workbench-area hidden">
+        <div class="wb-toolbar">
+          <span id="wbStatus">✅ 远程协助已开启，等待成员请求控制…</span>
+          <!-- ★ A6：限时授权的倒计时（授权中才显示，被控端随时知道还剩多久） -->
+          <span id="wbCountdown" class="wb-countdown hidden">⏳ --</span>
+          <span class="wb-toolbar-btns">
+            <!-- 收回控制：正在被控时显示，结束当前控制但保持工作台 -->
+            <button id="wbReclaimBtn" class="btn danger hidden">收回控制</button>
+            <!-- ★ A3：把被控端本机剪贴板内容发给控制端（反向剪贴板同步；正向是控制端 Ctrl+V） -->
+            <button id="wbClipBtn" class="btn">📋 剪贴板发给控制端</button>
+            <!-- ★ A6：审计日志（谁在何时点了什么，被控端本地记录，可导出） -->
+            <button id="wbAuditBtn" class="btn">📜 审计日志</button>
+            <!-- 关闭远程协助：收起工作台回到会议视图（共享继续） -->
+            <button id="wbAssistOffBtn" class="btn">关闭远程协助</button>
+            <!-- 停止共享：与主控制坞「停止共享」等效（这里不离手就能点） -->
+            <button id="wbStopShareBtn" class="btn">停止共享</button>
+          </span>
+        </div>
+        <!-- 工作台 iframe：src 指向同源演示页（伪桌面），事件重放目标 -->
+        <iframe id="workbenchFrame" src="workbench.html" title="远程协助工作台"></iframe>
+      </div>
+    </main>
+
+    <!-- 侧栏：成员列表（★ D4）+ 会议聊天 -->
+    <aside class="sidebar">
+      <div class="member-panel">
+        <div class="member-title">
+          <span>👥 成员 <span id="memberNum">1</span></span>
+          <span id="ownerTag" class="role-tag hidden">👑 你是房主</span>
+        </div>
+        <div id="memberList" class="member-list"></div>
+      </div>
+      <div class="chat-panel">
+        <div class="chat-title">💬 会议聊天 <span class="chat-via">经服务器转发</span></div>
+        <div class="chat-messages" id="chatList"></div>
+        <div class="chat-input-bar">
+          <textarea id="chatInput" rows="1" placeholder="发条消息…（Enter 发送）"></textarea>
+          <button id="chatSendBtn" class="btn send">发送</button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 信令/媒体流程日志：跨在底部（看这里理解 SFU：Transport → Producer/Consumer） -->
+    <section class="log-panel">
+      <div class="log-title">📋 流程日志（Transport → Producer/Consumer）</div>
+      <pre id="log"></pre>
+    </section>
+  </div>
+
+  <!-- ★ 远程协助（A1）：被控端授权卡片（点"允许/拒绝"后隐藏）
+       ★ A6 升级后多了两件东西：时长选择（限时授权）与「不再允许 TA」（本地黑名单） -->
+  <div id="remoteAskBox" class="remote-ask hidden">
+    <div class="remote-ask-text" id="remoteAskText">有人想控制你的屏幕</div>
+    <div class="remote-ask-btns">
+      <select id="remoteDurSel" class="dev-select" title="授权时长">
+        <option value="60000">允许 60 秒</option>
+        <option value="300000">允许 5 分钟</option>
+        <option value="0" selected>允许（不限时）</option>
+      </select>
+      <button id="remoteAllowBtn" class="btn primary">允许</button>
+      <button id="remoteDenyBtn" class="btn danger">拒绝</button>
+      <button id="remoteBlockBtn" class="btn danger">🚫 不再允许 TA</button>
+    </div>
+  </div>
+
+  <!-- ★ A4 升级：接收方看到的"有人要给你发文件"卡片（接受/拒绝） -->
+  <div id="fileAskBox" class="remote-ask hidden">
+    <div class="remote-ask-text" id="fileAskText">有人想给你发文件</div>
+    <div class="remote-ask-btns">
+      <button id="fileAcceptBtn" class="btn primary">接受</button>
+      <button id="fileRejectBtn" class="btn danger">拒绝</button>
+    </div>
+  </div>
+
+  <!-- ★ A6 升级：被控端的审计日志面板（本地记录 + 导出） -->
+  <div id="auditPanel" class="audit-panel hidden">
+    <div class="audit-head">
+      <span>📜 控制操作审计日志（被控端本地记录，不落服务器）</span>
+      <span class="audit-btns">
+        <button id="auditExportBtn" class="btn">导出 .txt</button>
+        <button id="auditClearBtn" class="btn">清空</button>
+        <button id="auditCloseBtn" class="btn danger">关闭</button>
+      </span>
+    </div>
+    <pre id="auditList"></pre>
+  </div>
+
+  <!-- ★ A4：隐藏的文件选择框（点成员列表里的 📎 触发） -->
+  <input type="file" id="fileInput" class="hidden" />
+
+  <!-- 轻提示 toast：控制权结果等一次性反馈（不用 alert，避免被浏览器拦截） -->
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- ★ 远程协助（A1）：远程光标（被控端用）。
+       控制端鼠标移动时，被控端这颗"假光标"跟着走——
+       因为合成事件不会移动系统真实光标，必须自己画一颗给被控端看。
+       pointer-events:none 保证它永远不挡真实点击。 -->
+  <div id="remoteCursor" class="remote-cursor hidden">🖱️</div>
+
+  <!-- 顺序：socket.io → mediasoup-client（本地打包） → 我们的业务代码 -->
+  <script src="vendor/socket.io.min.js"></script>
+  <script src="vendor/mediasoup-client.js"></script>
+  <script src="client.js"></script>
+</body>
+</html>

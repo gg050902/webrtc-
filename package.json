@@ -1,0 +1,39 @@
+{
+  "name": "simple-tencent-meeting",
+  "version": "1.0.0",
+  "description": "基于 WebRTC 与 mediasoup 的多人视频会议系统（毕业设计）：SFU 架构 + 屏幕共享协作批注 + H5 远程协助 + 服务器侧录制 + 实时观测面板，零前端框架零业务 SDK",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node scripts/test-signaling.js",
+    "start:sfu": "node sfu/server.js",
+    "test:sfu": "node scripts/test-sfu-signaling.js",
+    "test:smoke": "node scripts/test-sfu-client-smoke.js",
+    "build:sfu-vendor": "esbuild ./node_modules/mediasoup-client/lib/index.js --bundle --format=iife --global-name=mediasoupClient --outfile=sfu/public/vendor/mediasoup-client.js",
+    "start:demo": "node scripts/start-demo.js",
+    "test:record": "node -e \"const{spawn}=require('child_process');const p=spawn(process.execPath,['sfu/server.js'],{env:{...process.env,TEST_RECORD:'1',TEST_RECORD_EXIT:'1'},stdio:'inherit'});p.on('exit',c=>process.exit(c||0))\"",
+    "bench": "node scripts/bench.js",
+    "start:lan": "node scripts/start-lan.js",
+    "test:turn": "node scripts/test-turn.js",
+    "soak": "node scripts/soak.js",
+    "doctor": "node scripts/doctor.js"
+  },
+  "dependencies": {
+    "mediasoup": "^3.26.0",
+    "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "mediasoup-client": "^3.23.1",
+    "socket.io-client": "^4.8.3"
+  },
+  "license": "MIT",
+  "keywords": [
+    "webrtc",
+    "mediasoup",
+    "sfu",
+    "video-conference",
+    "sctp",
+    "simulcast"
+  ]
+}

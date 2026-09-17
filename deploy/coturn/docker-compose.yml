@@ -1,0 +1,17 @@
+# ══════════════════════════════════════════════════════════════
+# E1 自部署 TURN（coturn）—— 跨网络互通的最后一公里
+# ▎用法（任意有公网 IP 的 Linux 机器/云主机，装好 Docker 后）：
+#   1. 把本目录传上去，改 turnserver.conf 里的 realm / 账号密码；
+#   2. docker compose up -d
+#   3. 防火墙/安全组放行：3478/tcp+udp（TURN 信令）、49160-49200/udp（relay 端口段）；
+#   4. sfu/config.json 的 iceServers 填：
+#      { "urls": "turn:你的公网IP:3478", "username": "demo", "credential": "demo1234" }
+#   5. 重启 SFU → 会议页顶部「🔗 连接方式」徽标应显示"TURN 中继"（跨网时）。
+# ══════════════════════════════════════════════════════════════
+services:
+  coturn:
+    image: coturn/coturn:latest
+    network_mode: host          # TURN 需要直接持有公网端口，host 网络最省心
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    restart: unless-stopped

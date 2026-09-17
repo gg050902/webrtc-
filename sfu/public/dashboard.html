@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<!-- ════════════════════════════════════════════════════════════════
+  dashboard.html —— SFU 实时观测面板（2026-09-13 · "真实有用的可视化"）
+
+▎这是什么？
+  服务器把内部的运行状态（房间/成员/每路媒体的字节计数与健康分/发言时长/控制权）
+  通过 GET /api/rooms 摆出来；本页面每 2 秒拉一次，画成看得见的面板。
+  相当于给 SFU 装了个"仪表盘"——真实产品的运维监控就是这条思路，
+  只是我们零依赖手写（canvas 画曲线，不引任何图表库）。
+
+▎怎么用？
+  服务器启动后访问 http://localhost:3001/dashboard（和会议页同一个端口）。
+
+▎页面结构：
+    ① 顶部概览行：房间数 / 总人数 / 总 Producer / 总 Consumer / Worker PID
+    ② 每个房间一张卡：
+       · 成员表（状态徽标 + 发言秒数 + 订阅数 + Transport 数）
+       · 媒体表（每路 Producer 的来源/累计字节/实时码率/健康分）
+       · 码率曲线（最近 60 个采样点的 canvas 折线，0 依赖手写）
+    ③ 控制权：谁在控谁一眼可见
+▎为什么码率在页面算差值？
+    服务器只报"累计字节数"（和浏览器 getStats 一个道理：只给累计值），
+    两次采样相减 / 时间差 = 实时码率。这习惯和 client.js 第 13 步完全一致。
+════════════════════════════════════════════════════════════════ -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>SFU 观测面板</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+      background: linear-gradient(160deg, #0d1017 0%, #12151b 100%);
+      color: #e8eaf0; min-height: 100vh; padding: 20px;
+    }
+    h1 { font-size: 20px; display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+    h1 .dot { width: 9px; height: 9px; border-radius: 50%; background: #34d97b; box-shadow: 0 0 8px #34d97b; }
+    .sub { color: #8b93a5; font-size: 12px; margin-bottom: 18px; }
+    .sub b { color: #b9c2d4; }
+
+    /* 概览行 */
+    .overview { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+    .stat {
+      background: #161b24; border: 1px solid #232b3a; border-radius: 12px;
+      padding: 12px 18px; min-width: 130px;
+    }
+    .stat .num { font-size: 26px; font-weight: 700; color: #6fdc9b; font-variant-numeric: tabular-nums; }
+    .stat .lbl { font-size: 12px; color: #8b93a5; margin-top: 2px; }
+
+    /* 房间卡 */
+    .room-card {
+      background: #141922; border: 1px solid #232b3a; border-radius: 14px;
+      padding: 16px 18px; margin-bottom: 16px;
+      box-shadow: 0 8px 24px rgba(0,0,0,.35);
+    }
+    .room-head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 12px; flex-wrap: wrap; }
+    .room-head .rn { font-size: 17px; font-weight: 700; }
+    .room-head .rn::before { content: "🎛️ "; }
+    .room-head .meta { font-size: 12px; color: #8b93a5; }
+    .pill {
+      font-size: 12px; padding: 3px 10px; border-radius: 99px;
+      background: #1d2532; border: 1px solid #2c3648; color: #b9c2d4;
+    }
+    .pill.green { color: #6fdc9b; border-color: #2f9e5f; }
+    .pill.red   { color: #ff8f8f; border-color: #a04a4a; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 12px; }
+    th { text-align: left; color: #8b93a5; font-weight: 500; font-size: 12px; padding: 5px 8px; border-bottom: 1px solid #232b3a; }
+    td { padding: 6px 8px; border-bottom: 1px solid #1b212c; font-variant-numeric: tabular-nums; }
+    tr:last-child td { border-bottom: none; }
+
+    .bar { position: relative; height: 8px; background: #10141c; border-radius: 5px; overflow: hidden; min-width: 90px; }
+    .bar i { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, #2f9e5f, #6fdc9b); border-radius: 5px; }
+
+    .score-10 { color: #6fdc9b; } .score-mid { color: #ffcf6f; } .score-low { color: #ff8f8f; }
+
+    canvas.spark { width: 100%; height: 64px; display: block; background: #10141c; border-radius: 8px; border: 1px solid #1b212c; }
+
+    .empty { color: #5d6575; font-size: 14px; text-align: center; padding: 60px 0; }
+    .empty .big { font-size: 40px; margin-bottom: 10px; }
+  </style>
+</head>
+<body>
+  <h1><span class="dot"></span>SFU 实时观测面板</h1>
+  <div class="sub">数据每 2 秒刷新一次，来自服务器 <b>GET /api/rooms</b> · 码率 = 两次采样字节差 ÷ 时间差（和浏览器 getStats 同一个算法）</div>
+
+  <div class="overview" id="overview"></div>
+  <div id="rooms"><div class="empty"><div class="big">📡</div>还没有任何房间——先去 <a href="/" style="color:#6fdc9b">会议页</a> 创建一个</div></div>
+
+<script>
+'use strict';
+/* ---- 采样历史：roomId -> [{t, bytes}]（最多留 60 个点，画折线用）---- */
+const history = new Map(); // roomId -> [{t, bytes}]（房间总字节历史，画总码率曲线）
+const HISTORY_MAX = 60;
+
+async function poll() {
+  let data;
+  try {
+    const resp = await fetch('/api/rooms');
+    data = await resp.json();
+  } catch (e) {
+    document.getElementById('overview').innerHTML =
+      `<div class="stat"><div class="num">--</div><div class="lbl">服务器没连上</div></div>`;
+    return;
+  }
+  render(data);
+}
+
+function render(data) {
+  /* ① 概览行 */
+  const totalMembers = data.rooms.reduce((a, r) => a + r.counts.members, 0);
+  const totalProducers = data.rooms.reduce((a, r) => a + r.counts.producers, 0);
+  const totalConsumers = data.rooms.reduce((a, r) => a + r.counts.consumers, 0);
+  document.getElementById('overview').innerHTML = `
+    <div class="stat"><div class="num">${data.rooms.length}</div><div class="lbl">房间数</div></div>
+    <div class="stat"><div class="num">${totalMembers}</div><div class="lbl">参会人数</div></div>
+    <div class="stat"><div class="num">${totalProducers}</div><div class="lbl">上传媒体路数</div></div>
+    <div class="stat"><div class="num">${totalConsumers}</div><div class="lbl">转发中 Consumer</div></div>
+    <div class="stat"><div class="num">${data.worker.pid ?? '--'}</div><div class="lbl">mediasoup Worker PID</div></div>
+    <div class="stat"><div class="num" style="${data.recordingCount ? '' : 'color:#5d6575'}">⏺ ${data.recordingCount}</div><div class="lbl">服务器录制中（D+2）</div></div>`;
+
+  /* ② 房间卡 */
+  const roomsEl = document.getElementById('rooms');
+  if (!data.rooms.length) return;
+  roomsEl.innerHTML = '';
+  for (const room of data.rooms) {
+    // 先算这个房间的实时码率（用本房间所有 Producer 字节总和做差）
+    const bytesNow = room.media.reduce((a, m) => a + (m.byteCount || 0), 0);
+    const hist = history.get(room.roomNumber) || [];
+    let bitrateKbps = null;
+    if (hist.length) {
+      const prev = hist[hist.length - 1];
+      const dt = (data.now - prev.t) / 1000;
+      if (dt > 0 && bytesNow >= prev.bytes) bitrateKbps = ((bytesNow - prev.bytes) * 8 / dt / 1000);
+    }
+    hist.push({ t: data.now, bytes: bytesNow });
+    while (hist.length > HISTORY_MAX) hist.shift();
+    history.set(room.roomNumber, hist);
+
+    const ctl = room.control.controllerId
+      ? `<span class="pill">🖱️ 控制中：${room.control.controllerId.slice(-4)} → ${room.control.hostId.slice(-4)}</span>`
+      : '<span class="pill green">无远程控制</span>';
+    // ★ D+4：空房宽限期可视化（人走光 ≠ 立刻销毁，还剩多久一目了然）
+    const ttlPill = room.ttlRemainingSec !== null && room.ttlRemainingSec !== undefined
+      ? `<span class="pill">⏳ 空房宽限中 · 剩 ${room.ttlRemainingSec}s 后销毁</span>` : '';
+    const dur = fmtDur(room.durationSec);
+
+    // 发言占比在页面算（服务器给的是秒数）：总发言秒数 → 每人百分比
+    const totalTalk = room.members.reduce((a, m) => a + m.talkSec, 0);
+    const rowsWithShare = room.members.map((m) => {
+      const pct = totalTalk ? Math.round(m.talkSec / totalTalk * 100) : 0;
+      return `
+      <tr>
+        <td>${m.shortId}${m.owner ? ' 👑' : ''}</td>
+        <td>${m.muted ? '🔇' : ''} ${m.camOff ? '🚫' : ''} ${m.sharing ? '🖥️' : ''} ${m.hand ? '✋' : ''}</td>
+        <td><div class="bar"><i style="width:${pct}%"></i></div></td>
+        <td>${fmtSec(m.talkSec)}</td>
+        <td>${m.consumers}</td>
+        <td>${m.transports}</td>
+      </tr>`;
+    }).join('');
+
+    // ★ 每路媒体单独做差算码率：producerHistory 存上一次采样的 {t, bytes}
+    const mediaRows = room.media.map((md) => {
+      const key = md.producerId;
+      let kbpsText = '--';
+      if (md.byteCount !== null) {
+        const prev = producerHistory.get(key);
+        if (prev && data.now > prev.t && md.byteCount >= prev.bytes) {
+          kbpsText = ((md.byteCount - prev.bytes) * 8 / ((data.now - prev.t) / 1000) / 1000).toFixed(1) + ' kbps';
+        }
+        producerHistory.set(key, { t: data.now, bytes: md.byteCount });
+      }
+      const scoreCls = md.score === null ? '' : md.score >= 8 ? 'score-10' : md.score >= 5 ? 'score-mid' : 'score-low';
+      return `
+      <tr>
+        <td>${md.kind === 'audio' ? '🎙️' : md.source === 'screen' ? '🖥️' : '🎥'} ${md.source}${md.recorded ? ' <span style="color:#e0636f">⏺</span>' : ''}</td>
+        <td>${md.owner}</td>
+        <td>${md.byteCount === null ? '--' : fmtBytes(md.byteCount)}</td>
+        <td>${kbpsText}</td>
+        <td class="${scoreCls}">${md.score === null ? '--' : md.score + '/10'}</td>
+        <td>${md.layers}</td>
+      </tr>`;
+    }).join('');
+
+    const card = document.createElement('div');
+    card.className = 'room-card';
+    card.innerHTML = `
+      <div class="room-head">
+        <span class="rn">房间 ${room.roomNumber}</span>
+        <span class="meta">已进行 ${dur} · ${room.counts.members} 人</span>
+        ${ctl}
+        ${ttlPill}
+      </div>
+      <table>
+        <tr><th>成员</th><th>状态</th><th>发言占比</th><th>发言时长</th><th>订阅路数</th><th>Transport</th></tr>
+        ${rowsWithShare}
+      </table>
+      <table>
+        <tr><th>媒体</th><th>归属</th><th>累计流量</th><th>码率</th><th>健康分</th><th>编码层数</th></tr>
+        ${mediaRows || '<tr><td colspan="6" style="color:#5d6575">（还没有媒体上传）</td></tr>'}
+      </table>
+      <canvas class="spark" id="spark-${room.roomNumber}" width="800" height="64"></canvas>
+      <div class="meta" style="margin-top:4px">房间总码率曲线（近 ${HISTORY_MAX} 次采样 · kbps）</div>`;
+    roomsEl.appendChild(card);
+
+    drawSpark(`spark-${room.roomNumber}`, hist.map((h) => h.bytes), data.now);
+  }
+}
+
+/* ---- 工具 ---- */
+const producerHistory = new Map(); // producerId -> { t, bytes }（上次采样，算实时码率用）
+function fmtBytes(n) {
+  if (n > 1048576) return (n / 1048576).toFixed(1) + ' MB';
+  if (n > 1024) return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+function fmtSec(sec) { return sec >= 60 ? `${Math.floor(sec / 60)}分${sec % 60}秒` : `${sec}秒`; }
+function fmtDur(sec) {
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m >= 60 ? `${Math.floor(m / 60)}小时${m % 60}分` : `${m}分${s}秒`;
+}
+
+/* ---- canvas 折线图（零依赖手写：增量字节 → kbps → 折线）---- */
+function drawSpark(id, bytesArr, now) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // 相邻两次采样做差 → 每个点的 kbps
+  const points = [];
+  for (let i = 1; i < bytesArr.length; i++) {
+    const dt = 2; // 采样间隔约 2s（真实间隔有抖动，画趋势够用）
+    points.push(Math.max(0, (bytesArr[i] - bytesArr[i - 1]) * 8 / dt / 1000));
+  }
+  if (points.length < 2) {
+    ctx.fillStyle = '#5d6575';
+    ctx.font = '12px sans-serif';
+    ctx.fillText('正在积累采样点…', 12, H / 2);
+    return;
+  }
+  const max = Math.max(...points, 1);
+  ctx.strokeStyle = '#6fdc9b';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  points.forEach((p, i) => {
+    const x = 10 + (i / (points.length - 1)) * (W - 20);
+    const y = H - 8 - (p / max) * (H - 20);
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.stroke();
+  // 当前值标在右上角
+  ctx.fillStyle = '#6fdc9b';
+  ctx.font = '12px sans-serif';
+  ctx.fillText(points[points.length - 1].toFixed(1) + ' kbps', W - 90, 16);
+}
+
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>
