@@ -365,6 +365,23 @@
 >   按症状查的调试路径表、内存与长跑实录；
 > **回归（本次实测）**：冒烟 **95/95** + 信令 **86/86**；真机：日志折叠后画面大幅扩大、
 > 控制坞分组清晰。
+>
+> **09-19e 去 AI 味·图标化与克制化（用户反馈"AI 味还是重"，直击观感根源）**——
+> ① **彩色 emoji 全面换单色线性 SVG**（重灾区）：控制坞 10 个按钮、顶栏四徽标、
+>   成员行徽标六种（👑🖥️🔇🚫✋💬→crown/screen/micOff/camOff/hand/cc）、成员行小按钮
+>   （⏺⏹📎🚪）、AI bot 行——统一 24 viewBox 手绘 path、stroke=currentColor 随按钮状态
+>   变色；client.js 新增 `ICONS` 常量集 + `setIconBtn(btn,icon,text)`（动态改文本的按钮
+>   统一走它，innerHTML=icon+span 结构，与 HTML 静态按钮同构）；reaction 区 emoji 保留
+>   （表情本身就是 emoji，语义正确）；
+> ② **渐变/玻璃克制化**：primary/send/danger 按钮纯色化、brand-name/auth-title 渐变字→
+>   纯鎏金、印章纯色；backdrop-blur 只留顶栏/控制坞/字幕条三个真悬浮层，其余全部实底；
+>   圆角收紧（radius-lg 14、video-box 10、controls 14）、border-strong .38→.26、shadow-2 减淡；
+> ③ **白板色板带名字**：BOARD_COLORS 改 {v,n} 数组（墨/朱砂/鎏金/黛蓝/竹青——
+>   色点 title 从"这个颜色"变成色名）；
+> ④ **测试适配**：桩 innerHTML/textContent 不聚合（坑 27 家族）——4 处按钮态断言从
+>   textContent 改 innerHTML（真浏览器两端语义一致）；
+> **回归（本次实测）**：冒烟 **95/95** + 信令 **86/86**；DOM 断言：控制坞 10 个 .i 图标、
+> 2 根分隔线、徽标纯文字全过；真机特写：单色图标+纯色朱砂按钮+分组竖线=产品感。
 
 > **09-19 AI 主攻拍板 + 路线图重构（本次只动文档、不动代码）**——用户从 G 档 8 候选中拍板
 > **两条主线**：①纪要+问答（DeepSeek summarize + @AI 问答 + 值守 N2）②C1 AI 远程操作员

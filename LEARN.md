@@ -2001,3 +2001,19 @@ new-data-producer/data-producer-closed 广播、room-members 清单、两条错�
 - 聊天 DOM 300 条环形：SCTP 广播下长会 DOM 节点是重排开销大头；
 - 账本类数据（字幕/纪要/审计）一律"**内存热窗口 + 文件权威副本**"——
   这一句就是本项目全部长跑工程的总纲。
+
+#### 5.24.7 ★ 09-19e 去"AI 味"：界面克制化的方法论（UI 审美面试题）
+
+- **AI 味的三个根源**（对照本项目改造前后）：
+  ① **彩色 emoji 当图标**——真产品（腾讯会议/Zoom/Linear）全是单色线性图标；
+     彩色 emoji 一多，页面立刻像"AI 拼的演示稿"。对策：24 viewBox 手绘 path 的
+     SVG 常量集（ICONS），stroke=currentColor——图标颜色**继承文字色**，hover/active
+     变色零额外代码；静态按钮（HTML）与动态按钮（setIconBtn）同构输出；
+  ② **渐变与玻璃堆料**——什么都想"高级"，结果每样都在喊。对策：主按钮纯色
+     （渐变只在"压轴的一个"上用）、玻璃 blur 只留真正悬浮的层（顶栏/控制坞/字幕条），
+     面板一律实底——**层次靠明度差，不靠滤镜**；
+  ③ **圆角/描边/阴影过花**——圆角收成三档、描边默认退后 hover 才上前、投影近处浅。
+- **工程细节**：动态改文本的按钮必须走 setIconBtn（textContent 赋值会毁掉图标）；
+  徽标 addBadge 从 textContent 改 innerHTML（传 ICONS 常量，无 XSS 风险）；
+  测试断言从 textContent 改 innerHTML（桩不聚合，坑 27 家族）。
+- **reaction 区的 emoji 保留**——表情回应的语义就是 emoji，克制 ≠ 一刀切。

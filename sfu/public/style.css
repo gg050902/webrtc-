@@ -1435,3 +1435,41 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
 .log-title:hover { color: var(--fg-muted); }
 .app.log-collapsed { grid-template-rows: 58px 1fr 36px; }
 .log-collapsed .log-panel { margin-bottom: 8px; }
+
+/* ────────── 24. ★ 09-19e 去 AI 味·克制化（比"好看"更重要的是"不花"）──────────
+   AI 感的三个来源逐一对治：
+   ① 彩色 emoji 当图标 → 单色线性 SVG（见 index.html / client.js ICONS）；
+   ② 渐变与玻璃堆料 → 主按钮纯色、品牌字纯色、玻璃只留真正悬浮的三处；
+   ③ 圆角/描边/阴影过花 → 收紧一档，描边只在 hover 时变亮。 */
+.btn .i { width: 15px; height: 15px; vertical-align: -3px; margin-right: 6px; }
+.btn.mini .i { width: 12px; height: 12px; vertical-align: -2px; margin-right: 3px; }
+.m-badges .i { width: 12px; height: 12px; vertical-align: -2px; margin: 0; }
+.m-id .i { width: 13px; height: 13px; vertical-align: -2px; margin-right: 4px; }
+.role-tag .i { width: 11px; height: 11px; vertical-align: -1.5px; margin-right: 3px; }
+
+/* 主按钮/发送/危险:纯色替代渐变(按住一样有分量) */
+.btn.primary { background: #b93a26; box-shadow: inset 0 1px 0 rgba(255, 255, 255, .14), 0 4px 14px rgba(185, 58, 38, .28); }
+.btn.primary:hover:not(:disabled) { background: #a53322; box-shadow: 0 6px 18px rgba(185, 58, 38, .4); }
+.btn.send { background: #a5802f; box-shadow: inset 0 1px 0 rgba(255, 255, 255, .12); }
+.btn.danger { background: #8f3a3a; }
+/* 品牌字与印章:纯色(渐变字是"模板感"的另一半) */
+.brand-name, .auth-title { background: none; -webkit-background-clip: initial; background-clip: initial; color: var(--accent); }
+.brand-logo, .prejoin-logo { background: #a03322; box-shadow: inset 0 0 0 1px rgba(245, 234, 217, .14); text-shadow: none; }
+/* 玻璃收敛:只有真正悬浮的三处保留 blur(顶栏/控制坞/字幕条),其余实底 */
+.sidebar, .member-panel, .chat-panel, .room-hero, .auth-card, .prejoin-card,
+.fx-panel, .audit-panel, .cap-diag, .cap-history, .remote-ask, .toast, .wb-toolbar {
+  backdrop-filter: none; -webkit-backdrop-filter: none; background: #1c1710;
+}
+.room-panel { backdrop-filter: blur(14px) saturate(120%); -webkit-backdrop-filter: blur(14px) saturate(120%); }
+/* 圆角收紧 */
+:root { --radius-lg: 14px; }
+.room-hero, .auth-card { border-radius: 14px; }
+.prejoin-card { border-radius: 16px; }
+.video-box { border-radius: 10px; }
+.controls { border-radius: 14px; }
+/* 描边与阴影减淡:默认退后,hover 才上前 */
+:root { --border-strong: rgba(216, 179, 106, .26); --shadow-2: 0 12px 32px rgba(6, 4, 2, .42); }
+.room-hero, .auth-card, .prejoin-card { box-shadow: var(--shadow-2); }
+.room-hero:hover, .auth-card:hover { border-color: var(--border-strong); }
+/* 印章字重轻一点(别抢戏) */
+.brand-logo { font-weight: 600; }

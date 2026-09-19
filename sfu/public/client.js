@@ -31,6 +31,33 @@ const localVideo = $('localVideo');     // 显示"我自己"画面的 <video>
 const videoGrid = $('videoGrid');       // 装所有人视频的网格
 const logPanel = $('log');
 const logTitle = $('logTitle');   // ★ 09-19d：日志面板折叠开关
+
+/* ★ 09-19e 去 AI 味·图标系统：彩色 emoji 换单色线性 SVG（stroke=currentColor 随按钮状态变色）——
+ *   真产品的按钮都是单色图标+文字，彩色 emoji 堆在控件上是最大的「模板感」来源。
+ *   所有图标 24 viewBox 手绘线性 path；静态按钮（index.html）与这里同款。 */
+const svgIcon = (inner, cls) => `<svg class="i ${cls || ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
+const ICONS = {
+  mic: svgIcon('<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/>'),
+  micOff: svgIcon('<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M4.5 4.5l15 15"/>'),
+  cam: svgIcon('<rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10.5l5-3v9l-5-3"/>'),
+  camOff: svgIcon('<rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10.5l5-3v9l-5-3M4 4l16 16"/>'),
+  screen: svgIcon('<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8.5 20h7M12 16v4"/>'),
+  rec: svgIcon('<circle cx="12" cy="12" r="5.5"/>'),
+  recOn: svgIcon('<circle cx="12" cy="12" r="5.5" fill="currentColor" stroke="none"/>'),
+  recStop: svgIcon('<rect x="7.5" y="7.5" width="9" height="9" rx="1.5"/>'),
+  hand: svgIcon('<path d="M8 12.5V6a1.3 1.3 0 0 1 2.6 0V11M10.6 11V4.8a1.3 1.3 0 0 1 2.6 0V11M13.2 11V6a1.3 1.3 0 0 1 2.6 0v6.8M15.8 12.8l1.6-2c.9-1.1 2.5.1 1.7 1.3L15.4 16.4c-1.1 1.7-2.4 2.6-4.4 2.6-2.6 0-3.6-1.5-3.6-3.4v-3.4"/>'),
+  pen: svgIcon('<path d="M4 20l4.2-1.1L20 7.1a1.8 1.8 0 0 0-2.6-2.6L5.1 15.8 4 20z"/>'),
+  sparkle: svgIcon('<path d="M12 4l1.8 4.7 4.7 1.8-4.7 1.8L12 17l-1.8-4.7-4.7-1.8 4.7-1.8L12 4z"/><path d="M18.5 4v3M20 5.5h-3"/>'),
+  cc: svgIcon('<rect x="3" y="5" width="18" height="13" rx="2.5"/><path d="M7 11.5h4M13.5 11.5h3.5M7 15h7"/>'),
+  bot: svgIcon('<rect x="5" y="8.5" width="14" height="9.5" rx="3"/><circle cx="9.5" cy="13.2" r="1" fill="currentColor" stroke="none"/><circle cx="14.5" cy="13.2" r="1" fill="currentColor" stroke="none"/><path d="M12 8.5V5.5M9 5.5h6"/>'),
+  leave: svgIcon('<path d="M14 12H5M8.5 8.5L5 12l3.5 3.5"/><path d="M13 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/>'),
+  crown: svgIcon('<path d="M4.5 17.5h15L18 9l-3.8 3.2L12 6l-2.2 6.2L6 9l-1.5 8.5z"/>'),
+  clip: svgIcon('<path d="M8.5 12.5l5.5-5.5a3 3 0 0 1 4.2 4.2l-7.5 7.5a5 5 0 0 1-7.1-7.1L11 4.2"/>'),
+  door: svgIcon('<rect x="13" y="4" width="6" height="16" rx="1"/><path d="M3 12h7M7.5 8.5L11 12l-3.5 3.5"/>'),
+  cursor: svgIcon('<path d="M5 3.5l7 16.5 2.1-6.9L21 11 5 3.5z"/>'),
+};
+/* 动态改文本的按钮统一走这里：icon+span 结构，与 index.html 静态按钮同构 */
+function setIconBtn(btn, icon, text) { btn.innerHTML = icon + '<span>' + text + '</span>'; }
 const connBadge = $('connBadge');
 const netBadge = $('netBadge');         // 网络质量徽标（第 13 步）
 const connType = $('connType');         // ★ 09-13 可达性：到服务器的连接方式（直连/STUN/TURN）
@@ -248,7 +275,7 @@ let myRoomPassword = null;
 function enterRoom(roomNumber) {
   if (myRoom) return; // 已在房间里（room-created 和 room-members 会各触发一次）
   myRoom = roomNumber;
-  roomBadge.textContent = `🏠 房间号 ${roomNumber}`;
+  roomBadge.textContent = `房间号 ${roomNumber}`;
   roomBadge.classList.remove('hidden');
   roomPanel.classList.add('hidden');
   leaveBtn.disabled = false;
@@ -737,7 +764,7 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;');
 }
 function updateMemberCount() {
-  memberCount.textContent = `👥 ${1 + peersSeen.size} 人`;
+  memberCount.textContent = `${1 + peersSeen.size} 人`;
 }
 
 /* ──────────────────────────────────────────────────────────────
@@ -979,7 +1006,7 @@ shareBtn.addEventListener('click', async () => {
       myProducers.set(screenProducer.id, screenProducer);
 
       sharingScreen = true;
-      shareBtn.textContent = '停止共享';
+      setIconBtn(shareBtn, ICONS.screen, '停止共享');
       camBtn.disabled = true;
       // ★ 09-14 F5：给自己也开一个"我的屏幕"格——① 我能确认观众看到什么；
       //   ② 协作批注的"共享者视角落点"（别人在我屏幕上画，我实时看见）。
@@ -1016,7 +1043,7 @@ async function stopSharing() {
     }
   }
   sharingScreen = false;
-  shareBtn.textContent = '共享屏幕';
+  setIconBtn(shareBtn, ICONS.screen, '共享屏幕');
   camBtn.disabled = false;
   removeSelfScreenTile(); // ★ 09-14 F5：撤掉"我的屏幕"格
   reportMyState({ sharing: false }); // ★ D4：同步"我不再共享了"
@@ -1032,7 +1059,7 @@ muteBtn.addEventListener('click', () => {
   const audioTrack = localStream.getAudioTracks()[0];
   if (audioTrack) {
     audioTrack.enabled = !audioTrack.enabled;
-    muteBtn.textContent = audioTrack.enabled ? '静音' : '取消静音';
+    audioTrack.enabled ? setIconBtn(muteBtn, ICONS.mic, '静音') : setIconBtn(muteBtn, ICONS.micOff, '取消静音');
     log(audioTrack.enabled ? '🔊 声音已开启' : '🔇 已静音');
     reportMyState({ muted: !audioTrack.enabled }); // ★ D4：告诉大家"我静音了"（成员列表要显示）
   }
@@ -1043,7 +1070,7 @@ camBtn.addEventListener('click', () => {
   const videoTrack = localStream.getVideoTracks()[0];
   if (videoTrack) {
     videoTrack.enabled = !videoTrack.enabled;
-    camBtn.textContent = videoTrack.enabled ? '关摄像头' : '开摄像头';
+    videoTrack.enabled ? setIconBtn(camBtn, ICONS.cam, '关摄像头') : setIconBtn(camBtn, ICONS.camOff, '开摄像头');
     log(videoTrack.enabled ? '📷 摄像头已开启' : '🚫 摄像头已关闭');
     reportMyState({ camOff: !videoTrack.enabled }); // ★ D4：同步"我关了摄像头"
   }
@@ -1190,7 +1217,7 @@ let netRttMs = null; // null = 还没测到过
 
 async function monitorNetwork() {
   if (!sendTransport && !recvTransport) {
-    netBadge.textContent = '📶 网络 --';
+    netBadge.textContent = '网络 --';
     netBadge.className = 'badge idle';
     return;
   }
@@ -1238,7 +1265,7 @@ async function monitorNetwork() {
   if (connType && candTypes.size) {
     const label = candTypes.has('relay') ? 'TURN 中继'
       : candTypes.has('srflx') ? 'STUN 穿墙' : '直连';
-    connType.textContent = `🔗 ${label}`;
+    connType.textContent = label;
     connType.className = 'badge connected';
     connType.title = 'ICE 连接方式：' + [...candTypes].join(' / ');
     // ★ 09-14：带宽估计挂进悬浮提示（D+3 的"原料"，先看得见）
@@ -1248,7 +1275,7 @@ async function monitorNetwork() {
   }
 
   if (received === 0 && sentBytes === 0) {
-    netBadge.textContent = '📶 网络采集中…';
+    netBadge.textContent = '网络采集中…';
     netBadge.className = 'badge idle';
     lastStatsSample = null;
     return;
@@ -1941,7 +1968,7 @@ assistBtn.addEventListener('click', () => {
   }
   assistOn = true;
   assistBtn.classList.add('on');
-  assistBtn.textContent = '🖱️ 远程协助：已开启';
+  setIconBtn(assistBtn, ICONS.cursor, '远程协助：已开启');
   openWorkbench();
   log('🖱️ 远程协助已开启：工作台已进入共享画面，等待成员请求控制');
 });
@@ -1964,7 +1991,7 @@ function setWbStatus(text) { wbStatus.textContent = text; }
 function turnOffAssist() {
   assistOn = false;
   assistBtn.classList.remove('on');
-  assistBtn.textContent = '🖱️ 允许远程协助';
+  setIconBtn(assistBtn, ICONS.cursor, '允许远程协助');
   if (rcRole === 'host') socket.emit('remote-release'); // 有控制在进行 → 信令收权
   endHostControl();
   closeWorkbench();
@@ -2215,7 +2242,7 @@ socket.on('room-state', ({ members, expiresAt }) => {
   // ★ 09-19：AI Bot 在场状态 → 控制坞按钮亮/灭（快照是唯一权威，谁开关的全房一致）
   const hasBot = lastMembers.some((m) => m.isBot);
   aiBtn.classList.toggle('active', hasBot);
-  aiBtn.textContent = hasBot ? '🤖 送走 AI' : '🤖 AI';
+  hasBot ? setIconBtn(aiBtn, ICONS.bot, '送走 AI') : setIconBtn(aiBtn, ICONS.bot, 'AI 助理');
   // 被控/控制关系也可以通过快照同步（和 remote-state 广播互为兜底）
   if (expiresAt) { remoteExpiresAt = expiresAt; startCountdown(); }
   applyLayout(); // ★ F1：共享状态变了（比如有人开始共享屏幕），演讲者视图的大画面要跟着换人
@@ -2235,7 +2262,7 @@ function renderMembers(members) {
     if (m.isBot) {
       // ★ 09-19 AI Bot 行：无媒体无网络概念，一张安静的"机器同事"名牌
       row.classList.add('ai-bot-row');
-      row.innerHTML = `<span class="m-id">🤖 ${escapeHtml(m.name || 'AI 助理')}<span class="m-bot-note">聆听中…</span></span>`;
+      row.innerHTML = `<span class="m-id">${ICONS.bot} ${escapeHtml(m.name || 'AI 助理')}<span class="m-bot-note">聆听中…</span></span>`;
       memberListEl.appendChild(row);
       continue;
     }
@@ -2271,23 +2298,23 @@ function renderMembers(members) {
 
     const addBadge = (text, title) => {
       const s = document.createElement('span');
-      s.textContent = text;
+      s.innerHTML = text; // ★ 09-19e：徽标传 ICONS 常量 SVG（常量无 XSS 风险）
       s.title = title || '';
       badges.appendChild(s);
     };
-    if (m.owner) addBadge('👑', '房主（可移出成员）');
-    if (m.sharing) addBadge('🖥️', '正在共享屏幕');
-    if (m.muted) addBadge('🔇', '已静音');
-    if (m.camOff) addBadge('🚫', '摄像头已关');
-    if (m.hand) addBadge('✋', '举手中（想发言）'); // ★ 09-13 F4
-    if (m.caption) addBadge('💬', '字幕开启中'); // ★ 09-17b：实时字幕状态（member-state 白名单）
+    if (m.owner) addBadge(ICONS.crown, '房主（可移出成员）');
+    if (m.sharing) addBadge(ICONS.screen, '正在共享屏幕');
+    if (m.muted) addBadge(ICONS.micOff, '已静音');
+    if (m.camOff) addBadge(ICONS.camOff, '摄像头已关');
+    if (m.hand) addBadge(ICONS.hand, '举手中（想发言）'); // ★ 09-13 F4
+    if (m.caption) addBadge(ICONS.cc, '字幕开启中'); // ★ 09-17b：实时字幕状态（member-state 白名单）
 
     if (!isMe) {
       // ★ D+2（09-15）：服务器侧录制 —— 点 ⏺ 开始录"TA 的摄像头+麦克风"（服务器 ffmpeg 落盘），
       //   再点 ⏹ 停止；产物经 /recordings/<file> 下载。服务器没装 ffmpeg 会弹明确提示。
       const recBtn = document.createElement('button');
       recBtn.className = 'mini';
-      recBtn.textContent = '⏺';
+      recBtn.innerHTML = ICONS.recOn;
       recBtn.title = '服务器侧录制 TA 的摄像头+麦克风（D+2，产物在服务器 recordings/）';
       recBtn.addEventListener('click', async () => {
         try {
@@ -2295,12 +2322,12 @@ function renderMembers(members) {
           if (existing) {
             await request('record-stop', { recordId: existing });
             recordingsByMember.delete(m.id);
-            recBtn.textContent = '⏺';
+            recBtn.innerHTML = ICONS.recOn;
             showToast(`⏹ 已停止录制，文件在服务器 recordings/ 目录`, 'info');
           } else {
             const resp = await request('record-start', { memberId: m.id });
             recordingsByMember.set(m.id, resp.data.recordId);
-            recBtn.textContent = '⏹';
+            recBtn.innerHTML = ICONS.recStop;
             showToast(`⏺ 已开始服务器录制（成员 ${shortId(m.id)}）`, 'info');
           }
         } catch (err) {
@@ -2311,7 +2338,7 @@ function renderMembers(members) {
       // ★ A4：给任意成员发文件（点 📎 选文件 → file-offer）
       const fileBtn = document.createElement('button');
       fileBtn.className = 'mini';
-      fileBtn.textContent = '📎';
+      fileBtn.innerHTML = ICONS.clip;
       fileBtn.title = '发文件给 TA';
       fileBtn.addEventListener('click', () => pickFileFor(m.id));
       badges.appendChild(fileBtn);
@@ -2320,7 +2347,7 @@ function renderMembers(members) {
       if (me && me.owner) {
         const kickBtn = document.createElement('button');
         kickBtn.className = 'mini';
-        kickBtn.textContent = '🚪';
+        kickBtn.innerHTML = ICONS.door;
         kickBtn.title = '移出房间（仅房主可用）';
         kickBtn.addEventListener('click', () => kickMember(m.id));
         badges.appendChild(kickBtn);
@@ -2607,10 +2634,10 @@ async function startRecording() {
   recorder.start(1000); // 每 1 秒切一个数据块（掉电最多丢 1 秒）
   recStartAt = Date.now();
   recordBtn.classList.add('recording');
-  recordBtn.textContent = '⏹ 停止录制';
+  setIconBtn(recordBtn, ICONS.recStop, '停止录制');
   recTimer = setInterval(() => {
     const s = Math.floor((Date.now() - recStartAt) / 1000);
-    recordBtn.textContent = `⏹ 录制中 ${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+    recordBtn.querySelector('span').textContent = `录制中 ${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
   }, 1000);
   log('⏺️ 开始录制会议（画面网格 + 混音），再点一次停止并下载');
 }
@@ -2623,7 +2650,7 @@ function stopRecording() {
   recTimer = recDrawTimer = null;
   if (recAudioCtx) { try { recAudioCtx.close(); } catch (e) { /* 忽略 */ } recAudioCtx = null; }
   recordBtn.classList.remove('recording');
-  recordBtn.textContent = '⏺ 录制会议';
+  setIconBtn(recordBtn, ICONS.rec, '录制会议');
 }
 
 /* ──────────────────────────────────────────────────────────────
@@ -3363,7 +3390,7 @@ let myHand = false;
 handBtn.addEventListener('click', () => {
   myHand = !myHand;
   handBtn.classList.toggle('active', myHand);
-  handBtn.textContent = myHand ? '✋ 放下手' : '✋ 举手';
+  myHand ? setIconBtn(handBtn, ICONS.hand, '放下手') : setIconBtn(handBtn, ICONS.hand, '举手');
   reportMyState({ hand: myHand });
   log(myHand ? '✋ 你举手了（成员列表会显示 ✋）' : '🫱 你放下了手');
 });
@@ -3644,7 +3671,10 @@ if (typeof window.addEventListener === 'function') {
  * ────────────────────────────────────────────────────────────── */
 /* ★ 09-19 白板 v2（参考 recent.design igochi 案例的黑白 editorial 气质）:
  *   色板从通用色换「水墨丹青」五色——墨黑/朱砂/鎏金/黛蓝/竹青，纸白底上更统一 */
-const BOARD_COLORS = ['#2b2724', '#b93a26', '#a5802f', '#3a5a7a', '#5a7a44'];
+const BOARD_COLORS = [
+  { v: '#2b2724', n: '墨' }, { v: '#b93a26', n: '朱砂' }, { v: '#a5802f', n: '鎖金' },
+  { v: '#3a5a7a', n: '黛蓝' }, { v: '#5a7a44', n: '竹青' },
+];
 let boardColor = BOARD_COLORS[0];
 const boardStrokes = []; // 事件溯源账本
 let boardDrawing = false;
@@ -3661,11 +3691,12 @@ const boardCanvas = $('boardCanvas');
 const boardColorsEl = $('boardColors');
 
 // 工具条：颜色点 + 撤销 + 清空 + 关闭（全部 pointerdown / click，重放安全同款原则）
-for (const c of BOARD_COLORS) {
+for (const def of BOARD_COLORS) {
+  const c = def.v;
   const dot = document.createElement('button');
   dot.className = 'board-dot' + (c === boardColor ? ' active' : '');
   dot.style.background = c;
-  dot.title = '这个颜色';
+  dot.title = def.n;
   dot.addEventListener('pointerdown', () => {
     boardColor = c;
     for (const d of boardColorsEl.querySelectorAll('.board-dot')) d.classList.remove('active');
@@ -4487,8 +4518,8 @@ function toggleCaptions() {
     clearTimeout(cap.restartTimer);
     cap.restartTimer = 0; // ★ 第 30 步：排程句柄归零——看门狗靠「无排程」判断是否该接管
     if (cap.rec) { try { cap.rec.stop(); } catch (e) { /* 已停则忽略 */ } cap.rec = null; }
-    capBtn.textContent = '💬 字幕';
-    renderCapStatus('💬 未开启');
+    setIconBtn(capBtn, ICONS.cc, '字幕');
+    renderCapStatus('未开启');
     reportMyState({ caption: false }); // ★ 09-17b：字幕开关进房间状态机（成员列表 💬 徽标）
     log('💬 实时字幕已关闭');
     return;
@@ -4509,7 +4540,7 @@ function toggleCaptions() {
   cap.on = true;
   cap.neterr = 0;               // 重试预算清零
   if (!cap.sentry.startedAt) cap.sentry.startedAt = Date.now(); // ★ 第 30 步：值守计时起点（首次开字幕）
-  capBtn.textContent = '💬 关字幕';
+  setIconBtn(capBtn, ICONS.cc, '关字幕');
   renderCapStatus('🎙️ 识别中…', 'live');
   reportMyState({ caption: true });
   startCaptionRec();
@@ -4604,7 +4635,7 @@ function startCaptionRec() {
     log(`⚠️ 字幕识别器启动失败：${err.message}`);
     renderCapStatus('⚠️ 启动失败', 'bad');
     cap.on = false;
-    capBtn.textContent = '💬 字幕';
+    setIconBtn(capBtn, ICONS.cc, '字幕');
   }
 }
 

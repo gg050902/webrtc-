@@ -605,7 +605,7 @@ const emit = (ev, payload) => {
   // ② 本地开字幕 → 识别器启动 + member-state 上报 caption（房间状态机，成员列表 💬 数据源）
   const capBtnEl = documentStub.getElementById('capBtn');
   guard('字幕：点开开关', () => capBtnEl.dispatch('click'));
-  ok('字幕：识别器已启动且按钮进入开启态', rec.capStarts === 1 && capBtnEl.textContent.includes('关字幕'));
+  ok('字幕：识别器已启动且按钮进入开启态', rec.capStarts === 1 && capBtnEl.innerHTML.includes('关字幕'));
   ok('字幕：开字幕上报 member-state.caption=true', !!(rec.lastMemberState && rec.lastMemberState.patch && rec.lastMemberState.patch.caption === true));
 
   // ③ 本地识别半句（interim）→ 只本地跳动，不广播（"可靠性按内容价值定价"）
@@ -650,7 +650,7 @@ const emit = (ev, payload) => {
 
   // ⑦ 再点开关 → 停识别器（stop 触发 onend，但开关已关不再拉起）+ member-state 复位
   guard('字幕：点关开关', () => capBtnEl.dispatch('click'));
-  ok('字幕：识别器已停且不再自动重启', rec.capStops >= 1 && capBtnEl.textContent.includes('字幕') && !capBtnEl.textContent.includes('关字幕'));
+  ok('字幕：识别器已停且不再自动重启', rec.capStops >= 1 && capBtnEl.innerHTML.includes('字幕') && !capBtnEl.innerHTML.includes('关字幕'));
   ok('字幕：关字幕上报 member-state.caption=false', !!(rec.lastMemberState && rec.lastMemberState.patch && rec.lastMemberState.patch.caption === false));
 
   /* ---- ③h2 ★ 09-17c 字幕可用性修复：
@@ -691,7 +691,7 @@ const emit = (ev, payload) => {
    *   （"挂一夜不丢账"的真 7 小时验证归 0.2 节人工清单；这里验逻辑链路全通。） ---- */
   const capSentryEl = documentStub.getElementById('capSentryStats');
   guard('值守：重新开字幕（③h2 拦截用例把字幕关着）', () => capBtnEl.dispatch('click'));
-  ok('值守：识别器再次启动（开字幕即值守计时开始）', rec.capStarts >= 3 && capBtnEl.textContent.includes('关字幕'));
+  ok('值守：识别器再次启动（开字幕即值守计时开始）', rec.capStarts >= 3 && capBtnEl.innerHTML.includes('关字幕'));
   // ① 灌 501 条对端字幕：内存环形(500)装不下，溢出的旧段应触发一次归档 POST
   guard('值守：灌 501 条对端字幕（触发溢出）', () => {
     for (let i = 0; i < 501; i++) {
@@ -720,7 +720,7 @@ const emit = (ev, payload) => {
     for (let i = 0; i < 4; i++) liveRec.onerror({ error: 'network' });
   });
   ok('值守：network 连败 4 次没被永久关（值守退避生效，4/12）',
-    capBtnEl.textContent.includes('关字幕') && capStatusEl.textContent.includes('4/12'));
+    capBtnEl.innerHTML.includes('关字幕') && capStatusEl.textContent.includes('4/12'));
   // ④ 导出合并：导出时先拉服务器全档，和内存段拼成一份 txt
   guard('值守：导出记录（应先拉服务器全档）', () => documentStub.getElementById('capExportBtn').dispatch('click'));
   await new Promise((r) => setTimeout(r, 60));
@@ -788,7 +788,7 @@ const emit = (ev, payload) => {
   const memberListEl2 = documentStub.getElementById('memberList');
   const aiRow2 = memberListEl2.children.find((r) => r.classList.contains('ai-bot-row'));
   ok('AI：bot 在快照里 → 成员列表出现 ai-bot-row 名牌 + 按钮亮起',
-    !!aiRow2 && aiBtnEl.classList.contains('active') && aiBtnEl.textContent.includes('送走'));
+    !!aiRow2 && aiBtnEl.classList.contains('active') && aiBtnEl.innerHTML.includes('送走'));
   const aiEmitsBefore = rec.emits.length;
   documentStub.getElementById('chatInput').value = '@ai 谁发言最多';
   guard('AI：发送 @ai 消息', () => documentStub.getElementById('chatSendBtn').dispatch('click'));
