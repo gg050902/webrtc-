@@ -1895,3 +1895,24 @@ new-data-producer/data-producer-closed 广播、room-members 清单、两条错�
   ReferenceError（坑 14 "别把两版搞混"的函数级变体）。
 - **回归（本次实测）**：信令 **81/81**（+7 AI 断言）+ 冒烟 **95/95**（+4：AI 按钮/
   bot 行/按钮态/@ai 改道/金边气泡）+ 真机全流程（邀请→🤖 行→@ai→金边应答→白板 v2）。
+
+### 5.23 ★ 09-19c N2 纪要骨架 + G3 录制回放（"录了能看、说了有账、账能成文"）
+
+- **纪要合成器 buildMinutes**：字幕账本（loadCaptions 公共函数，读 sfu/captions/*.jsonl
+  权威副本）+ 发言统计 + **待办关键词规则抽取**（需要/记得/下周/明天/跟进……这组规则
+  在没有 LLM 的年代就实用——教学点是"规则层与智能层分层，规则层永远兜底"）。
+  双轨：DEEPSEEK_API_KEY 存在走 LLM（结构化 prompt：要点≤6/待办/结论），失败或无 key
+  降级本地模板，尾注 [Mock]——**用户永远分得清"这是机器想的还是模板拼的"**。
+- **三个触发**：ai-minutes 信令（手动）/ bot 在场时 setInterval 定时分段（config.
+  minutesIntervalSec，默认 1h，聊天里播报路径）/ ai-leave 与 destroyRoom 自动终稿
+  （异步 fire-and-forget，不阻塞信令主路）。终稿读的都是文件与闭包，不依赖已销毁的 room。
+- **HTTP 面**：GET /minutes/<房间>/<文件>（房间号 6 位 + 文件名 \w 白名单，双钳制防
+  路径穿越）+ /api/minutes 列表；@ai 问"纪要/总结"直接生成并回路径（零前端改动接入）。
+- **G3 录制回放**：/api/recordings（只报 .webm/.mkv）+ recordings.html（列表+<video>+
+  下载，零依赖暖墨风）——D+2 从"技术验证"变"真功能"。真机验证：test:record 产物
+  点击播放 duration=4.0s 自动播。
+- **实修坑（test:record 竞态）**：probeFfmpeg 是异步 500ms，媒体引擎 0.1s 就绪后
+  TEST_RECORD 立刻跑 → FFMPEG_OK 还是 false → 误报"ffmpeg 不可用"。修法：自测前
+  等探测收敛（轮询最多 3s）+ 深扫兜底。教训：**异步探测 × 立即消费 = 竞态**，
+  "还没探到"不等于"没有"。
+- 回归：信令 **86/86**（+5）+ 冒烟 95/95 + test:record PASS。

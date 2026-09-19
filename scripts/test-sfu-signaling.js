@@ -486,6 +486,31 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   try { await request(A.s, 'ai-ask', { question: '在吗' }); } catch (e) { aiErr = e.message; }
   ok('09-19 bot 不在房时 ai-ask 被拒（明确提示）', !!aiErr);
 
+  // --- ★ 09-19c：N2 纪要（手动生成/下载/列表）+ G3 录制列表 ---
+  // 先给房间塞 3 条字幕（N2 的原料走 /api/captions 权威副本）
+  await httpReq('POST', 'http://localhost:3001/api/captions', {
+    room: ROOM,
+    entries: [
+      { ts: Date.now(), from: A.id, name: '张三', text: '下周我们需要把部署手册补完' },
+      { ts: Date.now() + 1, from: A.id, name: '张三', text: '明天记得跟进TURN服务器' },
+      { ts: Date.now() + 2, from: A.id, name: '李四', text: '好的我来安排' },
+    ],
+  });
+  const minAck = await request(A.s, 'ai-minutes', { type: 'segment' });
+  ok('09-19c ai-minutes 生成纪要（返回文件路径，无 key 环境 mock=true）',
+     !!minAck.data && !!minAck.data.file && minAck.data.file.endsWith('.md') && minAck.data.mock === true);
+  const minDown = await httpReq('GET', 'http://localhost:3001' + minAck.data.path);
+  ok('09-19c 纪要可经 /minutes/<room>/<file> 下载且含统计与待办线索',
+     minDown.code === 200 && minDown.text.includes('# 会议纪要') &&
+     minDown.text.includes('## 待办线索') && minDown.text.includes('TURN'));
+  const minList = await httpReq('GET', `http://localhost:3001/api/minutes?room=${ROOM}`);
+  ok('09-19c /api/minutes 列表含刚生成的文件', minList.code === 200 &&
+     JSON.parse(minList.text).some((x) => x.name === minAck.data.file));
+  const minBad = await httpReq('GET', 'http://localhost:3001/minutes/../../etc/passwd');
+  ok('09-19c /minutes 路径穿越被钳制（403/404，绝不定成功）', minBad.code === 403 || minBad.code === 404);
+  const recList = await httpReq('GET', 'http://localhost:3001/api/recordings');
+  ok('09-19c G3 /api/recordings 列表可用（200 数组）', recList.code === 200 && Array.isArray(JSON.parse(recList.text)));
+
   // --- D1：对不存在的 Consumer 切层 → 走错误路径而不是崩服务 ---
   let layerErr = null;
   try { await request(F.s, 'set-preferred-layers', { consumerId: 'fake-consumer', spatialLayer: 1 }); }

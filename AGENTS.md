@@ -333,6 +333,24 @@
 >   （坑 13③ 变体，已把 ok/fail helper 统一加 typeof 守卫一劳永逸）；
 >   另：server 没有 client 的 shortId helper——AI 块里臆造即 ReferenceError（坑 14
 >   "别把两版搞混"函数级变体，已加 aiShortId 本地 helper）。
+>
+> **09-19c N2 纪要骨架 + G3 录制回放 ✅（持续升级）**——
+> ① **N2 会议纪要（分段+终稿，DeepSeek/[Mock] 双轨）**：buildMinutes 合成器吃字幕账本
+>   （loadCaptions 抽成公共函数）+ 发言统计 + **待办关键词规则抽取**（需要/记得/下周/跟进…
+>   ——无 LLM 也能捞出大半待办）；有 key 走 DeepSeek 出要点/待办/结论，无 key/失败降级
+>   本地模板（尾注 [Mock]）；落盘 sfu/minutes/<房间>/<时间戳>-<分段|终稿>.md；
+>   **三个触发**：ai-minutes 信令（手动）/ bot 在场时每 MINUTES_INTERVAL（config.
+>   minutesIntervalSec，默认 1h）自动分段纪要+聊天播报 / ai-leave 与 destroyRoom 自动终稿；
+>   HTTP：GET /api/minutes?room= 列表 + GET /minutes/<room>/<file> 下载（房间号+文件名
+>   双白名单钳路径穿越）；@ai 问"纪要/总结"直接生成并回路径；
+> ② **G3 录制回放 ✅**：GET /api/recordings 列表 + sfu/public/recordings.html（零依赖暖墨
+>   回放页：列表+<video> 播放+下载）+ dashboard 三个入口链接；真机验证：test:record 产物
+>   在列表出现、点击播放 duration=4.0s 自动播——"录了能看"闭环；
+> ③ **test:record 竞态修复**：媒体引擎就绪（0.1s）比 probeFfmpeg（异步 500ms）快时
+>   FFMPEG_OK 还是 false → 自测误报"ffmpeg 不可用"；自测前先等探测收敛（最多 3s）+
+>   深扫兜底；
+> **回归（本次实测）**：信令 **86/86**（+5：纪要生成/下载含待办/列表/穿越钳制/录制列表）+
+> 冒烟 **95/95** + test:record **PASS**（251KB/4.0s）。
 
 > **09-19 AI 主攻拍板 + 路线图重构（本次只动文档、不动代码）**——用户从 G 档 8 候选中拍板
 > **两条主线**：①纪要+问答（DeepSeek summarize + @AI 问答 + 值守 N2）②C1 AI 远程操作员

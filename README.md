@@ -72,6 +72,8 @@
 | 🚨 值守告警（G7-③） | `npm run watch` 定时拉 /api/rooms + /metrics：服务拉不到/媒体健康分低/房间宽限告急/内存超限四规则告警，同类 5 分钟限流，可选企业微信/钉钉 webhook | 零依赖脚本 scripts/watch.js，一次 fetch POST 即接 webhook（09-19） |
 | 🤖 AI Bot 参会者（AI 线 C 档） | AI 助理以参会者身份入会：成员列表 🤖 行、控制坞一键邀请/送走；**服务端音频管线**（每路音频 PlainTransport→ffmpeg astats RTP 旁路，服务器第一次真正"听到"会议）；聊天 @ai 提问（DeepSeek 真 LLM / 无 key [Mock] 模板双轨），金边气泡广播 | 零依赖；管线是 N2 真转写的现成插入口（09-19b，SFU 主版本） |
 | 🖌️ 白板 v2「宣纸 editorial」 | 参考 recent.design igochi 案例：水墨五色板（墨/朱砂/鎏金/黛蓝/竹青）、暖纸白+渐晕+颗粒纸面、hairline 头部排版 | 纯 CSS 零依赖（09-19b） |
+| 📝 会议纪要（N2 骨架） | 分段+终稿 markdown 纪要：发言占比/关键句节选/待办线索（关键词规则抽取）；值守期间定时生成+送走 bot/房间销毁自动终稿；@ai 问"纪要"即得 | DeepSeek/[Mock] 双轨（零依赖可跑）；sfu/minutes/ 落盘、/minutes/ 下载、/api/minutes 列表（09-19c，SFU 主版本） |
+| 📼 录制回放（G3） | /api/recordings 列表 + recordings.html 回放页（点开即播+下载）——D+2 从"能录"变"录了能看" | 零依赖暖墨页；dashboard 有入口（09-19c） |
 | 💬 字幕 Otter 式排版 | 字幕历史按说话人分组成段（段头名字+时间、段内逐句、最新句鎏金高亮）——Otter.ai 的转写排版节奏 | 纯前端重排（09-19b） |
 
 > **本表最后一栏的字母 = 升级编号**（A3/A4/A6 = 远程协助深化；D1~D6 = 会议本体 + SFU 深究；
@@ -340,6 +342,7 @@ npm run bench      # E4 压力基准（4/8/16 路，约 1 分钟，独立 Worker
 | 28 | **过夜全面升级（09-18）** | 前端美学 v3（全站暖墨统一/演讲者视图=大画面+胶片条/说话人金环呼吸/入场动效+reduced-motion 降级，真浏览器截图四屏验证）；宫格布局语义修正（tile-main 全宽圈定演讲者视图）；演讲人交接迟滞收尾+attachRemoteMedia 元数据腐蚀真 bug 修复（坑 32）；C1 值守日报（第 31 步）；G7 /metrics 首刀；dashboard 暖化；项目清理（config 备份×9/工具会话数据/运行时产物）+ start-lan.bat 路径修复 |
 | 29 | **丝滑化+跨网审计+G7-②③（09-19）** | 演讲者大画面 16:9 contain 收敛（不再撑满）+ View Transitions 布局过渡（0.25s crossfade，签名变化才触发）+ 全局平滑滚动；跨网根因澄清（SFU 媒体不走 TURN，announcedIp 可达是唯一关键）+ announcedIp 漂移实测修复 + 部署手册场景 B 重写（Tailscale 零成本方案）；结构化日志 logEvent（8 埋点 JSONL）+ watch.js 告警 |
 | 30 | **白板 v2 + Otter 字幕节奏 + AI Bot 参会者（09-19b）** | 白板宣纸 editorial 化（水墨五色+颗粒纸面）；字幕抽屉按说话人分组（Otter 节奏）；**AI Bot**：身份（room-state isBot 虚拟成员）+ 服务端音频管线（PlainTransport→ffmpeg astats→aiHearing 听觉账本）+ @ai 问答（DeepSeek/[Mock] 双轨）；坑 33（无回调 emit×ok 守卫缺失=崩服，已统一守卫） |
+| 31 | **N2 纪要骨架 + G3 录制回放（09-19c）** | buildMinutes 合成器（字幕账本+发言统计+待办关键词抽取，LLM/[Mock] 双轨）；三触发（ai-minutes 手动/值守定时分段/离开销毁终稿）；/minutes 下载（双白名单防穿越）+@ai 关键词直连；recordings.html 回放页真机播放验证；test:record 探测竞态修复 |
 
 **下一步方向**（`后续升级方向.md` 是唯一权威）：
 - ✅ **A 档（A1~A7）与 D 档（D1~D6）已全部完成**（2026-09-11，SFU 主版本）；

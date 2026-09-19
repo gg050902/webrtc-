@@ -147,7 +147,7 @@ AI 模块是**独立的**：它不碰你的 WebRTC 代码，只多监听一路�
   + `npm run soak`（`scripts/soak.js`：服务器侧耐久脚本，默认 7 小时，`--minutes` 可压缩自测，
     心跳落 `sfu/logs/soak-*.log`，结束出报告，错误超阈值 exit 1）。
   **今晚就能跑**：开会 → 开字幕 → 挂一夜 → 早上「⬇ 记录」拿全档。
-  **AI Bot 参会者已落地（09-19b）**：AI 助理以参会者身份入会（成员列表 🤖），服务端音频管线（PlainTransport→ffmpeg astats）实时"听"每路音频响度，聊天 @ai 问答——DeepSeek key 存在走真 LLM，无 key 降级 [Mock] 模板（AI 双轨约定首次实战）；这就是"阶段 3 形态 A"的第一个真闭环，N2 定时纪要可直接在此管线上插转写器。**值守日报已落地（09-18，第 31 步）**：「📋 日报」一键生成零 LLM 的 markdown 统计
+  **N2 纪要骨架已落地（09-19c）**：分段+终稿 markdown（LLM/[Mock] 双轨、待办关键词规则层）、值守定时生成+终稿自动、ai-minutes 信令与 @ai 直连——key 一配置即从 [Mock] 无缝升级为真 LLM 纪要；**AI Bot 参会者已落地（09-19b）**：AI 助理以参会者身份入会（成员列表 🤖），服务端音频管线（PlainTransport→ffmpeg astats）实时"听"每路音频响度，聊天 @ai 问答——DeepSeek key 存在走真 LLM，无 key 降级 [Mock] 模板（AI 双轨约定首次实战）；这就是"阶段 3 形态 A"的第一个真闭环，N2 定时纪要可直接在此管线上插转写器。**值守日报已落地（09-18，第 31 步）**：「📋 日报」一键生成零 LLM 的 markdown 统计
   （时长/说话人占比/每小时分布/值守健康）——N2 没接上也能先拿到结构化纪要。
 - **N2 LLM 定时纪要（需 DeepSeek key，预计一晚 < 1 元）**
   服务器值守定时器：每 30~60 分钟把该时段字幕段喂 `scripts/summarize.js` 的核心函数 →

@@ -124,6 +124,69 @@ async function requestHandler(req, res) {
     return;
   }
 
+  // ★ 09-19c G3 录制回放：录制产物列表（recordings.html 吃它；只报可播的 .webm/.mkv）
+  if (pathname === '/api/recordings') {
+    try {
+      const dir = path.join(__dirname, 'recordings');
+      const list = fs.existsSync(dir)
+        ? fs.readdirSync(dir)
+            .filter((f) => f.endsWith('.webm') || f.endsWith('.mkv'))
+            .map((f) => {
+              const st = fs.statSync(path.join(dir, f));
+              return { name: f, size: st.size, mtime: st.mtimeMs };
+            })
+            .sort((a, b) => b.mtime - a.mtime)
+        : [];
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(list));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // ★ 09-19c N2：纪要列表 + 纪要下载（房间号 6 位白名单 + 文件名白名单，路径穿越进不来）
+  if (pathname === '/api/minutes') {
+    const q = new URL(req.url, 'http://localhost').searchParams;
+    const room = String(q.get('room') || '');
+    if (!/^\d{6}$/.test(room)) {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('房间号必须是 6 位数字');
+      return;
+    }
+    const dir = path.join(MINUTES_DIR, room);
+    const list = fs.existsSync(dir)
+      ? fs.readdirSync(dir).filter((f) => f.endsWith('.md')).map((f) => {
+          const st = fs.statSync(path.join(dir, f));
+          return { name: f, size: st.size, mtime: st.mtimeMs };
+        }).sort((a, b) => b.mtime - a.mtime)
+      : [];
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(list));
+    return;
+  }
+  if (pathname.startsWith('/minutes/')) {
+    // /minutes/<6位房间>/<文件名>.md —— 两段白名单钳住路径穿越
+    const parts = pathname.split('/').filter(Boolean); // ['minutes', room, file]
+    const room = parts[1] || '';
+    const file = parts[2] || '';
+    if (!/^\d{6}$/.test(room) || !/^\w[\w.-]*\.md$/.test(file) || file.includes('..')) {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('403 Forbidden');
+      return;
+    }
+    const fp = path.join(MINUTES_DIR, room, file);
+    if (fs.existsSync(fp)) {
+      res.writeHead(200, { 'Content-Type': 'text/markdown; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(fs.readFileSync(fp, 'utf8'));
+    } else {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('纪要不存在');
+    }
+    return;
+  }
+
   // ★ 09-13 可达性：把 ICE 服务器配置下发给浏览器（客户端 fetch 后建 Transport 用）
   if (pathname === '/config.json') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -935,8 +998,26 @@ function setAiBot(roomNumber, on) {
       const producer = sock && sock.producers && sock.producers.get(pid);
       if (producer && producer.kind === 'audio') startAiAudioPipe(roomNumber, producer, owner);
     }
+    // ★ N2：值守分段纪要定时器（bot 在场才挂；interval = config.minutesIntervalSec，默认 1h）
+    if (!room.minutesTimer) {
+      const sinceMark = { ts: Date.now() }; // 每段只统计上一段之后的新字幕
+      room.minutesTimer = setInterval(async () => {
+        try {
+          const r = await buildMinutes(roomNumber, { type: 'segment', since: sinceMark.ts });
+          sinceMark.ts = Date.now();
+          io.to(roomNumber).emit('chat-message', {
+            from: 'ai-bot', name: '🤖 AI 助理',
+            text: `🌙 值守分段纪要已生成：${r.path}（${r.mock ? '[Mock] ' : ''}本段 ${r.markdown.includes('（本时段没有字幕记录）') ? '无字幕' : '已汇总'}）`,
+            ts: Date.now(),
+          });
+        } catch (e) { /* 定时纪要失败不打断值守，下一轮再试 */ }
+      }, MINUTES_INTERVAL_MS);
+    }
   } else {
     stopAiAudioPipeline(roomNumber);
+    // ★ N2：送走 bot = 值守段落结束 → 清定时器 + 出终稿（异步落盘，不阻塞信令）
+    if (room.minutesTimer) { clearInterval(room.minutesTimer); room.minutesTimer = null; }
+    buildMinutes(roomNumber, { type: 'final' }).catch(() => {});
   }
   broadcastRoomState(roomNumber);
   logEvent('info', on ? 'ai-join' : 'ai-leave', { roomNumber });
@@ -997,6 +1078,12 @@ async function aiBrain(roomNumber, question) {
   }
   // ── 本地模板（[Mock] 标记 = AI 双轨约定：无 key 环境的降级路径）──
   const q = String(question || '');
+  // ★ N2：问"纪要/总结"→ 直接生成并回路径（@ai 生成纪要 的入口）
+  if (/纪要|总结|摘要/.test(q)) {
+    const r = await buildMinutes(roomNumber, { type: 'segment' });
+    return `${r.mock ? '[Mock] ' : ''}纪要已生成：${r.path} —— 要点节选：` +
+      (r.markdown.split('## 关键句节选')[1] || '').split('\n').filter((l) => l.startsWith('- ')).slice(0, 3).join('；');
+  }
   let ans;
   if (/你是谁|介绍.*自己|hello|hi|你好/i.test(q)) {
     ans = `我是本房间的 AI 助理（🤖），${dur} 分钟前入会，一直在听：当前 ${members.length} 人在场。问"谁发言最多/会议多久/最近说了什么"都能答；配置 DEEPSEEK_API_KEY 后我会更聪明。`;
@@ -1012,6 +1099,121 @@ async function aiBrain(roomNumber, question) {
     ans = `我在听（${members.length} 人在场，字幕 ${capTail.length} 条）。目前是 [Mock] 模式：可以问我"谁发言最多/会议多久/刚才说了什么"；配 DEEPSEEK_API_KEY 后可自由问答。`;
   }
   return '[Mock] ' + ans;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * ★ 09-19c N2 会议纪要骨架（分段 + 终稿，DeepSeek/[Mock] 双轨，零依赖）
+ * ▎是什么：把一场会/一个时段的字幕账本+发言统计+待办关键词，合成一份 markdown 纪要，
+ *   落盘 sfu/minutes/<房间号>/<时间戳>-<分段|终稿>.md；值守期间每 MINUTES_INTERVAL
+ *   自动出一份分段纪要，AI 助理送走/房间销毁时自动出终稿。
+ * ▎双轨：有 DEEPSEEK_API_KEY → 字幕喂 LLM 出要点/待办/结论；无 key/失败 → 本地模板
+ *   （结构化统计 + 关键句节选 + 待办关键词抽取——"需要/记得/下周/明天/跟进…"这组
+ *   规则在无 LLM 时代就已能捞出大半待办，纪要尾注带 [Mock] 标记）。
+ * ▎与 N1 的衔接：字幕权威副本在 sfu/captions/*.jsonl（第 30 步归档），这里就是它的
+ *   第一个"消费者"——睡觉挂一夜，早上 minutes/ 里躺着按时段排好的纪要。
+ * ══════════════════════════════════════════════════════════════ */
+const MINUTES_DIR = path.join(__dirname, 'minutes');
+const MINUTES_INTERVAL_MS = (Number(CONFIG.minutesIntervalSec) || 3600) * 1000; // 分段间隔（config 可调）
+
+// 读房间全部字幕账本（aiBrain 同款来源，抽成公共函数）
+function loadCaptions(roomNumber) {
+  const files = fs.existsSync(CAPTIONS_DIR)
+    ? fs.readdirSync(CAPTIONS_DIR)
+        .filter((f) => f.startsWith(`cap-${roomNumber}-`) && f.endsWith('.jsonl')).sort()
+    : [];
+  const out = [];
+  for (const f of files) {
+    for (const line of fs.readFileSync(path.join(CAPTIONS_DIR, f), 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try { out.push(JSON.parse(line)); } catch (e) { /* 坏行跳过 */ }
+    }
+  }
+  return out.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+}
+
+// LLM 纪要（有 key 才走；失败抛错由调用方降级 Mock）
+async function llmMinutes(seg) {
+  const transcript = seg.slice(-200).map((e) => `${e.name}: ${e.text}`).join('\n');
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    const res = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [
+          { role: 'system', content: '你是会议纪要助手。基于会议字幕输出 markdown，只含三个小节：## 要点（不超过6条）## 待办（可执行的动作项，没有就写"（无）"）## 结论（一句话）。不要编造字幕里没有的内容。' },
+          { role: 'user', content: `会议字幕：\n${transcript}` },
+        ],
+        temperature: 0.3,
+      }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const text = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+    if (!text) throw new Error('empty completion');
+    return text.trim();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 纪要合成器：type='segment'|'final'；since=只统计该时刻之后（分段用）
+async function buildMinutes(roomNumber, opts = {}) {
+  const room = rooms.get(roomNumber);
+  const now = Date.now();
+  const entries = loadCaptions(roomNumber);
+  const seg = entries.filter((e) => (e.ts || 0) >= (opts.since || 0));
+  const durMin = room ? Math.round((now - room.createdAt) / 60000) : 0;
+  const talkRows = room ? [...room.talk.entries()].sort((a, b) => b[1] - a[1]) : [];
+  const bySpeaker = {};
+  for (const e of seg) bySpeaker[e.name || '未知'] = (bySpeaker[e.name || '未知'] || 0) + 1;
+  const speakers = Object.entries(bySpeaker).sort((a, b) => b[1] - a[1]);
+  // 待办关键词抽取（零 LLM 的规则层——分门别类永远有用的兜底）
+  const todoRe = /(需要|待办|记得|下周|明天|得去|别忘了|安排|跟进|然后要)/;
+  const todos = seg.filter((e) => todoRe.test(e.text || '')).slice(-8);
+
+  let body = null;
+  let isMock = false;
+  if (process.env.DEEPSEEK_API_KEY && seg.length) {
+    try { body = await llmMinutes(seg); } catch (e) { body = null; }
+  }
+  if (!body) {
+    isMock = true;
+    const lines = [];
+    lines.push('## 发言占比');
+    if (speakers.length) for (const [name, n] of speakers.slice(0, 10)) {
+      lines.push(`- ${name}：${n} 条（${Math.round((n / seg.length) * 100)}%）`);
+    } else lines.push('- （本时段没有字幕记录）');
+    lines.push('');
+    lines.push('## 关键句节选（最近 12 条）');
+    if (seg.length) for (const e of seg.slice(-12)) lines.push(`- ${e.name}："${e.text}"`);
+    else lines.push('- （无）');
+    lines.push('');
+    lines.push('## 待办线索（关键词规则抽取）');
+    if (todos.length) for (const e of todos) lines.push(`- [ ] ${e.name}："${e.text}"`);
+    else lines.push('- （未检测到含待办关键词的句子）');
+    body = lines.join('\n');
+  }
+  const stamp = new Date(now).toISOString().slice(0, 16).replace(/[-:T]/g, '');
+  const md = [
+    `# 会议纪要（${opts.type === 'final' ? '终稿' : '分段'}）· 房间 ${roomNumber}`, '',
+    `- 生成时间：${new Date(now).toLocaleString()}`,
+    `- 会议时长：约 ${durMin} 分钟；本${opts.type === 'final' ? '场' : '时段'}字幕 ${seg.length} 条（全档 ${entries.length} 条）`,
+    `- 发言统计：${talkRows.slice(0, 3).map(([id, v]) => `${aiShortId(id)} 约 ${Math.round(v)}s`).join('、') || '无'}`,
+    '', body, '',
+    opts.type === 'final' ? '> 终稿：AI 助理送走 / 房间销毁时自动生成。' : '> 分段纪要：值守期间定时生成。',
+    isMock ? '> [Mock] 本地模板生成（无 DEEPSEEK_API_KEY 或 LLM 失败）；配置 key 后本节由 LLM 撰写。' : '> 由 DeepSeek 撰写。',
+    '',
+  ].join('\n');
+  const dir = path.join(MINUTES_DIR, String(roomNumber));
+  fs.mkdirSync(dir, { recursive: true });
+  const file = `${stamp}-${opts.type || 'segment'}.md`;
+  fs.writeFileSync(path.join(dir, file), md, 'utf8');
+  logEvent('info', 'minutes-generated', { roomNumber, type: opts.type || 'segment', entries: seg.length, mock: isMock });
+  return { file, path: `/minutes/${roomNumber}/${file}`, markdown: md, mock: isMock };
 }
 
 function broadcastRoomState(roomNumber) {
@@ -1174,6 +1376,11 @@ function destroyRoom(roomNumber, reason) {
   if (room.netLevelTimer) clearInterval(room.netLevelTimer);
   if (room.talkTimer) clearInterval(room.talkTimer);
   if (room.ttlTimer) clearTimeout(room.ttlTimer);
+  // ★ N2：房间销毁时 bot 若在场 → 终稿纪要（异步，读的账本都在文件/闭包里，不依赖 room）
+  if (room.aiBot) {
+    if (room.minutesTimer) { clearInterval(room.minutesTimer); room.minutesTimer = null; }
+    buildMinutes(roomNumber, { type: 'final' }).catch(() => {});
+  }
   rooms.delete(roomNumber);
   remoteCtl.delete(roomNumber);
   stopAiAudioPipeline(roomNumber); // ★ 09-19：房间销毁 → AI 管线全拆（防 ffmpeg/Transport 泄漏）
@@ -1930,6 +2137,24 @@ io.on('connection', (socket) => {
     ok(callback, { answer });
   });
 
+  // ★ 09-19c N2：手动生成纪要（不需要 bot 在场——纪要吃的是字幕账本，人人可取）
+  socket.on('ai-minutes', async (payload = {}, callback) => {
+    if (!socket.roomNumber || !rooms.get(socket.roomNumber)) return fail(callback, '先进入房间再生成纪要');
+    const type = payload.type === 'final' ? 'final' : 'segment';
+    const since = Number(payload.since) || 0;
+    try {
+      const r = await buildMinutes(socket.roomNumber, { type, since });
+      io.to(socket.roomNumber).emit('chat-message', {
+        from: 'ai-bot', name: '🤖 AI 助理',
+        text: `📋 ${type === 'final' ? '终稿' : '分段'}纪要已生成：${r.path}${r.mock ? '（[Mock] 本地模板）' : ''}`,
+        ts: Date.now(),
+      });
+      ok(callback, { file: r.file, path: r.path, mock: r.mock });
+    } catch (err) {
+      fail(callback, '纪要生成失败：' + err.message);
+    }
+  });
+
   socket.on('set-preferred-layers', async ({ consumerId, spatialLayer } = {}, callback) => {
     const consumer = socket.consumers.get(consumerId);
     if (!consumer) { if (callback) fail(callback, '找不到这个 Consumer'); return; }
@@ -2396,6 +2621,13 @@ async function runRecordSelfTest() {
   console.log('🧪 [TEST_RECORD] 服务器侧录制端到端自测开始（ffmpeg 源 → mediasoup → ffmpeg 落盘）…');
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   try {
+    // ★ 09-19c 实修：probeFfmpeg 是异步的（500ms），媒体引擎就绪比它快时
+    //   FFMPEG_OK 还是 false——自测前先等探测收敛（最多 3s），别把"还没探到"当"没有"。
+    for (let i = 0; !FFMPEG_OK && i < 30; i++) await sleep(100);
+    if (!FFMPEG_OK) {
+      // 快探测确实失败了 → 走一次深度扫描（winget 目录兜底）再判死刑
+      await new Promise((r) => resolveFfmpegDeep ? resolveFfmpegDeep().then(r).catch(r) : r());
+    }
     if (!FFMPEG_OK) throw new Error('ffmpeg 不可用');
     // ① 独立 Router + 一条"收流"PlainTransport（comedia=true：等 ffmpeg 先发 RTP）
     const router = await worker.createRouter({ mediaCodecs });
