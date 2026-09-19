@@ -124,7 +124,7 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
               border-color .14s var(--ease), background-color .14s var(--ease), filter .14s var(--ease);
 }
 .btn:hover:not(:disabled) { transform: translateY(-1px); border-color: var(--border-strong); box-shadow: var(--shadow-1), inset 0 1px 0 rgba(255, 244, 220, .06); }
-.btn:active:not(:disabled) { transform: translateY(0); filter: brightness(1.18); }
+.btn:active:not(:disabled) { transform: translateY(0) scale(.965); filter: brightness(1.18); }
 .btn:disabled { opacity: .35; cursor: not-allowed; }
 .btn.primary {
   background: linear-gradient(135deg, #c8482f 0%, #932a16 100%); /* 朱砂印泥 */
@@ -512,6 +512,15 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
   -webkit-backdrop-filter: blur(18px) saturate(150%);
   overflow-x: auto;
 }
+/* ★ 09-19d 舒适性:控制坞分组竖线——"离开"单独一档（危险操作离手远），
+ *   媒体操作 / 设备 / 扩展功能 / 反应区 各自成组，扫一眼就能定位 */
+.ctl-sep {
+  flex-shrink: 0;
+  width: 1px;
+  height: 22px;
+  margin: 0 3px;
+  background: linear-gradient(180deg, transparent, var(--border-strong), transparent);
+}
 .react-bar {
   display: inline-flex;
   align-items: center;
@@ -634,6 +643,7 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
   gap: 8px;
   padding: 10px;
   border-top: 1px solid var(--border);
+  background: rgba(12, 9, 5, .25);
 }
 .chat-input-bar textarea {
   flex: 1;
@@ -1402,3 +1412,26 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
   animation: botPulse 2.4s ease-in-out infinite;
 }
 @keyframes botPulse { 50% { opacity: .45; } }
+
+/* ────────── 23. ★ 09-19d 舒适性打磨层（"去人机"：让界面有呼吸和分寸）──────────
+   人机感的三个来源与对策：
+   ① 万物等距 → 关键区块用分隔/留白分层（控制坞竖线、hero 呼吸）；
+   ② 无反馈 → 按压有回弹、悬停有提升（.btn active scale 已加）；
+   ③ 文案客套 → 说话像同事不像客服（placeholder 微调见 index.html）。 */
+/* 预览页 hero：标题再抬一档、副标题行高更松、进入按钮全宽压轴 */
+.prejoin-heading { font-size: 27px; }
+.prejoin-sub { line-height: 1.7; }
+.pj-enter { width: 100%; letter-spacing: .12em; }
+/* 房间 hero 同款呼吸 */
+.room-hero-sub { line-height: 1.7; }
+.room-hero { padding: 44px 46px; }
+/* 字幕条更轻（内容才是主角，边框退后） */
+.caption-bar { border-color: rgba(216, 179, 106, .16); }
+/* 聊天气泡阴影更含蓄（近处的东西不需要深投影） */
+.msg { box-shadow: 0 1px 4px rgba(8, 5, 2, .25); }
+/* 日志面板可折叠态（JS 切 .log-collapsed：标题条常驻，内容收起） */
+.log-panel.collapsed pre { display: none; }
+.log-title { cursor: pointer; user-select: none; transition: color .15s var(--ease); }
+.log-title:hover { color: var(--fg-muted); }
+.app.log-collapsed { grid-template-rows: 58px 1fr 36px; }
+.log-collapsed .log-panel { margin-bottom: 8px; }

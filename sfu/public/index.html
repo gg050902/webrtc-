@@ -5,7 +5,7 @@
   <link rel="icon" href="data:," /><!-- 占位图标：消掉 favicon.ico 404 噪音 -->
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>简易腾讯会议 Demo · SFU 版（mediasoup）</title>
-  <link rel="stylesheet" href="style.css?v=20260919c" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存 -->
+  <link rel="stylesheet" href="style.css?v=20260919d" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存 -->
 </head>
 <body>
   <!-- ★ F3 升级（2026-09-12）：加入前预览页 —— "进会先把设备检查好"（腾讯会议同款流程）。
@@ -186,6 +186,7 @@
       <!-- 控制坞：底部悬浮的玻璃胶囊（离开/共享/协助/静音/摄像头/设备/录制/举手/回应） -->
       <div class="controls">
         <button id="leaveBtn" class="btn danger" disabled>离开房间</button>
+        <span class="ctl-sep" aria-hidden="true"></span>
         <button id="shareBtn" class="btn" disabled>共享屏幕</button>
         <!-- ★ 远程协助（A1）：允许远程协助开关（被控端用）。
              只在"正在共享屏幕"时出现；打开 = 页面切到工作台模式（见 workbenchArea） -->
@@ -209,6 +210,7 @@
         <!-- ★ 09-17 实时字幕（第 29 步，AI 线 L1）：Web Speech API 识别自己的麦克风，成稿经 SCTP 广播全房 -->
         <button id="capBtn" class="btn" disabled title="实时字幕：识别自己的麦克风转文字并广播（Web Speech API）">💬 字幕</button>
         <!-- ★ 09-13 F4：表情回应（走 D+1 SCTP 数据通道广播，全房表情飞屏） -->
+        <span class="ctl-sep" aria-hidden="true"></span>
         <div class="react-bar" id="reactBar" title="表情回应：经 SFU 数据通道广播给全房">
           <button class="react-btn" data-emoji="👍" title="赞">👍</button>
           <button class="react-btn" data-emoji="❤️" title="喜欢">❤️</button>
@@ -318,7 +320,7 @@
         <div class="chat-title">💬 会议聊天 <span class="chat-via">经服务器转发</span></div>
         <div class="chat-messages" id="chatList"></div>
         <div class="chat-input-bar">
-          <textarea id="chatInput" rows="1" placeholder="发条消息…（Enter 发送）"></textarea>
+          <textarea id="chatInput" rows="1" placeholder="说点什么…（Enter 发送）"></textarea>
           <button id="chatSendBtn" class="btn send">发送</button>
         </div>
       </div>
@@ -326,7 +328,7 @@
 
     <!-- 信令/媒体流程日志：跨在底部（看这里理解 SFU：Transport → Producer/Consumer） -->
     <section class="log-panel">
-      <div class="log-title">📋 流程日志（Transport → Producer/Consumer）</div>
+      <div class="log-title" id="logTitle" title="点击折叠/展开日志">📋 流程日志（点击折叠）</div>
       <pre id="log"></pre>
     </section>
   </div>

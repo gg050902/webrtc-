@@ -30,6 +30,7 @@ const $ = (id) => document.getElementById(id);
 const localVideo = $('localVideo');     // 显示"我自己"画面的 <video>
 const videoGrid = $('videoGrid');       // 装所有人视频的网格
 const logPanel = $('log');
+const logTitle = $('logTitle');   // ★ 09-19d：日志面板折叠开关
 const connBadge = $('connBadge');
 const netBadge = $('netBadge');         // 网络质量徽标（第 13 步）
 const connType = $('connType');         // ★ 09-13 可达性：到服务器的连接方式（直连/STUN/TURN）
@@ -156,9 +157,15 @@ const capManualSend = $('capManualSend');
 /* ──────────────────────────────────────────────────────────────
  * 第 2 步：日志工具
  * ────────────────────────────────────────────────────────────── */
+/* ★ 09-19d 架构优化：日志环形上限（400 行）——过夜值守一晚能产生几万行日志，
+ *   textContent 无限增长会让页面越跑越卡（每次 += 都整串重建）。
+ *   环形剪掉旧行后 scrollTop 仍贴底；剪剩的小字符串替换开销可忽略。 */
+const LOG_MAX_LINES = 400;
 function log(msg) {
   const time = new Date().toLocaleTimeString();
   logPanel.textContent += `[${time}] ${msg}\n`;
+  const lines = logPanel.textContent.split('\n');
+  if (lines.length > LOG_MAX_LINES) logPanel.textContent = lines.slice(-LOG_MAX_LINES).join('\n');
   logPanel.scrollTop = logPanel.scrollHeight;
 }
 
@@ -1109,6 +1116,9 @@ function appendChat(text, sender, isMe, via, name) {
       `<div class="msg-time">${new Date().toLocaleTimeString()}</div>`;
   }
   chatList.appendChild(item);
+  // ★ 09-19d 架构优化：聊天 DOM 环形上限（300 条）——SCTP 广播语义下长会消息不少，
+  //   DOM 节点数是前端内存与重排开销的大头；超限剪最老的（字幕账本另有 jsonl 存档）。
+  while (chatList.children.length > 300) chatList.firstChild.remove();
   chatList.scrollTop = chatList.scrollHeight;
 }
 
@@ -5018,4 +5028,10 @@ capReportBtn.addEventListener('click', async () => {
 if (!window.mediasoupClient) {
   log('❌ 找不到 mediasoup-client：请先执行 npm run build:sfu-vendor 生成 vendor/mediasoup-client.js');
 }
+// ★ 09-19d 舒适性：日志面板可折叠——教学时展开，演示/开会时收起给画面让位
+logTitle.addEventListener('click', () => {
+  const collapsed = logPanel.classList.toggle('collapsed');
+  document.querySelector('.app').classList.toggle('log-collapsed', collapsed);
+});
+
 startLocalMedia();

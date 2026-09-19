@@ -1916,3 +1916,88 @@ new-data-producer/data-producer-closed 广播、room-members 清单、两条错�
   等探测收敛（轮询最多 3s）+ 深扫兜底。教训：**异步探测 × 立即消费 = 竞态**，
   "还没探到"不等于"没有"。
 - 回归：信令 **86/86**（+5）+ 冒烟 95/95 + test:record PASS。
+
+### 5.24 ★ 09-19d 代码地图：把"会看这份代码"教给你（详细版）
+
+> 这一节回答新接手的人（包括三个月后的你自己）最常问的问题：**"这个功能在哪、
+> 一条消息是怎么走的、我加一个功能要动哪几个文件"**。配合第 0 章阅读路线使用。
+
+#### 5.24.1 三份运行时代码各自管什么（单一职责）
+
+| 文件 | 一句话职责 | 绝不该出现的东西 |
+|---|---|---|
+| `sfu/server.js`（分区 A~E+AI） | **唯一权威**：房间表、媒体中枢（Router/Transport/Producer/Consumer）、授权门禁、录制、纪要、全部 HTTP 接口 | 任何"只属于某个浏览器"的状态（比如字幕热窗口） |
+| `sfu/protocol.js` | **信令字典**：每个事件的载荷/方向/门禁一览。改信令前先看它，改完先回填它 | 逻辑代码（它只有注释和常量） |
+| `sfu/public/client.js`（步骤 1~31） | 浏览器的一切：登录→预览→媒体→协作→字幕→值守。**「第 N 步」编号就是目录** | 别的成员的状态权威（UI 可以缓存，真相在服务器） |
+
+> **为什么不用模块拆分？**（面试必问的架构取舍）单文件分区 = **线性可读**：新人从
+> server.js 第一行读到最后一行就是一次完整导览；模块化 = 各取所需但需要"跳转地图"。
+> 本项目的选择：**文件内强分区注释 + 文件间靠 protocol.js 这份"接口字典"解耦**，
+> 拆分时机 = 出现第二个消费者（比如 bot 复用媒体层）再说。取舍本身比选择更重要。
+
+#### 5.24.2 四个平面：一条消息/一帧画面/一条聊天/一次巡检的完整旅程
+
+```
+【信令面】 socket.io（TCP）
+  浏览器 emit('create-room') ──▶ server joinRoom()：建房间记录 → Router 懒创建
+      ◀── room-created / room-members（带老成员 Producer 清单）
+  以后每个 room-state 快照 = 全房真相广播（成员/静音/举手/字幕开关/AI Bot 在不在）
+
+【媒体面】 RTP/UDP（40000-49999）
+  摄像头/麦 ─▶ sendTransport.produce() ─▶ 服务器 Producer ─▶ 每个订阅者一条 Consumer
+      （simulcast 三层 / SVC；服务器按丢包+BWE 自动选层 = D1/D+3）
+  屏幕共享 = 第二路 Producer（source:'screen'，独立格）
+
+【数据通道面】 SCTP（复用媒体连接，三条频道并存）
+  chat 频道：聊天+表情+字幕（广播语义；"定向"要应用层加 to 头）
+  annot 频道：屏幕批注（带 to 定向头） board 频道：全场白板（无定向头）
+
+【HTTP 面】 普通请求（和信令无关）
+  /api/rooms（快照） /dashboard /metrics（Prometheus） /config.json（ICE 下发）
+  /api/captions（字幕权威副本） /api/minutes + /minutes/…（纪要） /api/recordings + /recordings/…
+```
+
+#### 5.24.3 功能速查表（"它住在哪"）
+
+| 想改/想懂 | 去哪 | LEARN |
+|---|---|---|
+| 房间/密码/踢人/房主迁移 | server.js C 段（joinRoom/destroyRoom/scheduleRoomTtl） | 2.8/5.13.2 |
+| 媒体上下行/选层/SVC | server.js 事件 ④⑤、startLayerMonitor；client 第 6~7/19 步 | 5.8.3/5.13.1 |
+| 说话人/发言占比 | AudioLevelObserver→audio-levels/talk-stats 广播；client 第 16/26b 步 | 5.8.2 |
+| 远程协助全链路 | server 事件 5.5~5.9（授权/输入门禁/剪贴板/文件/限时）；client 第 14~23 步 | 5.7/2.13 |
+| 批注/白板 | client 第 26c/26d 步（事件溯源重放） | 5.12.2/5.16.2 |
+| 滤镜虚拟背景 | client 第 28 步（canvas 管线+replaceTrack） | 5.18 |
+| 字幕/值守/日报 | client 第 29/30/31 步；/api/captions | 5.19 |
+| AI Bot/纪要 | server.js「AI 基建块」+ aiBrain/buildMinutes；client aiBtn/@ai | 5.22/5.23 |
+| 观测/指标/日志 | snapshotRooms、/metrics、logEvent→sfu/logs/*.jsonl | 5.11/5.20 |
+
+#### 5.24.4 新功能接线清单（照做就不会漏——本项目每次升级都在走这张单子）
+
+1. `protocol.js`：先写事件注释（方向/载荷/门禁）——**想不清楚就不许写代码**；
+2. `sfu/server.js`：事件处理（fail/ok 回调守卫已有；跨连接状态放模块级=坑 18；
+   白名单过滤输入；房间销毁/断连的清理路径**三处都要顾**）；
+3. `sfu/public/client.js`：DOM 引用（$）→ 事件监听 → 渲染函数（textContent 纪律）；
+4. `sfu/public/index.html`：元素（id 契约）+ style.css 新节（类名先查 client 动态创建的契约类；
+   注释里不写 `*/`=坑 26；`.hidden` 终审=坑 24）；
+5. 测试：`scripts/test-sfu-client-smoke.js` 加桩+断言（坑 27/28/29 都在测试侧）；
+   `scripts/test-sfu-signaling.js` 加信令断言（坑 3：监听先于 emit；坑 31：先确认服务器是新的）；
+6. `node --check` 全家 → 冒烟 → 信令 → **浏览器真机**（回归全绿≠界面没坏）；
+7. 回填：protocol.js → LEARN（教学）→ README（功能表/历程表）→ AGENTS（记忆）→
+   路线图（存档+更新记录）；数字必须真跑。
+
+#### 5.24.5 调试路径（按"症状"查）
+
+| 症状 | 第一反应 |
+|---|---|
+| 连不上/没画面 | 顶部 🔗 徽标（直连/STUN/中继）→ `npm run doctor`（announcedIp 过期是头号惯犯） |
+| 信令通媒体死 | chrome://webrtc-internals 看候选对；/dashboard 看字节在不在流 |
+| 页面行为怪 | Ctrl+F5（no-store 已防，但浏览器记忆顽固）；控制台看有没有红字 |
+| "昨晚还好好的" | 服务器日志 sfu/logs/app-*.jsonl + `npm run watch`；`doctor --json` 机读 |
+| 值守夜里的事 | 值守统计行 + 心跳日志 + /api/captions 对账 + minutes/ 纪要时间线 |
+
+#### 5.24.6 内存与长跑（09-19d 架构优化实录）
+
+- `log()` 400 行环形：过夜几万行日志曾会无限撑大 textContent（每次 += 整串重建=O(n²)）；
+- 聊天 DOM 300 条环形：SCTP 广播下长会 DOM 节点是重排开销大头；
+- 账本类数据（字幕/纪要/审计）一律"**内存热窗口 + 文件权威副本**"——
+  这一句就是本项目全部长跑工程的总纲。
