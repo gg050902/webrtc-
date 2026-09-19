@@ -16,6 +16,7 @@
     "start:lan": "node scripts/start-lan.js",
     "test:turn": "node scripts/test-turn.js",
     "soak": "node scripts/soak.js",
+    "watch": "node scripts/watch.js",
     "doctor": "node scripts/doctor.js"
   },
   "dependencies": {

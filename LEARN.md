@@ -1843,3 +1843,24 @@ new-data-producer/data-producer-closed 广播、room-members 清单、两条错�
   纪要）的关系：**日报给结构骨架，LLM 负责读懂内容，两层互为兜底**。
 - **G7 /metrics 首刀（零依赖）**：复用 snapshotRooms() 手拼 Prometheus 文本格式——
   面板与监控吃同一份数据源（"同一份真相"）。回归：信令 73/73 + 冒烟 91/91。
+
+### 5.20.1 ★ 09-19 丝滑化与跨网（v3 的两道补丁）
+
+- **"说话人过大"的修法**：演讲者大画面原是 grid `1fr` 行 + stretch 撑满；改为
+  `place-self: center + width:100% + max-height:100% + aspect-ratio:16/9`——
+  CSS 的 contain 语义（宽定高随，高钳宽缩），大画面保持比例、绝不满溢。
+- **"切换生硬"的修法（View Transitions API，零依赖）**：`document.startViewTransition(cb)`
+  让浏览器对前后两帧 DOM 自动做 crossfade——grid 布局重排本来无法 transition，这是唯一
+  平滑路。关键工程点：**只在"布局签名"（视图模式+大画面归属）变化时包过渡**——
+  audio-levels 每 400ms 一 tick，无差别包过渡会每 tick 截屏一次（卡顿+浪费）。
+  降级链：API 不存在 → 直接切换；reduced-motion → 直接切换。
+- **跨网真相（面试讲点）**：TURN/STUN 只作用于浏览器侧；mediasoup 服务器不走 TURN，
+  它向浏览器通告的 candidate 就是 announcedIp——**announcedIp 不可达 = 跨网必挂**，
+  与 iceServers 配多少条 TURN 无关。所以跨网部署的三种正解是：公网 announcedIp（云机）、
+  虚拟组网（Tailscale，announcedIp=100.x IP）、端口映射（需公网 IPv4）。
+  运维经验：announcedIp 是静态配置、IP 是动态的——"昨天能连今天连不上"先跑 doctor。
+- **G7-②③ 收尾**：logEvent(level,event,fields) 追加 JSON Lines 到 `sfu/logs/app-日期.jsonl`
+  （console 人读照旧=双轨），只埋低频关键事件（8 个埋点）；实修坑：disconnect 清理作用域里
+  房间号是 `socket.roomNumber`，写错作用域 = 成员离开时服务器崩溃（node --check 验不出
+  作用域错误，只有信令回归真跑才炸出来）。watch.js = 拉 /metrics + /api/rooms 按阈值告警
+  （服务拉不到/健康分低/宽限告急/rss 超限），同类告警 5 分钟限流，webhook 就是一次 fetch POST。

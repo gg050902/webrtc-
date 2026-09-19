@@ -444,6 +444,20 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
      met.code === 200 && met.text.includes('# TYPE sfu_rooms_total gauge') &&
      met.text.includes('sfu_producer_bytes_total') && /sfu_members_total \d+/.test(met.text));
 
+  // --- ★ 09-19：G7-② 结构化日志（JSONL）---
+  const fsLog = require('fs');
+  const logDir = 'sfu/logs';
+  const logFiles = fsLog.existsSync(logDir)
+    ? fsLog.readdirSync(logDir).filter((f) => f.startsWith('app-') && f.endsWith('.jsonl')).sort()
+    : [];
+  let logLines = [];
+  for (const f of logFiles) {
+    logLines = logLines.concat(fsLog.readFileSync(`${logDir}/${f}`, 'utf8').split('\n').filter(Boolean));
+  }
+  const hasEvent = (ev) => logLines.some((l) => { try { return JSON.parse(l).event === ev; } catch (e) { return false; } });
+  ok('09-19 G7-② 结构化日志落盘（room-created/member-joined/member-left 三事件可检索）',
+     hasEvent('room-created') && hasEvent('member-joined') && hasEvent('member-left'));
+
   // --- D1：对不存在的 Consumer 切层 → 走错误路径而不是崩服务 ---
   let layerErr = null;
   try { await request(F.s, 'set-preferred-layers', { consumerId: 'fake-consumer', spatialLayer: 1 }); }

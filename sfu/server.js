@@ -533,6 +533,23 @@ const mediaCodecs = [
 
 // 媒体走 UDP，端口范围可调（云服务器要放行这段端口！）
 //   优先级：环境变量 > config.json > 默认值
+/* ★ 09-19 G7-② 结构化日志（零依赖）：
+ * ▎是什么：logEvent(level, event, fields) 把关键事件追加成 JSON Lines
+ *   （sfu/logs/app-YYYY-MM-DD.jsonl，按天分档）——人读的 console.log 照旧，
+ *   这份是给机器读的：jq / 脚本 / 未来的告警器直接吃。
+ * ▎纪律：只埋"值得回放"的关键事件（房间生命周期/成员进出/授权/录制/异常），
+ *   绝不埋高频 tick（net-levels/audio-levels 那些每 3s/400ms 一发的，日志会爆炸）。
+ * ▎健壮性：日志写失败绝不影响信令主路（try/catch 静默——教学项目磁盘满了也不能崩）。 */
+const LOGS_DIR = path.join(__dirname, 'logs');
+fs.mkdirSync(LOGS_DIR, { recursive: true });
+function logEvent(level, event, fields = {}) {
+  try {
+    const day = new Date().toISOString().slice(0, 10);
+    const line = JSON.stringify({ ts: new Date().toISOString(), level, event, ...fields });
+    fs.appendFileSync(path.join(LOGS_DIR, `app-${day}.jsonl`), line + '\n');
+  } catch (e) { /* 日志失败不干扰主路 */ }
+}
+
 const rtcMinPort = Number(process.env.MEDIASOUP_RTC_MIN_PORT) || Number(CONFIG.rtcMinPort) || 40000;
 const rtcMaxPort = Number(process.env.MEDIASOUP_RTC_MAX_PORT) || Number(CONFIG.rtcMaxPort) || 49999;
 
@@ -978,6 +995,7 @@ function destroyRoom(roomNumber, reason) {
   rooms.delete(roomNumber);
   remoteCtl.delete(roomNumber);
   console.log(`🗑️ 房间 ${roomNumber} 已销毁（${reason}），号码回收`);
+  logEvent('info', 'room-destroyed', { roomNumber, reason });
 }
 
 /* ★ D+4：空房进入 TTL 宽限期（不立刻销毁）。宽限期内任何人可凭原号（+密码）回归 */
@@ -1263,6 +1281,7 @@ io.on('connection', (socket) => {
       console.log(`⏳ 房间 ${roomNumber} 宽限期内有人进入，TTL 倒计时已取消`);
     }
     console.log(`[+] ${socket.id} 进入房间 ${roomNumber}（当前 ${members.size}/${MAX_MEMBERS} 人）`);
+    logEvent('info', 'member-joined', { roomNumber, memberId: socket.id, count: members.size });
 
     // ① 告诉新人：房间里有谁 + 他们各上传了哪些媒体（Producer）。
     //    ★ 和 Mesh 不一样：新人不是去"连人"，而是去"订阅"老成员的 Producer。
@@ -1309,6 +1328,7 @@ io.on('connection', (socket) => {
       talk: new Map(),            // ★ 09-13 发言时长统计：socketId -> 累计发言秒数（D2 延伸）
     });
     console.log(`🆕 新房间已创建：${roomNumber}（创建者 ${socket.id}）${password ? '🔒 已设密码' : ''}`);
+    logEvent('info', 'room-created', { roomNumber, by: socket.id, hasPassword: !!password });
     socket.emit('room-created', { roomNumber });
     await joinRoom(roomNumber);
     if (callback) ok(callback, { roomNumber });
@@ -1432,6 +1452,7 @@ io.on('connection', (socket) => {
       }, durationMs);
     }
     remoteCtl.set(roomNumber, entry);
+    logEvent('info', 'control-granted', { roomNumber, host: socket.id, controller: to, durationMs: durationMs || 0 });
 
     io.to(to).emit('remote-answer', { from: socket.id, ok: true, expiresAt });        // 回执给申请者
     io.to(roomNumber).emit('remote-state', { hostId: socket.id, controllerId: to, expiresAt }); // 广播全房
@@ -1516,6 +1537,7 @@ io.on('connection', (socket) => {
     if (!target) return;
     console.log(`🚪 房主 ${socket.id} 将 ${to} 移出房间 ${roomNumber}`);
     target.emit('kicked', { by: socket.id, reason: 'owner-kick' });
+    logEvent('warn', 'member-kicked', { roomNumber, by: socket.id, target: target.id });
     // 给前端 100ms 把提示画出来再断开（教学演示看得见；真实产品会直接断）
     setTimeout(() => target.disconnect(true), 100);
   });
@@ -1681,6 +1703,7 @@ io.on('connection', (socket) => {
         tracks,
         label: `成员 ${memberId || producerId}`,
       });
+      logEvent('info', 'record-start', { roomNumber: socket.roomNumber, recordId: rec.id, by: socket.id });
       ok(callback, { recordId: rec.id });
     } catch (err) {
       fail(callback, '录制启动失败：' + err.message);
@@ -1691,6 +1714,7 @@ io.on('connection', (socket) => {
     const rec = recordSessions.get(recordId);
     if (!rec) return fail(callback, '找不到这次录制（可能已结束）');
     rec.stop && rec.stop(); // 优雅收尾（写 muxer trailer），exit 回调统一清台账
+    logEvent('info', 'record-stop', { recordId, by: socket.id, file: rec.file ? path.basename(rec.file) : null });
     ok(callback, { file: rec.file ? path.basename(rec.file) : null });
   });
 
@@ -2070,6 +2094,7 @@ io.on('connection', (socket) => {
           }
           broadcastRoomState(socket.roomNumber); // ★ D4：人数/房主变了，全房刷新成员列表
           console.log(`[-] ${socket.id} 离开房间（剩 ${room.members.size} 人）`);
+          logEvent('info', 'member-left', { roomNumber: socket.roomNumber, memberId: socket.id, remaining: room.members.size });
         }
       }
     }

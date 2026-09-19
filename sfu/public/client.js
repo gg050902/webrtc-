@@ -3170,8 +3170,14 @@ function pickMainTile() {
   return null;
 }
 
-// 把布局状态"刷"到 DOM：换容器类 + 换 tile-main 标记（幂等，随时可反复调用）
-function applyLayout() {
+/* 把布局状态"刷"到 DOM：换容器类 + 换 tile-main 标记（幂等，随时可反复调用）。
+ * ★ 09-19 拆成两层：applyLayoutDOM 只做纯 DOM 标记；applyLayout 负责决定
+ *   "要不要带过渡"——布局签名（视图模式 + 大画面归属）真的变了，且环境支持
+ *   View Transitions API、用户没开"减少动态效果"，才包 startViewTransition
+ *   做跨帧过渡（0.25s crossfade，大画面交接/切视图不再瞬间跳变）。
+ *   audio-levels 每 400ms 一 tick，签名没变就直通，零过渡开销（防抖动的关键）。 */
+let lastLayoutSig = '';
+function applyLayoutDOM() {
   videoGrid.classList.toggle('layout-speaker', layoutMode === 'speaker');
   videoGrid.classList.toggle('layout-gallery', layoutMode === 'gallery');
   viewGalleryBtn.classList.toggle('active', layoutMode === 'gallery');
@@ -3189,6 +3195,21 @@ function applyLayout() {
   } else if (selfBox) {
     selfBox.classList.add('tile-main'); // 大画面是我自己
   }
+}
+
+function applyLayout() {
+  const selfBox = document.querySelector('.video-box.self');
+  const main = pickMainTile(); // 纯查询无副作用，签名可以先算
+  const sig = `${layoutMode}|${main ? main.box : (selfBox ? 'self' : 'none')}`;
+  const reduced = typeof window.matchMedia === 'function'
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (sig === lastLayoutSig || reduced || typeof document.startViewTransition !== 'function') {
+    applyLayoutDOM();
+  } else {
+    try { document.startViewTransition(() => applyLayoutDOM()); }
+    catch (e) { applyLayoutDOM(); } // 过渡失败不影响正确性
+  }
+  lastLayoutSig = sig;
 }
 
 viewGalleryBtn.addEventListener('click', () => {

@@ -56,6 +56,7 @@
 
 /* ────────── 2. Reset 与基础 ────────── */
 * { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
 html, body { height: 100%; }
 body {
   font-family: var(--font);
@@ -382,10 +383,16 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
   border-color: var(--accent-border);
   box-shadow: var(--shadow-gold), var(--shadow-1);
 }
+/* ★ 09-19 丝滑收敛（用户反馈"说话人过大"）：大画面不再 stretch 撑满整行——
+ *   保持 16:9、contain 在第一行内并居中（width:100% 起步，max-height 钳住，
+ *   aspect-ratio 让宽度按比例回缩），大而不满，与胶片条之间有呼吸空间 */
 .video-grid.layout-speaker .video-box.tile-main {
   grid-column: 1 / -1;
   grid-row: 1;
-  aspect-ratio: auto;
+  place-self: center;
+  width: 100%;
+  max-height: 100%;
+  aspect-ratio: 16 / 9;
   min-height: 0;
 }
 .video-grid.layout-speaker .video-box:not(.tile-main) {
@@ -1330,3 +1337,14 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
 
 /* 滤镜面板勾选框（保持与旧版选择器契约一致） */
 .fx-check input { accent-color: var(--accent-emphasis); }
+
+/* ────────── 20. ★ 09-19 丝滑层：View Transitions（布局切换/大画面交接的跨帧过渡）──
+   client.js 的 applyLayout 在"布局签名变化"时包 document.startViewTransition
+   （Chrome 111+，零依赖）；这里把默认过渡调快调温和——0.25s crossfade，
+   视频内容同帧完成，人眼只看到"格子滑到位"，不再瞬间跳变。
+   不支持的环境 / 用户开了"减少动态效果"时走直接切换（client 侧已防御式降级）。 */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: .25s;
+  animation-timing-function: cubic-bezier(.2, .7, .3, 1);
+}

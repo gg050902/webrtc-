@@ -116,6 +116,12 @@ async function main() {
   console.log('    第 2 步  把链接发给另一台电脑（微信/QQ/手输均可）');
   console.log('    第 3 步  对方浏览器打开 → 提示证书点"继续访问" → 自动进入同一房间');
   console.log('──────────────────────────────────────────────────────');
+  console.log('  ★ 真跨网（两处不同网络）零成本方案 = Tailscale 组网（09-19 新增说明）：');
+  console.log('    两台设备都装 Tailscale（免费，tailscale.com）→ 各得一个 100.x.x.x 虚拟 IP；');
+  console.log('    把 sfu/config.json 的 announcedIp 改成服务器机的 Tailscale IP → 重启本脚本；');
+  console.log('    另一台设备用 https://<Tailscale-IP>:3443 访问（媒体走加密隧道，无需公网 IP）。');
+  console.log('    详读《部署手册.md》方案 D。其他形态（云主机/端口映射）也在该手册。');
+  console.log('──────────────────────────────────────────────────────');
 
   const child = spawn(process.execPath, [path.join(ROOT, 'sfu', 'server.js')], {
     cwd: ROOT, stdio: 'inherit',

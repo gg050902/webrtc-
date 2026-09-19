@@ -290,6 +290,36 @@
 >   （cd /d "%~dp0.." 会跳到上级目录）；
 > **回归（本次实测）**：信令 **73/73**（+1 /metrics）+ 冒烟 **91/91**（+4：日报、迟滞两拍、
 > 回退）+ 浏览器截图四屏全过；坑 32 入册。
+>
+> **09-19 继续奔跑（丝滑化 + 跨网审计 + G7-②③）**——
+> ① **演讲人视图丝滑化（用户反馈"说话人过大/切换生硬"）**：大画面从 stretch 撑满改为
+>   **16:9 contain 居中**（width:100% + max-height + aspect-ratio，place-self:center）；
+>   applyLayout 拆两层（applyLayoutDOM 纯标记 + applyLayout 管"布局签名"），签名变了才包
+>   **View Transitions API**（document.startViewTransition，0.25s crossfade，Chrome 111+ 零依赖；
+>   不支持/reduced-motion/签名没变走直通——audio-levels 每 400ms 一 tick 不产生过渡开销）；
+>   全局 scroll-behavior: smooth；浏览器实测 startViewTransition=function 可用；
+> ② **跨网直连审计（用户点名"跨网网络问题"）**：代码链路无 bug（listenIps/announcedIp/
+>   iceServers 下发/防火墙放行全在），**根因 = announcedIp 是内网 IP + 会漂移**——
+>   doctor 实测抓到 config 里 192.168.170.194 已过期（本机已变 192.168.127.194），已修；
+>   **技术澄清（写进部署手册）**：SFU 媒体不走 TURN，跨网唯一决定因素 = announcedIp 跨网可达，
+>   场景 B 重写为四方案：**B-1 Tailscale 组网（零成本首选）** / B-2 云机 / B-3 端口映射 / B-4 自检；
+>   start:lan 输出加 Tailscale 三步提示；防火墙放行需管理员（命令已给用户）；
+> ③ **G7-② 结构化日志 ✅**：logEvent(level,event,fields) → sfu/logs/app-YYYY-MM-DD.jsonl
+>   （JSON Lines，console 人读照旧），8 个埋点（建房/销毁/进出/踢人/授权/录制起停）；
+>   埋点踩坑：disconnect 清理作用域里房间号是 socket.roomNumber 不是 roomNumber
+>   （错一次 = 服务器在成员离开时崩溃，信令回归真跑才抓到）；
+> ④ **G7-③ watch.js ✅**：npm run watch（--interval/--max-rss/WATCH_WEBHOOK_URL 可配），
+>   四规则（服务拉不到/健康分<4/宽限<10s/rss 超限），同类告警 5 分钟限流；首轮实测即
+>   抓到 3 个测试遗留宽限房间；
+> **回归（本次实测）**：信令 **74/74**（+1 G7-② 日志断言）+ 冒烟 **91/91**；
+> 待用户拍板：跨网形态（Tailscale/云机/端口映射）——问题卡已留在部署手册+对话。
+
+> **09-19 AI 主攻拍板 + 路线图重构（本次只动文档、不动代码）**——用户从 G 档 8 候选中拍板
+> **两条主线**：①纪要+问答（DeepSeek summarize + @AI 问答 + 值守 N2）②C1 AI 远程操作员
+> （ReAct 工具循环 × 控制协议，授权不豁免）；确立 **Mock+真测双轨**约定（无 key 降级 Mock 带
+> `[Mock]` 标记、回归永远跑 Mock、真 key 走 `npm run test:ai`）；`后续升级方向.md` 从 708 行
+> 重构为聚焦版（完成档压成存档表，AI 主攻=第 1 节，其余 G 项=第 2 节备选池）；
+> 基线复核实测：冒烟 **91/91**、信令 **73/73**；下一步 = AI 阶段 0（充 10 元拿 DeepSeek key 写 chat.js）。
 
 ---
 
@@ -722,12 +752,15 @@ LEARN.md 第 4/5 节进度（✅=已完成，🔜=待做）：
    信令 **72/72** + 冒烟 **87/87** + soak 压缩 PASS；导读 **LEARN.md 5.19.5**；
    N2 定时纪要（LLM 分段总结+终稿）等 key；真 7h 过夜在 0.2 节人工清单。
 
-6. 🔜 **下一步 = `后续升级方向.md` 的 G 档（2026-09-17 公布，8 个候选方向）**：云部署与多机 SFU 级联 /
-   AI 会议助理落地（字幕账本 + 审计流已就位，只差 LLM key）/ 录制产物回放与剪辑 / PWA 移动端 /
-   端到端自动化（E3 的 Playwright 分支）/ 安全加固 / 可观测性升级 / 规模与性能。
+6. 🔜 **下一步 = `后续升级方向.md`（2026-09-19 重构）第 1 节「AI 会议助手主攻」**——用户拍板收敛为两条主线：
+   ①**纪要+问答**（`summarize.js` → 服务器 `minutes-generate`/`ai-ask` 信令 + @AI 聊天问答 + 值守 N2 联动）
+   ②**C1 AI 远程操作员**（`agent.js` 50 行 ReAct 工具循环 × 远程协助协议，授权链路完整不豁免）；
+   LLM 走 **DeepSeek API**（内置 fetch，零新依赖），测试执行 **Mock+真测双轨**（无 key 自动降级 Mock 带
+   `[Mock]` 标记，冒烟/信令永远跑 Mock，真 key 只跑 `npm run test:ai`）——这是全项目 AI 功能的统一约定。
+   前置 = AI 阶段 0~2（`chat.js`/`summarize.js`/`agent.js`，key 充 10 元）。
    **另有真实剩余项**：① 0.2 节"做完但没实测"清单（浏览器人工验证，10 分钟就能补一批）；
-   ② E3 浏览器端 e2e（现只有零依赖冒烟 76 项）；③ AI 阶段 0~2（`chat.js`/`summarize.js`/`agent.js`）→ C1/C2；
-   ④ 论文提纲/录屏（用户明确押后）。
+   ② E3 浏览器端 e2e（现只有零依赖冒烟 91 项）；③ 论文提纲/录屏（用户明确押后）。
+   G 档其余六项（云部署/录制回放/PWA/安全/可观测/规模）压缩为该文件第 2 节备选池，做完主线再挑。
 7. 🔜 排错/优化：chrome://webrtc-internals
 
 **AI 规划（AI部分功能计划.md）**：作者已接受"申请 API 密钥 + 少量费用"，并决定**先学 agent 基础再定 AI 形态**。
