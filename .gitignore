@@ -7,6 +7,7 @@ sfu/config.json.bak-*
 .reasonix/
 reasonix.toml
 sfu/captions/
+sfu/minutes/
 sfu/logs/
 sfu/users.json
 sfu/config.json
