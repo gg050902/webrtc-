@@ -338,7 +338,7 @@ async function snapshotRooms() {
   }
   return {
     now: Date.now(),
-    worker: { pid: worker ? worker.pid : null },
+    worker: { pid: worker ? worker.pid : null, count: workers.length }, // count = 多 Worker 池大小（09-19f）
     recordingCount: recordSessions.size, // ★ D+2：全服务器进行中的录制数
     rooms: list,
   };
@@ -371,6 +371,8 @@ function buildMetrics(snap) {
       L.push(`sfu_producer_bytes_total{room="${r.roomNumber}",kind="${m.kind}",source="${m.source}"} ${m.byteCount}`);
     }
   }
+  help('sfu_workers', 'gauge', 'mediasoup Worker processes in the pool');
+  L.push(`sfu_workers ${workers.length}`);
   help('sfu_recordings_active', 'gauge', 'Server-side recordings currently running');
   L.push(`sfu_recordings_active ${snap.recordingCount || 0}`);
   help('sfu_process_uptime_seconds', 'gauge', 'SFU server process uptime in seconds');
@@ -573,6 +575,16 @@ if (tlsCfg.enabled) {
  * ────────────────────────────────────────────────────────────── */
 
 // 一个 Worker 就够了：它内部能开无数个 Router
+/* ★ 09-19f SFU 深造（G1-②）：单 Worker → 多 Worker 横向扩展。
+ * ▎为什么值得做：mediasoup 的媒体转发跑在 Worker（C++ 子进程）里——一个 Worker
+ *   只能吃满一个核。单机横向扩容的第一步就是多 Worker（多核），第二步才是多机级联。
+ * ▎分配策略：**轮询**（无状态、O(1)、够用）——"按 Router 数最少"这类最少连接策略
+ *   需要自己记账，教学版注释里点明扩展点即可（面试话术：无状态策略与记账策略的取舍）。
+ * ▎兼容：`worker` 变量保留 = workers[0]（TEST_RECORD 自测与快照 pid 引用不变）；
+ *   CONFIG.workerCount / 环境变量 MEDIASOUP_WORKERS 控制数量，默认 1（行为不变）。
+ * ▎健壮：某个 Worker 挂了 → 从池里摘除 + 5 秒补位（其它 Worker 上的房间不受影响）。 */
+const workers = [];
+let workerIdx = 0;
 let worker = null;
 
 // 每个房间（Router）支持的编码。浏览器会从这里面挑一种来编码发送：
@@ -623,19 +635,36 @@ const rtcMaxPort = Number(process.env.MEDIASOUP_RTC_MAX_PORT) || Number(CONFIG.r
 const LISTEN_IP = process.env.MEDIASOUP_LISTEN_IP || CONFIG.listenIp || '127.0.0.1';
 const ANNOUNCED_IP = process.env.MEDIASOUP_ANNOUNCED_IP || CONFIG.announcedIp || undefined;
 
-async function createWorker() {
-  worker = await mediasoup.createWorker({
+async function startOneWorker() {
+  const w = await mediasoup.createWorker({
     logLevel: 'warn',          // 生产环境日志级别可以调成 debug 排查
     rtcMinPort,
     rtcMaxPort,
   });
-  console.log(`⚙️  mediasoup Worker 已启动（端口 ${rtcMinPort}-${rtcMaxPort}）`);
-  // Worker 是常驻 C++ 进程；万一崩了自动重启（面试可讲：Worker 崩溃恢复）
-  worker.on('died', () => {
-    console.error('❌ mediasoup Worker 挂了，5 秒后自动重启...');
-    setTimeout(() => createWorker(), 5000);
+  workers.push(w);
+  if (!worker) worker = w; // 兼容旧引用（workers[0]）
+  // Worker 是常驻 C++ 进程；万一崩了：摘出池子 → 记日志 → 5 秒补一个新槽位
+  w.on('died', () => {
+    const i = workers.indexOf(w);
+    if (i >= 0) workers.splice(i, 1);
+    console.error('❌ mediasoup Worker 挂了，5 秒后自动补位...');
+    logEvent('error', 'worker-died', { pid: w.pid, remaining: workers.length });
+    setTimeout(() => startOneWorker().catch((e) => console.error('Worker 补位失败：', e.message)), 5000);
   });
-  return worker;
+  return w;
+}
+async function createWorker() {
+  const count = Math.max(1, Number(CONFIG.workerCount) || Number(process.env.MEDIASOUP_WORKERS) || 1);
+  for (let i = 0; i < count; i++) await startOneWorker();
+  console.log(`⚙️  mediasoup Workers×${workers.length} 已启动（端口 ${rtcMinPort}-${rtcMaxPort}）`);
+  return workers[0];
+}
+// 轮询挑一个 Worker 挂新 Router（无状态策略；扩展点：按 Router 数最少需要记账）
+function pickWorker() {
+  if (!workers.length) throw new Error('没有可用的 mediasoup Worker');
+  const w = workers[workerIdx % workers.length];
+  workerIdx = (workerIdx + 1) % Math.max(1, workers.length * 7); // 防溢出的简单轮询
+  return w;
 }
 
 /* ──────────────────────────────────────────────────────────────
@@ -1356,11 +1385,13 @@ function generateRoomNumber() {
 async function getOrCreateRouter(roomNumber) {
   // ★ 09-17c：媒体引擎可能还在后台启动——这里等一下（首次进房最多多等 ~2s，
   //   但 HTTP/登录/建房这些不依赖 Worker 的动作早就能用了）
-  if (!worker && global.__workerReady) await global.__workerReady.catch(() => {});
+  if (!workers.length && global.__workerReady) await global.__workerReady.catch(() => {});
   const room = rooms.get(roomNumber);
   if (!room.router) {
-    room.router = await worker.createRouter({ mediaCodecs });
-    console.log(`🎛️  房间 ${roomNumber} 的 Router 已创建`);
+    const w = pickWorker();
+    room.router = await w.createRouter({ mediaCodecs });
+    room.workerPid = w.pid; // 记账：这个房间在哪个 Worker 上（Router 无 .worker 引用，pick 时记）
+    console.log(`🎛️  房间 ${roomNumber} 的 Router 已创建（Worker ${room.workerPid}）`);
   }
   return room.router;
 }
@@ -2155,6 +2186,11 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ★ 09-19f G8-③：ping 探活（bench-signaling 的 RTT 探针；也是运维探活的轻量信令）
+  socket.on('ping', (payload = {}, callback) => {
+    if (typeof callback === 'function') callback({ data: { t: Date.now() } });
+  });
+
   socket.on('set-preferred-layers', async ({ consumerId, spatialLayer } = {}, callback) => {
     const consumer = socket.consumers.get(consumerId);
     if (!consumer) { if (callback) fail(callback, '找不到这个 Consumer'); return; }
@@ -2630,7 +2666,7 @@ async function runRecordSelfTest() {
     }
     if (!FFMPEG_OK) throw new Error('ffmpeg 不可用');
     // ① 独立 Router + 一条"收流"PlainTransport（comedia=true：等 ffmpeg 先发 RTP）
-    const router = await worker.createRouter({ mediaCodecs });
+    const router = await worker.createRouter({ mediaCodecs }); // workers[0]（兼容引用）
     const ingest = await router.createPlainTransport({
       listenIp: { ip: '127.0.0.1' },
       comedia: true,    // 等对端先发（ffmpeg -f rtp 是单向推流）

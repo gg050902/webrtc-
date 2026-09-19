@@ -511,6 +511,15 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   const recList = await httpReq('GET', 'http://localhost:3001/api/recordings');
   ok('09-19c G3 /api/recordings 列表可用（200 数组）', recList.code === 200 && Array.isArray(JSON.parse(recList.text)));
 
+  // --- ★ 09-19f：SFU 深造（多 Worker 池 + ping 探活）---
+  const met2 = await httpReq('GET', 'http://localhost:3001/metrics');
+  ok('09-19f /metrics 带 sfu_workers gauge（Worker 池大小）',
+     met2.code === 200 && /sfu_workers \d+/.test(met2.text));
+  const pingT0 = Date.now();
+  const pingResp = await new Promise((resolve) => A.s.emit('ping', {}, (r) => resolve(r)));
+  ok('09-19f ping 探活信令回显 ack（RTT 探针可用）',
+     !!pingResp && !!pingResp.data && typeof pingResp.data.t === 'number' && Date.now() - pingT0 < 2000);
+
   // --- D1：对不存在的 Consumer 切层 → 走错误路径而不是崩服务 ---
   let layerErr = null;
   try { await request(F.s, 'set-preferred-layers', { consumerId: 'fake-consumer', spatialLayer: 1 }); }

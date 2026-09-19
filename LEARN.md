@@ -2017,3 +2017,27 @@ new-data-producer/data-producer-closed 广播、room-members 清单、两条错�
   徽标 addBadge 从 textContent 改 innerHTML（传 ICONS 常量，无 XSS 风险）；
   测试断言从 textContent 改 innerHTML（桩不聚合，坑 27 家族）。
 - **reaction 区的 emoji 保留**——表情回应的语义就是 emoji，克制 ≠ 一刀切。
+
+### 5.25 ★ 09-19f SFU 深造：多 Worker 横向扩展 + 信令压测（G1-② + G8-③）
+
+- **为什么多 Worker 是 SFU 深造的第一步**：mediasoup 的媒体转发跑在 Worker（C++
+  子进程）里——**一个 Worker 只能吃满一个核**。E4 基准测出"16 发 16 收仅占单核 6%"
+  意味着单 Worker 还有余量，但"多核横向扩容"是容量天花板被摸到之前就该备好的路。
+  第二步（多机 pipeTransport 级联）成本高得多，第一步零依赖、改动只有一处。
+- **实现（最小侵入）**：`workers` 数组 + `startOneWorker()`（died 时摘除+5s 补位，
+  其它 Worker 上的房间不受影响）+ `pickWorker()` **轮询**分配新 Router；`worker`
+  变量保留 = workers[0]（TEST_RECORD 自测与快照 pid 引用零改动）。数量 =
+  `CONFIG.workerCount` 或环境变量 `MEDIASOUP_WORKERS`，默认 1（行为完全不变）。
+- **取舍话术（面试）**：分配策略选了**轮询**而非"按 Router 数最少"——轮询无状态
+  O(1)，最少连接需要自己记账；在房间数远小于 Worker 承载上限时两者差异可忽略，
+  等真的需要再上记账策略。**实测**：`MEDIASOUP_WORKERS=2` 起服务，三个房间依次
+  分到 W(pid 74720)/W(77872)/W(74720)——轮询生效。
+- **实修坑**：mediasoup Router **没有 `.worker` 引用**（想当然即 null）——在
+  pickWorker 时把 `w.pid` 记到 `room.workerPid` 才是正路。教训同"别把两版搞混"：
+  **别想当然 API，查不到就自己记账**。
+- **信令压测（bench-signaling.js，诚实声明：压的是信令+房间管理面，不是媒体面——
+  媒体面看 bench.js 的 16 发 16 收 RTP 数字）**：32 客户端 4 房 × 15s 实测——
+  连接 32/32、ping RTT **p50=3ms / p95=6ms / max=8ms**、聊天广播放大 ≈17.8×。
+  退出码规则：连接全成功且 p95<1s 才 PASS。
+- **配套**：`ping` 探活信令（RTT 探针+运维探活双用）；`/metrics` 加 `sfu_workers`
+  gauge；config.example.json 加 `workerCount`。

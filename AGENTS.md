@@ -382,6 +382,18 @@
 >   textContent 改 innerHTML（真浏览器两端语义一致）；
 > **回归（本次实测）**：冒烟 **95/95** + 信令 **86/86**；DOM 断言：控制坞 10 个 .i 图标、
 > 2 根分隔线、徽标纯文字全过；真机特写：单色图标+纯色朱砂按钮+分组竖线=产品感。
+>
+> **09-19f SFU 深造（多 Worker + 信令压测）+ 清理**——
+> ① **G1-② 多 Worker 横向扩展 ✅**：workers 数组 + startOneWorker（died 摘除+5s 补位）
+>   + pickWorker 轮询；CONFIG.workerCount / MEDIASOUP_WORKERS 控制，默认 1 行为不变；
+>   `worker` 变量保留=workers[0]（TEST_RECORD/快照零改动）；/metrics 加 sfu_workers；
+>   实测 Workers×2 三房分到两 Worker（轮询生效）；**实修坑：Router 无 .worker 引用，
+>   pick 时记 room.workerPid**；② **G8-③ 信令压测 ✅**：scripts/bench-signaling.js
+>   （npm run bench:signaling）——32 客户端 4 房实测连接 32/32、ping RTT p50=3ms/
+>   p95=6ms/max=8ms、聊天广播放大 17.8×；诚实声明：压信令面，媒体面看 bench.js；
+>   配套 ping 探活信令（RTT 探针+运维双用）；③ **清理**：recordings/minutes/captions/
+>   logs 运行时产物全清（gitignore 已覆盖），临时注入脚本已删；
+> **回归（本次实测）**：信令 **88/88**（+2：sfu_workers gauge/ping 回显）+ 冒烟 **95/95**。
 
 > **09-19 AI 主攻拍板 + 路线图重构（本次只动文档、不动代码）**——用户从 G 档 8 候选中拍板
 > **两条主线**：①纪要+问答（DeepSeek summarize + @AI 问答 + 值守 N2）②C1 AI 远程操作员

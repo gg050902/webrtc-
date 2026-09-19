@@ -13,6 +13,7 @@
     "start:demo": "node scripts/start-demo.js",
     "test:record": "node -e \"const{spawn}=require('child_process');const p=spawn(process.execPath,['sfu/server.js'],{env:{...process.env,TEST_RECORD:'1',TEST_RECORD_EXIT:'1'},stdio:'inherit'});p.on('exit',c=>process.exit(c||0))\"",
     "bench": "node scripts/bench.js",
+    "bench:signaling": "node scripts/bench-signaling.js",
     "start:lan": "node scripts/start-lan.js",
     "test:turn": "node scripts/test-turn.js",
     "soak": "node scripts/soak.js",

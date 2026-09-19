@@ -1,6 +1,7 @@
 {
   "port": 3001,
   "maxMembers": 8,
+  "workerCount": 1,          // mediasoup Worker 进程数（SFU 深造：多核横向扩展，默认 1；多核机器可 2~4）
   "listenIp": "0.0.0.0",
   "announcedIp": "192.168.1.10",
   "rtcMinPort": 40000,
