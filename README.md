@@ -70,6 +70,9 @@
 | 📈 Prometheus 指标端点 | `GET /metrics` 输出 Prometheus 文本格式：房间/成员/Producer/Consumer 总数、每路媒体累计字节、录制数、进程 uptime/rss——Grafana 直接可抓 | 复用观测面板同一份 snapshotRooms() 数据源，零依赖手拼（G7 首刀，09-18，SFU 主版本） |
 | 📜 结构化日志（G7-②） | 关键事件 JSON Lines 落 `sfu/logs/app-日期.jsonl`（建房/销毁/成员进出/踢人/授权/录制起停），console 人读照旧——机器可检索（jq/脚本直吃） | logEvent 零依赖，只埋低频关键事件、绝不埋 3s/400ms tick（09-19，SFU 主版本） |
 | 🚨 值守告警（G7-③） | `npm run watch` 定时拉 /api/rooms + /metrics：服务拉不到/媒体健康分低/房间宽限告急/内存超限四规则告警，同类 5 分钟限流，可选企业微信/钉钉 webhook | 零依赖脚本 scripts/watch.js，一次 fetch POST 即接 webhook（09-19） |
+| 🤖 AI Bot 参会者（AI 线 C 档） | AI 助理以参会者身份入会：成员列表 🤖 行、控制坞一键邀请/送走；**服务端音频管线**（每路音频 PlainTransport→ffmpeg astats RTP 旁路，服务器第一次真正"听到"会议）；聊天 @ai 提问（DeepSeek 真 LLM / 无 key [Mock] 模板双轨），金边气泡广播 | 零依赖；管线是 N2 真转写的现成插入口（09-19b，SFU 主版本） |
+| 🖌️ 白板 v2「宣纸 editorial」 | 参考 recent.design igochi 案例：水墨五色板（墨/朱砂/鎏金/黛蓝/竹青）、暖纸白+渐晕+颗粒纸面、hairline 头部排版 | 纯 CSS 零依赖（09-19b） |
+| 💬 字幕 Otter 式排版 | 字幕历史按说话人分组成段（段头名字+时间、段内逐句、最新句鎏金高亮）——Otter.ai 的转写排版节奏 | 纯前端重排（09-19b） |
 
 > **本表最后一栏的字母 = 升级编号**（A3/A4/A6 = 远程协助深化；D1~D6 = 会议本体 + SFU 深究；
 > D+1~D+4 = SFU 深水区；E1/E2/E4/E5 = 工程化与可交付；F1~F7 = 对齐商业产品的产品体验，
@@ -336,6 +339,7 @@ npm run bench      # E4 压力基准（4/8/16 路，约 1 分钟，独立 Worker
 | 27 | **过夜值守（AI 线 C3-N1，主版本独有）** | 目标="睡前启动、无人值守跑 ≥7 小时、早上拿全档字幕+值守日志"：账本溢出归档（内存 500 条热窗口 + 服务器 jsonl 权威副本）、network 3 次永久停改指数退避（约 45 分钟才放弃）+ 30s 看门狗巡检自愈、值守统计与 30 分钟心跳、导出合并服务器全档；`npm run soak` 服务器耐久自测（默认 7h、--minutes 压缩、对账"一条不丢"）；零依赖零费用不需要 key（教学导读 LEARN.md 5.19.5） |
 | 28 | **过夜全面升级（09-18）** | 前端美学 v3（全站暖墨统一/演讲者视图=大画面+胶片条/说话人金环呼吸/入场动效+reduced-motion 降级，真浏览器截图四屏验证）；宫格布局语义修正（tile-main 全宽圈定演讲者视图）；演讲人交接迟滞收尾+attachRemoteMedia 元数据腐蚀真 bug 修复（坑 32）；C1 值守日报（第 31 步）；G7 /metrics 首刀；dashboard 暖化；项目清理（config 备份×9/工具会话数据/运行时产物）+ start-lan.bat 路径修复 |
 | 29 | **丝滑化+跨网审计+G7-②③（09-19）** | 演讲者大画面 16:9 contain 收敛（不再撑满）+ View Transitions 布局过渡（0.25s crossfade，签名变化才触发）+ 全局平滑滚动；跨网根因澄清（SFU 媒体不走 TURN，announcedIp 可达是唯一关键）+ announcedIp 漂移实测修复 + 部署手册场景 B 重写（Tailscale 零成本方案）；结构化日志 logEvent（8 埋点 JSONL）+ watch.js 告警 |
+| 30 | **白板 v2 + Otter 字幕节奏 + AI Bot 参会者（09-19b）** | 白板宣纸 editorial 化（水墨五色+颗粒纸面）；字幕抽屉按说话人分组（Otter 节奏）；**AI Bot**：身份（room-state isBot 虚拟成员）+ 服务端音频管线（PlainTransport→ffmpeg astats→aiHearing 听觉账本）+ @ai 问答（DeepSeek/[Mock] 双轨）；坑 33（无回调 emit×ok 守卫缺失=崩服，已统一守卫） |
 
 **下一步方向**（`后续升级方向.md` 是唯一权威）：
 - ✅ **A 档（A1~A7）与 D 档（D1~D6）已全部完成**（2026-09-11，SFU 主版本）；

@@ -458,6 +458,34 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('09-19 G7-② 结构化日志落盘（room-created/member-joined/member-left 三事件可检索）',
      hasEvent('room-created') && hasEvent('member-joined') && hasEvent('member-left'));
 
+  // --- ★ 09-19：AI Bot 参会者（ai-join/ai-ask/ai-leave + room-state 注入）---
+  // 坑 3 纪律：监听先于 emit——room-state 广播发生在 ack 之前
+  const aiStateP0 = waitEvent(A.s, 'room-state');
+  const aiJoinAck = await request(A.s, 'ai-join', {});
+  ok('09-19 ai-join 应答 { aiBot: true }', aiJoinAck.data && aiJoinAck.data.aiBot === true);
+  const aiState = await Promise.race([aiStateP0, sleep(800).then(() => null)]);
+  const aiRow = aiState && (aiState.members || []).find((m) => m.id === 'ai-bot');
+  ok('09-19 ai-join 后 room-state 注入 isBot 虚拟成员（🤖 AI 助理）',
+     !!aiRow && aiRow.isBot === true && aiRow.name.includes('AI'));
+  const aiAskP = waitEvent(A.s, 'chat-message');
+  const aiAns = await request(A.s, 'ai-ask', { question: '你好，你是谁？' });
+  ok('09-19 ai-ask 应答含答案（无 key 环境 = [Mock] 前缀）',
+     !!aiAns.data && !!aiAns.data.answer && aiAns.data.answer.includes('[Mock]'));
+  const aiMsg = await Promise.race([aiAskP, sleep(1500).then(() => null)]);
+  ok('09-19 ai-ask 的回答以 chat-message(from=ai-bot) 广播全房',
+     !!aiMsg && aiMsg.from === 'ai-bot');
+  let aiErr = null;
+  try { await request(A.s, 'ai-ask', { question: '' }); } catch (e) { aiErr = e.message; }
+  ok('09-19 ai-ask 空问题被拒（错误路径正确）', !!aiErr);
+  const aiState2P0 = waitEvent(A.s, 'room-state');
+  await request(A.s, 'ai-leave', {});
+  const aiState2 = await Promise.race([aiState2P0, sleep(800).then(() => null)]);
+  ok('09-19 ai-leave 后 room-state 不再含 bot',
+     aiState2 && !(aiState2.members || []).some((m) => m.isBot));
+  aiErr = null;
+  try { await request(A.s, 'ai-ask', { question: '在吗' }); } catch (e) { aiErr = e.message; }
+  ok('09-19 bot 不在房时 ai-ask 被拒（明确提示）', !!aiErr);
+
   // --- D1：对不存在的 Consumer 切层 → 走错误路径而不是崩服务 ---
   let layerErr = null;
   try { await request(F.s, 'set-preferred-layers', { consumerId: 'fake-consumer', spatialLayer: 1 }); }

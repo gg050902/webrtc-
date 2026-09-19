@@ -5,7 +5,7 @@
   <link rel="icon" href="data:," /><!-- 占位图标：消掉 favicon.ico 404 噪音 -->
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>简易腾讯会议 Demo · SFU 版（mediasoup）</title>
-  <link rel="stylesheet" href="style.css?v=20260919b" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存 -->
+  <link rel="stylesheet" href="style.css?v=20260919c" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存 -->
 </head>
 <body>
   <!-- ★ F3 升级（2026-09-12）：加入前预览页 —— "进会先把设备检查好"（腾讯会议同款流程）。
@@ -201,6 +201,9 @@
         <button id="handBtn" class="btn" disabled title="举手让大家看见你要发言">✋ 举手</button>
         <!-- ★ 09-15 F7：独立协作白板（第三条 SCTP 频道 'board'，全场共享一块画布） -->
         <button id="boardBtn" class="btn" disabled title="打开全场共享白板（人人可画）">🖌️ 白板</button>
+        <!-- ★ 09-19 AI Bot 参会者（C 档）：邀请 AI 助理入会——成员列表出现 🤖 行，
+             它通过服务端音频管线"听"全场，聊天里 @ai 提问（零依赖 Mock/DeepSeek 双轨） -->
+        <button id="aiBtn" class="btn" disabled title="邀请 AI 助理入会（能听全场，聊天里 @ai 提问）">🤖 AI</button>
         <!-- ★ 09-14 F6：滤镜与虚拟背景（canvas 逐帧处理 + replaceTrack，纯前端零依赖） -->
         <button id="fxBtn" class="btn" disabled title="滤镜/磨皮/虚拟背景（绿幕抠像，经 replaceTrack 上行）">✨ 滤镜</button>
         <!-- ★ 09-17 实时字幕（第 29 步，AI 线 L1）：Web Speech API 识别自己的麦克风，成稿经 SCTP 广播全房 -->

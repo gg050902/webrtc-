@@ -1010,16 +1010,28 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
 }
 .board-dot:hover { transform: scale(1.2); }
 .board-dot.active { border-color: var(--fg); box-shadow: 0 0 0 2px rgba(255, 255, 255, .25); }
+/* ★ 09-19 白板 v2「宣纸 editorial」（参考 recent.design igochi：黑白极简+杂志排版+笔迹感）：
+ *   纸张 = 暖纸白 + 四缘水墨渐晕 + 极淡颗粒（纯 CSS，消除"纯色画布"的塑料感）；
+ *   头部 = 衬线标题 + 小型大写英文 caps + hairline 细线（杂志页眉的节奏）。 */
 .board-canvas {
   flex: 1;
   min-height: 0;
   width: 100%;
-  background: #ece7db;             /* 月白底（暖一档） */
+  background:
+    radial-gradient(ellipse 90% 80% at 50% 42%, rgba(60, 48, 30, .06), transparent 70%),
+    radial-gradient(ellipse 140% 120% at 50% 50%, transparent 62%, rgba(58, 46, 28, .12) 100%),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='p'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23p)' opacity='0.55'/%3E%3C/svg%3E"),
+    #ece7db;
+  background-blend-mode: normal, normal, multiply, normal;
   border: 1px solid var(--border);
   border-radius: 10px;
+  box-shadow: inset 0 0 40px rgba(58, 46, 28, .08);
   cursor: crosshair;
   touch-action: none;
 }
+.board-head { border-bottom: 1px solid var(--border); padding-bottom: 8px; margin-bottom: 2px; }
+.board-dot { width: 22px; height: 22px; }
+.board-bar .btn.mini { background: rgba(43, 39, 36, .06); }
 
 /* ────────── 16. ★ 登录/注册 ────────── */
 .auth-overlay {
@@ -1348,3 +1360,45 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
   animation-duration: .25s;
   animation-timing-function: cubic-bezier(.2, .7, .3, 1);
 }
+
+/* ── 21 ★ 09-19 字幕抽屉 Otter.ai 节奏（说话人分组段）──
+   连续同一说话人 = 一段：段头（名字+段首时间）+ 段内每句一行；
+   最新一句 .now 带鎏金左线高亮。段用细左线锚出"归属"，比流水账可读。 */
+.cap-h-group {
+  border-left: 2px solid var(--border);
+  padding: 2px 0 2px 10px;
+  transition: border-color .2s var(--ease);
+}
+.cap-h-group:hover { border-left-color: var(--accent-border); }
+.cap-h-head-row { display: flex; align-items: baseline; gap: 8px; margin-bottom: 3px; }
+.cap-h-lines { display: flex; flex-direction: column; gap: 3px; }
+.cap-h-line { font-size: 13px; line-height: 1.55; color: var(--fg); word-break: break-word; padding-left: 8px; border-left: 2px solid transparent; margin-left: -12px; transition: border-color .2s; }
+.cap-h-line.now { color: var(--fg); border-left-color: var(--accent); }
+.cap-h-time { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--fg-faint); }
+
+/* ── 22 ★ 09-19 AI Bot 参会者 ──
+   聊天里的机器同事气泡（鎏金边 + AI 徽标）+ 成员列表的"聆听中"名牌。 */
+.msg.bot {
+  align-self: flex-start;
+  background: linear-gradient(135deg, rgba(216, 179, 106, .14), rgba(216, 179, 106, .05));
+  border: 1px solid var(--accent-border);
+  border-bottom-left-radius: 4px;
+}
+.msg.bot .msg-name { color: var(--accent); }
+.msg.bot .msg-via {
+  margin-left: 6px; padding: 1px 6px;
+  font-size: 9px; letter-spacing: .14em;
+  color: var(--accent); background: var(--accent-muted);
+  border: 1px solid var(--accent-border); border-radius: 999px;
+}
+.member-row.ai-bot-row { background: rgba(216, 179, 106, .06); }
+.member-row.ai-bot-row::before {
+  background:
+    radial-gradient(circle at 32% 28%, rgba(255, 246, 220, .5), transparent 42%),
+    linear-gradient(150deg, rgba(216, 179, 106, .5), rgba(43, 39, 36, .4));
+}
+.m-bot-note {
+  margin-left: 8px; font-size: 10px; color: var(--fg-faint);
+  animation: botPulse 2.4s ease-in-out infinite;
+}
+@keyframes botPulse { 50% { opacity: .45; } }

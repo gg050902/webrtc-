@@ -1864,3 +1864,34 @@ new-data-producer/data-producer-closed 广播、room-members 清单、两条错�
   房间号是 `socket.roomNumber`，写错作用域 = 成员离开时服务器崩溃（node --check 验不出
   作用域错误，只有信令回归真跑才炸出来）。watch.js = 拉 /metrics + /api/rooms 按阈值告警
   （服务拉不到/健康分低/宽限告急/rss 超限），同类告警 5 分钟限流，webhook 就是一次 fetch POST。
+
+### 5.22 ★ 09-19b 白板 v2 + Otter 字幕节奏 + AI Bot 参会者（AI 线 C 档第一站）
+
+- **白板 v2「宣纸 editorial」**（参考 recent.design igochi 案例：黑白极简+杂志排版+
+  手写笔迹感）：色板换水墨五色（墨黑/朱砂/鎏金/黛蓝/竹青——通用红蓝绿与整体气质脱节）；
+  纸张=暖纸白+四缘渐晕+feTurbulence 颗粒（background-blend-mode: multiply），消除
+  "纯色画布"的塑料感。手法与会议主界面同源：**一套材质语言贯穿所有面板**。
+- **字幕抽屉的 Otter.ai 节奏**：转写可读性的关键是**按说话人分组**——连续同一人合并成段
+  （段头=名字+段首时间，段内每句一行），中间插了别人的发言就开新段（对话流）；
+  最新一句金色左线高亮。实现：分组状态从 DOM 自身推断（最后一段的 dataset.speaker），
+  全量渲染与逐条追加走同一条路径——**状态放 DOM、两条路径天然一致**（事件溯源同款哲学）。
+- **AI Bot 参会者（三件套）**：
+  ① 身份：`room.aiBot` → room-state 快照注入 `isBot` 虚拟成员——bot 没有 socket，
+  它只是"房间记录上的状态 + 服务器自己的媒体管线"；前端成员列表 🤖 行 +
+  控制坞按钮（快照驱动按钮态=状态放唯一权威处）；
+  ② 耳朵（**服务端音频管线**）：对每路音频 Producer 建 `PlainTransport→consume→
+  本机 ffmpeg(astats)` 的 RTP 旁路，2s 解析 RMS 分贝记 `aiHearing`——这是服务器
+  第一次真正拿到会议音频字节流；将来 N2 真转写（Whisper/云 ASR）就在这条管线插
+  转写器，管线不动。与 D+2 录制同源（PlainTransport 套路复用），区别：录制求落盘、
+  听觉求实时响度；
+  ③ 嘴巴（@ai 问答）：`aiBrain` 读感知数据（成员/talk-stats/字幕账本 jsonl/aiHearing）
+  → 有 `DEEPSEEK_API_KEY` 走 DeepSeek 真答（纯 fetch，15s 超时），无 key/失败降级
+  本地模板（答案带 `[Mock]` 前缀）→ `chat-message(from='ai-bot')` 金边气泡广播。
+  **AI 双轨约定第一次实战**：回归永远跑 Mock（信令 81 里有 [Mock] 断言），真 key 只在真环境生效。
+- **坑 33（AI Bot 实机炸出来）**：浏览器端"不带回调"的 emit × 服务器 `ok(callback)`
+  无条件调用 = 服务器崩（一邀请 AI 全房断线）。修法：ok/fail helper 统一加
+  `typeof callback === 'function'` 守卫——**在公共 helper 上修一次，胜过在每个事件上防守**。
+  另：server 没有 client 的 `shortId`——把 client 的 helper 想当然搬进 server 就是
+  ReferenceError（坑 14 "别把两版搞混"的函数级变体）。
+- **回归（本次实测）**：信令 **81/81**（+7 AI 断言）+ 冒烟 **95/95**（+4：AI 按钮/
+  bot 行/按钮态/@ai 改道/金边气泡）+ 真机全流程（邀请→🤖 行→@ai→金边应答→白板 v2）。

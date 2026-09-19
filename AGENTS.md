@@ -313,6 +313,26 @@
 >   抓到 3 个测试遗留宽限房间；
 > **回归（本次实测）**：信令 **74/74**（+1 G7-② 日志断言）+ 冒烟 **91/91**；
 > 待用户拍板：跨网形态（Tailscale/云机/端口映射）——问题卡已留在部署手册+对话。
+>
+> **09-19b 三连（白板 v2 + Otter 字幕节奏 + AI Bot 参会者✅）**——
+> ① **白板 v2「宣纸 editorial」**（参考 recent.design igochi 案例的黑白极简+杂志排版）：
+>   色板换水墨五色（墨/朱砂/鎏金/黛蓝/竹青）、纸张=暖纸白+四缘渐晕+SVG 颗粒（纯 CSS）、
+>   头部 hairline 细线；② **字幕历史抽屉改 Otter.ai 排版节奏**：连续同说话人合并成段
+>   （段头=名字+段首时间，段内每句一行），最新句 .now 鎏金左线高亮——分组状态从 DOM 自身
+>   推断（dataset.speaker），全量渲染与逐条追加同一条路径；冒烟断言按"段"语义重写；
+> ③ **AI Bot 参会者 ✅（AI 主攻线 C 档落地第一站，零依赖）**：
+>   身份=room.aiBot→room-state 注入 isBot 虚拟成员（成员列表 🤖 行"聆听中…"，控制坞
+>   「🤖 AI」按钮开关、快照驱动全房同步）；**耳朵=服务端音频管线**（每路音频
+>   PlainTransport→consume→本机 ffmpeg astats RTP 旁路，2s 解析 RMS 记 aiHearing——
+>   服务器第一次真正拿到会议音频字节流，N2 真转写就在此插转写器）；**嘴巴=ai-ask 问答**
+>   （聊天发 @ai 前缀或 ai-ask 信令→aiBrain：有 DEEPSEEK_API_KEY 走 DeepSeek 真 LLM
+>   （纯 fetch），无 key/失败降级本地模板带 [Mock] 前缀（AI 双轨约定）→chat-message
+>   (from=ai-bot) 金边气泡广播全房）；**实测**：信令 81/81（+7 AI 断言）+ 冒烟 95/95
+>   （+4）+ 真机全流程过（邀请→🤖 行→@ai 提问→金边气泡应答）；
+> **新坑 33**：浏览器端"不带回调"emit（ai-join）× 服务器 ok(callback) 无守卫 = 整服崩溃
+>   （坑 13③ 变体，已把 ok/fail helper 统一加 typeof 守卫一劳永逸）；
+>   另：server 没有 client 的 shortId helper——AI 块里臆造即 ReferenceError（坑 14
+>   "别把两版搞混"函数级变体，已加 aiShortId 本地 helper）。
 
 > **09-19 AI 主攻拍板 + 路线图重构（本次只动文档、不动代码）**——用户从 G 档 8 候选中拍板
 > **两条主线**：①纪要+问答（DeepSeek summarize + @AI 问答 + 值守 N2）②C1 AI 远程操作员
@@ -657,6 +677,13 @@ node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU �
     修法：按 box 匹配（`tiles.values().find(t => t.box === main.box)`），box 才是稳定锚点
     （key 里的 producerId 会变）。测试侧同源教训：冒烟断言引用的"死元素"（D6 reset 后
     createdEls 里残留的旧格子）永远不会被标记，断言前要补订活格子。
+
+33. **"不带回调"的 emit × 服务器 ok(callback) 无守卫 = 整服崩溃**（09-19b AI Bot 实机抓到，
+    坑 13③ 的变体）：浏览器端 ai-join 这类信令是"普通 emit"（无第三个回调参数），
+    服务器处理里 `ok(callback, ...)` 无条件调用 → callback undefined → TypeError →
+    服务器进程退出，表现为"一邀请 AI 全房断线"。已修：ok/fail helper 统一加
+    `typeof callback === 'function'` 守卫（对全部信令生效，一劳永逸）；新增信令时
+    不再需要逐个防守，但也别绕开 helper 直接裸调 callback。
 
 
 ---

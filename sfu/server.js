@@ -840,6 +840,180 @@ function clearRemoteCtl(roomNumber, reason = 'released') {
  *   room-members = "我刚进房，该订阅谁"的一次性清单（带 Producer 明细，比较重）；
  *   room-state   = "每次变化就广播"的轻量快照（谁在、什么状态、谁在控制谁）。
  */
+/* ══════════════════════════════════════════════════════════════
+ * ★ 09-19 AI Bot 参会者（AI 主攻线·C 档落地第一站，零依赖）
+ * ▎是什么：一个以"参会者"身份入会的 AI 助理——成员列表可见、能"听"整场会议、
+ *   能在聊天里被提问。三部分：
+ *   ① 身份：room.aiBot 布尔 → room-state 快照注入 isBot 虚拟成员（前端渲染 🤖 行）；
+ *   ② 耳朵（服务端音频管线）：对房间每路音频 Producer 建 PlainTransport→consume→
+ *      本机 ffmpeg(astats) 的 RTP 旁路——服务器第一次真正"拿到"会议音频字节流，
+ *      每 2s 解析 RMS 分贝记 aiHearing（谁多大声）；将来 N2 真转写(Whisper/云 ASR)
+ *      就在管线插转写器即可，管线不动；
+ *   ③ 嘴巴（ai-ask 问答）：读感知数据（成员/talk-stats/字幕账本 jsonl/aiHearing）→
+ *      有 DEEPSEEK_API_KEY 走真 LLM（零 SDK 纯 fetch），无 key/失败降级本地模板
+ *      （答案带 [Mock] 前缀——AI 双轨约定），答案以 chat-message(from='ai-bot') 广播。
+ * ▎纪律：bot 没有 socket——它不是 io 连接，只是房间记录上的状态 + 服务器自己的媒体
+ *   管线；所有清理路径（ai-leave/断连/房间销毁/Producer 关闭）都要拆管线防泄漏。
+ * ══════════════════════════════════════════════════════════════ */
+const aiShortId = (id) => String(id).slice(-4); // AI 块内的短 id（server 没有 client 的 shortId，09-19 实修）
+const aiHearing = new Map();          // roomNumber -> Map(memberId -> {rms, ts})（bot 的听觉账本）
+const aiAudioPipes = new Map();       // roomNumber -> Set<管线对象>
+
+// 单路音频管线：PlainTransport 把这路音频 RTP 推给本机 ffmpeg，astats 每 ~2s 吐一次 RMS
+async function startAiAudioPipe(roomNumber, producer, memberId) {
+  const room = rooms.get(roomNumber);
+  if (!room || !room.router) return;
+  try {
+    const used = new Set([...(aiAudioPipes.get(roomNumber) || [])].map((x) => x.port));
+    let port = 51000;
+    while (used.has(port)) port += 2;
+    if (port > 51998) return; // 端口段用尽（教学规模到不了）
+    const t = await room.router.createPlainTransport({ listenIp: { ip: '127.0.0.1' }, rtcpMux: true, comedia: false });
+    await t.connect({ ip: '127.0.0.1', port });
+    const c = await t.consume({ producerId: producer.id, rtpCapabilities: room.router.rtpCapabilities });
+    await c.resume(); // 坑 13①：Consumer 建完必须 resume
+    // ffmpeg：按 SDP 收 RTP → astats 量响度（不落盘，落盘是 D+2 录制的职责）→ 输出丢弃
+    const sdp = ['v=0', 'o=- 0 0 IN IP4 127.0.0.1', 's=ai-hear', 't=0 0',
+      sdpMediaSection(c, 'audio', port)].join('\r\n');
+    const sdpFile = path.join(LOGS_DIR, `ai-${roomNumber}-${producer.id}.sdp`);
+    fs.writeFileSync(sdpFile, sdp);
+    const proc = require('child_process').spawn(FFMPEG_BIN, [
+      '-loglevel', 'error', '-protocol_whitelist', 'file,udp,rtp',
+      '-fflags', '+genpts', '-i', sdpFile,
+      '-af', 'astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level',
+      '-f', 'null', '-',
+    ], { stdio: ['pipe', 'ignore', 'pipe'] });
+    let buf = '';
+    proc.stderr.on('data', (d) => {
+      buf += d.toString();
+      const m = buf.match(/RMS_level=(-?\d+\.?\d*)/g);
+      if (!m) return;
+      if (buf.length > 8192) buf = buf.slice(-4096); // 防 stderr 积压
+      const rms = parseFloat(m[m.length - 1].split('=')[1]);
+      if (Number.isNaN(rms)) return;
+      if (!aiHearing.has(roomNumber)) aiHearing.set(roomNumber, new Map());
+      aiHearing.get(roomNumber).set(memberId, { rms, ts: Date.now() }); // bot 听见：某人当前 -xx dB
+    });
+    // 被跟的 Producer 关闭（关麦克风/断线）→ 收掉 ffmpeg（exit 回调统一清理管道）
+    c.on('producerclose', () => { try { proc.kill(); } catch (e) { /* 已退 */ } });
+    const pipe = { transport: t, consumer: c, proc, memberId, producerId: producer.id, port, sdpFile };
+    if (!aiAudioPipes.has(roomNumber)) aiAudioPipes.set(roomNumber, new Set());
+    aiAudioPipes.get(roomNumber).add(pipe);
+    proc.on('exit', () => {
+      const set = aiAudioPipes.get(roomNumber);
+      if (set) set.delete(pipe);
+      try { c.close(); t.close(); } catch (e) { /* 已关 */ }
+      try { fs.unlinkSync(sdpFile); } catch (e) { /* 无所谓 */ }
+    });
+    console.log(`🤖 AI 管线：${aiShortId(memberId)} 的音频 → astats（端口 ${port}）`);
+  } catch (err) {
+    console.log(`🤖 AI 管线启动失败（${err.message}）——bot 听觉降级为音量事件（AudioLevelObserver）`);
+  }
+}
+
+// 停掉某房间全部 AI 管线
+function stopAiAudioPipeline(roomNumber) {
+  const set = aiAudioPipes.get(roomNumber);
+  if (!set) return;
+  for (const pipe of set) {
+    try { pipe.proc.stdin.write('q\n'); } catch (e) { /* 已退 */ }
+    try { setTimeout(() => { try { pipe.proc.kill(); } catch (e) { /* 已退 */ } }, 1500); } catch (e) { /* */ }
+  }
+  aiAudioPipes.delete(roomNumber);
+  aiHearing.delete(roomNumber);
+}
+
+// bot 开/关（幂等）：改房间状态 + 拆/建管线 + 广播快照
+function setAiBot(roomNumber, on) {
+  const room = rooms.get(roomNumber);
+  if (!room) return null;
+  room.aiBot = !!on;
+  if (on) {
+    // 把当前所有音频路喂给管线（bot 入会晚了也能"听见"在场的每个说话人）
+    for (const [pid, owner] of room.producerOwner) {
+      const sock = [...room.members].find((m) => m.id === owner);
+      const producer = sock && sock.producers && sock.producers.get(pid);
+      if (producer && producer.kind === 'audio') startAiAudioPipe(roomNumber, producer, owner);
+    }
+  } else {
+    stopAiAudioPipeline(roomNumber);
+  }
+  broadcastRoomState(roomNumber);
+  logEvent('info', on ? 'ai-join' : 'ai-leave', { roomNumber });
+  return room.aiBot;
+}
+
+// AI 大脑：有 key 走 DeepSeek（真答），无 key/失败走本地模板（[Mock] 标记）——AI 双轨约定
+async function aiBrain(roomNumber, question) {
+  const room = rooms.get(roomNumber);
+  const members = room ? [...room.members] : [];
+  const talkRows = room ? [...room.talk.entries()].sort((a, b) => b[1] - a[1]) : [];
+  const talkTxt = talkRows.slice(0, 3).map(([id, v], i) =>
+    `${i + 1}. ${aiShortId(id)} 发言约 ${Math.round(v)}s`).join('；') || '（还没有发言统计）';
+  const capFiles = fs.existsSync(CAPTIONS_DIR)
+    ? fs.readdirSync(CAPTIONS_DIR).filter((f) => f.startsWith(`cap-${roomNumber}-`) && f.endsWith('.jsonl')).sort() : [];
+  let capTail = [];
+  for (const f of capFiles) {
+    for (const line of fs.readFileSync(path.join(CAPTIONS_DIR, f), 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try { capTail.push(JSON.parse(line)); } catch (e) { /* 坏行跳过 */ }
+    }
+  }
+  capTail = capTail.slice(-40);
+  const capTxt = capTail.slice(-8).map((e) => `${e.name}: ${e.text}`).join('\n') || '（还没有字幕记录）';
+  const hearingTxt = (() => {
+    const h = aiHearing.get(roomNumber);
+    if (!h || !h.size) return '（音频管线暂无响度数据）';
+    return [...h.entries()].map(([id, v]) => `${aiShortId(id)}:${v.rms}dB`).join('，');
+  })();
+  const dur = room ? Math.round((Date.now() - room.createdAt) / 60000) : 0;
+  const context = `会议时长约 ${dur} 分钟，${members.length} 人在线（含 AI 助理）。\n发言统计：${talkTxt}\n近期字幕：\n${capTxt}\n音频响度：${hearingTxt}`;
+
+  const key = process.env.DEEPSEEK_API_KEY;
+  if (key) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 15000);
+      const res = await fetch('https://api.deepseek.com/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+        body: JSON.stringify({
+          model: 'deepseek-chat',
+          messages: [
+            { role: 'system', content: '你是简易腾讯会议的 AI 会议助理，以参会者身份入会。用简短中文回答（不超过120字），基于给的会议上下文，不要编造上下文里没有的内容。' },
+            { role: 'user', content: `会议上下文：\n${context}\n\n成员提问：${question}` },
+          ],
+          temperature: 0.4,
+        }),
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (res.ok) {
+        const data = await res.json();
+        const answer = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+        if (answer) return answer.trim();
+      }
+    } catch (e) { /* 掉到 Mock */ }
+  }
+  // ── 本地模板（[Mock] 标记 = AI 双轨约定：无 key 环境的降级路径）──
+  const q = String(question || '');
+  let ans;
+  if (/你是谁|介绍.*自己|hello|hi|你好/i.test(q)) {
+    ans = `我是本房间的 AI 助理（🤖），${dur} 分钟前入会，一直在听：当前 ${members.length} 人在场。问"谁发言最多/会议多久/最近说了什么"都能答；配置 DEEPSEEK_API_KEY 后我会更聪明。`;
+  } else if (/谁|发言|说话/.test(q)) {
+    ans = `按服务器发言统计：${talkTxt}。`;
+  } else if (/多久|时长|开.*久/.test(q)) {
+    ans = `这场会已开约 ${dur} 分钟（${members.length} 人在场）。`;
+  } else if (/多少人|几个人|在线/.test(q)) {
+    ans = `当前 ${members.length} 人在场${room && room.aiBot ? '（含我）' : ''}。`;
+  } else if (/字幕|说了|提到|刚才/.test(q)) {
+    ans = capTail.slice(-3).map((e) => `${e.name}："${e.text}"`).join('；') || '字幕账本还是空的——请大家打开「💬 字幕」。';
+  } else {
+    ans = `我在听（${members.length} 人在场，字幕 ${capTail.length} 条）。目前是 [Mock] 模式：可以问我"谁发言最多/会议多久/刚才说了什么"；配 DEEPSEEK_API_KEY 后可自由问答。`;
+  }
+  return '[Mock] ' + ans;
+}
+
 function broadcastRoomState(roomNumber) {
   const room = rooms.get(roomNumber);
   if (!room) return;
@@ -854,6 +1028,14 @@ function broadcastRoomState(roomNumber) {
     hand: !!(m.state && m.state.hand),     // ★ 09-13 F4：举手（要发言）
     caption: !!(m.state && m.state.caption), // ★ 09-17b：实时字幕开关（成员列表 💬）
   }));
+  // ★ 09-19 AI Bot 参会者（C 档）：bot 在场时以虚拟成员身份出现在快照里——
+  //   它没有 socket/媒体，muted/camOff 都是"是"（它不推流，只"听"：见下方音频管线）
+  if (room.aiBot) {
+    members.push({
+      id: 'ai-bot', name: '🤖 AI 助理', isBot: true,
+      owner: false, muted: true, camOff: true, sharing: false, hand: false, caption: true,
+    });
+  }
   io.to(roomNumber).emit('room-state', {
     roomNumber,
     members,
@@ -994,6 +1176,7 @@ function destroyRoom(roomNumber, reason) {
   if (room.ttlTimer) clearTimeout(room.ttlTimer);
   rooms.delete(roomNumber);
   remoteCtl.delete(roomNumber);
+  stopAiAudioPipeline(roomNumber); // ★ 09-19：房间销毁 → AI 管线全拆（防 ffmpeg/Transport 泄漏）
   console.log(`🗑️ 房间 ${roomNumber} 已销毁（${reason}），号码回收`);
   logEvent('info', 'room-destroyed', { roomNumber, reason });
 }
@@ -1202,8 +1385,11 @@ io.on('connection', (socket) => {
    *   服务器：(数据, callback) => callback({ data }) 或 callback({ error: '...' })
    * 这样一问一答不用额外造事件名，代码更好懂。
    */
-  const ok = (callback, data) => callback({ data });
-  const fail = (callback, error) => callback({ error });
+  /* ★ 坑 13③ 守卫：浏览器端很多 emit 是"不带回调"的（create-room/join-room 传统、
+   *   09-19 的 ai-join/ai-leave 也这样）——无守卫时 callback undefined 直接崩服务器
+   *   （09-19 真机抓到：点「🤖 AI」按钮 → 整个服务器 transport close）。 */
+  const ok = (callback, data) => { if (typeof callback === 'function') callback({ data }); };
+  const fail = (callback, error) => { if (typeof callback === 'function') callback({ error }); };
 
   /* ---- 事件 0：★ 09-16 登录/注册/恢复登录态 ----
    * ▎三个动作共用"成功后把身份绑到 socket"的逻辑：之后的聊天广播/成员快照
@@ -1718,6 +1904,32 @@ io.on('connection', (socket) => {
     ok(callback, { file: rec.file ? path.basename(rec.file) : null });
   });
 
+  /* ---- ★ 09-19 AI Bot 参会者：ai-join / ai-leave / ai-ask（详见上方 AI 基建块注释）----
+   * ▎ai-join/ai-leave：任何成员都能邀请/送走 AI 助理（教学版权限从宽；G6 权限分级可收紧）；
+   * ▎ai-ask：向 bot 提问——应答以 chat-message(from='ai-bot') 广播全房（人人可见问答）。 */
+  socket.on('ai-join', (payload = {}, callback) => {
+    if (!socket.roomNumber || !rooms.get(socket.roomNumber)) return fail(callback, '先进入房间再邀请 AI 助理');
+    ok(callback, { aiBot: setAiBot(socket.roomNumber, true) === true });
+  });
+
+  socket.on('ai-leave', (payload = {}, callback) => {
+    if (!socket.roomNumber || !rooms.get(socket.roomNumber)) return fail(callback, '不在房间里');
+    ok(callback, { aiBot: setAiBot(socket.roomNumber, false) === true });
+  });
+
+  socket.on('ai-ask', async (payload = {}, callback) => {
+    const roomNumber = socket.roomNumber;
+    const room = roomNumber && rooms.get(roomNumber);
+    if (!room) return fail(callback, '先进入房间再向 AI 助理提问');
+    if (!room.aiBot) return fail(callback, 'AI 助理不在房间里（点控制坞「🤖 AI 助理」邀请入会）');
+    const question = String(payload.question || '').trim().slice(0, 300);
+    if (!question) return fail(callback, '问题不能为空');
+    const answer = await aiBrain(roomNumber, question);
+    io.to(roomNumber).emit('chat-message', { from: 'ai-bot', name: '🤖 AI 助理', text: answer, ts: Date.now() });
+    logEvent('info', 'ai-ask', { roomNumber, by: socket.id, qLen: question.length });
+    ok(callback, { answer });
+  });
+
   socket.on('set-preferred-layers', async ({ consumerId, spatialLayer } = {}, callback) => {
     const consumer = socket.consumers.get(consumerId);
     if (!consumer) { if (callback) fail(callback, '找不到这个 Consumer'); return; }
@@ -1838,6 +2050,11 @@ io.on('connection', (socket) => {
     //   "分层编码是发送端的事，服务器只负责按层转发"（这就是 SFU 的优雅之处）。
     const producer = await transport.produce({ kind, rtpParameters, appData });
     socket.producers.set(producer.id, producer);
+    // ★ 09-19 AI Bot：bot 在场时新音频路自动补管线（bot 入会后才开始共享/开麦的人也能被听见）
+    const aiRoom = rooms.get(socket.roomNumber);
+    if (aiRoom && aiRoom.aiBot && producer.kind === 'audio') {
+      startAiAudioPipe(socket.roomNumber, producer, socket.id);
+    }
 
     // ★ D2/D4：记下"这路媒体属于谁"——AudioLevelObserver 只给 producerId，
     //   要翻译成"哪个人在说话"必须靠这张表。

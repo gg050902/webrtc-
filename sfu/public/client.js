@@ -249,6 +249,7 @@ function enterRoom(roomNumber) {
   boardBtn.disabled = false;  // ★ 09-15 F7：白板同理（数据通道功能，不依赖媒体）
   fxBtn.disabled = false;     // ★ F6：会内滤镜入口（没摄像头时点了会提示，不会崩）
   capBtn.disabled = false;    // ★ 第 29 步：字幕开关（识别不依赖进房，但广播要）
+  aiBtn.disabled = false;     // ★ 09-19 AI Bot：邀请助理不依赖媒体（信令功能）
   log(`🏠 已进入房间「${roomNumber}」。把房间号或右上角链接发给别人即可邀请`);
 }
 
@@ -1087,6 +1088,15 @@ function appendChat(text, sender, isMe, via, name) {
   if (sender === 'system') {
     item.className = 'msg system';
     item.innerHTML = `<div class="msg-text">${escapeHtml(text)}</div>`;
+  } else if (sender === 'ai-bot') {
+    // ★ 09-19 AI Bot 的气泡（金边 + 徽标，一眼区分机器同事）
+    // （classList.add 而非纯 className 字符串——冒烟桩的 classList 与 className 不同步，坑 27 同源）
+    item.className = 'msg';
+    item.classList.add('bot');
+    item.innerHTML =
+      `<div class="msg-name">🤖 ${escapeHtml(name || 'AI 助理')}<span class="msg-via" title="AI 会议助理">AI</span></div>` +
+      `<div class="msg-text">${escapeHtml(text)}</div>` +
+      `<div class="msg-time">${new Date().toLocaleTimeString()}</div>`;
   } else {
     item.className = isMe ? 'msg me' : 'msg other';
     // ★ 09-14：路径徽标——🛰️ = 这条是经 SFU 数据通道（SCTP）直达的；
@@ -1107,6 +1117,13 @@ function sendChat() {
   if (!text) return;
   if (!myRoom) {
     appendChat('（还没进房间，消息发不出去）', 'system', false);
+    return;
+  }
+  // ★ 09-19 AI Bot：以「@ai」开头的消息走 ai-ask 问答（服务器应答会以 ai-bot 气泡广播回来）
+  if (/^@ai\b|^@ai$/i.test(text) || text.toLowerCase().startsWith('@ai ')) {
+    const question = text.replace(/^@ai\b\s*/i, '').trim() || '你好，介绍一下你自己';
+    socket.emit('ai-ask', { question });
+    chatInput.value = '';
     return;
   }
   // ★ D+1 双路径发送：主路 SCTP（mediasoup 自动广播给所有订阅者），兜底信令广播。
@@ -2185,6 +2202,10 @@ let lastLevels = [];    // 最近一次音量数据（列表重建后要立刻�
 socket.on('room-state', ({ members, expiresAt }) => {
   lastMembers = members || [];
   renderMembers(lastMembers);
+  // ★ 09-19：AI Bot 在场状态 → 控制坞按钮亮/灭（快照是唯一权威，谁开关的全房一致）
+  const hasBot = lastMembers.some((m) => m.isBot);
+  aiBtn.classList.toggle('active', hasBot);
+  aiBtn.textContent = hasBot ? '🤖 送走 AI' : '🤖 AI';
   // 被控/控制关系也可以通过快照同步（和 remote-state 广播互为兜底）
   if (expiresAt) { remoteExpiresAt = expiresAt; startCountdown(); }
   applyLayout(); // ★ F1：共享状态变了（比如有人开始共享屏幕），演讲者视图的大画面要跟着换人
@@ -2201,6 +2222,13 @@ function renderMembers(members) {
     const row = document.createElement('div');
     row.className = `member-row${isMe ? ' me' : ''}`;
     row.dataset.id = m.id; // ★ D2：说话高亮要按 id 找行，所以把 id 存在 dataset 上
+    if (m.isBot) {
+      // ★ 09-19 AI Bot 行：无媒体无网络概念，一张安静的"机器同事"名牌
+      row.classList.add('ai-bot-row');
+      row.innerHTML = `<span class="m-id">🤖 ${escapeHtml(m.name || 'AI 助理')}<span class="m-bot-note">聆听中…</span></span>`;
+      memberListEl.appendChild(row);
+      continue;
+    }
     // ★ 09-16：登录用户的昵称贯通成员列表（未登录回退"成员 xxxx"）
     const who = isMe ? `我${myDisplayName ? ' · ' + myDisplayName : ''}` : (m.name || `成员 ${shortId(m.id)}`);
     row.innerHTML = `<span class="m-id" title="${escapeHtml(m.name || '')}">${escapeHtml(who)}</span>`;
@@ -3604,7 +3632,9 @@ if (typeof window.addEventListener === 'function') {
  *   坐标 0~1 归一化（窗口大小无关），各端用同一个 applyBoardOp 重放 = 事件溯源。
  * ▎白板底色是浅的（月白），所以笔迹用深色系 BOARD_COLORS——和批注的亮色板区分。
  * ────────────────────────────────────────────────────────────── */
-const BOARD_COLORS = ['#3a3f52', '#c0392b', '#2471a3', '#1e8449', '#b7791f'];
+/* ★ 09-19 白板 v2（参考 recent.design igochi 案例的黑白 editorial 气质）:
+ *   色板从通用色换「水墨丹青」五色——墨黑/朱砂/鎏金/黛蓝/竹青，纸白底上更统一 */
+const BOARD_COLORS = ['#2b2724', '#b93a26', '#a5802f', '#3a5a7a', '#5a7a44'];
 let boardColor = BOARD_COLORS[0];
 const boardStrokes = []; // 事件溯源账本
 let boardDrawing = false;
@@ -3644,6 +3674,17 @@ $('boardClearBtn').addEventListener('pointerdown', () => {
 $('boardCloseBtn').addEventListener('click', () => boardOverlay.classList.add('hidden'));
 
 const boardBtn = $('boardBtn');
+const aiBtn = $('aiBtn');             // ★ 09-19 AI Bot：邀请/送走 AI 助理
+/* ★ 09-19 AI Bot 参会者（前端）：
+ * ▎「🤖 AI」按钮 = 邀请/送走 AI 助理（emit ai-join/ai-leave）；
+ * ▎按钮态以 room-state 的 isBot 字段为准（任何人开关，全房按钮同步——状态放唯一权威处）；
+ * ▎成员列表的 bot 行：🤖 徽标 + "聆听中…"，没有网络点/音量条（它不消费媒体）。 */
+aiBtn.addEventListener('click', () => {
+  const on = aiBtn.classList.contains('active');
+  socket.emit(on ? 'ai-leave' : 'ai-join', {});
+  log(on ? '🤖 正在送走 AI 助理…' : '🤖 正在邀请 AI 助理入会…');
+});
+
 boardBtn.addEventListener('click', () => {
   boardOn = !boardOn;
   boardOverlay.classList.toggle('hidden', !boardOn);
@@ -4685,35 +4726,59 @@ if (capDiagCloseBtn) capDiagCloseBtn.addEventListener('click', () => capDiagBox.
  *      绝不 innerHTML 拼接）；
  *   ② 抽屉开着时新字幕"追加一行 + 滚底"（不全量重渲染，列表不闪烁）；关→开时全量渲染
  *      尾部 100 条（再早的还在账本里，导出 txt 是全量）。 ---- */
-function renderCapHistory() {
-  if (!capHistoryList) return;
-  capHistoryList.textContent = '';
-  const tail = cap.log.slice(-100);
-  for (const entry of tail) capHistoryList.appendChild(buildCapHistoryRow(entry));
-  capHistoryList.scrollTop = capHistoryList.scrollHeight;
-}
-
 function appendCapHistoryRow(entry) {
   if (!capHistoryList) return;
-  capHistoryList.appendChild(buildCapHistoryRow(entry));
+  appendToCapGroup(capHistoryList, entry);
   capHistoryList.scrollTop = capHistoryList.scrollHeight; // 新字幕自动滚到底（回看时会被拉下去，真产品同款行为）
 }
 
-// 一行历史 = [时间] 名字：文本（全 textContent，防 XSS）
-function buildCapHistoryRow(entry) {
-  const row = document.createElement('div');
-  row.className = 'cap-h-row';
-  const time = document.createElement('span');
-  time.className = 'cap-h-time';
-  time.textContent = `[${new Date(entry.ts).toLocaleTimeString()}]`;
+/* ★ 09-19 Otter.ai 排版节奏（用户点名参考）：
+ *   连续同一说话人的字幕合并成一个「段」——段头 = 名字 + 段首时间，
+ *   段内每句一行；最新一行加金色高亮（.now）。这种"说话人分组"的节奏
+ *   让回看时一眼分清"谁在连续发言"，比逐条 [时间][名][文] 的流水账可读得多。
+ *   全部 createElement + textContent（XSS 纪律同聊天）。
+ * ▎实现注意：分组状态从 DOM 自身推断（最后一段的 dataset.speaker）——
+ *   全量渲染与逐条追加走同一条路径，两端天然一致（事件溯源同款哲学）。 */
+function capGroupOf(list, entry) {
+  const kids = list.children;
+  const last = kids.length ? kids[kids.length - 1] : null;
+  if (last && last.dataset && last.dataset.speaker === entry.name) return last;
+  const group = document.createElement('div');
+  group.className = 'cap-h-group';
+  group.dataset.speaker = entry.name;
+  const head = document.createElement('div');
+  head.className = 'cap-h-head-row';
   const name = document.createElement('span');
   name.className = 'cap-h-name';
   name.textContent = entry.name;
-  const text = document.createElement('span');
-  text.className = 'cap-h-text';
-  text.textContent = entry.text;
-  row.appendChild(time); row.appendChild(name); row.appendChild(text);
-  return row;
+  const time = document.createElement('span');
+  time.className = 'cap-h-time';
+  time.textContent = new Date(entry.ts).toLocaleTimeString();
+  head.appendChild(name); head.appendChild(time);
+  const lines = document.createElement('div');
+  lines.className = 'cap-h-lines';
+  group.appendChild(head); group.appendChild(lines);
+  list.appendChild(group);
+  return group;
+}
+
+function appendToCapGroup(list, entry) {
+  const group = capGroupOf(list, entry);
+  const lines = group.children[1]; // [head, lines] 固定结构（桩与真 DOM 都按 children 索引取）
+  const prev = lines.children.length ? lines.children[lines.children.length - 1] : null;
+  if (prev) prev.classList.remove('now');
+  const row = document.createElement('div');
+  row.className = 'cap-h-line';
+  row.classList.add('now'); // ★ 桩兼容（坑 27 同源）：className 字符串赋值不会同步 classList 集合
+  row.textContent = entry.text;
+  lines.appendChild(row);
+}
+
+function renderCapHistory() {
+  const tail = cap.log.slice(-100);
+  capHistoryList.textContent = '';
+  for (const entry of tail) appendToCapGroup(capHistoryList, entry);
+  capHistoryList.scrollTop = capHistoryList.scrollHeight;
 }
 
 function toggleCapHistory(show) {

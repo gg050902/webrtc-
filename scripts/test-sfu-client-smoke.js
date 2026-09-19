@@ -635,10 +635,16 @@ const emit = (ev, payload) => {
   const capHistListEl = documentStub.getElementById('capHistoryList');
   guard('字幕：打开历史抽屉', () => documentStub.getElementById('capHistoryBtn').dispatch('click'));
   const rowsBefore = capHistListEl.children.length;
-  ok('字幕：抽屉打开并渲染账本（此时应有 2 条：对端成稿 + 本地成稿）',
+  // ★ 09-19 Otter 节奏：连续同说话人合并成段——此刻小张 1 段 + 我 1 段 = 2 段
+  ok('字幕：抽屉打开并渲染账本（Otter 段结构：小张 + 我 = 2 段）',
     !capHistPanelEl.classList.contains('hidden') && rowsBefore === 2);
   guard('字幕：抽屉开着时再来一条对端字幕', () => rec.dataMessageHandler(JSON.stringify({ type: 'caption', from: PEER, name: '小张', text: '追加的一句' })));
-  ok('字幕：新字幕追加一行并滚底（不全量重渲染）', capHistListEl.children.length === rowsBefore + 1);
+  // 中间隔了"我"的发言——Otter 节奏下小张新句应开新段（连续同人才合并），全 3 段
+  ok('字幕：隔段发言开新段（3 段）且最新段带 now 高亮',
+    capHistListEl.children.length === rowsBefore + 1 &&
+    capHistListEl.children[2].dataset.speaker === '小张' &&
+    capHistListEl.children[2].children[1].children.length === 1 &&
+    capHistListEl.children[2].children[1].children[0].classList.contains('now'));
   guard('字幕：收起抽屉', () => documentStub.getElementById('capHistoryCloseBtn').dispatch('click'));
   ok('字幕：抽屉已收起', capHistPanelEl.classList.contains('hidden'));
 
@@ -763,6 +769,35 @@ const emit = (ev, payload) => {
   })));
   ok('迟滞：坐稳后大画面交接给他（tile-main 落在 PEER 的格子）',
     peerMainBox.classList.contains('tile-main'));
+
+  /* ---- ③h5 ★ 09-19 AI Bot 参会者（前端四件套）----
+   *   按钮 emit ai-join / room-state 注入 bot → 成员行+按钮态 / @ai 走 ai-ask /
+   *   bot 聊天气泡 .msg.bot。 ---- */
+  const aiBtnEl = documentStub.getElementById('aiBtn');
+  guard('AI：点「🤖 AI」按钮', () => aiBtnEl.dispatch('click'));
+  ok('AI：点击发出 ai-join 信令', rec.emits.includes('ai-join'));
+  emit('room-state', {
+    roomNumber: '123456',
+    members: [
+      { id: socketStub.id, owner: true, muted: false, camOff: false, sharing: false },
+      { id: PEER, owner: false, muted: false, camOff: false, sharing: false },
+      { id: 'ai-bot', name: '🤖 AI 助理', isBot: true, muted: true, camOff: true, sharing: false },
+    ],
+    hostId: null, controllerId: null, expiresAt: null,
+  });
+  const memberListEl2 = documentStub.getElementById('memberList');
+  const aiRow2 = memberListEl2.children.find((r) => r.classList.contains('ai-bot-row'));
+  ok('AI：bot 在快照里 → 成员列表出现 ai-bot-row 名牌 + 按钮亮起',
+    !!aiRow2 && aiBtnEl.classList.contains('active') && aiBtnEl.textContent.includes('送走'));
+  const aiEmitsBefore = rec.emits.length;
+  documentStub.getElementById('chatInput').value = '@ai 谁发言最多';
+  guard('AI：发送 @ai 消息', () => documentStub.getElementById('chatSendBtn').dispatch('click'));
+  ok('AI：@ai 前缀改走 ai-ask（不再进普通聊天/SCTP 路径）',
+    rec.emits.slice(aiEmitsBefore).includes('ai-ask') &&
+    !rec.sctpSends.some((x) => { try { return JSON.parse(x).text && JSON.parse(x).text.includes('@ai'); } catch (e) { return false; } }));
+  emit('chat-message', { from: 'ai-bot', name: '🤖 AI 助理', text: '[Mock] 我是 AI 助理', ts: Date.now() });
+  ok('AI：bot 回答渲染为金边 AI 气泡（.msg.bot）',
+    chatListEl && chatListEl.children.some((m) => m.classList.contains('bot')));
 
   // ③ F6 滤镜失败要"弹出来"而不是静默（用户反馈"滤镜没实现"的另一半答案）
   const fxCostEl2 = documentStub.getElementById('fxCost');
