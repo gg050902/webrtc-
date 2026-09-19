@@ -394,6 +394,18 @@
 >   配套 ping 探活信令（RTT 探针+运维双用）；③ **清理**：recordings/minutes/captions/
 >   logs 运行时产物全清（gitignore 已覆盖），临时注入脚本已删；
 > **回归（本次实测）**：信令 **88/88**（+2：sfu_workers gauge/ping 回显）+ 冒烟 **95/95**。
+>
+> **09-19g C1 AI 远程操作员 ✅（AI 主攻线第二条主线落地）**——
+> **核心设计：AI 与人类控制端协议层完全平等**——服务器自开真实 socket.io 客户端
+> （botSocket），走与人类一模一样的 remote-request→授权卡→remote-answer→
+> remote-input 门禁→remote-release；**授权绝不豁免**（可拒绝/限时，被控端审计照记）。
+> ReAct 教学版="计划-执行"（LLM/Mock 双轨把目标翻成操作 JSON：move/click/dblclick/
+> type/key；Observation 回环留升级点）；帧编码在服务器端（DataView 大端→Buffer *BE）；
+> 入口=控制坞「🛰️ AI 操作」按钮 + @ai"操作/打开…"关键词；执行中 busy 互斥+30s 总
+> 超时保护；实修三条：botSocket 每任务全新连接（复用=状态残留迷路）/授权等待独立 5s
+> 超时（30s 等授权会占死互斥锁）/回放侧零改动（协议层平等的红利）；
+> **回归（本次实测）**：信令 **93/93**（+5 C1 全链路断言：无共享拒绝/受理/真实授权/
+> 输入序列含 16 字节帧/自动交还）+ 冒烟 **95/95**。
 
 > **09-19 AI 主攻拍板 + 路线图重构（本次只动文档、不动代码）**——用户从 G 档 8 候选中拍板
 > **两条主线**：①纪要+问答（DeepSeek summarize + @AI 问答 + 值守 N2）②C1 AI 远程操作员

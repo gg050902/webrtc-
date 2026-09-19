@@ -1131,6 +1131,189 @@ async function aiBrain(roomNumber, question) {
 }
 
 /* ══════════════════════════════════════════════════════════════
+ * ★ 09-19g C1 AI 远程操作员（模块级：botSocket / 计划 / 执行器）
+ * ▎步骤间隔与总时长可用环境变量调（测试 AI_OP_STEP_MS=20 加速）。
+ * ▎Mock 桌面坐标按 workbench.html 的伪桌面布局（计算器图标在最左上）校准；
+ *   被控端视口不同会有偏差——教学演示前可在 1280×800 视口校一遍。
+ * ══════════════════════════════════════════════════════════════ */
+const AI_OP_STEP_MS = Number(process.env.AI_OP_STEP_MS) || 600;
+const AI_OP_MAX_MS = Number(process.env.AI_OP_MAX_MS) || 30000;
+let aiOpBusy = false;      // 全服务器同一时刻只跑一个 AI 操作任务（简单互斥）
+let aiOpSocket = null;     // AI 的"真实控制端"连接（连自己的信令端口）
+
+function ensureAiOpSocket() {
+  // ★ 09-19g 实修：每个任务用**全新连接**——复用旧连接会把上一轮的房间状态/监听
+  //   带进来（重跑时 remote-request 迷路）。一次 TCP 握手 ~50ms，演示无感。
+  if (aiOpSocket) { try { aiOpSocket.disconnect(); } catch (e) { /* 已断 */ } }
+  // socket.io-client 已在 devDependencies（压测/测试都在用）——不引新依赖
+  const { io: ioClient } = require('socket.io-client');
+  aiOpSocket = ioClient(`http://127.0.0.1:${PORT}`, { transports: ['websocket'], reconnection: false });
+  return aiOpSocket;
+}
+const aiSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 16 字节控制帧（与客户端 encodeCtlFrame 同一格式，DataView 默认大端 → Buffer 用 *BE）
+function ctlFrame(kindId, x, y, flags = 0) {
+  const b = Buffer.alloc(16);
+  b.writeUInt8(kindId, 0);
+  b.writeUInt8(flags, 1);
+  b.writeUInt16BE(0, 2);
+  b.writeFloatBE(x, 4);
+  b.writeFloatBE(y, 8);
+  b.writeInt32BE(0, 12);
+  return b;
+}
+const KIND = { move: 3, down: 4, up: 5, dblclick: 6, wheel: 7 };
+
+// 把"操作计划"翻译成 remote-input 序列并发送（工具层：click/type/key/dblclick/scroll）
+function aiInput(sock, step) {
+  const emit = (data) => sock.emit('remote-input', { to: step._to, event: data });
+  switch (step.op) {
+    case 'move': emit(ctlFrame(KIND.move, step.x, step.y)); break;
+    case 'click':
+      emit(ctlFrame(KIND.move, step.x, step.y));
+      emit(ctlFrame(KIND.down, step.x, step.y, 0));
+      emit(ctlFrame(KIND.up, step.x, step.y, 0));
+      break;
+    case 'dblclick':
+      emit(ctlFrame(KIND.move, step.x, step.y));
+      emit(ctlFrame(KIND.dblclick, step.x, step.y, 0));
+      break;
+    case 'type': emit({ kind: 'input-text', text: String(step.text || '') }); break;
+    case 'key':
+      emit({ kind: 'keydown', key: step.key, code: step.code || step.key });
+      emit({ kind: 'keyup', key: step.key, code: step.code || step.key });
+      break;
+    case 'scroll': emit(ctlFrame(KIND.wheel, step.x || 0.5, step.y || 0.5)); break;
+    default: throw new Error(`未知操作 ${step.op}`);
+  }
+}
+
+// Mock 计划：目标关键词 → 确定性操作序列（LLM 不可用时的兜底，也是回归测试的固定路径）
+function mockPlan(goal) {
+  const g = String(goal || '');
+  if (/计算器|calc|按.*7|乘/i.test(g)) {
+    return [
+      { op: 'move', x: 0.5, y: 0.5 },
+      { op: 'dblclick', x: 0.045, y: 0.09 },   // 双击桌面"计算器"图标（workbench 最左上）
+      { op: 'wait', ms: 900 },
+      { op: 'click', x: 0.272, y: 0.238 },     // 计算器按钮 7
+      { op: 'click', x: 0.318, y: 0.238 },     // 8
+      { op: 'click', x: 0.341, y: 0.352 },     // =
+    ];
+  }
+  if (/画|线|drag/i.test(g)) {
+    return [
+      { op: 'move', x: 0.35, y: 0.5 }, { op: 'move', x: 0.4, y: 0.52 },
+      { op: 'click', x: 0.4, y: 0.52 }, { op: 'move', x: 0.6, y: 0.6 },
+    ];
+  }
+  return [
+    { op: 'move', x: 0.3, y: 0.3 }, { op: 'move', x: 0.6, y: 0.5 },
+    { op: 'dblclick', x: 0.045, y: 0.09 }, { op: 'wait', ms: 800 },
+    { op: 'type', text: 'AI 远程操作演示' },
+  ];
+}
+
+// LLM 计划（有 key 才走）：把目标翻成操作 JSON；失败抛错由调用方降级 Mock
+async function llmPlan(goal) {
+  const tools = '可用操作（JSON 数组，每项 {op,x?,y?,text?,key?,ms?}）：' +
+    'move{x,y} click{x,y} dblclick{x,y}（坐标 0~1 归一化，桌面计算器图标≈{0.045,0.09}）' +
+    'type{text} key{key} wait{ms}。最多 12 步。';
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 20000);
+  try {
+    const res = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [
+          { role: 'system', content: '你是远程桌面 AI 操作员。只输出一个 JSON 数组（不要任何其他文字），表示完成目标的鼠标/键盘操作序列。' },
+          { role: 'user', content: `${tools}\n目标：${goal}` },
+        ],
+        temperature: 0.2,
+      }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const raw = (data.choices[0].message.content || '').replace(/```json|```/g, '').trim();
+    const plan = JSON.parse(raw);
+    if (!Array.isArray(plan)) throw new Error('LLM 计划不是数组');
+    return plan.slice(0, 12);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 主流程：连入 → join-room → remote-request（真实授权）→ 执行 → release
+async function runAiOperator(roomNumber, hostId, goal) {
+  const room = rooms.get(roomNumber);
+  const sock = ensureAiOpSocket();
+  await new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('AI 控制端连接超时')), 5000);
+    if (sock.connected) { clearTimeout(t); resolve(); }
+    else sock.once('connect', () => { clearTimeout(t); resolve(); });
+    sock.once('connect_error', () => { clearTimeout(t); reject(new Error('AI 控制端连接失败')); });
+  });
+  // 进房（房间邀请自己的 AI：密码由房间自己给出——这不是绕过，是"主人的 AI"）
+  await new Promise((resolve) => {
+    sock.emit('join-room', { roomNumber, password: room.password || null }, () => resolve());
+    setTimeout(resolve, 1500);
+  });
+  await aiSleep(300); // 等进房广播落地
+
+  // 发起真实授权（host 前端会弹与人类控制端一模一样的授权卡，可拒绝/限时长）
+  // ★ 09-19g 实修：授权等待独立 5s 超时——30s 的任务超时若用于等授权，
+  //   "没人理授权卡"会把 aiOpBusy 占住半分钟（跨测试轮次表现为 busy 拒绝）。
+  const granted = new Promise((resolve, reject) => {
+    const onAns = (p) => {
+      clearTimeout(t);
+      sock.off('remote-answer', onAns);
+      if (p && p.ok) resolve();
+      else reject(new Error('被控端拒绝了授权' + (p && p.reason === 'busy' ? '（已有控制端在控）' : '')));
+    };
+    const t = setTimeout(() => {
+      sock.off('remote-answer', onAns);
+      reject(new Error('授权超时（5 秒内没人回应授权卡）'));
+    }, Number(process.env.AI_OP_AUTH_MS) || 5000);
+    sock.on('remote-answer', onAns);
+  });
+  sock.emit('remote-request', { to: hostId });
+  await granted;
+  io.to(roomNumber).emit('chat-message', {
+    from: 'ai-bot', name: '🤖 AI 操作员', text: '✅ 授权通过——开始执行操作计划（被控端审计日志同步记账）', ts: Date.now(),
+  });
+  logEvent('info', 'ai-op-granted', { roomNumber, hostId });
+
+  // 计划：LLM 优先，Mock 兜底（双轨）
+  let plan = null;
+  if (process.env.DEEPSEEK_API_KEY) {
+    try { plan = await llmPlan(goal); } catch (e) { plan = null; }
+  }
+  const isMock = !plan;
+  if (!plan) plan = mockPlan(goal);
+  const deadline = Date.now() + AI_OP_MAX_MS;
+
+  // 执行（ReAct 的 Act；Observation 回环=每步拿屏幕反馈修正，教学版留作升级点）
+  for (const step of plan) {
+    if (Date.now() > deadline) throw new Error('执行超时保护触发');
+    const ctl = remoteCtl.get(roomNumber);
+    if (!ctl || !ctl.controllerId) throw new Error('授权已被收回，任务中止');
+    if (step.op === 'wait') { await aiSleep(Math.min(Number(step.ms) || 500, 3000)); continue; }
+    step._to = hostId;
+    try { aiInput(sock, step); } catch (e) { /* 单步失败不中断（比如坐标越界） */ }
+    await aiSleep(AI_OP_STEP_MS);
+  }
+  sock.emit('remote-release', {});
+  io.to(roomNumber).emit('chat-message', {
+    from: 'ai-bot', name: '🤖 AI 操作员', text: `🏁 任务完成（${plan.length} 步${isMock ? '，[Mock] 本地脚本' : '，LLM 计划'}）；控制权已交还`, ts: Date.now(),
+  });
+  logEvent('info', 'ai-op-done', { roomNumber, steps: plan.length, mock: isMock });
+}
+
+/* ══════════════════════════════════════════════════════════════
  * ★ 09-19c N2 会议纪要骨架（分段 + 终稿，DeepSeek/[Mock] 双轨，零依赖）
  * ▎是什么：把一场会/一个时段的字幕账本+发言统计+待办关键词，合成一份 markdown 纪要，
  *   落盘 sfu/minutes/<房间号>/<时间戳>-<分段|终稿>.md；值守期间每 MINUTES_INTERVAL
@@ -1816,7 +1999,10 @@ io.on('connection', (socket) => {
     const roomNumber = socket.roomNumber;
     const room = rooms.get(roomNumber);
     // 只有"同房间的人"才有资格申请控制（防御：防乱发给房间外的人）
-    if (!room || !isRoommate(room, to)) return;
+    if (!room || !isRoommate(room, to)) {
+      console.log(`[!] remote-request 静默拒绝：申请者 roomNumber=${roomNumber} to=${to}`);
+      return;
+    }
 
     // 互斥：这个房间已经有人在被控制 → 拒绝新申请（busy 回给申请者）
     const ctl = remoteCtl.get(roomNumber);
@@ -2189,6 +2375,48 @@ io.on('connection', (socket) => {
   // ★ 09-19f G8-③：ping 探活（bench-signaling 的 RTT 探针；也是运维探活的轻量信令）
   socket.on('ping', (payload = {}, callback) => {
     if (typeof callback === 'function') callback({ data: { t: Date.now() } });
+  });
+
+  /* ---- ★ 09-19g C1：AI 远程操作员（ReAct 式工具循环 × 控制协议）----
+   * ▎核心设计：**AI 与人类控制端在协议层完全平等**——服务器自己开一条 socket.io
+   *   客户端连接（botSocket），走与人类一模一样的 remote-request → 被控端授权卡 →
+   *   remote-answer → remote-input 门禁转发 → remote-release。**授权绝不豁免**：
+   *   被控端可以拒绝、可以限时长，被控端的审计日志照记 AI 的每一个输入。
+   * ▎为什么不"借用发起者 socket 发输入"？那会破坏门禁语义（controllerId 校验）——
+   *   门禁的价值就是"只有服务器在册的那个控制端能发输入"，AI 必须在册。
+   * ▎双轨：DEEPSEEK_API_KEY 存在 → LLM 把目标翻成操作 JSON 计划；无 key/失败 →
+   *   本地 Mock 脚本（确定性演示：打开计算器按 7×8）。计划生成后顺序执行。
+   * ▎诚实定位：教学版是"计划-执行"型 agent——ReAct 的 Observation 回环
+   *   （每步之后拿屏幕状态反馈给 LLM 修正）是明确的升级点，注释里画了插口。
+   */
+  socket.on('ai-op', async (payload = {}, callback) => {
+    const roomNumber = socket.roomNumber;
+    const room = roomNumber && rooms.get(roomNumber);
+    if (!room) return fail(callback, '先进入房间再召唤 AI 操作员');
+    if (aiOpBusy) return fail(callback, 'AI 操作员正在执行上一个任务，稍后再试');
+    // 被控端 = 正在共享屏幕并开着"允许远程协助"的人（和人类控制端找的是同一个人）
+    const host = [...room.members].find((m) => m.state && m.state.sharing);
+    if (!host) return fail(callback, '先有人共享屏幕并打开「允许远程协助」，AI 操作员才有用武之地');
+    console.log(`🛰️ [ai-op] host=${host.id} room=${roomNumber} members=${room.members.size}`);
+    const goal = String(payload.goal || '').trim().slice(0, 200) || '演示：打开计算器按 7×8';
+
+    aiOpBusy = true;
+    ok(callback, { started: true, goal });
+    logEvent('info', 'ai-op-start', { roomNumber, by: socket.id, goal });
+    io.to(roomNumber).emit('chat-message', {
+      from: 'ai-bot', name: '🤖 AI 操作员', text: `🛰️ 收到目标「${goal}」——正在向被控端发起授权请求（与人类控制端同一套授权卡）`, ts: Date.now(),
+    });
+
+    try {
+      await runAiOperator(roomNumber, host.id, goal);
+    } catch (err) {
+      io.to(roomNumber).emit('chat-message', {
+        from: 'ai-bot', name: '🤖 AI 操作员', text: `⚠️ 任务中止：${err.message}`, ts: Date.now(),
+      });
+      logEvent('warn', 'ai-op-abort', { roomNumber, reason: err.message });
+    } finally {
+      aiOpBusy = false;
+    }
   });
 
   socket.on('set-preferred-layers', async ({ consumerId, spatialLayer } = {}, callback) => {

@@ -284,6 +284,7 @@ function enterRoom(roomNumber) {
   fxBtn.disabled = false;     // ★ F6：会内滤镜入口（没摄像头时点了会提示，不会崩）
   capBtn.disabled = false;    // ★ 第 29 步：字幕开关（识别不依赖进房，但广播要）
   aiBtn.disabled = false;     // ★ 09-19 AI Bot：邀请助理不依赖媒体（信令功能）
+  aiOpBtn.disabled = false;   // ★ 09-19g：AI 操作员入口（授权链路见服务器 ai-op）
   log(`🏠 已进入房间「${roomNumber}」。把房间号或右上角链接发给别人即可邀请`);
 }
 
@@ -1157,8 +1158,14 @@ function sendChat() {
     return;
   }
   // ★ 09-19 AI Bot：以「@ai」开头的消息走 ai-ask 问答（服务器应答会以 ai-bot 气泡广播回来）
+  //   ★ 09-19g：@ai 后接「操作/打开/点击…」走 C1 AI 远程操作员（授权卡照弹，与人类同链路）
   if (/^@ai\b|^@ai$/i.test(text) || text.toLowerCase().startsWith('@ai ')) {
     const question = text.replace(/^@ai\b\s*/i, '').trim() || '你好，介绍一下你自己';
+    if (/^(操作|打开|点击|帮我操作|远程)/.test(question)) {
+      socket.emit('ai-op', { goal: question });
+      chatInput.value = '';
+      return;
+    }
     socket.emit('ai-ask', { question });
     chatInput.value = '';
     return;
@@ -3716,10 +3723,16 @@ $('boardCloseBtn').addEventListener('click', () => boardOverlay.classList.add('h
 
 const boardBtn = $('boardBtn');
 const aiBtn = $('aiBtn');             // ★ 09-19 AI Bot：邀请/送走 AI 助理
+const aiOpBtn = $('aiOpBtn');         // ★ 09-19g C1：AI 远程操作员
 /* ★ 09-19 AI Bot 参会者（前端）：
  * ▎「🤖 AI」按钮 = 邀请/送走 AI 助理（emit ai-join/ai-leave）；
  * ▎按钮态以 room-state 的 isBot 字段为准（任何人开关，全房按钮同步——状态放唯一权威处）；
  * ▎成员列表的 bot 行：🤖 徽标 + "聆听中…"，没有网络点/音量条（它不消费媒体）。 */
+aiOpBtn.addEventListener('click', () => {
+  socket.emit('ai-op', { goal: '演示：打开计算器按 7×8' });
+  log('🛰️ AI 操作员任务已下发（被控端会弹授权卡——可拒绝/限时长）');
+});
+
 aiBtn.addEventListener('click', () => {
   const on = aiBtn.classList.contains('active');
   socket.emit(on ? 'ai-leave' : 'ai-join', {});

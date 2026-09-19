@@ -520,6 +520,43 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('09-19f ping 探活信令回显 ack（RTT 探针可用）',
      !!pingResp && !!pingResp.data && typeof pingResp.data.t === 'number' && Date.now() - pingT0 < 2000);
 
+  // --- ★ 09-19g：C1 AI 远程操作员（真实授权链路 + 输入序列 + 释放）---
+  // 前置清理：清掉前段测试残留的控制态与 sharing（A6 场景会留 controllerId → AI 会被 busy 拒）
+  A.s.emit('remote-release');
+  for (const mem of [A, F]) {
+    try { mem.s.emit('member-state', { patch: { sharing: false } }); } catch (e) { /* 已断开 */ }
+  }
+  await sleep(300);
+  // 前置拒绝：没人共享屏幕 → AI 无被控端可操作
+  let aiOpErr = null;
+  try { await request(A.s, 'ai-op', { goal: '测试' }); } catch (e) { aiOpErr = e.message; }
+  ok('09-19g 无共享者时 ai-op 被拒（明确提示）', !!aiOpErr);
+  // A 共享屏幕（成为被控端）→ 发起 ai-op → bot 走真实授权 → A 收到输入序列 → 释放
+  A.s.emit('member-state', { patch: { sharing: true } });
+  await sleep(150);
+  const inputs = [];
+  const onInput = (p) => inputs.push(p);
+  A.s.on('remote-input', onInput);
+  // remote-state 在授权/释放时都会广播——持久收集，最后断言"出现过 controllerId=null"
+  const aiStates = [];
+  A.s.on('remote-state', (p) => aiStates.push(p));
+  const reqP = waitEvent(A.s, 'remote-request'); // 被控端应收到 AI 的授权请求
+  const opAck = await request(A.s, 'ai-op', { goal: '演示：打开计算器按 7×8' });
+  ok('09-19g ai-op 受理（started=true）', !!opAck.data && opAck.data.started === true);
+  const botReq = await Promise.race([reqP, sleep(6000).then(() => null)]);
+  ok('09-19g bot 以真实控制端身份发起 remote-request（被控端弹同一张授权卡）',
+     !!botReq && typeof botReq.from === 'string' && botReq.from !== A.id);
+  if (!botReq) { ok('09-19g 后续：授权/输入/释放（依赖上一步，未达）', false); }
+  // 被控端允许（与人类授权完全同一条信令；限时 8s 防泄漏）
+  else A.s.emit('remote-answer', { to: botReq.from, ok: true, durationMs: 8000 });
+  await sleep(2500); // 等计划执行（AI_OP_STEP_MS 环境变量加速；Mock 计划 7 步）
+  A.s.off('remote-input', onInput);
+  ok('09-19g 被控端收到 AI 的 remote-input 序列（≥5 条，含 16 字节帧）',
+     inputs.length >= 5 &&
+     inputs.some((p) => p.event && (p.event.byteLength === 16 || p.event.length === 16)));
+  ok('09-19g 任务完成后 AI 自动交还控制权（remote-state 出现过 controllerId=null）',
+     aiStates.some((p) => p.controllerId === null));
+
   // --- D1：对不存在的 Consumer 切层 → 走错误路径而不是崩服务 ---
   let layerErr = null;
   try { await request(F.s, 'set-preferred-layers', { consumerId: 'fake-consumer', spatialLayer: 1 }); }
