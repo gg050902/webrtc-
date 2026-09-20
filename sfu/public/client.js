@@ -406,6 +406,15 @@ function saveAuth(user, token) {
   if (authStore) authStore.setItem('wb_auth', JSON.stringify({ username: user.username, token }));
   hideAuth();
   log(`👤 已登录：${myDisplayName}`);
+    // ★ 09-19h G6：每小时滑动续期（长期值守不掉线；失效则静默回登录态）
+    if (window.__authRefreshTimer) clearInterval(window.__authRefreshTimer);
+    window.__authRefreshTimer = setInterval(() => {
+      const saved = JSON.parse(localStorage.getItem('wb_auth') || '{}');
+      if (!saved.token) return;
+      socket.emit('auth-refresh', { username: saved.username, token: saved.token }, (resp) => {
+        if (resp && resp.error) log('👤 登录态已过期，请重新登录');
+      });
+    }, 60 * 60 * 1000);
 }
 
 async function doAuth(event) {

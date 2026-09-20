@@ -91,8 +91,20 @@
 <script>
 'use strict';
 /* ---- 采样历史：roomId -> [{t, bytes}]（最多留 60 个点，画折线用）---- */
-const history = new Map(); // roomId -> [{t, bytes}]（房间总字节历史，画总码率曲线）
+/* ★ 09-19h G7-④：历史留存——采样写 localStorage（环形 60 点），刷新页面曲线不丢。
+ *   只存"字节累计值"（每房间一条），2s×60 点 ≈ 4KB，localStorage 完全无压力。 */
 const HISTORY_MAX = 60;
+const HISTORY_KEY = 'dashboard_history_v1';
+const history = new Map(); // roomId -> [{t, bytes}]（房间总字节历史，画总码率曲线）
+try {
+  const saved = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+  for (const [k, arr] of saved) history.set(k, arr.slice(-HISTORY_MAX));
+} catch (e) { /* 损坏就当没有 */ }
+function persistHistory() {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify([...history.entries()].map(([k, arr]) => [k, arr.slice(-HISTORY_MAX)])));
+  } catch (e) { /* 隐私模式等场景写不进就算了 */ }
+}
 
 async function poll() {
   let data;
@@ -136,6 +148,7 @@ function render(data) {
     }
     hist.push({ t: data.now, bytes: bytesNow });
     while (hist.length > HISTORY_MAX) hist.shift();
+    persistHistory(); // ★ G7-④：刷新页面曲线仍在
     history.set(room.roomNumber, hist);
 
     const ctl = room.control.controllerId
@@ -233,7 +246,7 @@ function drawSpark(id, bytesArr, now) {
   // 相邻两次采样做差 → 每个点的 kbps
   const points = [];
   for (let i = 1; i < bytesArr.length; i++) {
-    const dt = 2; // 采样间隔约 2s（真实间隔有抖动，画趋势够用）
+    const dt = 2; // 采样间隔约 2s（留存恢复后的首点跨越刷新间隙，按 2s 算对趋势无碍）
     points.push(Math.max(0, (bytesArr[i] - bytesArr[i - 1]) * 8 / dt / 1000));
   }
   if (points.length < 2) {

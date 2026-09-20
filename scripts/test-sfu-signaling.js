@@ -18,12 +18,22 @@ function client(name) {
   });
 }
 const waitEvent = (s, ev) => new Promise(r => s.once(ev, r));
+let authTtlMs = Infinity; // G6：TTL 在主 IIFE 里拉取（CJS 不能顶层 await）
 // socket.io 请求-应答：emit(事件, 载荷, 回调)，回调收到 { data } 或 { error }
 const request = (s, ev, payload) => new Promise((resolve, reject) => {
   s.emit(ev, payload, (resp) => resp && resp.error ? reject(new Error(resp.error)) : resolve(resp));
 });
 
 (async () => {
+  // G6：读服务器 token TTL（决定过期路径断言是否实测）
+  try {
+    const cfgBody = await new Promise((resolve, reject) => {
+      require('http').get('http://localhost:3001/config.json', (r) => {
+        let b = ''; r.on('data', (c) => (b += c)); r.on('end', () => resolve(b));
+      }).on('error', reject);
+    });
+    authTtlMs = (JSON.parse(cfgBody).authTtlMs) || Infinity;
+  } catch (e) { /* 拉不到按默认跳过 */ }
   const A = await client('A');
 
   // --- A 创建房间：拿到号（同时验证 ack 应答）---
@@ -510,6 +520,44 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('09-19c /minutes 路径穿越被钳制（403/404，绝不定成功）', minBad.code === 403 || minBad.code === 404);
   const recList = await httpReq('GET', 'http://localhost:3001/api/recordings');
   ok('09-19c G3 /api/recordings 列表可用（200 数组）', recList.code === 200 && Array.isArray(JSON.parse(recList.text)));
+
+  // --- ★ 09-19h：G6 安全加固（滑动续期 / 聊天限流 / 过期路径）---
+  let g6Tok = null;
+  try { g6Tok = (await request(A.s, 'auth-login', { username: 'g6user', password: 'secret6' })).data.token; }
+  catch (e) { /* 还没注册 */ }
+  if (!g6Tok) {
+    try { await request(A.s, 'auth-register', { username: 'g6user', password: 'secret6', displayName: 'G6测试' }); }
+    catch (e) { /* 已被注册（跨轮次复跑） */ }
+    try { g6Tok = (await request(A.s, 'auth-login', { username: 'g6user', password: 'secret6' })).data.token; }
+    catch (e) { /* 仍失败则下面的断言会如实报告 */ }
+  }
+  ok('09-19h G6 登录拿到 token', !!g6Tok);
+  const g6Verify = await request(A.s, 'auth-verify', { username: 'g6user', token: g6Tok });
+  ok('09-19h G6 verify 通过（滑动续期已生效）', !!(g6Verify.data && g6Verify.data.user));
+  const g6Refresh = await request(A.s, 'auth-refresh', { username: 'g6user', token: g6Tok });
+  ok('09-19h G6 auth-refresh 返回新过期时间（expiresAt 数字）',
+     !!(g6Refresh.data && typeof g6Refresh.data.expiresAt === 'number' && g6Refresh.data.expiresAt > Date.now()));
+  // 聊天限流：单 socket 瞬发 60 条（>40/10s），后段应被静默丢弃
+  const chatRecv = [];
+  const onChatG6 = (p) => { if ((p.text || '').startsWith('g6spam')) chatRecv.push(p.text); };
+  A.s.on('chat-message', onChatG6);
+  for (let i = 0; i < 60; i++) A.s.emit('chat-message', { text: `g6spam-${i}`, msgId: `g6-${i}` });
+  await sleep(800);
+  A.s.off('chat-message', onChatG6);
+  ok('09-19h G6 聊天限流生效（60 条瞬发，收到 < 45 = 后段被丢）', chatRecv.length < 45);
+  // 过期路径：短 TTL 服务器（AUTH_TTL_MS=2000 启动）才实测；默认 24h 自动跳过
+  if (authTtlMs <= 5000) {
+    const shortLogin = await request(A.s, 'auth-login', { username: 'g6user', password: 'secret6' });
+    const shortTok = (shortLogin.data || {}).token;
+    await sleep(authTtlMs + 400);
+    let expired = null;
+    try { expired = await request(A.s, 'auth-verify', { username: 'g6user', token: shortTok }); }
+    catch (e) { expired = { error: e.message }; }
+    ok('09-19h G6 过期 token 被 verify 拒绝（短 TTL 实测）',
+       !!expired.error && expired.error.includes('失效'));
+  } else {
+    ok('09-19h G6 过期路径（默认 24h TTL 跳过实测——AUTH_TTL_MS=2000 启动可验）', true);
+  }
 
   // --- ★ 09-19f：SFU 深造（多 Worker 池 + ping 探活）---
   const met2 = await httpReq('GET', 'http://localhost:3001/metrics');

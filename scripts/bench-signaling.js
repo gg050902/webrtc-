@@ -63,6 +63,9 @@ function percentile(arr, p) {
   console.log(`✅ 连接+进房：${connected}/${CLIENTS}（失败 ${connectFail}）`);
 
   // ② 流量阶段
+  // ★ 09-19h 实修：chat-message 监听必须只挂一次（原实现挂在 setInterval 里，
+  //   每 tick 重复叠加监听器 → chatsRecv 被重复计数，放大倍数虚高）。
+  sockets.forEach((s) => s.on('chat-message', () => chatsRecv++));
   const timer = setInterval(() => {
     for (const s of sockets) {
       if (!s._room) continue;
@@ -71,15 +74,10 @@ function percentile(arr, p) {
       s.emit('ping', {}, (resp) => {
         if (resp && resp.data) rtt.push(Date.now() - resp.data.t);
       });
-      // 聊天广播负载（服务器 ×8 放大转发）
+      // 聊天广播负载（服务器 ×房间人数 放大转发）
       s.emit('chat-message', { text: `bench #${chats}`, msgId: `bench-${chats++}` });
-      s.on('chat-message', () => chatsRecv++); // 累计广播回包（放在循环里会重复挂——见下修正）
     }
   }, 1000);
-  // 上面把 chat-message 监听放循环里会重复——修正：监听只挂一次
-  for (const s of sockets) s.removeAllListeners('chat-message');
-  sockets.forEach((s) => s.on('chat-message', () => chatsRecv++));
-  // （interval 里的 s.on 是笔误防线：上面已统一移除重挂）
 
   await new Promise((r) => setTimeout(r, SECONDS * 1000));
   clearInterval(timer);

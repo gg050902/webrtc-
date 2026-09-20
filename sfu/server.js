@@ -193,6 +193,7 @@ async function requestHandler(req, res) {
     res.end(JSON.stringify({
       iceServers: Array.isArray(CONFIG.iceServers) ? CONFIG.iceServers : [],
       videoSvc: !!CONFIG.videoSvc, // ★ D+3：VP9 SVC 开关（true = 摄像头改用单路 SVC 上传）
+      authTtlMs: AUTH_TTL_MS, // ★ G6：token TTL（回归用它开短 TTL 实测过期路径）
       // ★ 09-16 局域网交付：announcedIp 存在时，告诉前端"发给别的电脑的邀请链接长什么样"——
       //   服务器机自己访问的是 localhost，直接复制 location.href 别的电脑打不开
       lanUrl: ANNOUNCED_IP ? `https://${ANNOUNCED_IP}:${(tlsCfg.port || 3443)}` : null,
@@ -688,7 +689,47 @@ const rooms = new Map();
  * ▎身份的用途：昵称贯通成员列表/聊天气泡/工作台状态条；不登录也能玩（游客模式）。 */
 const crypto = require('crypto');
 const USERS_FILE = path.join(__dirname, 'users.json');
-const authTokens = new Map(); // token -> username
+/* ★ 09-19h G6-③ 限流（零依赖手写固定窗口计数器，~15 行）：
+ * ▎防什么：撞库（login）/暴力猜 6 位房间号（join-room）/注册机刷号（register）/刷屏（chat）。
+ * ▎用固定窗口而非令牌桶：实现最短、语义直白（"一分钟最多 N 次"），教学项目够用；
+ *   需要平滑限流再换令牌桶（扩展点注释）。
+ * ▎内存纪律：桶本身带过期，定时清理防 Map 无限涨（与日志环形上限同一总纲）。 */
+const rateBuckets = new Map(); // key -> { count, windowStart }
+function rateLimit(key, max, windowMs) {
+  const now = Date.now();
+  const b = rateBuckets.get(key);
+  if (!b || now - b.windowStart >= windowMs) {
+    rateBuckets.set(key, { count: 1, windowStart: now });
+    return true;
+  }
+  b.count += 1;
+  return b.count <= max;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, b] of rateBuckets) if (now - b.windowStart > 15 * 60000) rateBuckets.delete(k);
+}, 10 * 60000).unref();
+
+/* ★ 09-19h G6-① token 生命周期（原来是无过期内存 Map——"敢公开演示"的第一道坎）：
+ * ▎authTokens 值升级为 { username, displayName, expiresAt }；
+ *   默认 24h（AUTH_TTL_MS 环境变量可调——信令回归用它开短 TTL 实测过期路径）；
+ * ▎滑动续期：auth-verify / auth-refresh 命中即续期（真实产品的"活跃不掉线"语义）；
+ *   auth-refresh = 显式续期信令（前端定时调，长期会话不中断）。 */
+const AUTH_TTL_MS = Number(process.env.AUTH_TTL_MS) || 24 * 3600 * 1000;
+const authTokens = new Map(); // token -> { username, expiresAt }
+function issueToken(username) {
+  const token = crypto.randomBytes(24).toString('hex');
+  authTokens.set(token, { username, expiresAt: Date.now() + AUTH_TTL_MS });
+  return token;
+}
+function validToken(token, username) {
+  const t = authTokens.get(token);
+  if (!t || t.username !== username) return false;
+  if (Date.now() > t.expiresAt) { authTokens.delete(token); return false; }
+  t.expiresAt = Date.now() + AUTH_TTL_MS; // 滑动续期：活跃会话不过期
+  return true;
+}
+const clientIp = (socket) => (socket.handshake && socket.handshake.address) || 'unknown';
 function loadUsers() {
   try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) { return {}; }
 }
@@ -1835,9 +1876,10 @@ io.on('connection', (socket) => {
       createdAt: Date.now(),
     };
     saveUsers(users);
-    const token = crypto.randomBytes(24).toString('hex');
-    authTokens.set(token, username);
+    if (!rateLimit(`reg:${clientIp(socket)}`, 30, 10 * 60000)) return fail(callback, '注册过于频繁，请稍后再试');
+    const token = issueToken(username);
     bindIdentity(username, users[username].displayName);
+    logEvent('info', 'auth-register', { username });
     console.log(`👤 注册成功: ${username}（昵称 ${users[username].displayName}）`);
     ok(callback, { user: { username, displayName: users[username].displayName }, token });
   });
@@ -1846,9 +1888,9 @@ io.on('connection', (socket) => {
     const users = loadUsers();
     const u = users[username];
     // 用户不存在与密码错误给同一句提示：不向试探者泄露"用户名是否存在"
+    if (!rateLimit(`login:${clientIp(socket)}`, 20, 60000)) return fail(callback, '尝试过于频繁，请一分钟后再试');
     if (!u || hashPassword(password, u.salt) !== u.hash) return fail(callback, '用户名或密码不对');
-    const token = crypto.randomBytes(24).toString('hex');
-    authTokens.set(token, username);
+    const token = issueToken(username);
     bindIdentity(username, u.displayName);
     console.log(`👤 登录成功: ${username}`);
     ok(callback, { user: { username, displayName: u.displayName }, token });
@@ -1857,9 +1899,17 @@ io.on('connection', (socket) => {
     if (!callback) return;
     const users = loadUsers();
     const u = users[username];
-    if (!u || authTokens.get(token) !== username) return fail(callback, '登录态已失效，请重新登录');
+    if (!u || !validToken(token, username)) return fail(callback, '登录态已失效，请重新登录');
     bindIdentity(username, u.displayName);
     ok(callback, { user: { username, displayName: u.displayName } });
+  });
+  // ★ 09-19h G6-①：显式滑动续期（前端每小时调一次，长期值守不掉线）
+  socket.on('auth-refresh', ({ username, token } = {}, callback) => {
+    if (!callback) return;
+    const users = loadUsers();
+    const u = users[username];
+    if (!u || !validToken(token, username)) return fail(callback, '登录态已失效，请重新登录');
+    ok(callback, { expiresAt: authTokens.get(token).expiresAt });
   });
 
   /* ---- 公共函数：真正把一个连接放进房间（创建/加入的"后半段"共用）---- */
@@ -1942,6 +1992,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('join-room', async ({ roomNumber, password } = {}, callback) => {
+    if (!rateLimit(`join:${socket.id}`, 20, 60000)) return; // ★ G6-③：防暴力猜 6 位房间号(静默丢弃,不给试探反馈)
     if (socket.roomNumber) { if (callback) return fail(callback, '已在房间里'); return; }
     if (!/^\d{6}$/.test(roomNumber || '')) {
       socket.emit('room-not-found', { roomNumber });
@@ -1968,6 +2019,7 @@ io.on('connection', (socket) => {
   //   兜底 = 这条信令广播（数据通道还没建立/建立失败的人也能收到）。服务器原样带 msgId。
   socket.on('chat-message', ({ text, msgId } = {}) => {
     if (!socket.roomNumber || typeof text !== 'string' || !text.trim()) return;
+    if (!rateLimit(`chat:${socket.id}`, 40, 10000)) return; // ★ G6-③：防刷屏(静默丢弃)
     // 广播给整个房间（包括自己），前端按 from 区分"我/别人"
     io.to(socket.roomNumber).emit('chat-message', {
       from: socket.id,
