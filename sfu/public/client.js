@@ -314,6 +314,15 @@ const pendingRoom = (() => {
 let myRoom = null;
 // ★ D6 升级：把进房用的密码留一份——断线重连时要拿它重新 join-room（不然有锁的房间回不去）
 let myRoomPassword = null;
+/* ★ 09-24 C4：我的房间内令牌（roomToken）——进房成功时服务器随 room-members 发给我（游客也有）。
+ *   用途：/api/captions、/api/minutes、/minutes/* 这些"会议内容"接口的门禁。
+ * ▎生命周期：进房/断线重连（会拿新的）时更新；主动离开房间时清空。
+ * ▎安全：它是**只属于我、只对我这个房间有效**的凭证——绝不写进日志、绝不发给别人。
+ *   （所以三处 fetch 用请求头带它；只有"导航链接"发不出头，才退而用 ?roomToken=。） */
+let myRoomToken = null;
+// ★ 09-24 C4：请求头小 helper——有令牌就带上 X-Room-Token，没有就返回空对象（不发坏头）。
+//   三处 captions 请求（导出 GET / 归档 POST / 日报 GET）都用它，避免各写一遍、漏一处。
+function roomTokenHeader() { return myRoomToken ? { 'X-Room-Token': myRoomToken } : {}; }
 
 function enterRoom(roomNumber) {
   if (myRoom) return; // 已在房间里（room-created 和 room-members 会各触发一次）
@@ -831,7 +840,9 @@ function updateMemberCount() {
  * 进房后主流程（room-members 一到就执行）：
  *   建通道 → 上传自己 → 订阅房间里已有的老成员媒体
  * ────────────────────────────────────────────────────────────── */
-socket.on('room-members', ({ roomNumber, members }) => {
+socket.on('room-members', ({ roomNumber, members, roomToken }) => {
+  // ★ 09-24 C4：进房成功时服务器**单播给我自己**的房间内令牌（游客也有；重连后会换新，直接覆盖）
+  if (roomToken) myRoomToken = roomToken;
   enterRoom(roomNumber);
 
   (async () => {
@@ -1138,6 +1149,7 @@ camBtn.addEventListener('click', () => {
 
 leaveBtn.addEventListener('click', () => {
   leaving = true;        // ★ D6：主动离开不算断线，别触发重连流程
+  myRoomToken = null;    // ★ 09-24 C4：离房即弃令牌（令牌只对"还在房里"有意义）
   socket.disconnect();   // 服务器端会释放 Transport/Producer/Router 资源
   location.reload();
 });
@@ -1254,8 +1266,14 @@ function appendChat(text, sender, isMe, via, name, ai) {
     // （classList.add 而非纯 className 字符串——冒烟桩的 classList 与 className 不同步，坑 27 同源）
     const mode = ai ? (ai.mock ? 'Mock' : 'LLM') : (sfuAiEnabled ? 'LLM' : 'Mock');
     const meta = ai && ai.tokens ? `<span class="msg-ai-tok" title="本次调用的 token 用量">${ai.tokens}t</span>` : '';
-    const link = ai && ai.path
-      ? `<a class="msg-link" href="${escapeHtml(ai.path)}" target="_blank" rel="noopener">📄 打开纪要</a>` : '';
+    /* ★ 09-24 C4：纪要链接是 <a href> 导航，浏览器发不出自定义请求头——只能把 roomToken
+     *   挂到查询串（服务端 extractRoomToken 已支持 ?roomToken= 这条兜底）。
+     *   ai.path 可能已经带查询串，所以判断用 '?' 还是 '&'。文案与 DOM 结构一个字没动。 */
+    const minutesHref = (ai && ai.path)
+      ? ai.path + (myRoomToken ? (ai.path.includes('?') ? '&' : '?') + 'roomToken=' + encodeURIComponent(myRoomToken) : '')
+      : '';
+    const link = minutesHref
+      ? `<a class="msg-link" href="${escapeHtml(minutesHref)}" target="_blank" rel="noopener">📄 打开纪要</a>` : '';
     item.className = 'msg';
     item.classList.add('bot');
     item.innerHTML =
@@ -2492,10 +2510,18 @@ function renderMembers(members) {
         try {
           const existing = recordingsByMember.get(m.id);
           if (existing) {
-            await request('record-stop', { recordId: existing });
+            const stopped = await request('record-stop', { recordId: existing });
             recordingsByMember.delete(m.id);
             recBtn.innerHTML = ICONS.recOn;
-            showToast(`⏹ 已停止录制，文件在服务器 recordings/ 目录`, 'info');
+            /* ★ 09-24 C4：/recordings/<文件> 改成"admin 或短时效签名 URL"才放行；非管理员的
+             *   录制者靠服务器回的签名 URL（默认 1 小时有效）下载自己的产物。写进流程日志可点/复制。 */
+            const dlUrl = stopped && stopped.data && stopped.data.url;
+            if (dlUrl) {
+              log(`⏹ 录制已停止，下载链接（1 小时内有效）：${dlUrl}`);
+              showToast('⏹ 已停止录制，下载链接见下方「流程日志」', 'info');
+            } else {
+              showToast(`⏹ 已停止录制，文件在服务器 recordings/ 目录`, 'info');
+            }
           } else {
             const resp = await request('record-start', { memberId: m.id });
             recordingsByMember.set(m.id, resp.data.recordId);
@@ -4885,7 +4911,9 @@ capExportBtn.addEventListener('click', async () => {
   let archiveCount = 0;
   if (myRoom && typeof fetch === 'function') {
     try {
-      const res = await fetch(`/api/captions?room=${encodeURIComponent(String(myRoom))}&format=txt`);
+      const res = await fetch(`/api/captions?room=${encodeURIComponent(String(myRoom))}&format=txt`, {
+        headers: roomTokenHeader(), // ★ 09-24 C4：会议内容接口要房间内令牌（游客也有）
+      });
       if (res.ok) {
         archiveText = await res.text();
         archiveCount = archiveText ? archiveText.split('\n').filter(Boolean).length : 0;
@@ -5110,7 +5138,8 @@ async function capSentryFlush() {
   try {
     const res = await fetch('/api/captions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      // ★ 09-24 C4：归档 POST 也要房间内令牌（游客的字幕归档靠它，绝不能被门禁误伤）
+      headers: { 'Content-Type': 'application/json', ...roomTokenHeader() },
       body: JSON.stringify({ room: String(myRoom), entries: send }),
     });
     if (res.ok) {
@@ -5200,7 +5229,9 @@ capReportBtn.addEventListener('click', async () => {
   let all = cap.log.slice();
   if (myRoom && typeof fetch === 'function') {
     try {
-      const res = await fetch(`/api/captions?room=${encodeURIComponent(String(myRoom))}&format=json`);
+      const res = await fetch(`/api/captions?room=${encodeURIComponent(String(myRoom))}&format=json`, {
+        headers: roomTokenHeader(), // ★ 09-24 C4：日报回读同样要房间内令牌
+      });
       if (res.ok) all = (await res.json()).concat(cap.log);
     } catch (err) { /* 服务器不可达：用内存窗口出简版 */ }
   }

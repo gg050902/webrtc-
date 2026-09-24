@@ -67,7 +67,7 @@
 | 🎬 演示包 | `npm run start:demo` 一键起两版；5 分钟演示讲稿（含 Q&A） | scripts/start-demo.js + 《演示脚本-5分钟.md》（E5） |
 | 👤 登录/注册 | 用户名+密码注册登录（游客可进）；昵称贯通成员列表与聊天气泡，登录态自动恢复 | node:sqlite 账号库 `sfu/data/meeting.db` + 内置 scrypt 哈希（零依赖；09-24 由旧 users.json 自动迁移、原样保留 salt/hash）+ auth-register/login/verify 三信令 + token 存档（09-16，SFU 主版本；09-24 换存储） |
 | 🛡️ 管理员门禁 · 观测类（09-24） | **甲类·观测**接口只对 admin 开放：`/api/rooms`（房间×成员×媒体字节×控制权全景）、`/metrics`（Prometheus 文本版）、`/api/recordings`（全服务器录像清单，跨房枚举）；带 token 两种方式——`Authorization: Bearer <token>`（脚本首选）/ `?token=<token>`（浏览器地址栏、`<video src>` 兜底，代价是 token 进 URL 历史与访问日志）；`/dashboard` 页面本身不设门禁（否则页面都打不开、没法提示去登录），它调的 `/api/rooms` 才受门禁 | 首个注册账号（或 `config.json` 的 adminUsername）自动成为 admin；token 里带 role；`scripts/watch.js`/`doctor.js`/`soak.js` 支持 `ADMIN_TOKEN` 环境变量（09-24，SFU 主版本） |
-| 🔓 内容类接口 · 刻意开放（09-24） | **乙类·内容**靠"能力 = 房间号/文件名"保护，**不加 admin 门禁**：`/api/captions`（字幕归档，POST 追加/GET 回读）、`/api/minutes` + `/minutes/<6位房号>/<文件名>.md`（纪要列表与正文）、`/recordings/<文件名>`（单个录像）。原因：本产品允许**游客进会**，而字幕归档是浏览器端 `client.js` **自动**调用的——加门禁会让游客的归档**静默失效**（功能坏了却只在控制台留一行日志）。核心：**安全靠"能力只发给在场的人"，不靠"拦所有人"** | 残余风险：6 位房间号可暴力枚举（10^6）、录像文件名含毫秒时间戳、属**弱能力**；生产做法 = join 时下发房间内令牌 + 录像短时效签名 URL（本教学版未实现）（09-24，SFU 主版本） |
+| 🔐 内容类接口 · 房间内令牌 + 录像签名 URL（09-24） | **乙类·内容**不再靠"能力 = 房间号"裸奔：进房成功时给**本人**签发一张**无状态 HMAC 房间令牌**（`base64url(JSON{room,iat,exp}) + "." + base64url(hmacSHA256(payloadB64, SECRET))`），`/api/captions`（字幕归档 POST/GET）、`/api/minutes` + `/minutes/<6位房号>/<文件名>.md`（纪要列表与正文）校验它（`X-Room-Token` 头首选 / `?roomToken=` 兜底）；`/recordings/<文件名>`（单个录像）改用 **admin 或短时效签名 URL**（`signRecordingUrl`，默认 1 小时）。令牌发给**本人**、存在 **socket 上**（非成员对象）、成员列表是**显式投影**，故绝不会广播他人令牌；**游客也有令牌**（否则游客字幕归档会静默失效） | SECRET 持久化在 `sfu/data/room-secret`（已 gitignore），首次运行自动生成；TTL 默认 **86400s/24h**（`roomTokenTtlSec` / `ROOM_TOKEN_TTL_SEC`）；逃逸开关 `roomTokenRequired`（默认 `true`，设 `false` 退回旧"开放"行为，供教学对比）；诚实边界：仍是 **Bearer 语义**（不绑成员/IP）、与录像签名**共用同一把 SECRET**、Windows 上 `chmod 600` 不生效（靠目录 ACL）（09-24，SFU 主版本） |
 | 🗄️ 账号存储 · node:sqlite（09-24） | 账号从 JSON 文件换成 **Node 内置 `node:sqlite`**（**零新依赖**）：库文件优先级 `DB_FILE` 环境变量 > `config.json` 的 `dbFile` > 默认 `sfu/data/meeting.db`；开启 **WAL**（读不挡写、写不挡读）；两张表 users / audit + `idx_audit_ts` 索引；**旧 `users.json` 首次启动自动整表迁移**（原样保留 salt/hash、**绝不重新哈希**），旧文件改名 `users.json.imported-<日期>` 保留不删 | 口令方案抽成单一实现 `sfu/password.js`（scrypt + 每账号 16 字节随机盐 + `timingSafeEqual`），服务器与 CLI **require 同一份**——用结构消除"两处照抄、参数漂移导致 CLI 建的账号登不上"的隐患（09-24，SFU 主版本） |
 | 🛑 优雅退出（09-24） | `SIGINT`/`SIGTERM`/`uncaughtException` → 关所有 mediasoup Worker → 停收新连接 → `closeDb()` 做 WAL checkpoint → 退出；**幂等**（连按两次 Ctrl+C 第二次直接退）+ **5 秒保险丝**兜底。此前完全没注册信号处理器，Ctrl+C = 进程暴毙（Worker 变孤儿占 RTC 端口、WAL 堆积、正在录制的 ffmpeg 被硬切） | `shuttingDown` 标志顺带修掉"正常退出却被当成 Worker 崩溃"的日志噪声；自测钩子 `TEST_SHUTDOWN_AFTER_MS`（Windows 上投递不了 SIGTERM，靠它自动化验证）（`npm run test:shutdown` ★ 9/9，09-24，SFU 主版本） |
 | 🔐 自签证书 SAN 自愈（09-24） | 浏览器早已不看 CN（RFC 6125），自签证书必须带 **SAN**，否则手机常连"继续访问"都不给；且 DHCP 换 IP 后"只判有没有 SAN"永远不重签——现改为**证书缺失 / 无 SAN / SAN 未覆盖当前局域网 IP 三种都重新生成**，SAN 写入所有检测到的本机 IPv4 并保留旧证书已有 IP | 实测 `DNS:localhost, IP:127.0.0.1, IP:192.168.74.194, IP:192.168.116.194`（10 年期自签，`sfu/tls/`）；顺带修正漂移的 `announcedIp`（09-24，SFU 主版本） |
@@ -314,8 +314,8 @@ npm run start:sfu
 
 ## 🗄️ 账号数据库 · 管理员 CLI · 可靠性（09-24）
 
-> 这一节把本轮"从演示到能交付"的工程改动集中讲清：账号换成真数据库、观测接口加门禁但内容接口刻意开放、
-> Ctrl+C 正确退出、自签证书修好手机。教学细节见 `LEARN.md` 5.33~5.37，排查步骤见《跨电脑连接-操作指南.md》第八节。
+> 这一节把本轮"从演示到能交付"的工程改动集中讲清：账号换成真数据库、观测接口加门禁、内容接口补上房间内令牌与录像签名 URL、
+> Ctrl+C 正确退出、自签证书修好手机。教学细节见 `LEARN.md` 5.33~5.38，排查步骤见《跨电脑连接-操作指南.md》第八节。
 
 ### 存储层：Node 内置 SQLite（零新依赖）
 
@@ -349,14 +349,19 @@ npm run admin:purge   -- [--yes] [--match <正则>]  # 清理测试垃圾账号�
 
 ### HTTP 门禁的两类边界（本轮最重要的修正）
 
-| 类别 | 接口 | 是否 admin 门禁 | 理由 |
+| 类别 | 接口 | 门禁 | 理由 |
 |---|---|---|---|
 | **甲类·观测** | `/api/rooms`、`/metrics`、`/api/recordings` | ✅ 必须带管理员 token | 跨房聚合 / 实时全景，知道它 = 掌握全局，且与"是否参会"无关 |
-| **乙类·内容** | `/api/captions`、`/api/minutes`、`/minutes/<房号>/<文件>.md`、`/recordings/<文件名>` | ❌ **刻意开放**（能力 = 房间号 / 文件名） | 本产品允许游客进会，且字幕归档由 `client.js` **自动**调用——加门禁会让游客的字幕归档**静默失效**（功能坏了却只在控制台留一行日志） |
+| **乙类·内容** | `/api/captions`、`/api/minutes`、`/minutes/<房号>/<文件>.md` | ✅ 必须带**有效房间令牌** | 令牌在**进房成功时签发给本人**；本产品允许游客进会、且字幕归档由 `client.js` **自动**调用，所以令牌**必须发给游客**（做成"需登录"就会让游客归档**静默失效**）。用它替代原先可枚举的 6 位房号，关闭"房间号可枚举"的缺口 |
+| **乙类·录像** | `/recordings/<文件名>` | ✅ admin 或**短时效签名 URL**（默认 1 小时） | 文件清单已由甲类拦住；单文件改用"谁按下 ⏺、谁拿到自己的签名链接"，链接自带过期时间 |
 
-**一句话**：**安全不靠"拦所有人"，靠"能力（房间号）只发给在场的人"**。
-**残余风险**（诚实交代）：6 位房间号可暴力枚举（10^6）、录像文件名含毫秒时间戳，故乙类属**弱能力**；
-生产做法是 join 时下发**房间内令牌**、录像用**短时效签名 URL**——本教学版未实现。
+**一句话**：**安全不再寄望于"房间号只发给在场的人"，而是"进了这场会的人才拿得到令牌"**——6 位房号可枚举的缺口由此关闭。
+
+**门禁怎么取令牌**：`X-Room-Token: <token>` 请求头（首选，干净、不进 URL 历史/日志）/ `?roomToken=<token>` 查询串兜底（因为 `<a href="/minutes/...">` 这类导航链接发不出自定义头）；管理员的 admin token 不受房间限制（用于跨房巡检）。
+
+**配置项**：`config.json` 的 `roomTokenRequired`（默认 `true`，设 `false` 退回旧的"开放"行为，供教学对比/本地调试）与 `roomTokenTtlSec`（令牌有效期，默认 `86400` 秒；环境变量 `ROOM_TOKEN_TTL_SEC` 优先级更高）。
+
+**诚实边界**（如实交代，不吹成完美方案）：令牌是 **Bearer 语义**（谁拿到谁用，**不绑成员身份 / IP**），24h 内泄露即可用；录像签名 URL 同理（1 小时内谁拿到谁下）；两者**共用同一把 `SECRET`**（数据格式不同、实际不会互相混淆，但严格说少了 domain separation）；`sfu/data/room-secret` 一旦换掉，**所有**已签发的房间令牌与录像签名链接立即失效；`chmod 600` 在 **Windows 上不生效**（文件实际是 `-rw-r--r--`，Windows 需靠目录 ACL 保护）。
 
 ### 优雅退出 与 证书 SAN 自愈
 
@@ -389,7 +394,7 @@ webrtc/
 ├── deploy/coturn/          # 自建 TURN 包（docker-compose.yml + turnserver.conf）
 ├── scripts/
 │   ├── test-signaling.js   # Mesh 信令回归（npm test，需先起 3000）★ 36/36
-│   ├── test-sfu-signaling.js  # SFU 信令回归（npm run test:sfu，需先起 3001）★ 134/134
+│   ├── test-sfu-signaling.js  # SFU 信令回归（npm run test:sfu，需先起 3001）★ 149/149
 │   ├── test-sfu-client-smoke.js # SFU 前端无头冒烟（npm run test:smoke，零依赖不用起服务器）★ 136/136
 │   ├── test-store.js       # ★ 09-24 账号存储层回归（node:sqlite：迁移/改密/删号安全闸）★ 49/49
 │   ├── test-shutdown.js    # ★ 09-24 优雅退出回归（关 Worker/关库 checkpoint/幂等/5s 保险丝）★ 9/9
@@ -412,7 +417,7 @@ webrtc/
 └── sfu/                    # ★ 主版本（SFU：mediasoup 服务器转发，端口 3001）
     ├── server.js           #   后端：静态托管 + 房间/密码 + Worker/Router/Transport 媒体中枢（分区 A~E）
     ├── protocol.js         #   信令事件总表（改 server/client 前先看）
-    ├── config.example.json #   配置模板（端口/人数/监听 IP/announcedIp/ICE/HTTPS/roomTtlSec/videoSvc/dbFile/adminUsername）
+    ├── config.example.json #   配置模板（端口/人数/监听 IP/announcedIp/ICE/HTTPS/roomTtlSec/videoSvc/dbFile/adminUsername/roomTokenRequired/roomTokenTtlSec）
     ├── config.json         #   实际配置（可缺省；start:lan 会自动生成；含 lanUrl 供邀请链接改写）
     ├── store.js            #   账号/审计存储层（node:sqlite，零新依赖；WAL + 旧 users.json 自动迁移）
     ├── password.js         #   口令方案唯一实现（scrypt + 随机盐 + timingSafeEqual；服务器与 CLI 共用）
@@ -457,7 +462,7 @@ webrtc/
 ## 🧪 运行回归测试
 
 ```bash
-npm run test:sfu   # SFU 主版本信令：需先起 3001（AI 操作员断言要 AI_OP_STEP_MS=20 node sfu/server.js）★ 2026-09-24 实测 134/134（含门禁边界断言：该拦的拦、该放的放）
+npm run test:sfu   # SFU 主版本信令：需先起 3001（AI 操作员断言要 AI_OP_STEP_MS=20 node sfu/server.js）★ 2026-09-24 实测 149/149（含门禁边界 + 房间令牌断言：该拦的拦、该放的放、跨房/篡改/过期一律 401）
 npm run test:store # 账号存储层 node:sqlite：迁移保留 salt/hash、改密、删号安全闸、完整性 ★ 2026-09-24 实测 49/49
 npm run test:shutdown # 优雅退出：关 Worker / 关库 checkpoint / 幂等 / 5s 保险丝 ★ 2026-09-24 实测 9/9
 npm test           # Mesh 对照版信令：需先 npm start（连 localhost:3000）★ 2026-09-24 实测 36/36
@@ -477,17 +482,20 @@ npm run test:e2e     # 真机远程桌面 e2e（真双窗 + 模拟手机双指�
 npm run admin:list   # 管理员 CLI：看库里有哪些账号 / 谁是 admin（另有 grant/revoke/passwd/adduser/purge）
 ```
 
-> ✅ **合计 425 项断言全绿**（2026-09-24 实测）：SFU 信令 134 + 存储层 49 + 优雅退出 9 + 冒烟 136 +
-> Mesh 36 + 桌面代理 16 + 发布链 30 + 真浏览器 e2e 15 = **425**。
+> ✅ **合计 440 项断言全绿**（2026-09-24 实测）：SFU 信令 149 + 存储层 49 + 优雅退出 9 + 冒烟 136 +
+> Mesh 36 + 桌面代理 16 + 发布链 30 + 真浏览器 e2e 15 = **440**。
 
-- SFU 版测试（**2026-09-24 实测：134 通过 / 0 失败**；冒烟 **136/136**）：房间/密码复用 + mediasoup Router 能力 +
+- SFU 版测试（**2026-09-24 实测：149 通过 / 0 失败**；冒烟 **136/136**）：房间/密码复用 + mediasoup Router 能力 +
   Transport 创建与防重 + consume 错误路径 + 远程协助（授权/互斥/输入门禁/二进制与中文透传）+
   A/D 档（成员状态白名单、房主踢人、剪贴板门禁、文件配额、限时授权、切层错误路径）+
   D+ 档（`sctpParameters`/`produce-data`/`consume-data`、跨房间录制目标被拒、VP9 能力、
   房主迁移、空房 TTL 宽限期内原号回归、`/api/rooms` 与 `/dashboard`）+ 09-16 **auth 8 项**
   （注册/重复注册/错密码统一提示/登录/token 恢复/伪造 token/昵称贯通 room-state）+
-  09-17b 字幕状态入册 + **09-24 门禁边界 8 项**（甲类该拦的拦、乙类该放的放，
-  含"游客无 token 也能归档字幕"的端到端回归）。
+  09-17b 字幕状态入册 + **09-24 门禁边界 + 房间令牌 15 项**（甲类该拦的拦；
+  乙类无令牌→401、带 `X-Room-Token`/`?roomToken=`→200、跨房令牌→401、签名篡改→401、
+  payload 篡改→401、过期令牌→401；`/api/rooms`/`room-state`/`room-members` 三处**不含他人令牌**的泄露检查；
+  录像：签名有效但文件不存在→**404**（区别于 401）、exp 过期→401、sig 改一字符→401、管理员不签名也过→404；
+  以及"**游客凭房间内令牌可归档并回读**"的正向回归）。
   ⚠️ **真实音视频、simulcast 三档、说话人检测、浏览器侧录制、触屏手势、滤镜与字幕需要浏览器人工验证**
   （命令行只到信令层）；清单见 `后续升级方向.md` 第 0.2 节。
 - **账号存储层 `npm run test:store`（2026-09-24 实测：49 通过 / 0 失败）**：
@@ -571,7 +579,7 @@ npm run admin:list   # 管理员 CLI：看库里有哪些账号 / 谁是 admin�
 | 37 | **G4 移动端 / PWA（09-23）** | manifest + Service Worker（可安装到主屏、静态壳离线兜底）+ 侧栏抽屉/控制坞图标化/竖屏预览（≤980/≤760 两档响应式）+ 低带宽模式（省流开关锁最低层，复用 set-preferred-layers，服务器零改动）；顺手修 F6 冒烟 flaky 与 updateLayerPicker 守卫；冒烟 107/107 + 信令 98/98 |
 | 38 | **AI 主攻收官（09-24）** | **真 DeepSeek key 接入**：`sfu/ai/provider.js` 收口三处 LLM 调用（askLLM/streamLLM，Node 内置 fetch 零 SDK），密钥三来源（env > `.env` > config 的 ai.key）且**永不下发浏览器**，用量账本并入 `/metrics`；教学三件套 `scripts/{chat,summarize,agent}.js` + `npm run test:ai` 双轨自检 10/10；产品化四项：**流式打字机**（ai-stream + 终态去重）、**助理缺位自动入会**、**📝 纪要入口**、LLM/Mock 徽标与 token 用量；**实修三 bug**：announcedIp 漂移自动纠偏（跨机黑屏元凶）、ffmpeg 探测超时误判 + test:record 的 spawnSync EBUSY、配了 key 反而生成不了纪要（动作被聊天抢答）；回归：冒烟 **118/118**、信令 **106/106**（Mock 轨/LLM 轨双绿）、Mesh 33/33、test:record 连跑 3 次 PASS |
 | 39 | **真 OS 级远程桌面 + 跨网一键发布 + SW 缓存纪律（09-24b）** | **B 档落地**：本地代理 `agent/`（零新依赖手写 **CDP** 客户端，`Page.startScreencast` 抓真屏 + `Input.*` 注入真输入）驱动真实 Chromium 窗口，控制端在网页里操作被控电脑真实浏览器；新信令 `agent-hello`/`remote-frame`/`remote-meta` + 复用 `remote-input`，三道闸门（身份/授权/体量，"信任≠免检查"）；**📱 手机控电脑**——控制台 canvas 全用 **Pointer Events**（单指=鼠标、双指=滚轮、中文整段 insertText）；**跨网 ICE 下发**（Mesh 版 `mesh.config.json` + `/config.json`）；**一键发布** `npm run publish:mesh`（生成 publish-mesh/ → 真起一次体检 → 可选 cloudflared/ngrok 隧道；`--check` 过期闸）；**坑 40**：Service Worker 缓存旧代码（cache-first 绕过 HTTP `no-store`，改业务代码 sw.js 不动就一直吃旧缓存 → 按资源性质分 cache-first/network-first + `?nosw=1` 逃生舱 + e2e 每次清 profile）；回归 `test:agent` 16/16、`test:e2e` 15 项全过、`test:publish` 29/29 |
-| 40 | **账号上真数据库 + 门禁边界修正 + 优雅退出（09-24）** | **存储层**：新增 `sfu/store.js`，用 Node 内置 `node:sqlite`（零新依赖）替换 JSON 文件——WAL 模式、users/audit 两表、旧 `users.json` **自动迁移（原样保留 salt/hash、绝不重新哈希）** + 旧文件改名备份；**口令单一实现** `sfu/password.js`（scrypt + 随机盐 + timingSafeEqual，服务器与 CLI 共用，消除"照抄漂移"）；**管理员 CLI** `scripts/admin.js`（list/grant/revoke/adduser/passwd/purge，purge 默认干跑、deleteUser 拒绝删唯一 admin）；**门禁边界修正**：观测类（`/api/rooms`/`/metrics`/`/api/recordings`）加 admin 门禁，内容类（captions/minutes/单录像是**刻意开放**——游客也在用字幕归档，加门禁会静默失效；安全靠"能力=房间号"）；**优雅退出**（SIGINT/SIGTERM→关 Worker→关库 checkpoint→退出，幂等 + 5s 保险丝，`TEST_SHUTDOWN_AFTER_MS` 自测钩子）；**证书 SAN 自愈**（缺失/无 SAN/未覆盖当前 IP 都重生成，修手机连不上）；**测试隔离**（账号测试一律 `DB_FILE` 指临时目录，硬断言不碰真实库）+ 修 `test:sfu` 默认带 token 掩盖游客视角的回归；回归：SFU 信令 **134/134**、存储 **49/49**、优雅退出 **9/9**、冒烟 **136/136**、Mesh **36/36**、代理 **16/16**、发布 **30/30**、e2e **15/15** = **合计 425 全绿** |
+| 40 | **账号上真数据库 + 门禁边界修正 + 房间令牌 + 优雅退出（09-24）** | **存储层**：新增 `sfu/store.js`，用 Node 内置 `node:sqlite`（零新依赖）替换 JSON 文件——WAL 模式、users/audit 两表、旧 `users.json` **自动迁移（原样保留 salt/hash、绝不重新哈希）** + 旧文件改名备份；**口令单一实现** `sfu/password.js`（scrypt + 随机盐 + timingSafeEqual，服务器与 CLI 共用，消除"照抄漂移"）；**管理员 CLI** `scripts/admin.js`（list/grant/revoke/adduser/passwd/purge，purge 默认干跑、deleteUser 拒绝删唯一 admin）；**门禁边界修正**：观测类（`/api/rooms`/`/metrics`/`/api/recordings`）加 admin 门禁；**内容类加房间内令牌**——进房成功时给**本人**签发**无状态 HMAC 房间令牌**（`/api/captions`、`/api/minutes`、`/minutes/<房号>/<文件>.md` 校验，`X-Room-Token` 头首选 / `?roomToken=` 兜底），`/recordings/<文件名>` 改用 **admin 或短时效签名 URL**（默认 1 小时），关闭"6 位房号可枚举"的弱能力缺口（令牌确保**游客也有**，否则游客字幕归档会静默失效）；**优雅退出**（SIGINT/SIGTERM→关 Worker→关库 checkpoint→退出，幂等 + 5s 保险丝，`TEST_SHUTDOWN_AFTER_MS` 自测钩子）；**证书 SAN 自愈**（缺失/无 SAN/未覆盖当前 IP 都重生成，修手机连不上）；**测试隔离**（账号测试一律 `DB_FILE` 指临时目录，硬断言不碰真实库）+ 修 `test:sfu` 默认带 token 掩盖游客视角的回归；回归：SFU 信令 **149/149**（含房间令牌 15 项）、存储 **49/49**、优雅退出 **9/9**、冒烟 **136/136**、Mesh **36/36**、代理 **16/16**、发布 **30/30**、e2e **15/15** = **合计 440 全绿** |
 
 **下一步方向**（`后续升级方向.md` 是唯一权威）：
 - ✅ **A 档（A1~A7）与 D 档（D1~D6）已全部完成**（2026-09-11，SFU 主版本）；

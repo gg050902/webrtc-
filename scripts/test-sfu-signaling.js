@@ -37,9 +37,34 @@ function cleanupTestDb() {
 }
 process.on('exit', cleanupTestDb);
 
+/* ★ 09-24 C4：房间内令牌（room token）的测试工具。
+ * ▎为什么要读服务器的 SECRET（sfu/data/room-secret）？
+ *   "过期令牌 / 篡改 payload / 签名被改"这三条只靠真实令牌测不出来（真实令牌 24h 才过期）。
+ *   拿到同一把密钥自己造令牌，是**唯一能可靠实测过期与篡改路径**的办法——不必等一天、
+ *   也不必改系统时钟。这是测试对实现的"白盒"依赖，这里如实说明，不假装是纯黑盒。
+ * ▎令牌算法（与 sfu/server.js 的 signRoomToken 完全一致）：
+ *     base64url(JSON.stringify({room,iat,exp})) + "." + base64url(hmacSHA256(payloadB64, SECRET))
+ */
+const cryptoTest = require('crypto');
+const ROOM_SECRET_FILE = nodePath.join(__dirname, '..', 'sfu', 'data', 'room-secret');
+function loadRoomSecret() {
+  try { return fsClean.readFileSync(ROOM_SECRET_FILE, 'utf8').trim(); } catch (e) { return null; }
+}
+const b64url = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+function forgeRoomToken(secret, payloadObj) {
+  const payloadB64 = b64url(JSON.stringify(payloadObj));
+  const sig = cryptoTest.createHmac('sha256', secret).update(payloadB64).digest();
+  return payloadB64 + '.' + b64url(sig);
+}
+function forgeRecordingSig(secret, fileName, exp) {
+  return cryptoTest.createHmac('sha256', secret).update(fileName + '|' + exp).digest('hex');
+}
+
 // ★ 09-24 G8：HTTP 接口已加管理员门禁 —— 本脚本的 HTTP 断言需要带 token。
 //   取 token 的办法：临时库是全新的，所以**第一个注册的账号自动是管理员**（见 sfu/store.js）。
 let adminToken = null;
+// ★ 09-24 C4：房间令牌的密钥（运行期从 sfu/data/room-secret 读入，用来伪造过期/被篡改的令牌）
+let roomSecret = null;
 
 let serverProc = null;
 
@@ -106,6 +131,7 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
 
 (async () => {
   await ensureServer();   // ★ 09-24：一条命令跑完全套，环境差异由脚本自己抹平
+  roomSecret = loadRoomSecret(); // ★ 09-24 C4：读服务器房间令牌密钥（造过期/篡改令牌用）
   // G6：读服务器 token TTL（决定过期路径断言是否实测）
   try {
     const cfgBody = await new Promise((resolve, reject) => {
@@ -142,8 +168,16 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('A 创建房间 ack 应答 { roomNumber }', /^\d{6}$/.test((ack.data || {}).roomNumber || ''));
   const created = await aCreatedP;
   ok('A 收到 room-created（6 位房间号）', /^\d{6}$/.test(created.roomNumber));
-  await aMembersP; // 等 A 进房完成（Router 已建好）
+  const aMembers = await aMembersP; // 等 A 进房完成（Router 已建好）
   const ROOM = created.roomNumber;
+  /* ★ 09-24 C4 断言①：进房载荷里**确实带** roomToken（格式 xxx.yyy、非空）。
+   *   A 全程没注册/没登录 = 游客 → 它的令牌就是"游客自己的房间内令牌"，
+   *   后面游客归档/回读两条正向断言都用它（证明令牌机制没有把游客路径打死）。 */
+  const A_ROOM_TOKEN = (aMembers && aMembers.roomToken) || '';
+  ok('09-24 C4 进房载荷 room-members 带本人 roomToken（游客也有，格式 xxx.yyy）',
+     typeof A_ROOM_TOKEN === 'string' && /^[\w-]+\.[\w-]+$/.test(A_ROOM_TOKEN));
+  ok('09-24 C4 创建房间 ack 也带 roomToken（不依赖是否接住 room-members 事件）',
+     /^[\w-]+\.[\w-]+$/.test(String((ack.data || {}).roomToken || '')));
 
   // --- A 问 Router 能力 ---
   const caps = await request(A.s, 'get-router-rtp-capabilities', {});
@@ -522,32 +556,83 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('09-13 /api/rooms 返回观测快照（成员/媒体/计数/Worker PID 齐全）',
      !!roomSnap && Array.isArray(roomSnap.members) && Array.isArray(roomSnap.media) &&
      !!roomSnap.counts && typeof api.worker.pid === 'number');
+  /* ★ 09-24 C4 断言⑦：roomToken 绝不泄露给"别人"。三处都要查——
+   *   ① 管理员拉的全景快照 /api/rooms 的 JSON 原文里不出现 roomToken；
+   *   ② 全房广播的成员快照 room-state 里每个成员行没有 roomToken 字段；
+   *   ③ room-members 里给新人的 others 列表同样没有（令牌只在"单播给自己"的顶层字段）。 */
+  ok('09-24 C4 /api/rooms 快照里不出现 roomToken（不泄露任何人的令牌）',
+     !/roomToken/.test(apiBody));
+  const leakStateP = waitEvent(A.s, 'room-state');
+  A.s.emit('member-state', { patch: {} }); // 触发一次 room-state 广播（空 patch 也走白名单 + 广播）
+  const leakState = await Promise.race([leakStateP, sleep(1000).then(() => null)]);
+  ok('09-24 C4 room-state 广播的成员列表不含 roomToken',
+     !!leakState && Array.isArray(leakState.members)
+     && leakState.members.every((mm) => !('roomToken' in mm)));
+  ok('09-24 C4 room-members 的 others 成员列表不含 roomToken',
+     !!aMembers && Array.isArray(aMembers.members)
+     && aMembers.members.every((mm) => !('roomToken' in mm)));
   // /dashboard 页面本身**不设门禁**（否则页面都打不开、没法提示"去登录"）——必须保持 200
   ok('09-13 /dashboard 面板页可访问（200，页面本身不设门禁）', (await getCode('/dashboard')) === 200);
 
-  /* ★ 09-24 G8 复审：门禁的**边界**也必须断言。
-   * ▎为什么光测"带 token 能过"不够：那样即使门禁加过头、把游客的字幕归档一并拦死，
-   *   测试依然全绿——这正是第一版的风险（第一版曾给 /api/captions 也加了 requireAdmin，
-   *   而游客根本没有 token，结果是功能静默失效）。
-   * ▎这里正面锁定两类接口的**不同**待遇：该拦的必须拦、该放的必须放。 */
+  /* ★ 09-24 G8 复审 + ★ 09-24 C4 本轮：门禁的**边界**与**新语义**都必须断言。
+   * ▎C4 之前：内容类（captions/minutes/recordings 单文件）是"能力=房间号"→ 不带 token 也 200/404。
+   * ▎C4 之后：内容类一律要"房间内令牌"（或 admin token）——**不带令牌必须 401**。
+   *   注意：这里问的 token 是**管理员 token**；房间内令牌是另一套（见下面第②③④⑤⑥条）。
+   * ▎该拦的必须拦、该放的必须放：观测类仍走 admin；内容类换房间令牌。 */
   ok('09-24 G8 观测类 /api/recordings 不带 token → 401（跨房录像清单属观测信息）',
      (await getCode('/api/recordings')) === 401);
-  ok('09-24 G8 内容类 /api/captions 不带 token → 200（游客的字幕归档不能被门禁误伤）',
-     (await getCode(`/api/captions?room=${ROOM}`)) === 200);
-  ok('09-24 G8 内容类 /api/minutes 不带 token → 200（会议内容，能力=房间号）',
-     (await getCode(`/api/minutes?room=${ROOM}`)) === 200);
-  ok('09-24 G8 内容类 /minutes/<房>/<文件> 不带 token → 404 而非 401（放行到业务层再判存在性）',
-     (await getCode(`/minutes/${ROOM}/nope.md`)) === 404);
-  ok('09-24 G8 内容类 /recordings/<文件> 不带 token → 404 而非 401（单文件靠文件名做能力）',
-     (await getCode('/recordings/nope.webm')) === 404);
+  ok('09-24 C4 内容类 /api/captions 不带任何令牌 → 401（无房间令牌必须被拦）',
+     (await getCode(`/api/captions?room=${ROOM}`)) === 401);
+  ok('09-24 C4 内容类 /api/minutes 不带任何令牌 → 401',
+     (await getCode(`/api/minutes?room=${ROOM}`)) === 401);
+  ok('09-24 C4 内容类 /minutes/<房>/<文件> 不带任何令牌 → 401',
+     (await getCode(`/minutes/${ROOM}/nope.md`)) === 401);
+  ok('09-24 C4 录像 /recordings/<文件> 不带任何令牌 → 401（admin 或签名 URL 才放行）',
+     (await getCode('/recordings/nope.webm')) === 401);
+
+  /* ★ 09-24 C4 断言②③④⑤⑥：房间内令牌的正/反向用例。
+   *   OTHER_ROOM = 与本房不同的另一个 6 位号（守住"令牌只对签发它的房间有效"）。 */
+  const OTHER_ROOM = String((Number(ROOM) + 1) % 1000000).padStart(6, '0');
+  ok('09-24 C4 带 X-Room-Token 可过门禁（/api/captions?room=<本房> → 200）',
+     (await getCode(`/api/captions?room=${ROOM}`, { 'X-Room-Token': A_ROOM_TOKEN })) === 200);
+  ok('09-24 C4 跨房不行：拿 A 房令牌请求 B 房 captions → 401（令牌只对签发房间有效）',
+     (await getCode(`/api/captions?room=${OTHER_ROOM}`, { 'X-Room-Token': A_ROOM_TOKEN })) === 401);
+  {
+    // 断言④：把签名**第一段的首字符**改掉（首字符 6 bit 全用，必然改变字节，不会撞上 base64 尾部的填充位）
+    const dot = A_ROOM_TOKEN.indexOf('.');
+    const sigPart = A_ROOM_TOKEN.slice(dot + 1);
+    const tamperedSig = A_ROOM_TOKEN.slice(0, dot + 1)
+      + (sigPart[0] === 'A' ? 'B' : 'A') + sigPart.slice(1);
+    ok('09-24 C4 签名被篡改（改 sig 首字符）→ 401',
+       (await getCode(`/api/captions?room=${ROOM}`, { 'X-Room-Token': tamperedSig })) === 401);
+    // 断言⑥：payload 段换成"另一个房间的 payload"，但沿用原签名 → HMAC 对不上 → 401
+    const otherPayload = b64url(JSON.stringify({ room: OTHER_ROOM, iat: Date.now(), exp: Date.now() + 3600000 }));
+    const swapped = otherPayload + '.' + A_ROOM_TOKEN.slice(dot + 1);
+    ok('09-24 C4 payload 被篡改（换房间号 payload、沿用原签名）→ 401',
+       (await getCode(`/api/captions?room=${OTHER_ROOM}`, { 'X-Room-Token': swapped })) === 401);
+  }
+  // 断言⑤：过期令牌。用服务器 SECRET 现造一张 exp 在过去的令牌（比"等 24 小时"可靠）。
+  if (roomSecret) {
+    const expiredTok = forgeRoomToken(roomSecret, { room: ROOM, iat: Date.now() - 2000, exp: Date.now() - 1000 });
+    ok('09-24 C4 过期令牌被拒（exp 在过去 → 401，实测过期路径而非恒真）',
+       (await getCode(`/api/captions?room=${ROOM}`, { 'X-Room-Token': expiredTok })) === 401);
+  } else {
+    console.log('  SKIP  09-24 C4 过期令牌被拒（读不到 sfu/data/room-secret，无法可靠造过期令牌；'
+      + '不硬写可能恒真的断言）');
+  }
+  // 断言：查询串兜底（AI 纪要链接是 <a href>，发不出请求头，只能走 ?roomToken=）
+  ok('09-24 C4 ?roomToken= 查询串兜底可过（AI「打开纪要」链接走的就是这条）',
+     (await getCode(`/api/minutes?room=${ROOM}&roomToken=${encodeURIComponent(A_ROOM_TOKEN)}`)) === 200);
 
   // --- ★ 09-17e：/api/captions 过夜值守归档（HTTP 层：落盘 / 回读 / 坏输入拒绝）---
   // （注意：本文件顶部 const URL='http://localhost:3001' 遮蔽了全局 URL 构造器，
   //   所以这里用手写正则拆 URL，别用 new URL(...)）
   /* ★ 09-24 G8 复审：默认带管理员 token（/metrics、/api/rooms 要它），
    *   但加一个 noAuth 开关——用来**扮演游客**（无 token）验证"内容类接口没被门禁误伤"。
-   *   没有这个开关，全套断言都在管理员身份下跑，恰好会漏掉游客视角的回归。 */
-  const httpReq = (method, url, body, noAuth) => new Promise((resolve, reject) => {
+   *   没有这个开关，全套断言都在管理员身份下跑，恰好会漏掉游客视角的回归。
+   * ★ 09-24 C4：再加一个 extraHeaders 口子——房间内令牌走 X-Room-Token 请求头，
+   *   没有它就没法扮演"持房间令牌但无管理员 token"的游客。 */
+  const httpReq = (method, url, body, noAuth, extraHeaders) => new Promise((resolve, reject) => {
     const m = String(url).match(/^http:\/\/([^:/]+):(\d+)(\/[^?]*)?(\?.*)?$/);
     if (!m) return reject(new Error('bad url: ' + url));
     const rq = http.request({
@@ -555,6 +640,7 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
       headers: {
         ...(body ? { 'Content-Type': 'application/json' } : {}),
         ...(!noAuth && adminToken ? { Authorization: 'Bearer ' + adminToken } : {}),
+        ...(extraHeaders || {}), // ★ C4：自定义头（如 X-Room-Token）最后合并，调用方可覆盖
       },
     }, (r) => {
       let b = '';
@@ -572,14 +658,16 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('09-17e GET format=txt 回读全档（含刚归档的条目）', capTxt.code === 200 && capTxt.text.includes('归档对账第 3 条'));
   const capJson = await httpReq('GET', `http://localhost:3001/api/captions?room=${ROOM}&format=json`);
   ok('09-17e GET format=json 回读结构化全档（≥3 条）', capJson.code === 200 && JSON.parse(capJson.text).length >= 3);
-  /* ★ 09-24 G8 复审：**游客视角**的端到端回归 —— 不带 token 也能归档 + 回读。
-   *   这是本轮最容易被踩坏的一条：给内容类接口加 admin 门禁，会让游客的自动归档
-   *   （client.js 的 capSentryFlush）静默失败——用户只看到"导出少了历史段"，不知为何。 */
+  /* ★ 09-24 C4 本轮最重要的正向回归：把"游客"从"无 token"改成"**带游客自己的房间内令牌**"。
+   *   意义：证明房间令牌门禁没有把游客路径打死——A 就是未登录的游客，它的 roomToken 就是
+   *   "游客自己的房间内令牌"。noAuth=true 确保**不带管理员 token**，能力完全来自 X-Room-Token。 */
   const capGuest = await httpReq('POST', 'http://localhost:3001/api/captions',
-    { room: ROOM, entries: [{ ts: Date.now(), from: 'guest-test', name: '游客', text: '游客归档回归' }] }, true);
-  ok('09-24 G8 游客（无 token）POST /api/captions 归档成功', capGuest.code === 200 && JSON.parse(capGuest.text).saved === 1);
-  const capGuestRead = await httpReq('GET', `http://localhost:3001/api/captions?room=${ROOM}&format=txt`, null, true);
-  ok('09-24 G8 游客（无 token）GET 回读得到自己刚归档的那条',
+    { room: ROOM, entries: [{ ts: Date.now(), from: 'guest-test', name: '游客', text: '游客归档回归' }] },
+    true, { 'X-Room-Token': A_ROOM_TOKEN });
+  ok('09-24 C4 游客凭房间内令牌可归档并回读：POST /api/captions 成功', capGuest.code === 200 && JSON.parse(capGuest.text).saved === 1);
+  const capGuestRead = await httpReq('GET', `http://localhost:3001/api/captions?room=${ROOM}&format=txt`,
+    null, true, { 'X-Room-Token': A_ROOM_TOKEN });
+  ok('09-24 C4 游客凭房间内令牌可归档并回读：GET 回读得到自己刚归档的那条',
      capGuestRead.code === 200 && capGuestRead.text.includes('游客归档回归'));
   const capBad = await httpReq('POST', 'http://localhost:3001/api/captions', { room: '../../etc', entries: capEntries });
   ok('09-17e 非法房间号被拒（400，路径穿越进不来）', capBad.code === 400);
@@ -695,6 +783,28 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('09-19c /minutes 路径穿越被钳制（403/404，绝不定成功）', minBad.code === 403 || minBad.code === 404);
   const recList = await httpReq('GET', 'http://localhost:3001/api/recordings');
   ok('09-19c G3 /api/recordings 列表可用（200 数组）', recList.code === 200 && Array.isArray(JSON.parse(recList.text)));
+  /* ★ 09-24 C4 断言⑧：录像签名 URL —— /recordings/<文件> 现在是"admin 或短时效签名 URL"。
+   * ▎重点：**必须分清 401 与 404**（这是权限 vs 业务存在性两件事）：
+   *     签名/管理员不过 → 401；签名通过但文件不存在 → 404。
+   *   为了不往真实 recordings/ 目录塞假文件，用"签名有效 + 文件名不存在"断言 404——
+   *   恰好证明"签名过了才走到业务层"。混成一条就分不清"没权限"和"文件被删/还没生成"。 */
+  const REC_NAME = 'signed-test-nonexistent.webm';
+  if (roomSecret) {
+    const goodExp = Date.now() + 3600000;
+    const goodSig = forgeRecordingSig(roomSecret, REC_NAME, goodExp);
+    ok('09-24 C4 录像：签名通过的链接放行到业务层（文件不存在 → 404，而非 401）',
+       (await getCode(`/recordings/${REC_NAME}?exp=${goodExp}&sig=${goodSig}`)) === 404);
+    ok('09-24 C4 录像：exp 改成过期值 → 401',
+       (await getCode(`/recordings/${REC_NAME}?exp=${Date.now() - 1000}&sig=${goodSig}`)) === 401);
+    const badSig = (goodSig[0] === 'a' ? 'b' : 'a') + goodSig.slice(1);
+    ok('09-24 C4 录像：sig 改一个字符 → 401',
+       (await getCode(`/recordings/${REC_NAME}?exp=${goodExp}&sig=${badSig}`)) === 401);
+    // 管理员不受签名限制（不签名也过门禁；404 = 过了门禁、只是文件不存在）
+    ok('09-24 C4 录像：管理员 token 不受签名限制（不签名也过门禁 → 404）',
+       (await getCode(`/recordings/${REC_NAME}`, { Authorization: 'Bearer ' + adminToken })) === 404);
+  } else {
+    console.log('  SKIP  09-24 C4 录像签名 URL 四条（读不到 sfu/data/room-secret，无法可靠造签名）');
+  }
 
   // --- ★ 09-19h：G6 安全加固（滑动续期 / 聊天限流 / 过期路径）---
   let g6Tok = null;

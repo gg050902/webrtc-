@@ -32,6 +32,15 @@
     }
   ],
   "roomTtlSec": 60,
+  // ★ 09-24 C4 房间内令牌（room token）：会议内容接口（/api/captions、/api/minutes、/minutes/*）
+  //   的门禁开关。默认 true（安全默认值）：进房时给每个成员（含游客）发一张只对本房间有效的
+  //   签名令牌，读内容要带它。设成 false 则退回旧行为（这些接口开放）——仅供本地调试/教学对比，
+  //   公网部署**不要**关。
+  "roomTokenRequired": true,
+  // 房间内令牌有效期（秒），默认 86400 = 24 小时。无状态令牌：服务器重启后依然有效
+  //   （不存内存），但无法单独吊销——换掉 sfu/data/room-secret 会让所有已签发令牌立即失效。
+  // 环境变量 ROOM_TOKEN_TTL_SEC 优先级更高（信令测试用它造"已过期"的令牌，传 -1）。
+  "roomTokenTtlSec": 86400,
   "videoSvc": false,
   "https": {
     "enabled": true,

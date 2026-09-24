@@ -495,7 +495,7 @@
 > 导读 LEARN.md **5.28**；⚠️ 待人工验证：真浏览器打字机观感、跨机画面（announcedIp 自动纠偏后）、
 > 纪要质量（真开会 10 分钟）、操作员演示（有 key 后走 LLM 计划而非 Mock 脚本）。
 >
-> **09-24 账号上真数据库 + 门禁边界修正 + 优雅退出（本次只改文档、不动代码）**——
+> **09-24 账号上真数据库 + 门禁边界修正 + 房间内令牌 + 优雅退出（代码已落地，本次为文档同步）**——
 > ① **存储层：Node 内置 `node:sqlite`（零新依赖）**：新增 `sfu/store.js` 取代 `sfu/users.json`——
 >   库文件优先级 `DB_FILE` 环境变量 > `config.json` 的 `dbFile` > 默认 `sfu/data/meeting.db`；
 >   `PRAGMA journal_mode = WAL`（读不挡写、写不挡读）；两张表 `users(username PK, salt, hash, display_name,
@@ -516,13 +516,11 @@
 >   **提权后需重新登录**新 token 才是 admin（换来 HTTP 门禁"零数据库查询"）。
 > ④ **★ HTTP 门禁边界（本轮最重要的修正）**：接口分两类——
 >   **甲类·观测**（`/api/rooms`、`/metrics`、`/api/recordings`）上 `requireAdmin`；
->   **乙类·内容**（`/api/captions`、`/api/minutes`、`/minutes/<6位房>/<文件>.md`、`/recordings/<文件名>`）
->   **刻意开放**（能力 = 房间号/文件名）。理由：本产品允许**游客进会**，而字幕归档由 `client.js` **自动**调用
->   （游客没 token）——若给乙类加门禁，游客的字幕归档会**静默失效**（功能坏了却只在控制台留一行日志）；
->   **第一版曾误加门禁，复核时发现这条已回退**。一句话：**安全不靠"拦所有人"，靠"能力（房间号）只发给在场的人"**。
->   token 取法：`Authorization: Bearer <token>`（首选）/ `?token=<token>`（浏览器地址栏、`<video src>` 兜底，
->   代价是进 URL 历史与访问日志）。残余风险（诚实交代）：6 位房间号可枚举（10^6）、录像文件名含毫秒时间戳
->   属**弱能力**；生产做法 = join 下发房间内令牌 + 录像短时效签名 URL，本教学版未实现。
+>   **乙类·内容**（`/api/captions`、`/api/minutes`、`/minutes/<6位房>/<文件>.md`）**不加 admin 门禁**——
+>   理由：本产品允许**游客进会**，而字幕归档由 `client.js` **自动**调用（游客没 token）——
+>   若给乙类加 admin 门禁，游客的字幕归档会**静默失效**（功能坏了却只在控制台留一行日志）；
+>   **第一版曾误加门禁，复核时发现这条已回退**。token 取法：`Authorization: Bearer <token>`（首选）/
+>   `?token=<token>`（浏览器地址栏、`<video src>` 兜底，代价是进 URL 历史与访问日志）。
 >   `/dashboard` 页本身不设门禁（否则页面都打不开、没法提示去登录），它调的 `/api/rooms` 才受门禁。
 > ⑤ **自签证书 SAN 自愈**：浏览器早已不看 CN（RFC 6125），自签必须带 SAN——改为"**证书缺失 / 无 SAN /
 >   SAN 未覆盖当前局域网 IP**"三种都重新生成（修 DHCP IP 漂移导致"只判有没有 SAN 就永不重签"），
@@ -540,10 +538,37 @@
 >   **绝不碰真实库**（`test-store` 有硬断言自证：真实 `sfu/users.json` 逐字节一致、`sfu/data/` 下没建库）；
 >   根因是此前测试直接往真实 `users.json` 注册账号、累积了 61 个垃圾账号；注册限流也挪到**写库之前**；
 >   另修 `test-sfu-signaling.js` 的 `httpReq` 默认带管理员 token、会掩盖"游客视角"回归的问题，加 `noAuth` 开关。
-> **回归（2026-09-24 实测，全绿 = 425 项）**：`test:store` **49/49**（36→49）、`test:shutdown` **9/9**（新增）、
->   `test:sfu` **134/134**（127→134，新增门禁**边界**断言，含"游客无 token 也能归档字幕"端到端回归）、
+> ⑧ **★ 房间内令牌 + 录像签名 URL（关闭"房间号可枚举"的弱能力缺口）**：④ 把乙类留在"能力 = 房间号"上，
+>   而 6 位房号可枚举（10^6）——本轮补上**无状态 HMAC 房间令牌**给"在场的人"兜底，乙类不再裸奔。
+>   · **令牌格式** `base64url(JSON{room,iat,exp}) + "." + base64url(hmacSHA256(payloadB64, SECRET))`；
+>   `SECRET` = 32 字节随机 hex，持久化 `sfu/data/room-secret`（已 gitignore），首次运行自动生成、之后复用；
+>   校验 `timingSafeEqual` + 未过期 + **room 与请求房号一致（跨房 401）**，任何异常 fail-closed。
+>   · **为什么无状态**：令牌若存服务器内存 Map，服务器一重启（房间是内存结构、重启即没）→ 过夜值守攒下的
+>   归档**早上就读不出来**；无状态令牌重启后依然有效。
+>   · **TTL** 默认 **86400s/24h**（`config.json` 的 `roomTokenTtlSec`，env `ROOM_TOKEN_TTL_SEC` 优先）。
+>   · **签发时机**：进房成功发给**本人**（`create-room`/`join-room`/`agent-hello` 的 ack +
+>   该 socket 收到的 `room-members` 顶层字段）；**游客也有令牌**（否则游客字幕归档又静默失效）。
+>   令牌存 **`socket.roomToken`**（**不挂成员对象**），`room-members`/`room-state` 成员列表均为**显式投影**
+>   （逐字段写、非 `{...m}` 展开）、`/api/rooms` 快照亦无令牌——**结构上就放不进去，绝不广播他人令牌**。
+>   · **门禁** `requireRoomAccess(req,res,room)`：① admin token（跨房巡检）或 ② 该房有效令牌；
+>   令牌取法 `X-Room-Token` 头（首选）/ `?roomToken=` 兜底（`<a href>` 发不出自定义头），401 返回可读 HTML。
+>   应用 `/api/captions`(GET+POST)、`/api/minutes`、`/minutes/*`；**甲类不变**。逃逸开关 `roomTokenRequired`
+>   默认 `true`（设 `false` 退回旧的"开放"行为，供教学/调试）。
+>   · **录像短时效签名 URL**：`/recordings/<文件名>` 改为 admin 或签名链接
+>   `signRecordingUrl(fileName, ttlMs=3600000)` → `?exp=&sig=`（默认 **1 小时**），录制停止 ack 回 `url`
+>   （**非管理员也能拿到自己的产物**）；**明确区分 401（没权限/签名错/过期）与 404（签名过了但文件不存在）**。
+>   · **前端配套**：`client.js` 存 `myRoomToken`（`room-members` 存、离房清空）、三处 captions 请求带
+>   `X-Room-Token`、AI 气泡「📄 打开纪要」链接带 `?roomToken=`。
+>   · **诚实边界**：令牌是 **Bearer 语义**（不绑成员/IP）、24h 内泄露即可用；录像签名同理（1 小时窗口）；
+>   两者**共用同一把 SECRET**（格式不同、实际不混淆，但严格说少了 domain separation）；
+>   换掉 `room-secret` 会让**所有**已签发令牌与录像签名链接立即失效；`chmod 600` 在 **Windows 不生效**
+>   （实际 `-rw-r--r--`，需靠目录 ACL）。
+> **回归（2026-09-24 实测，全绿 = 440 项）**：`test:store` **49/49**（36→49）、`test:shutdown` **9/9**（新增）、
+>   `test:sfu` **149/149**（134→149，新增门禁**边界** + **房间令牌**断言：无令牌→401 / 带令牌→200 /
+>   跨房→401 / 签名篡改→401 / payload 篡改→401 / 过期→401 / 游客凭令牌可归档并回读正向回归 /
+>   `/api/rooms`·`room-state`·`room-members` 三处不含他人令牌的泄露检查 / 录像 401 与 404 区分）、
 >   `npm test`（Mesh）**36/36**、`test:smoke` **136/136**、`test:agent` **16/16**、`test:publish` **30/30**、
->   `test:e2e` **15/15**（退出码 0）；合计 **425**。导读新增 `LEARN.md` **5.33~5.37**。
+>   `test:e2e` **15/15**（退出码 0）；合计 **440**。导读新增 `LEARN.md` **5.33~5.38**。
 >
 > **09-23 G4 移动端/PWA ✅ + 毕设题目定名（"按后续升级方向升级 SFU 版"）**——
 > ① **题目定名**：《基于 WebRTC 与 Mediasoup 的智能多人视频会议系统》（README 头部；
@@ -721,7 +746,7 @@ npm run start:demo     # 一键起两版（Mesh 3000 + SFU 3001）并打印地�
 npm run start:lan      # 局域网交付：探 IP → 生成 sfu/config.json（HTTPS 自签+announcedIp+TURN）→ 放行防火墙
 npm run build:sfu-vendor  # 一次性：打包 mediasoup-client → sfu/public/vendor/（改依赖后重跑）
 npm test               # Mesh 版信令回归（必须先起 3000）★ 2026-09-24 实测 36/36
-npm run test:sfu       # SFU 版信令回归（必须先起 3001，且 AI_OP_STEP_MS=20）★ 2026-09-24 实测 134/134（Mock 轨 / LLM 轨各跑一遍；含门禁边界断言）
+npm run test:sfu       # SFU 版信令回归（必须先起 3001，且 AI_OP_STEP_MS=20）★ 2026-09-24 实测 149/149（Mock 轨 / LLM 轨各跑一遍；含门禁边界 + 房间令牌断言）
 npm run test:store     # ★ 09-24 账号存储层回归（node:sqlite：迁移保留 salt/hash / 改密换盐 / 删号安全闸 / 完整性）★ 49/49
 npm run test:shutdown  # ★ 09-24 优雅退出回归（关 Worker / 关库 WAL checkpoint / 幂等 / 5s 保险丝）★ 9/9
 npm run test:smoke     # SFU 版**前端**无头冒烟（假 DOM/假 mediasoup，零依赖不用起服务器）★ 2026-09-24 实测 136/136
@@ -741,7 +766,7 @@ npm run publish:mesh   # ★ 09-24b 一键发布 Mesh 版（生成 publish-mesh/
 npm run test:publish   # ★ 09-24b 发布链回归（含 --check 过期闸：源码改了不重发必报错）★ 2026-09-24 实测 30/30
 node --check public/client.js && node --check server.js      # 改完 Mesh 版 JS 查语法
 node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU 版 JS 查语法
-# ★ 09-24 全部回归合计 425 项全绿：SFU 134 + 存储 49 + 优雅退出 9 + 冒烟 136 + Mesh 36 + 代理 16 + 发布 30 + e2e 15
+# ★ 09-24 全部回归合计 440 项全绿：SFU 149 + 存储 49 + 优雅退出 9 + 冒烟 136 + Mesh 36 + 代理 16 + 发布 30 + e2e 15
 ```
 
 - ✅ **`npm run doctor`**：环境自检（17 项 / 4 组：环境·配置·端口·跨网 ICE），失败项都给"怎么修"；`node scripts/doctor.js --json` 出结构化结果。换机器 / 交付前先跑一遍。

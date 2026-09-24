@@ -113,17 +113,19 @@ const MIME = {
  *     /metrics       上面那堆的 Prometheus 文本版    → requireAdmin
  *     /api/recordings 全服务器录像清单（跨房枚举）    → requireAdmin
  *
- *   【乙类·内容】单场会议的产物，**能力 = 房间号/文件名**（知道标识符才拿得到）。
- *     这类**必须对非管理员开放**，否则功能就坏了：
- *     /api/captions  字幕归档——client.js 自动 POST，游客也在用 → 开放
- *     /api/minutes、/minutes/<房>/<文件>  纪要列表与正文      → 开放（AI 气泡里点的链接）
- *     /recordings/<文件名>  单个录像文件                      → 开放（列表已拦，单文件靠文件名）
+ *   【乙类·内容】单场会议的产物，**能力 = 房间内令牌 / 短时效签名 URL**
+ *     （★ 09-24 C4 本轮补齐：见下面 requireRoomAccess 与 signRecordingUrl）：
+ *     /api/captions  字幕归档——client.js 自动 POST，游客也在用 → requireRoomAccess
+ *     /api/minutes、/minutes/<房>/<文件>  纪要列表与正文      → requireRoomAccess
+ *     /recordings/<文件名>  单个录像文件                      → admin 或签名 URL
  *   ▎核心理由一句话：**本产品允许游客进会**（登录卡有「游客进入」）。给乙类加 admin
  *     门禁 = 游客的字幕归档静默失效，功能坏了还不报错——这比"少一层鉴权"更糟。
- *     安全不靠"拦所有人"，靠"能力（房间号）只发给在场的人"。
- *   ▎残余风险（诚实交代，已写进《项目说明》局限一节）：房间号 10^6 可枚举、
- *     录像文件名的时间戳可估，故乙类属**弱能力**。生产做法：join 时下发房间内令牌
- *     + 录像用短时效签名 URL。本教学版未实现，不假装已实现。
+ *     所以门禁不靠"登录"，靠**进房时给每个成员（含游客）发一张房间内令牌**。
+ *   ▎回填历史缺口（为什么本轮要做）：C4 之前乙类只靠"能力 = 6 位房间号"，
+ *     而房间号空间只有 10^6、可被暴力枚举，属**弱能力**——知道房号就能读别人的会议记录。
+ *     本轮补上房间内令牌（无状态 HMAC）+ 录像签名 URL，把"知道房号"与"能读内容"解耦。
+ *   ▎诚实边界（不吹成完美方案）：房间令牌是 **Bearer 语义**（拿到即用，不绑定成员身份/IP）、
+ *     TTL 默认 24h；换掉 SECRET 会让所有已签发令牌立即失效。详见 requireRoomAccess 注释。
  *
  * ▎token 从哪取（两种都支持，各有各的场景）：
  *   ① Authorization: Bearer <token> —— 首选。脚本 / Prometheus / curl 的标准姿势。
@@ -178,6 +180,100 @@ function requireAdmin(req, res) {
   return { ok: true, username: v.username };
 }
 
+/* ★ 09-24 C4（本轮）：房间内令牌门禁 —— requireRoomAccess（与上面 requireAdmin 并列的第二种门禁）
+ *
+ * ▎要解决什么（上一轮复审留下的缺口）：/api/captions、/api/minutes、/minutes/* 这些
+ *   "会议内容"接口此前只靠"能力 = 6 位房间号"，而房间号空间只有 10^6、可被暴力枚举——
+ *   知道房号就能读别人的字幕/纪要，属**弱能力**。本轮给它补一张"进房时才发的令牌"。
+ *
+ * ▎为什么是"房间内令牌"而不是"要求登录"？（这是上一轮踩过的坑，绝不能违反）
+ *   本产品**允许游客进会**（登录卡上的「游客进入」按钮，client.js 的 authGuestBtn），
+ *   游客没有登录 token；而 /api/captions 是浏览器端 client.js **自动**调用的
+ *   （capSentryFlush POST 归档、导出/日报 GET 回读）。所以令牌必须在**进房那一刻
+ *   发给每一个成员（含游客）**，否则游客的字幕归档会静默失效——功能坏了却不报错。
+ *
+ * ▎放行条件（满足其一即可）：
+ *   ① 带**管理员 token**（requireAdmin 那套，Authorization: Bearer 或 ?token=）——
+ *      admin 不受房间限制，跨房巡检/排障都要它；
+ *   ② 带**有效的房间内令牌**，且该令牌的 room 与请求的房间号一致（跨房必须 401）。
+ * ▎令牌两种取法（与现有 admin token 风格保持一致）：
+ *   · X-Room-Token: <token>  请求头（首选，干净、不进 URL 历史/日志）
+ *   · ?roomToken=<token>     查询串兜底——因为 <a href="/minutes/..."> 这类"导航链接"
+ *     发不出自定义请求头（AI 气泡里「📄 打开纪要」就是这种链接，只能走查询串）。
+ *
+ * ▎返回值：{ ok: true, via } 或 { ok: false }（后者已把 401 写回响应），
+ *   调用方一律写成 `if (!requireRoomAccess(req, res, 房间号).ok) return;`——
+ *   与 requireAdmin 同一约定："门禁 = 写响应 + 返回状态"，比"返回布尔让调用方自己写 401"更难漏。
+ *
+ * ▎诚实边界（答辩会被问，先讲清楚）：
+ *   · 房间令牌是 **Bearer 语义**：拿到令牌的任何人都能用，不绑定成员身份/IP（教学取舍）；
+ *   · TTL 默认 24h，期间一直有效（无状态令牌无法单独吊销，只能等过期或轮换 SECRET）；
+ *   · SECRET 轮换 = 所有已签发令牌立即失效（对过夜值守的归档是"要重新进房拿新令牌"）。
+ *   这些都能写成"更进一步"的扩展点，但本教学版如实停在这里，不假装是终端方案。
+ */
+function extractRoomToken(req) {
+  // ① 请求头（首选）：Node 把请求头名一律小写，这里两种写法都兜一下，避免踩大小写坑
+  const h = req.headers && (req.headers['x-room-token'] || req.headers['X-Room-Token']);
+  if (typeof h === 'string' && h.trim()) return h.trim();
+  // ② 查询串兜底（导航链接用）
+  try {
+    const t = new URL(req.url, 'http://localhost').searchParams.get('roomToken');
+    return t || null;
+  } catch (e) { return null; }
+}
+function roomGateHtml(reason) {
+  // 401 页面给人看，所以是 HTML 而不是 JSON（浏览器直接打开 /minutes/... 时能看懂）
+  // 风格照抄上面 adminGateHtml——两种门禁的 401 长得一致，用户不会以为是两个系统。
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>401 需要房间内令牌</title></head>
+<body style="font-family:system-ui,'Microsoft YaHei',sans-serif;background:#14100a;color:#ece5d8;padding:40px;line-height:1.7">
+  <h1>🔑 401 需要房间内令牌</h1>
+  <p>${reason || '这是会议内容接口，需要房间内令牌。'}</p>
+  <p>房间内令牌在你**进入房间时自动获取**（每场会一张，只对本房间有效，游客也有）——
+     请回到会议页重新进入房间，再点这个链接。</p>
+  <p>带令牌的两种方式：</p>
+  <ul>
+    <li><code>X-Room-Token: &lt;roomToken&gt;</code>（脚本 / fetch 首选）</li>
+    <li><code>?roomToken=&lt;roomToken&gt;</code>（浏览器直接打开 / 导航链接的兜底，URL 会进历史，尽量少用）</li>
+  </ul>
+  <p>管理员不受房间限制：改用管理员 token（<code>Authorization: Bearer</code> 或 <code>?token=</code>）即可跨房访问。</p>
+  <p><a href="/" style="color:#d8b36a">← 回会议页登录/进会</a></p>
+</body></html>`;
+}
+function recordingGateHtml() {
+  // 录像门禁的 401 页面：管理员可以直接带 token；非管理员需要"签名 URL"（录制停止时前端会给）
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>401 需要管理员或签名链接</title></head>
+<body style="font-family:system-ui,'Microsoft YaHei',sans-serif;background:#14100a;color:#ece5d8;padding:40px;line-height:1.7">
+  <h1>🎬 401 录制文件需要管理员或签名链接</h1>
+  <p>服务器上的录制文件不再"知道文件名就能下"，需要**短时效签名链接**（录制停止时自动给出，默认 1 小时有效）。</p>
+  <p>带令牌的两种方式：</p>
+  <ul>
+    <li>管理员：<code>Authorization: Bearer &lt;admin token&gt;</code> 或 <code>?token=&lt;admin token&gt;</code></li>
+    <li>录制者：用录制结束时拿到的签名链接（形如 <code>/recordings/xxx.webm?exp=…&amp;sig=…</code>）</li>
+  </ul>
+  <p>签名过了但文件不存在会返回 404（两者是两件事：401 = 没权限，404 = 文件不在）。</p>
+  <p><a href="/recordings" style="color:#d8b36a">← 回录像列表（需管理员）</a></p>
+</body></html>`;
+}
+function requireRoomAccess(req, res, room) {
+  // ★ 逃逸开关（教学/调试）：roomTokenRequired === false → 退回"开放"旧行为。
+  //   用途：本地调试接口、或做"关掉门禁前后对比"的教学演示。默认 true（安全默认值）。
+  if (CONFIG.roomTokenRequired === false) return { ok: true, via: 'disabled' };
+  // ① 管理员 token：不受房间限制（跨房巡检/排障）。走与 requireAdmin 完全相同的取法。
+  const v = verifyToken(extractAuthToken(req));
+  if (v && v.role === 'admin') return { ok: true, via: 'admin', username: v.username };
+  // ② 房间内令牌：签名有效、未过期、且**房间号一致**（令牌只对签发它的房间有效）。
+  //    room 为空/不是 6 位也没关系：verifyRoomToken 里 String(room) 比对自然不通过。
+  if (verifyRoomToken(extractRoomToken(req), room)) return { ok: true, via: 'room' };
+  res.writeHead(401, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+  });
+  res.end(roomGateHtml(v ? '当前账号不是管理员（role=' + v.role + '），且未提供本房间的令牌。' : '缺少或无效的房间内令牌。'));
+  return { ok: false };
+}
+
 /* 请求处理器（命名函数）：HTTP 和 HTTPS 两个服务器共用同一份逻辑 */
 async function requestHandler(req, res) {
   // ★ 坑 15（Mesh 版当年踩过，SFU 复制时漏带了）：req.url 会带 "?room=xxx" 查询串，
@@ -201,21 +297,22 @@ async function requestHandler(req, res) {
 
   // ★ 09-17e 值守归档（C3-N1）：字幕账本的服务器权威副本——POST=追加，GET=回读全档
   if (pathname === '/api/captions') {
-    /* ★ 09-24 G8 复审修订：**这里刻意不加 admin 门禁** —— 它属"会议内容"类，不是"观测"类。
-     * ▎为什么：本接口由浏览器端 client.js **自动**调用（内存溢出时归档 POST、导出/日报回读 GET），
-     *   而本产品**允许游客模式进会**（登录卡上的「游客进入」，authGuestBtn），游客根本没有 token。
-     *   若在此加 requireAdmin，字幕归档会对所有非管理员**静默失效**——功能坏了却只在控制台
-     *   留一行日志，比直接报错更难发现。第一版曾在此加门禁，正是复核时发现这条而回退。
-     * ▎那靠什么保护：**能力 = 房间号**。6 位房间号本身就是这场会的暗号，
-     *   知道房号才能读写这场会的字幕——与"能进这场会"是同一道门，没有降低安全等级。
-     * ▎诚实边界（已写进《项目说明-发给老师.md》的局限一节）：房间号可被暴力枚举（10^6），
-     *   因此字幕对"知道房号的人"不设机密。生产做法是给每个成员发房间内令牌（join 时下发、
-     *   captions/minutes 校验），本教学版未实现。 */
+    /* ★ 09-24 G8 复审修订 + ★ 09-24 C4 本轮补齐：这里**不加 admin 门禁**，改加**房间内令牌门禁** ——
+     *   它属"会议内容"类，不是"观测"类。
+     * ▎为什么不能加 requireAdmin：本接口由浏览器端 client.js **自动**调用（内存溢出时归档 POST、
+     *   导出/日报回读 GET），而本产品**允许游客模式进会**（登录卡上的「游客进入」，authGuestBtn），
+     *   游客根本没有登录 token。若加 requireAdmin，字幕归档会对所有非管理员**静默失效**。
+     * ▎那靠什么保护：**房间内令牌**——进房成功时发给每个成员（含游客）一张只对本房间有效的
+     *   HMAC 签名令牌。GET 走查询串的 room，POST 的 room 在 body 里（读出来后再判，见 handleApiCaptions）。
+     * ▎诚实边界：令牌是 Bearer 语义、TTL 24h，SECRET 轮换会让所有已签发令牌失效。 */
     if (req.method === 'POST') {
+      // POST 的房间号在 JSON body 里，门禁放到 handleApiCaptions 读完 body 之后判（见那里）
       handleApiCaptions(req, res);
     } else {
       const q = new URL(req.url, 'http://localhost').searchParams;
-      handleCaptionRead(res, String(q.get('room') || ''), q.get('format') || 'txt');
+      const room = String(q.get('room') || '');
+      if (!requireRoomAccess(req, res, room).ok) return;
+      handleCaptionRead(res, room, q.get('format') || 'txt');
     }
     return;
   }
@@ -252,9 +349,10 @@ async function requestHandler(req, res) {
 
   // ★ 09-19c N2：纪要列表 + 纪要下载（房间号 6 位白名单 + 文件名白名单，路径穿越进不来）
   if (pathname === '/api/minutes') {
-    // ★ 09-24 G8 复审修订：归"会议内容"类，能力=房间号 → 不加 admin 门禁（理由同 /api/captions）
+    // ★ 09-24 G8 复审修订 + ★ 09-24 C4：归"会议内容"类 → **房间内令牌**门禁（理由同 /api/captions）
     const q = new URL(req.url, 'http://localhost').searchParams;
     const room = String(q.get('room') || '');
+    if (!requireRoomAccess(req, res, room).ok) return;
     if (!/^\d{6}$/.test(room)) {
       res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('房间号必须是 6 位数字');
@@ -272,12 +370,14 @@ async function requestHandler(req, res) {
     return;
   }
   if (pathname.startsWith('/minutes/')) {
-    // ★ 09-24 G8 复审修订：纪要正文 = 会议内容类（房间号 6 位白名单 + 文件名白名单已防穿越），不加 admin 门禁。
-    //   这是 AI 助理气泡里「📄 打开纪要」的落点——普通参会者和游客都要能点开。
-    // /minutes/<6位房间>/<文件名>.md —— 两段白名单钳住路径穿越
+    // ★ 09-24 G8 复审修订 + ★ 09-24 C4：纪要正文 = 会议内容类 → **房间内令牌**门禁。
+    //   这是 AI 助理气泡里「📄 打开纪要」的落点——普通参会者和游客都要能点开（client.js 会给
+    //   href 补 ?roomToken=，因为导航链接发不出自定义请求头）。
+    // /minutes/<6位房间>/<文件名>.md —— 两段白名单钳住路径穿越（门禁在前，白名单在后）
     const parts = pathname.split('/').filter(Boolean); // ['minutes', room, file]
     const room = parts[1] || '';
     const file = parts[2] || '';
+    if (!requireRoomAccess(req, res, room).ok) return;
     if (!/^\d{6}$/.test(room) || !/^\w[\w.-]*\.md$/.test(file) || file.includes('..')) {
       res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('403 Forbidden');
@@ -318,15 +418,30 @@ async function requestHandler(req, res) {
 
   // ★ D+2：录制产物下载（只允许纯文件名，path.basename 天然防路径穿越）
   if (pathname.startsWith('/recordings/')) {
-    /* ★ 09-24 G8 复审修订：单个录制文件 = 内容类，能力 = 文件名（文件名形如
-     *   rec-<6位房号>-<毫秒时间戳>.webm），不加 admin 门禁。
-     * ▎为什么列表加了门禁、单个文件却不加：**列表是跨房聚合**（谁能看到"这台服务器上
-     *   有哪些会的录像"就是观测信息，必须拦）；而**单个文件**是"手里已经有这个地址"
-     *   的人才拿得到，与 /api/captions 同属"能力=标识符"模型。
-     * ▎诚实边界：文件名里的房号只有 6 位、时间戳可估，属**弱能力**。生产应换成
-     *   短时效签名 URL（signed ticket）。本条已写进《项目说明》的局限一节。
-     * ▎path.basename 仍保留——它防的是路径穿越，与门禁是两件事，不能因为开放就撤掉。 */
-    const fileName = path.basename(pathname);
+    /* ★ 09-24 C4 本轮修订：单个录制文件 = 内容类，改 **admin 或短时效签名 URL** 才放行。
+     * ▎为什么不再是"能力 = 文件名"：文件名形如 rec-<6位房号>-<毫秒时间戳>.webm，
+     *   房号只有 6 位可枚举、时间戳可估——等于没门（弱能力）。改成签名 URL 后，
+     *   链接自带过期时间（signRecordingUrl 默认 1 小时），泄露也只在一个窗口内。
+     * ▎401 与 404 必须分清：**签名/管理员不过 → 401**；**通过了但文件不存在 → 404**
+     *   （后者是业务判断，不是权限问题——把两者混成一句会让"链接过期"和"文件被删"无法区分）。
+     * ▎admin 仍直接放行（巡检/排障不受限）；roomTokenRequired===false 时退回旧行为（开放）。
+     * ▎path.basename 仍保留——它防的是路径穿越，与门禁是两件事，不能因为开放就撤掉。
+     *   签名 URL 里文件名是 encodeURIComponent 过的，所以先 decode 再 basename（basename 在 decode 之后，
+     *   顺序不能反：先 basename 再 decode 会让 %2F 解出斜杠、绕过单段限制）。 */
+    let fileName;
+    try { fileName = path.basename(decodeURIComponent(pathname)); }
+    catch (e) { fileName = path.basename(pathname); } // 畸形转义：退化为按原样取 basename
+    if (CONFIG.roomTokenRequired !== false) {
+      const v = verifyToken(extractAuthToken(req));
+      const isAdmin = !!(v && v.role === 'admin');
+      const q = new URL(req.url, 'http://localhost').searchParams;
+      const sigOk = verifyRecordingSig(fileName, q.get('exp'), q.get('sig'));
+      if (!isAdmin && !sigOk) {
+        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(recordingGateHtml());
+        return;
+      }
+    }
     const filePath = path.join(__dirname, 'recordings', fileName);
     if (fs.existsSync(filePath)) {
       res.writeHead(200, {
@@ -593,6 +708,9 @@ async function handleApiCaptions(req, res) {
     const body = await readJsonBody(req);
     const room = String((body && body.room) || '');
     const entries = Array.isArray(body && body.entries) ? body.entries : null;
+    // ★ 09-24 C4：POST 的房间号在 body 里，所以门禁在这里判（GET 在 requestHandler 里判）。
+    //   注意门禁放在格式校验之前：**没权限的人不该通过"房间号格式对不对"来判断信息**。
+    if (!requireRoomAccess(req, res, room).ok) return;
     if (!/^\d{6}$/.test(room)) {
       res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('房间号必须是 6 位数字');
@@ -995,6 +1113,112 @@ function verifyToken(token) {
 function validToken(token, username) {
   const v = verifyToken(token);
   return v && v.username === username ? v : null;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * ★ 09-24 C4（本轮）：房间内令牌的签发/校验 + 录像签名 URL
+ *
+ * ▎为什么做成**无状态 HMAC 签名令牌**，而不是服务器内存里的 Map？
+ *   内存 Map 看起来更简单，但有一个致命场景：服务器一重启，房间没了、Map 也空了，
+ *   于是"过夜值守"归档的令牌全失效——第二天早上用户拿着昨天的链接读不出自己的纪要。
+ *   无状态签名的令牌只依赖 SECRET，**重启后依然有效**（只要 SECRET 没换）。
+ *   代价：无法单独吊销某张令牌（只能等过期或轮换 SECRET）——本教学版如实接受。
+ *
+ * ▎令牌格式（两个 base64url 段，点号分隔）：
+ *     roomToken = base64url(JSON.stringify({ room, iat, exp })) + "." + base64url(hmacSHA256(payloadB64, SECRET))
+ *   校验三件事：① 签名匹配（crypto.timingSafeEqual，防时序侧信道）；② 未过期；
+ *   ③ token.room === 请求的房间号（跨房必须是 401）。任何解析失败一律返回 false，绝不抛。
+ *
+ * ▎SECRET 的存放：32 字节随机 hex，持久化到 sfu/data/room-secret（该目录已在 .gitignore 内）。
+ *   首次运行自动生成（mkdir -p + 写文件 + 尝试 chmod 600），之后读取复用；
+ *   启动时若生成过会打印一行日志。**换掉这个文件 = 所有已签发令牌立即失效**。
+ * ══════════════════════════════════════════════════════════════════ */
+const ROOM_SECRET_FILE = path.join(__dirname, 'data', 'room-secret');
+
+/* TTL：默认 24h（86400s）。优先级：环境变量 ROOM_TOKEN_TTL_SEC > config.roomTokenTtlSec > 86400。
+ * ▎为什么环境变量优先：信令回归要靠它造"已经过期"的令牌（传 -1 → exp 落在过去），
+ *   这是唯一能可靠实测过期路径的办法（不去改系统时钟、也不依赖"等 24 小时"）。 */
+const ROOM_TOKEN_TTL_MS = (() => {
+  const env = process.env.ROOM_TOKEN_TTL_SEC;
+  if (env !== undefined && env !== '' && !Number.isNaN(Number(env))) return Number(env) * 1000;
+  const cfg = Number(CONFIG.roomTokenTtlSec);
+  if (Number.isFinite(cfg) && cfg > 0) return cfg * 1000;
+  return 86400 * 1000;
+})();
+
+function loadOrCreateRoomSecret() {
+  // 已存在且格式像 32 字节 hex（64 个 hex 字符）→ 直接复用
+  try {
+    const existing = fs.readFileSync(ROOM_SECRET_FILE, 'utf8').trim();
+    if (/^[0-9a-f]{64}$/i.test(existing)) return existing.toLowerCase();
+  } catch (e) { /* 不存在/读不了 → 下面重新生成 */ }
+  const secret = crypto.randomBytes(32).toString('hex');
+  try {
+    fs.mkdirSync(path.dirname(ROOM_SECRET_FILE), { recursive: true });
+    fs.writeFileSync(ROOM_SECRET_FILE, secret, { encoding: 'utf8', mode: 0o600 });
+    // Windows 上 chmod 语义有限，失败可忽略；POSIX 上让密钥文件只有 owner 可读写。
+    try { fs.chmodSync(ROOM_SECRET_FILE, 0o600); } catch (e) { /* 见上 */ }
+    console.log('🔑 已生成房间令牌密钥 sfu/data/room-secret（32 字节随机；换掉它会让所有已签发令牌失效）');
+  } catch (e) {
+    // 落盘失败也不能让服务起不来：退化成"本次进程内的临时密钥"（重启即失效——不理想但可用）
+    console.log(`⚠️ 房间令牌密钥落盘失败（${e.message}），改用本次进程内的临时密钥（重启后已签发令牌会失效）`);
+  }
+  return secret;
+}
+const ROOM_TOKEN_SECRET = loadOrCreateRoomSecret();
+
+// base64url（URL 安全：+ → -、/ → _、去尾 = ）——放进 URL 查询串/请求头都不用再转义
+const b64url = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const fromB64url = (s) => Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+const hmacSha256 = (data) => crypto.createHmac('sha256', ROOM_TOKEN_SECRET).update(data).digest();
+
+/* 给某个房间签发一张令牌 —— 只在"这个 socket 进房成功"时对**它自己**调用（绝不给别人签）。 */
+function signRoomToken(room) {
+  const now = Date.now();
+  const payloadB64 = b64url(JSON.stringify({ room: String(room), iat: now, exp: now + ROOM_TOKEN_TTL_MS }));
+  return payloadB64 + '.' + b64url(hmacSha256(payloadB64));
+}
+/* 校验：签名匹配 + 未过期 + room 一致。任何一步失败返回 false（不抛），供 requireRoomAccess 用。 */
+function verifyRoomToken(token, room) {
+  try {
+    if (typeof token !== 'string' || !token) return false;
+    const dot = token.indexOf('.');
+    if (dot <= 0 || dot === token.length - 1) return false;
+    const payloadB64 = token.slice(0, dot);
+    const sig = token.slice(dot + 1);
+    const expect = hmacSha256(payloadB64);
+    const got = fromB64url(sig);
+    // timingSafeEqual 要求等长；长度不等直接判false（也顺手挡掉畸形输入）
+    if (got.length !== expect.length) return false;
+    if (!crypto.timingSafeEqual(got, expect)) return false;
+    const obj = JSON.parse(fromB64url(payloadB64).toString('utf8'));
+    if (!obj || typeof obj !== 'object') return false;
+    if (typeof obj.exp !== 'number' || Date.now() > obj.exp) return false; // 过期
+    if (String(obj.room) !== String(room)) return false;                   // 跨房（令牌只对签发它的房间有效）
+    return true;
+  } catch (e) { return false; }
+}
+
+/* ★ 录像的"短时效签名 URL"：/recordings/<文件名> 改成 admin 或签名 URL 才放行。
+ * ▎为什么要它：单个录像此前只靠"能力 = 文件名"（文件名含 6 位房号 + 可估的时间戳）——
+ *   同样属弱能力。改成签名 URL 后，链接自带过期时间，泄露也只在一小时窗口内。
+ * ▎签名内容 fileName + '|' + exp 用同一把 SECRET 做 HMAC；exp 是绝对毫秒时间戳。
+ * ▎诚实边界：签名 URL 同样是 Bearer（谁拿到谁下），只是加了"一小时过期"这道闸。
+ */
+function signRecordingUrl(fileName, ttlMs = 3600000) {
+  const exp = Date.now() + ttlMs;
+  const sig = hmacSha256(fileName + '|' + exp).toString('hex');
+  return `/recordings/${encodeURIComponent(fileName)}?exp=${exp}&sig=${sig}`;
+}
+function verifyRecordingSig(fileName, exp, sig) {
+  try {
+    const e = Number(exp);
+    if (!Number.isFinite(e) || Date.now() > e) return false;        // 缺失/过期
+    const expect = hmacSha256(fileName + '|' + e);                  // Buffer
+    const got = Buffer.from(String(sig || ''), 'hex');
+    if (got.length !== expect.length) return false;
+    return crypto.timingSafeEqual(got, expect);
+  } catch (err) { return false; }
 }
 const clientIp = (socket) => (socket.handshake && socket.handshake.address) || 'unknown';
 /* ★ 09-24：loadUsers/saveUsers 已删除（不留两套并行实现）。
@@ -1717,6 +1941,8 @@ function broadcastRoomState(roomNumber) {
   const room = rooms.get(roomNumber);
   if (!room) return;
   const ctl = remoteCtl.get(roomNumber) || {};
+  // ★ 09-24 C4：下面这段是**显式投影**（一个字段一个字段写），不是 {...m} 展开——
+  //   正因如此，socket 上的 roomToken 不会被顺手广播出去。改这里时务必保持"显式"。
   const members = [...room.members].map((m) => ({
     id: m.id,
     name: m.displayName || null,           // ★ 09-16：昵称（成员列表显示用）
@@ -2194,6 +2420,13 @@ io.on('connection', (socket) => {
     socket.roomNumber = roomNumber;
     socket.joinedAt = Date.now();   // ★ D+4：进房次序（房主迁移要选"最早进房的幸存者"）
     socket.state = { muted: false, camOff: false, sharing: false, hand: false }; // 进房状态清零（重连也走这里）
+    /* ★ 09-24 C4：给**这个成员自己**签一张房间内令牌（只对本房间有效）。
+     * ▎为什么在这里签：创建/加入/代理报到三条路都汇到 joinRoom，签一次就全覆盖；
+     *   断线重连（D6）会换新 socket.id 重新进房 → 自然拿到新令牌，属预期（旧的随旧 socket 作废）。
+     * ▎令牌只挂在 socket 上、且**只在这个 socket 单独收到的载荷里回给它**（见下方 room-members）；
+     *   所有"广播用"的成员快照（room-state / room-members 的 others 列表 / /api/rooms）都是显式投影，
+     *   绝不含 roomToken——别人的令牌泄露等于把别人的会议记录给了你。 */
+    socket.roomToken = signRoomToken(roomNumber);
     // ★ D+4：宽限期内有人回来/进来 → 取消销毁倒计时（房间"复活"）
     if (room.ttlTimer) {
       clearTimeout(room.ttlTimer);
@@ -2221,8 +2454,11 @@ io.on('connection', (socket) => {
         label: dp.label,
       })),
       agent: m.isAgent === true, // ★ 09-24：让新人一眼看出"这台是机器代理，可以控它电脑"
-    }));
-    socket.emit('room-members', { roomNumber, members: memberList });
+    }));   // ★ 注意：上面是**显式投影**，成员对象上的 roomToken 绝不出现在广播/他收的列表里
+    /* ★ 09-24 C4：把**新人自己的** roomToken 附在这条"只发给它自己"的载荷里。
+     *   room-members 是 socket.emit（单播给自己），不是 io.to(room) 广播——
+     *   这就是"令牌只发给令牌所属的那个 socket"的落点，绝不用广播。 */
+    socket.emit('room-members', { roomNumber, members: memberList, roomToken: socket.roomToken });
 
     // ② 通知老成员"来新人了"（老成员不用现在做什么，等他 produce 时会收到 new-producer）
     socket.to(roomNumber).emit('new-member', { id: socket.id });
@@ -2255,7 +2491,8 @@ io.on('connection', (socket) => {
     logEvent('info', 'room-created', { roomNumber, by: socket.id, hasPassword: !!password });
     socket.emit('room-created', { roomNumber });
     await joinRoom(roomNumber);
-    if (callback) ok(callback, { roomNumber });
+    // ★ 09-24 C4：ack 也带上自己的 roomToken（前端即便没接 room-members 也能拿到）
+    if (callback) ok(callback, { roomNumber, roomToken: socket.roomToken });
   });
 
   socket.on('join-room', async ({ roomNumber, password } = {}, callback) => {
@@ -2279,7 +2516,8 @@ io.on('connection', (socket) => {
     }
     const joined = await joinRoom(roomNumber);
     // ★ 09-24：joinRoom 现在会如实返回成败——满员时要明确报错，不能"假成功"
-    if (callback) return joined ? ok(callback, { roomNumber }) : fail(callback, '房间已满');
+    //    ★ 09-24 C4：成功时带上本成员自己的 roomToken（只回给这个 socket，绝不广播）
+    if (callback) return joined ? ok(callback, { roomNumber, roomToken: socket.roomToken }) : fail(callback, '房间已满');
   });
 
   /* ---- 事件 5.4b：★ 09-24 真远程桌面 —— 被控端"桌面代理"进房 ----
@@ -2324,7 +2562,8 @@ io.on('connection', (socket) => {
     if (!agJoined) return fail(callback, '房间已满');   // ★ 09-24：满员要明确报错（防"假成功"）
     logEvent('info', 'agent-joined', { roomNumber, memberId: socket.id, name: socket.displayName });
     console.log(`🖥️ 桌面代理进房：${socket.displayName}（${socket.agentInfo.browser || '未知浏览器'}）→ 房间 ${roomNumber}`);
-    ok(callback, { roomNumber, memberId: socket.id });
+    // ★ 09-24 C4：代理也是"房间成员"，同样拿到自己的 roomToken（未来代理若直连内容接口也用得上）
+    ok(callback, { roomNumber, memberId: socket.id, roomToken: socket.roomToken });
   });
 
   // 聊天（SFU 版方案 A：走服务器广播——见 SFU-BLUEPRINT.md 5.4）
@@ -2742,8 +2981,12 @@ io.on('connection', (socket) => {
     const rec = recordSessions.get(recordId);
     if (!rec) return fail(callback, '找不到这次录制（可能已结束）');
     rec.stop && rec.stop(); // 优雅收尾（写 muxer trailer），exit 回调统一清台账
-    logEvent('info', 'record-stop', { recordId, by: socket.id, file: rec.file ? path.basename(rec.file) : null });
-    ok(callback, { file: rec.file ? path.basename(rec.file) : null });
+    const base = rec.file ? path.basename(rec.file) : null;
+    logEvent('info', 'record-stop', { recordId, by: socket.id, file: base });
+    /* ★ 09-24 C4：把**短时效签名 URL** 一并回给录制者——/recordings/<文件> 已改成
+     *   "admin 或签名 URL"才放行，非管理员的录制者必须靠这个 URL 才能下载自己的产物
+     *   （默认 1 小时有效）。前端拿到后写进流程日志，用户可直接点/复制。 */
+    ok(callback, { file: base, url: base ? signRecordingUrl(base) : null });
   });
 
   /* ---- ★ 09-19 AI Bot 参会者：ai-join / ai-leave / ai-ask（详见上方 AI 基建块注释）----
