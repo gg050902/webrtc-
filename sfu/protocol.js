@@ -225,4 +225,28 @@ module.exports = {
    *   iceServers（STUN/TURN，经 /config.json 下发到两条 Transport 的底层 PC）/
    *   https:{enabled,port,cert,key,autoSelfSigned}（自动起 HTTPS+wss，证书缺失时
    *   用 openssl 现场自签）。部署步骤见 README「跨网络部署」。 */
+
+  /* ══ ★ 09-24 AI 会议助理（第四类：AI 信令 + 统一 Provider 契约）══
+   * ▎AI_JOIN / AI_LEAVE：任何成员都能邀请/送走 AI 助理（教学版权限从宽，G6 分级可收紧）；
+   *   bot 在 room-state 里以 `isBot:true` 的虚拟成员出现（无 socket、无媒体、只"听"）。
+   * ▎AI_ASK：向助理提问。回执**先**给 `{ started, streamId }`（前端立刻立"思考中"气泡），
+   *   随后两路下发：① `ai-stream` 增量（SSE 逐段，打字机手感，可被丢弃）；
+   *   ② 终态 `chat-message`（带同一个 streamId 与 `ai:{mock,tokens}`，**去重 + 兜底**——
+   *   中途进房或丢过流事件的人靠它拿到完整答案）。这也呼应全项目的双路哲学：
+   *   字幕"容忍丢"（无兜底）、问答"不容忍丢"（必然兜底）。
+   *   ★ 助理缺位时自动邀请入会（不等成员先点按钮）——少一步仪式感，多一分像助手。
+   * ▎AI_MINUTES：把该房间的字幕账本合成 markdown 纪要，落 sfu/minutes/<房间>/，
+   *   应答 `{ file, path, mock }`；经 GET /minutes/<房间>/<file> 下载（双白名单防穿越）。
+   *   触发三处：手动、值守定时器分段（每 config.minutesIntervalSec）、助理送走/房间销毁终稿。
+   * ▎AI_OP：C1 AI 远程操作员——服务器自己开一条 socket.io 客户端连上来，走与人类完全相同的
+   *   remote-request → 授权卡 → remote-input 门禁 → remote-release。**授权绝不豁免**。
+   * ▎AI 双轨契约（全项目统一）：有 DEEPSEEK_API_KEY → 真模型；无 key / 超时 / 限流 →
+   *   本地规则兜底，输出带 `[Mock]` 前缀。真相写在返回值的 `mock` 字段与 UI 徽标上，
+   *   **不许假装自己是 LLM**。密钥永不下发到浏览器（/config.json 只有 aiEnabled 布尔值）。 */
+  AI_JOIN: 'ai-join',     // C→S {} 应答 { aiBot }
+  AI_LEAVE: 'ai-leave',   // C→S {} 应答 { aiBot }
+  AI_ASK: 'ai-ask',       // C→S { question } 应答 { started, streamId } → S→C ai-stream* + chat-message
+  AI_STREAM: 'ai-stream', // S→C { id, delta, done, mock? }（流式增量；done=true 为收尾帧）
+  AI_MINUTES: 'ai-minutes', // C→S { type:'segment'|'final', since? } 应答 { file, path, mock }
+  AI_OP: 'ai-op',         // C→S { goal } 应答 { started, goal }（后续走既有远程协助五信令）
 };

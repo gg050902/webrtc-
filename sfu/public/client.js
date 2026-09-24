@@ -178,6 +178,14 @@ const capStatus = $('capStatus');
 const capDiagBox = $('capDiagBox');
 const capDiagList = $('capDiagList');
 const capDiagCloseBtn = $('capDiagCloseBtn');
+
+/* ★ G4 移动端/PWA（第 32 步，2026-09-23）新增元素
+ *   sideBtn   = 顶栏"成员/聊天"抽屉开关（≤980px 才显示，桌面侧栏常驻）
+ *   sideScrim = 抽屉遮罩（小屏点它关抽屉）
+ *   lowBwBtn  = 低带宽模式开关（把所有远端画面锁到 simulcast 最低层） */
+const sideBtn = $('sideBtn');
+const sideScrim = $('sideScrim');
+const lowBwBtn = $('lowBwBtn');
 const capManualInput = $('capManualInput');
 const capManualSend = $('capManualSend');
 
@@ -285,6 +293,7 @@ function enterRoom(roomNumber) {
   capBtn.disabled = false;    // ★ 第 29 步：字幕开关（识别不依赖进房，但广播要）
   aiBtn.disabled = false;     // ★ 09-19 AI Bot：邀请助理不依赖媒体（信令功能）
   aiOpBtn.disabled = false;   // ★ 09-19g：AI 操作员入口（授权链路见服务器 ai-op）
+  lowBwBtn.disabled = false;  // ★ 第 32 步：省流开关（订阅了别人画面才有意义，进房后放开）
   log(`🏠 已进入房间「${roomNumber}」。把房间号或右上角链接发给别人即可邀请`);
 }
 
@@ -456,6 +465,7 @@ let recvTransport = null;     // 接收通道（consume 用）
 let deviceReady = false;
 let sfuIceServers = [];       // ★ 09-13：服务器下发的 ICE 服务器（STUN/TURN），initSFU 时拉取
 let sfuVideoSvc = false;      // ★ D+3：VP9 SVC 开关（config.json 的 videoSvc 下发）
+let sfuAiEnabled = false;     // ★ 09-24：AI 是否接了真模型（服务器只下发布尔值，绝不回显 key）
 let lanUrl = null;            // ★ 09-16：局域网 HTTPS 入口（邀请链接跨电脑用）
 const myProducers = new Map(); // producerId -> Producer（我上传的，如屏幕共享要用）
 
@@ -501,6 +511,11 @@ async function initSFU() {
     const cfg = await fetch('/config.json').then((r) => r.json());
     if (Array.isArray(cfg.iceServers)) sfuIceServers = cfg.iceServers;
     sfuVideoSvc = !!cfg.videoSvc; // ★ D+3：true = 摄像头改用 VP9 SVC 单路分层上传
+    // ★ 09-24 AI 模式：服务器只给 true/false（不给 key），前端据此显示「LLM / Mock」状态灯。
+    //   为什么值得显示：用户要能一眼分清"AI 真在思考"还是"在走本地模板"——
+    //   把不确定性藏在黑盒里，是最容易被误解为"糊弄"的地方。
+    sfuAiEnabled = !!cfg.aiEnabled;
+    updateAiModeUi();
     if (cfg.lanUrl) lanUrl = cfg.lanUrl; // ★ 09-16：局域网邀请入口（跨电脑复制链接用）
   } catch (e) { /* 忽略：本机演示不需要 */ }
 
@@ -1120,26 +1135,98 @@ roomBadge.addEventListener('click', async () => {
  *   建立/订阅完成前的消息会丢——所以每条消息同时走两条路，接收端按 msgId 去重。
  *   这是工程上常见的"双发去重"做法（面试讲点：at-least-once + 幂等接收）。
  * ────────────────────────────────────────────────────────────── */
-socket.on('chat-message', ({ from, text, ts, msgId, name }) => {
+socket.on('chat-message', ({ from, text, ts, msgId, name, ai, streamId }) => {
   // ★ D+1：同一条消息可能从 SCTP 和信令各到一次，msgId 相同的只显示第一条
   if (msgId && seenChatIds.has(msgId)) return;
   if (msgId) markSeenChatId(msgId);
-  appendChat(text, from, from === socket.id, 'signaling', name);
+  // ★ 09-24：带 streamId 的是流式回答的"终态"——增量已经在同一个气泡里渲染过了，
+  //   这里再插一条就是两遍。（终态仍然必要：给中途进房/丢过流事件的人兜底）
+  if (streamId && aiStreamDone.has(streamId)) return;
+  appendChat(text, from, from === socket.id, 'signaling', name, ai);
 });
 
-function appendChat(text, sender, isMe, via, name) {
+/* ══════════════════════════════════════════════════════════════
+ * ★ 09-24 AI 会议助理 · 三段式：状态灯 / 流式打字机 / 纪要入口
+ * ▎状态灯：服务器只发得出 aiEnabled 布尔值（密钥绝不下发），前端据此标注当前处于
+ *   LLM 还是 [Mock]——把"AI 现在到底在不在真跑"摊开写，是诚实的 UI。
+ * ▎打字机：ai-stream 增量渲染。为什么要流？一次性回答要等模型憋完（常见 3~8 秒），
+ *   用户会以为卡死；逐字吐出后哪怕首字要等 1 秒，也是"它在动"的确定信号。
+ * ▎纪要入口：字幕账本的产物一键变成 markdown 纪要（/minutes 下载）。
+ * ══════════════════════════════════════════════════════════════ */
+function updateAiModeUi() {
+  const btn = $('aiBtn');
+  if (!btn) return;                       // 还没渲染到按钮时安全返回（首屏早于 DOM 就绪）
+  btn.dataset.aiMode = sfuAiEnabled ? 'LLM' : 'Mock';
+  btn.classList.toggle('ai-mock', !sfuAiEnabled);
+  btn.title = sfuAiEnabled
+    ? '邀请 AI 助理入会（已接 DeepSeek 真模型；聊天里 @ai 提问、@ai 生成纪要）'
+    : '邀请 AI 助理入会（未配置 DEEPSEEK_API_KEY → 走本地 [Mock] 规则，功能照样可用）';
+}
+
+const aiStreamNodes = new Map();   // streamId -> 正在打字中的气泡 DOM
+const aiStreamDone = new Set();    // 已靠增量渲染完成的 streamId（终态消息据此去重）
+
+socket.on('ai-stream', ({ id, delta, done, mock }) => {
+  let box = aiStreamNodes.get(id);
+  if (!box) {
+    const node = document.createElement('div');
+    node.className = 'msg';
+    node.classList.add('bot', 'streaming');
+    // ★ 09-24 实修：气泡的子节点**各自持有引用**，不用 querySelector 反复查——
+    //   ① 少一次选择器开销（每条增量都查的话，长答案就是几百次无关遍历）；
+    //   ② 无头回归里 querySelector 拿不到真子节点（它只能返回缓存占位元素），断言会失真。
+    const nameEl = document.createElement('div');
+    nameEl.className = 'msg-name';
+    nameEl.innerHTML = '🤖 AI 助理<span class="msg-via">AI</span>';
+    const textEl = document.createElement('div');
+    textEl.className = 'msg-text typing';
+    const timeEl = document.createElement('div');
+    timeEl.className = 'msg-time';
+    timeEl.textContent = new Date().toLocaleTimeString();
+    node.appendChild(nameEl);
+    node.appendChild(textEl);
+    node.appendChild(timeEl);
+    chatList.appendChild(node);
+    while (chatList.children.length > 300) chatList.firstChild.remove();
+    chatList.scrollTop = chatList.scrollHeight;
+    box = { node, nameEl, textEl };
+    aiStreamNodes.set(id, box);
+  }
+  if (delta) {
+    box.textEl.classList.remove('typing');
+    box.textEl.textContent += delta;          // textContent 而非 innerHTML：增量是远程文本，天然免疫 XSS
+    chatList.scrollTop = chatList.scrollHeight;
+  }
+  if (done) {
+    box.node.classList.remove('streaming');
+    const mode = mock ? 'Mock' : 'LLM';
+    box.nameEl.innerHTML += `<span class="msg-ai-mode${mock ? ' mock' : ''}" title="这条答案由${mock ? '本地规则（未接 LLM）' : 'DeepSeek 模型'}生成">${mode}</span>`;
+    aiStreamNodes.delete(id);
+    aiStreamDone.add(id);
+    if (aiStreamDone.size > 60) aiStreamDone.delete(aiStreamDone.values().next().value); // 环形，防长会内存涨
+  }
+});
+
+function appendChat(text, sender, isMe, via, name, ai) {
   const item = document.createElement('div');
   if (sender === 'system') {
     item.className = 'msg system';
     item.innerHTML = `<div class="msg-text">${escapeHtml(text)}</div>`;
   } else if (sender === 'ai-bot') {
-    // ★ 09-19 AI Bot 的气泡（金边 + 徽标，一眼区分机器同事）
+    // ★ 09-19 AI Bot 的气泡（徽标一眼区分机器同事）+ ★ 09-24 mode/tokens/纪要下载三类元信息
+    //   mode 由服务器逐条告知（这条答案到底谁写的），比前端猜更准——
+    //   因为调用过程中可能中途降级：看着像 LLM 的一次会话，某一条其实走了 Mock。
     // （classList.add 而非纯 className 字符串——冒烟桩的 classList 与 className 不同步，坑 27 同源）
+    const mode = ai ? (ai.mock ? 'Mock' : 'LLM') : (sfuAiEnabled ? 'LLM' : 'Mock');
+    const meta = ai && ai.tokens ? `<span class="msg-ai-tok" title="本次调用的 token 用量">${ai.tokens}t</span>` : '';
+    const link = ai && ai.path
+      ? `<a class="msg-link" href="${escapeHtml(ai.path)}" target="_blank" rel="noopener">📄 打开纪要</a>` : '';
     item.className = 'msg';
     item.classList.add('bot');
     item.innerHTML =
-      `<div class="msg-name">🤖 ${escapeHtml(name || 'AI 助理')}<span class="msg-via" title="AI 会议助理">AI</span></div>` +
-      `<div class="msg-text">${escapeHtml(text)}</div>` +
+      `<div class="msg-name">🤖 ${escapeHtml(name || 'AI 助理')}<span class="msg-via" title="AI 会议助理">AI</span>` +
+      `<span class="msg-ai-mode${mode === 'Mock' ? ' mock' : ''}" title="这条答案由${mode === 'Mock' ? '本地规则（未接 LLM）' : 'DeepSeek 模型'}生成">${mode}</span>${meta}</div>` +
+      `<div class="msg-text">${escapeHtml(text)}${link ? '<br>' + link : ''}</div>` +
       `<div class="msg-time">${new Date().toLocaleTimeString()}</div>`;
   } else {
     item.className = isMe ? 'msg me' : 'msg other';
@@ -2684,6 +2771,9 @@ const layerState = new Map(); // consumerId -> { layerCount, spatialLayer, auto 
 
 socket.on('layer-changed', ({ consumerId, spatialLayer, layerCount, auto, reason }) => {
   layerState.set(consumerId, { layerCount, spatialLayer, auto });
+  // ★ 第 32 步（G4 低带宽模式）：省流开着时，任何"回到自动"的层都立刻重新锁回最低层
+  //   （服务器 ABR 会在网络好转时升层 → auto=true；省流模式下这是"不该发生的事"，纠回去）
+  if (lowBwOn && auto && layerCount > 1) lockLayerLow(consumerId);
   const tile = consumerTiles.get(consumerId);
   if (!tile) return;
   ensureLayerPicker(tile, consumerId, layerCount);
@@ -2719,8 +2809,9 @@ function ensureLayerPicker(tile, consumerId, layerCount) {
 }
 
 function updateLayerPicker(tile, state) {
+  if (!tile || !state) return;   // ★ 第 32 步补的守卫：D6 重连清格后，迟到的换层通知不该炸
   const sel = tile.box.querySelector('.layer-pick select');
-  if (!sel || !state) return;
+  if (!sel) return;
   sel.value = state.auto ? 'auto' : String(state.spatialLayer);
 }
 
@@ -4754,6 +4845,31 @@ capExportBtn.addEventListener('click', async () => {
 
 capBtn.addEventListener('click', toggleCaptions);
 
+/* ---- ★ 09-24 AI 会议助理：「📝 纪要」按钮（字幕资产的下游产品）----
+ * ▎一路走来：第 29 步攒字幕账本 → 第 30 步把账本归档到服务器 → 现在这一步，
+ *   账本第一次被真正"消费"（喂 LLM 出要点/待办/结论）。**账本先建好，AI 自然能长出来**。
+ *   这也是为什么纪要不需要 bot 在场：它吃的是账本，不是聊天对话。 */
+const capMinutesBtn = $('capMinutesBtn');
+if (capMinutesBtn) {
+  capMinutesBtn.addEventListener('click', async () => {
+    if (!myRoom) { showToast('先进房间再生成纪要', 'error'); return; }
+    capMinutesBtn.disabled = true;
+    const old = capMinutesBtn.textContent;
+    capMinutesBtn.textContent = '📝 生成中…';
+    try {
+      const res = await request('ai-minutes', { type: 'segment' });
+      // 服务器已经向全房广播了一条带下载链接的气泡，这里只补本地反馈 + 日志
+      showToast(res.data.mock ? '纪要已生成（[Mock] 本地模板）' : '纪要已生成（LLM 撰写）', 'ok');
+      log(`📝 纪要已生成：${res.data.path}${res.data.mock ? '（[Mock] 本地模板）' : ''}`);
+    } catch (err) {
+      showToast('纪要生成失败：' + (err.message || err), 'error');
+    } finally {
+      capMinutesBtn.disabled = false;
+      capMinutesBtn.textContent = old;
+    }
+  });
+}
+
 /* ---- ★ 09-17c 手动字幕兜底 + 自检卡交互 ----
  * ▎为什么值得做？实时字幕的"不可用"往往是环境问题（安全上下文/云端服务），
  *   用户没法当天解决，但"开会要记录内容"这件事不能因此卡住——
@@ -5074,6 +5190,85 @@ capReportBtn.addEventListener('click', async () => {
   log(`📋 已生成值守日报（${all.length} 条 · ${speakers.length} 位说话人 · 跨度 ${durMin} 分钟）`);
 });
 
+
+/* ──────────────────────────────────────────────────────────────
+ * 第 32 步 ★ 2026-09-23 G4 移动端 / PWA（路线图 G 档：手机也能体面开会）
+ * ▎三件事，全是纯前端零依赖：
+ *   ① 侧栏抽屉（≤980px）：侧栏在 CSS 里被移出画布，这里给它一个"拉出来"的
+ *     开关（顶栏按钮）+ 遮罩点击关闭。桌面布局一行代码都不走。
+ *   ② 低带宽模式："省流"开关把**所有远端画面**锁到 simulcast 最低清晰度层
+ *     （复用 D1 的 set-preferred-layers 手动锁层信令，服务器零改动）——
+ *     弱网/流量敏感场景一键降级；关掉时逐路发 spatialLayer:null 交回服务器自动选层。
+ *     新来的成员/服务器 ABR 升层（layer-changed auto=true）会被上面的钩子重新锁回。
+ *   ③ Service Worker 注册：manifest + sw.js 让会议页能"安装到主屏"、
+ *     静态壳离线可用（音视频照旧要活的服务器——SW 只管静态资源）。
+ * ────────────────────────────────────────────────────────────── */
+
+/* ---- ① 侧栏抽屉（小屏）----
+ * body.side-open 是唯一的状态位：CSS（style.css 第 25 节）只认它——
+ * 抽屉滑入、遮罩亮起、背景冻结滚动，三条规则都挂在同一个类上，好排查。 */
+sideBtn.addEventListener('click', () => {
+  // ▎注意：不依赖 classList.toggle 的返回值（真 DOM 返回布尔，但老浏览器/测试桩可能返回
+  //   undefined）——先 toggle 再用 contains 读回状态，两端语义一致。
+  document.body.classList.toggle('side-open');
+  const open = document.body.classList.contains('side-open');
+  sideBtn.classList.toggle('active', open);
+  if (open) sideScrim.classList.remove('hidden');
+  else sideScrim.classList.add('hidden');
+});
+sideScrim.addEventListener('click', () => {
+  document.body.classList.remove('side-open');
+  sideBtn.classList.remove('active');
+  sideScrim.classList.add('hidden');
+});
+
+/* ---- ② 低带宽模式（省流）---- */
+let lowBwOn = false; // 省流状态位（layer-changed 钩子会读它，见 D1 段）
+
+// 把一路 Consumer 锁到最低清晰度层（simulcast 第 1 层）
+function lockLayerLow(consumerId) {
+  socket.emit('set-preferred-layers', { consumerId, spatialLayer: 0 }, (resp) => {
+    if (resp && resp.error) log(`⚠️ 省流锁层失败：${resp.error}`);
+  });
+}
+
+lowBwBtn.addEventListener('click', () => {
+  lowBwOn = !lowBwOn;
+  lowBwBtn.classList.toggle('active', lowBwOn);
+  if (lowBwOn) {
+    // 开：把**当前所有**多层的远端画面全部锁最低层
+    let n = 0;
+    for (const [consumerId, st] of layerState) {
+      if (st.layerCount > 1) { lockLayerLow(consumerId); n++; }
+    }
+    showToast(`🐢 省流已开启：${n} 路画面锁定最低清晰度`, 'ok');
+    log(`🐢 低带宽模式开启（锁定 ${n} 路画面的最低层；新成员进来也会自动锁）`);
+  } else {
+    // 关：逐路交回服务器自动选层（null = 自动，D1 的约定）
+    let n = 0;
+    for (const [consumerId, st] of layerState) {
+      if (st.layerCount > 1) {
+        socket.emit('set-preferred-layers', { consumerId, spatialLayer: null }, () => {});
+        n++;
+      }
+    }
+    showToast('🚀 省流已关闭：画质交回服务器按网络自动调', 'ok');
+    log(`🚀 低带宽模式关闭（${n} 路画面交回自动选层）`);
+  }
+});
+
+/* ---- ③ Service Worker 注册（PWA 外壳）----
+ * ▎两个前置：浏览器支持 SW + 安全上下文（https / localhost）——
+ *   纯 IP 的 http 页面注册不了（和 getUserMedia 同一条安全规则）。
+ * ▎教学提示：注册后 DevTools → Application → Service Workers 可见；
+ *   更新 sw.js 后要 bump sw.js 里的 SW_CACHE_VERSION，旧缓存才会被清。 */
+if ('serviceWorker' in navigator && (window.isSecureContext !== false)) {
+  navigator.serviceWorker.register('sw.js').then(() => {
+    log('📦 PWA 外壳已就绪（可安装到桌面/主屏；静态壳离线可用）');
+  }).catch((err) => {
+    log(`⚠️ Service Worker 注册失败：${err.message}（不影响会议功能）`);
+  });
+}
 
 /* ──────────────────────────────────────────────────────────────
  * 启动：页面一加载就打开摄像头

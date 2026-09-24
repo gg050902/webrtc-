@@ -2074,3 +2074,142 @@ new-data-producer/data-producer-closed 广播、room-members 清单、两条错�
 - **回归（本次实测）**：信令 **93/93**（+5：无共享拒绝/受理/真实授权请求/输入序列含
   16 字节帧/自动交还控制权）+ 冒烟 95/95。真机：两窗口演示（共享+协助 → 另一窗
   点「🛰️ AI 操作」→ 授权 → 看伪桌面上的鼠标被 AI 牵着走）。
+
+### 5.27 ★ 09-23 G4 移动端 / PWA（手机也能体面开会，路线图 G 档）
+
+> 一次"纯前端零依赖"的收官：不加任何库，让会议页在手机上可用、可安装、可省流。
+
+**三件事（对应 client.js 第 32 步 + style.css 第 25 节）**：
+
+1. **PWA 外壳**：`manifest.webmanifest`（名字/图标/主题色，用 `.webmanifest` 扩展名
+   避开 `/config.json` 特殊路由）+ `sw.js`（Service Worker：预热缓存核心静态文件、
+   cache-first 拦截、**socket.io 请求绝不碰**、导航 network-first 断网兜底 index.html、
+   版本号缓存激活时自清）。`index.html` 挂 `<link rel="manifest">` + theme-color；
+   图标 = 墨底金框朱砂"會"（1024×1024，`icons/`）。服务器 MIME 表补
+   `.webmanifest/.png/.svg/.json` 四条。**安装到主屏后像个原生 App**——
+   答辩现场手机扫码进会再长按"添加到主屏幕"，演示效果直接拉满。
+2. **移动端响应式**：≤980px 时侧栏本来就是"移出画布"的抽屉，但**没有任何开关能拉出来**
+   （真缺口）——顶栏补 `sideBtn`（桌面隐藏）+ `sideScrim` 遮罩（点它关抽屉），
+   状态位只有一个 `body.side-open`；≤760px 紧凑档：控制坞按钮收成图标
+   （`.btn:has(.i) span{display:none}`，Chrome 105+ 的 `:has` 选择器，老浏览器退化成
+   完整文字，可用性不受损）、网格列 150px、字幕条上移避让两层控制坞、预览页竖屏堆叠。
+3. **低带宽模式（"省流"开关）**：一键把**所有远端画面**锁到 simulcast 最低层——
+   复用 D1 的 `set-preferred-layers` 信令，**服务器零改动**；关 = 逐路发 `spatialLayer:null`
+   交回自动。钩子挂在 `layer-changed`：省流开着时，服务器 ABR 的任何"升层/回自动"
+   都会被立刻纠回 0 层（弱网下"不该发生的事"就纠回去）。
+
+**顺手修的三件事**：
+- 冒烟既有 flaky（F6 绿幕断言）：逐像素色键循环让桩帧率 10→28ms/帧，固定 500ms
+  等待跨不过 `%24` 徽标刷新点——改轮询（最多 3s），快机器零等待；
+- `updateLayerPicker` 补 tile 空值守卫（D6 重连清格后迟到的换层通知不再炸）；
+- 测试头部补记：起服务器要带 `AI_OP_STEP_MS=20`，否则 09-19g 那组会"假失败"。
+
+**新坑两条（记入 AGENTS 第 7 节）**：sw.js 注释里写 `**/socket.io`——`*/` 提前终止
+块注释（坑 26 家族第三例，`node --check` 抓到了）；冒烟桩的 `classList.toggle()`
+不返回布尔（真 DOM 返回）——依赖返回值的代码在桩里语义反转，要"toggle 后用
+contains 读回"。
+
+**回归（2026-09-23 实测）**：冒烟 **107/107**（+12）+ 信令 **98/98**（需
+`AI_OP_STEP_MS=20 node sfu/server.js`）。
+⚠️ 待人工验证：手机真机（扫码进会/装到主屏/横竖屏）、省流开关真实锁层效果、
+断网后壳子能否渲染。
+
+---
+
+### 5.28 ★ 09-24 AI 会议助理：从"能跑"到"敢上线"（Provider / 双轨 / 流式 / 三处实修）
+
+> 这一节回答一个很实际的问题：**给项目接 LLM，到底要动哪些工程决策？**
+> 代码本身很简单（一次 HTTP POST），难的都在它周围：密钥放哪、失败怎么办、
+> 花多少钱怎么量、怎么在没网络的机器上也能演示、怎么让"AI 故障"不拖垮会议。
+
+#### 5.28.1 先把重复代码收口：`sfu/ai/provider.js`
+
+改造前 server.js 里有三份几乎一样的 DeepSeek 调用（aiBrain 问答、llmPlan 操作员计划、
+llmMinutes 纪要），各自写超时、各自判错、各自的降级提示文案——这种"复制三次"的代码，
+改一处忘两处只是时间问题。收口后只有一个入口：
+
+```js
+const res = await AI.askLLM(messages, { temperature: 0.3, maxTokens: 800, mock: () => '本地兜底' });
+// res = { text, mock:false, usage:{promptTokens, completionTokens, totalTokens}, ms }
+const s   = await AI.streamLLM(messages, opts, (delta) => io.to(room).emit('ai-stream', { delta }));
+```
+
+三个设计点值得单独讲：
+
+1. **密钥三来源**：`DEEPSEEK_API_KEY` 环境变量 > 项目根 `.env` > `sfu/config.json` 的 `ai.key`。
+   `.env` 的解析器自己写了 12 行（跳过 `#` 注释、去掉包裹引号、**不覆盖已存在的环境变量**）——
+   不引 dotenv，也是想说明"那玩意儿做的事就这么点"。
+2. **密钥永远不出服务器**：`/config.json` 只下发 `aiEnabled: true/false`，
+   连密钥末四位都不给。浏览器是公开可下载的资源，**任何回显都等于泄露**；
+   这条线有一条自动化断言站着（下发体里搜 key 特征）。
+3. **降级钩子随调用方走**：`mock()` 由调用方给，provider 只负责在"无 key / 超时 / HTTP 错误 /
+   空返回"时调用它并把 `mock:true` 标出来。**AI 故障绝不上抛到信令层**——
+   字幕 F3/F6 那套"非阻塞哲学"在这里再次生效：AI 是锦上添花，不是会议的关键路径。
+
+#### 5.28.2 长文本纪要：map-reduce 是怎么用出来的（scripts/summarize.js）
+
+LLM 的上下文窗口是有限的，但会议可以开三小时。通用解法是**分而治之**：
+
+```
+原文（3h 字幕） → 切成 N 段 → 每段各出一份摘要（map） → 把 N 份摘要合并成终稿（reduce）
+```
+
+它不是"取巧"而是必需的：一次性塞 10 万字符，要么被截断，要么费用翻几倍。
+本项目 `scripts/summarize.js` 的 `summarize()` 与服务器 `buildMinutes()` 是同一套策略的
+两个外壳——**离线版用来调 prompt**（改完立刻 `npm run ai:summarize` 看效果），
+调满意了再同步回服务器：调 AI 不用重启线上会议。
+
+#### 5.28.3 agent 的本质：手写那个循环（scripts/agent.js）
+
+所谓 function calling，**模型从不真的执行任何东西**——它只是输出一段 JSON 说"我想调 X，
+参数是 Y"，真正的执行在你自己的代码里。因此核心循环只有四步：
+
+```
+① 拼消息（工具清单 + 历史 + 目标）
+② 让模型决策：{"action":"工具名","args":{...}} 或 {"final":"答案"}
+③ 真去跑那个函数
+④ 把结果作为 Observation 塞回消息列表 → 回到 ① （设最大步数防打转）
+```
+
+教学版特意保留了两个细节：**工具报错也要喂回去**（模型看到 ERROR 会自己改参数重试，
+这正是 ReAct 里 Observation 的价值），以及**最大步数**（6 步还收敛不了就收尾汇报）。
+LangChain 的核心也就是这几行——手写一遍之后，"agent 在干什么"这件事就不再神秘。
+
+#### 5.28.4 为什么做了流式（`ai-stream`）
+
+一次性回答要等模型憋完整段，常见 3~8 秒。**对延迟的感知不是由总时长决定的，
+而是由"有没有东西在动"决定的**——首字 1 秒 + 持续吐字，比沉默 5 秒后整段出现好得多。
+实现上是两条路并存：
+
+- `ai-stream {id, delta, done}`：SSE 增量，边解析边转发（DeepSeek 的 SSE 帧要按 `\n` 切，
+  末半帧留到下一轮，否则 JSON.parse 会炸）；
+- 结束再补一条 `chat-message`（带同一个 `streamId`）：它是**权威终态**，
+  给中途进房或丢过流事件的人兜底；前端收到时按 streamId 去重，同一条不显示两遍。
+
+这就是全项目的双路哲学在不同场景下的两种定价：**字幕容忍丢**（不兜底）/
+**问答不容忍丢**（必然兜底）——可靠性应该按内容价值收费。
+
+#### 5.28.5 顺带修掉的三个真 bug（都有复现，不是猜的）
+
+| 现象 | 根因 | 修法 |
+|---|---|---|
+| config 里 IP 是旧的 → **别的电脑一律黑屏**，本机却一切正常 | 旧代码只打印告警，**仍把错 IP 通告进 ICE candidate**（最难的"沉默故障"） | 三层取值 + 与本机网卡核对，**漂移时自动回退**真实 IPv4 |
+| 装了 ffmpeg，服务器说"未检测到" | 500ms 超时在"启动同时拉 Worker 子进程"的机器上必然超时，`err.killed` 被当成"没装" | 超时放宽 + 重试 + **只有 ENOENT 才算没装** |
+| `npm run test:record` 稳定红 `EBUSY` | 不是文件锁，是 **Windows 上 Node 的 `spawnSync`** 与未排空的子进程 stdio 相冲（同文件在 shell 里 ffprobe 秒出结果） | 改异步 `execFile` + 三次重试 |
+
+还有一条属于 AI 特有的错位：`@ai 生成纪要` 原本写在 Mock 分支里，**配上 key 之后
+LLM 抢先回一句"好的我来总结"，纪要文件根本没生成**——用户看到的是"AI 答应了"。
+修法是**动作型意图在进 LLM 之前先路由**（tools-first），聊天模型只负责聊天。
+
+#### 5.28.6 回归与自查
+
+```bash
+npm run test:ai     # AI 双轨自检：无 key 只跑 Mock 轨，有 key 两条都跑（当前 10/10）
+npm run ai:chat -- --q "一句话解释 SFU 与 Mesh 的区别"
+npm run ai:summarize -- --room 123456    # 直接吃某房间的字幕账本出纪要
+curl -s localhost:3001/metrics | grep sfu_ai_llm   # 调用次数/错误数/tokens/估算花费
+```
+
+**回归（2026-09-24 实测）**：冒烟 **118/118**（+11）+ 信令 **106/106**（Mock 轨、LLM 轨各跑一遍双绿）
++ Mesh **33/33** + test:ai **10/10** + test:record 连跑 3 次 PASS。
+⚠️ 待人工验证：真浏览器打字机观感、真开会十分钟看纪要质量、AI 操作员走 LLM 计划的演示。

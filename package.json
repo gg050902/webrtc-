@@ -18,7 +18,11 @@
     "test:turn": "node scripts/test-turn.js",
     "soak": "node scripts/soak.js",
     "watch": "node scripts/watch.js",
-    "doctor": "node scripts/doctor.js"
+    "doctor": "node scripts/doctor.js",
+    "test:ai": "node scripts/test-ai.js",
+    "ai:chat": "node scripts/chat.js",
+    "ai:summarize": "node scripts/summarize.js",
+    "ai:agent": "node scripts/agent.js"
   },
   "dependencies": {
     "mediasoup": "^3.26.0",

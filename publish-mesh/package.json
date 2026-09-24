@@ -1,0 +1,16 @@
+{
+  "name": "simple-tencent-meeting-mesh",
+  "version": "1.0.0",
+  "description": "简易版腾讯会议（Mesh P2P 版）：浏览器直连视频会议 + 屏幕共享 + 群聊 + 房间密码 + H5 远程协助",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "socket.io": "^4.7.5"
+  },
+  "license": "MIT"
+}

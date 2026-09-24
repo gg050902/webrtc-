@@ -39,6 +39,8 @@ const fs = require('fs');
 const path = require('path');
 const { Server } = require('socket.io');
 const mediasoup = require('mediasoup');
+// ★ 09-24 AI Provider：所有 LLM 调用的唯一入口（密钥托管 + 双轨降级 + 用量记账）
+const AI = require('./ai/provider');
 
 /* ★ 09-13 可达性升级（对应路线图 E1/E2 的"自助版"）：配置文件 config.json
  * ▎硬边界是什么？这套系统之前只能"同机/同局域网"玩：
@@ -86,6 +88,12 @@ const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js':   'text/javascript; charset=utf-8',
   '.css':  'text/css; charset=utf-8',
+  // ★ G4 移动端/PWA（第 32 步）：manifest 与图标的正确 MIME——
+  //   manifest 用 .webmanifest 扩展名（避开 /config.json 特殊路由），图标给 image/png
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
+  '.png':  'image/png',
+  '.svg':  'image/svg+xml',
+  '.json': 'application/json; charset=utf-8',
 };
 
 /* 请求处理器（命名函数）：HTTP 和 HTTPS 两个服务器共用同一份逻辑 */
@@ -197,6 +205,9 @@ async function requestHandler(req, res) {
       // ★ 09-16 局域网交付：announcedIp 存在时，告诉前端"发给别的电脑的邀请链接长什么样"——
       //   服务器机自己访问的是 localhost，直接复制 location.href 别的电脑打不开
       lanUrl: ANNOUNCED_IP ? `https://${ANNOUNCED_IP}:${(tlsCfg.port || 3443)}` : null,
+      // ★ 09-24 AI 模式：**只下发布尔值**——前端据此显示「LLM / Mock」状态灯。
+      //   密钥本身绝不下发（连末四位都不给）：浏览器是公开可下载的资源，任何回显都是泄露。
+      aiEnabled: AI.aiEnabled(),
     }));
     return;
   }
@@ -364,6 +375,26 @@ function buildMetrics(snap) {
   L.push(`sfu_producers_total ${rooms.reduce((a, r) => a + r.counts.producers, 0)}`);
   help('sfu_consumers_total', 'gauge', 'Total consumers (server-side subscriptions)');
   L.push(`sfu_consumers_total ${rooms.reduce((a, r) => a + r.counts.consumers, 0)}`);
+  /* ★ 09-24 AI 用量指标：把 LLM 调用次数/错误数/tokens/估算花费也纳入同一份 Prometheus 面。
+   * ▎为什么值得：AI 功能一旦上线，"它到底有没有在被调用、失败了多少次、花了多少钱"
+   *   就必须能观测——否则半夜烧钱或全量降级无人知晓。这也是 AI 从"能跑"到"可运维"的一步。 */
+  const aiS = AI.getStats();
+  help('sfu_ai_llm_enabled', 'gauge', '1 when a real LLM key is configured, 0 for mock-only mode');
+  L.push(`sfu_ai_llm_enabled ${aiS.enabled ? 1 : 0}`);
+  help('sfu_ai_llm_calls_total', 'counter', 'LLM calls attempted (excludes pure mock fallbacks before any HTTP attempt)');
+  L.push(`sfu_ai_llm_calls_total ${aiS.calls}`);
+  help('sfu_ai_llm_ok_total', 'counter', 'LLM calls answered by the real model');
+  L.push(`sfu_ai_llm_ok_total ${aiS.ok}`);
+  help('sfu_ai_llm_errors_total', 'counter', 'LLM calls that failed (timeout / HTTP error / empty completion)');
+  L.push(`sfu_ai_llm_errors_total ${aiS.errors}`);
+  help('sfu_ai_llm_mock_total', 'counter', 'Requests served by local mock rules (no key or degraded)');
+  L.push(`sfu_ai_llm_mock_total ${aiS.mock}`);
+  help('sfu_ai_llm_prompt_tokens_total', 'counter', 'Cumulative prompt tokens reported by the LLM');
+  L.push(`sfu_ai_llm_prompt_tokens_total ${aiS.promptTokens}`);
+  help('sfu_ai_llm_completion_tokens_total', 'counter', 'Cumulative completion tokens reported by the LLM');
+  L.push(`sfu_ai_llm_completion_tokens_total ${aiS.completionTokens}`);
+  help('sfu_ai_llm_cost_cny', 'gauge', 'Estimated cumulative LLM spend in CNY');
+  L.push(`sfu_ai_llm_cost_cny ${aiS.costCny}`);
   help('sfu_room_members', 'gauge', 'Members per room');
   for (const r of rooms) L.push(`sfu_room_members{room="${r.roomNumber}"} ${r.counts.members}`);
   help('sfu_producer_bytes_total', 'counter', 'Cumulative bytes forwarded per producer');
@@ -634,7 +665,38 @@ const rtcMaxPort = Number(process.env.MEDIASOUP_RTC_MAX_PORT) || Number(CONFIG.r
 //   MEDIASOUP_LISTEN_IP=0.0.0.0 MEDIASOUP_ANNOUNCED_IP=192.168.1.10 node sfu/server.js
 //   （或写进 config.json 的 listenIp / announcedIp）
 const LISTEN_IP = process.env.MEDIASOUP_LISTEN_IP || CONFIG.listenIp || '127.0.0.1';
-const ANNOUNCED_IP = process.env.MEDIASOUP_ANNOUNCED_IP || CONFIG.announcedIp || undefined;
+
+/* ★ 09-24 实修「announcedIp 漂移」（跨机看不见画面的头号根因，本次真复现：
+ *   config.json 里躺着 192.168.127.194，本机实际早已换成 192.168.209.194）。
+ * ▎旧行为：只打印告警，**仍然用错 IP 通告给浏览器** → 同机 localhost 一切正常，
+ *   别的电脑/手机进会一律黑屏，且没有任何运行时错误可循极难排查。
+ * ▎新行为：三层取值，取不到有效值就**自动回退到本机真实网卡 IP**：
+ *     ① 环境变量 MEDIASOUP_ANNOUNCED_IP（最高优先级，运维/容器场景）
+ *     ② config.json 的 announcedIp **且与本机某个网卡一致**（有效才用）
+ *     ③ 都不成立 → 自动挑一个本机对外 IPv4（私网优先），并打印醒目提示
+ *   这样"IP 换了"从致命故障降级为一行提示——延迟满足 ⟨可靠性⟩ 而非 ⟨可配置性⟩。 */
+function detectLocalIps() {
+  const os = require('os');
+  const ips = [];
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const ni of list || []) {
+      if (ni.family === 'IPv4' && !ni.internal) ips.push(ni.address);
+    }
+  }
+  // 私网优先（192.168/10/172.16-31 才是典型的局域网可达地址）
+  const priv = (ip) => /^192\.168\./.test(ip) || /^10\./.test(ip) || /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
+  return ips.sort((a, b) => (priv(b) ? 1 : 0) - (priv(a) ? 1 : 0));
+}
+const ANNOUNCED_DECISION = (() => {
+  const ips = detectLocalIps();
+  const env = process.env.MEDIASOUP_ANNOUNCED_IP;
+  if (env) return { ip: env, source: 'env', ips };
+  const cfg = CONFIG.announcedIp;
+  if (cfg && ips.includes(cfg)) return { ip: cfg, source: 'config', ips };
+  if (cfg) return { ip: ips[0] || undefined, source: 'fallback', stale: cfg, ips };
+  return { ip: ips[0] || undefined, source: 'auto', ips };
+})();
+const ANNOUNCED_IP = ANNOUNCED_DECISION.ip;
 
 async function startOneWorker() {
   const w = await mediasoup.createWorker({
@@ -782,12 +844,31 @@ let FFMPEG_BIN = 'ffmpeg'; // 具体可执行文件（PATH 里有就用名字；
  */
 function probeFfmpeg() {
   const { execFile } = require('child_process');
-  execFile(FFMPEG_BIN, ['-version'], { timeout: 500, windowsHide: true }, (err) => {
-    FFMPEG_OK = !err;
-    console.log(FFMPEG_OK
-      ? `✅ 已检测到 ffmpeg（${FFMPEG_BIN}）：服务器侧录制（D+2）可用`
-      : '⚠️ 未检测到 ffmpeg：服务器侧录制（D+2）暂不可用（首次录制时会再深扫一次 winget 目录）');
+  const runOnce = () => new Promise((resolve) => {
+    execFile(FFMPEG_BIN, ['-version'], { timeout: 2500, windowsHide: true }, (err) => {
+      resolve(err
+        ? { ok: false, code: err.code, killed: err.killed, msg: String(err.message || '') }
+        : { ok: true });
+    });
   });
+  (async () => {
+    /* ★ 09-24 实修「装了 ffmpeg 却说没装」（本次真复现一次，第二次又正常——典型竞态）：
+     *   旧版 500ms 超时太紧——启动瞬间在拉 mediasoup Worker（C++ 子进程）的机器上，
+     *   `ffmpeg -version` 冷启动可达数百毫秒，于是定时器一到就被 kill，调用方
+     *   收到 err.killed=true 判成"未安装"，录音/AI 听觉管线全部被误关。
+     *   现在：超时放宽到 2.5s + 超时重试一次 + **区分失败类型**——
+     *   ENOENT 才是"真没装"，超时属于环境抖动，不能据此关掉功能。 */
+    let r = await runOnce();
+    if (!r.ok && (r.killed || /TIMEDOUT|ETIMEDOUT/i.test(r.msg))) r = await runOnce();
+    if (!r.ok && (r.code === 'ENOENT' || /ENOENT/.test(r.msg))) {
+      console.log('⚠️ 未检测到 ffmpeg（PATH 中无此命令）：服务器侧录制（D+2）暂不可用；首次录制时会深扫 winget 目录');
+      return;
+    }
+    FFMPEG_OK = !!r.ok;
+    console.log(FFMPEG_OK
+      ? `✅ 已检测到 ffmpeg（${FFMPEG_BIN}）：服务器侧录制（D+2）/AI 听觉管线可用`
+      : `⚠️ ffmpeg 探测未通过（${r.code || r.msg}）：首次录制时会深扫 winget 目录再试`);
+  })();
 }
 
 // 深度扫描（只在"要录制但快探测失败"时调用；异步，绝不阻塞启动）
@@ -823,28 +904,24 @@ function resolveFfmpegDeep() {
 /* ★ 09-17c 可达性自检（跨网连不上的头号原因）：announcedIp 必须等于本机某个真实网卡 IP。
  *   ▎为什么必须检查？mediasoup 会把 announcedIp 写进 ICE candidate 告诉浏览器"媒体发这里"；
  *     这个值一旦是旧 IP/写错，同机 localhost 能连、**别的电脑一律黑屏**（最难排查的那种）。
- *   ▎策略：不一致时**大声告警**并打印本机实际可用 IP + 修复命令；不擅自改用户配置。
+ *   ★ 09-24 升级：不再只是"大声告警"——实际用在信令里的 ANNOUNCED_IP 已经在上面
+ *     被修正过（漂移时自动回退本机 IP），这里只负责把"用了什么、为什么"讲清楚。
  */
 function checkAnnouncedIp() {
-  const os = require('os');
-  const ips = [];
-  for (const list of Object.values(os.networkInterfaces())) {
-    for (const ni of list || []) {
-      if (ni.family === 'IPv4' && !ni.internal) ips.push(ni.address);
-    }
-  }
-  const announced = CONFIG.announcedIp;
-  if (!announced) {
-    console.log(`⚠️ config.json 未设置 announcedIp：mediasoup 只会通告 ${CONFIG.listenIp || '127.0.0.1'}，`
+  const { ip, source, stale, ips } = ANNOUNCED_DECISION;
+  if (!ip) {
+    console.log(`⚠️ 没探到对外 IPv4：当前只通告 ${CONFIG.listenIp || '127.0.0.1'}，`
       + `\n   本机可用 IP：${ips.join('、') || '(无)'} —— 别的电脑将看不到画面（跑 npm run start:lan 可自动写好）`);
     return;
   }
-  if (!ips.includes(announced)) {
-    console.log(`❌ announcedIp=${announced} 与本机网卡不匹配！当前实际 IP：${ips.join('、') || '(无)'}`);
-    console.log('   ▸ 后果：本机 localhost 正常，但**其它电脑/手机进会看不到任何画面**');
-    console.log('   ▸ 修复：改 sfu/config.json 的 announcedIp 为上面某个 IP，或直接跑 npm run start:lan（自动探测并重写）');
+  if (source === 'fallback') {
+    console.log(`🩹 announcedIp 已自动纠偏：config.json 里的 ${stale} 不是本机网卡`
+      + `（当前实际 ${ips.join('、')}）→ 本次运行改用 ${ip}`);
+    console.log(`   ▸ 已经能正常跨机；想永久生效：把 config.json 的 announcedIp 改成 ${ip}（或跑 npm run start:lan 自动重写）`);
+  } else if (source === 'auto') {
+    console.log(`✅ 自动选用本机 IP ${ip} 作为 announcedIp（config.json 未设置）`);
   } else {
-    console.log(`✅ announcedIp=${announced} 与本机网卡一致（局域网其它设备可直连）`);
+    console.log(`✅ announcedIp=${ip}（来源：${source === 'env' ? '环境变量' : 'config.json'}，与本机网卡一致）`);
   }
 }
 const recordSessions = new Map(); // recordId -> 会话（跨连接状态放全局：坑 18）
@@ -1094,8 +1171,11 @@ function setAiBot(roomNumber, on) {
   return room.aiBot;
 }
 
-// AI 大脑：有 key 走 DeepSeek（真答），无 key/失败走本地模板（[Mock] 标记）——AI 双轨约定
-async function aiBrain(roomNumber, question) {
+/* AI 大脑：统一走 AI.askLLM（sfu/ai/provider.js）——有 key 走 DeepSeek 真答，
+ *   无 key/超时/限流走本地模板并返回 mock:true（输出带 [Mock] 前缀，AI 双轨约定）。
+ * ★ 09-24 返回值从 string 改成 { text, mock, usage }——调用方要拿得到"这一答是 LLM 还是 Mock"
+ *   （前端据此给气泡打 mode 徽标），用量也要能进 /metrics。 */
+async function aiBrain(roomNumber, question, onDelta) {
   const room = rooms.get(roomNumber);
   const members = room ? [...room.members] : [];
   const talkRows = room ? [...room.talk.entries()].sort((a, b) => b[1] - a[1]) : [];
@@ -1120,55 +1200,47 @@ async function aiBrain(roomNumber, question) {
   const dur = room ? Math.round((Date.now() - room.createdAt) / 60000) : 0;
   const context = `会议时长约 ${dur} 分钟，${members.length} 人在线（含 AI 助理）。\n发言统计：${talkTxt}\n近期字幕：\n${capTxt}\n音频响度：${hearingTxt}`;
 
-  const key = process.env.DEEPSEEK_API_KEY;
-  if (key) {
-    try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 15000);
-      const res = await fetch('https://api.deepseek.com/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-        body: JSON.stringify({
-          model: 'deepseek-chat',
-          messages: [
-            { role: 'system', content: '你是简易腾讯会议的 AI 会议助理，以参会者身份入会。用简短中文回答（不超过120字），基于给的会议上下文，不要编造上下文里没有的内容。' },
-            { role: 'user', content: `会议上下文：\n${context}\n\n成员提问：${question}` },
-          ],
-          temperature: 0.4,
-        }),
-        signal: ctrl.signal,
-      });
-      clearTimeout(timer);
-      if (res.ok) {
-        const data = await res.json();
-        const answer = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-        if (answer) return answer.trim();
-      }
-    } catch (e) { /* 掉到 Mock */ }
-  }
-  // ── 本地模板（[Mock] 标记 = AI 双轨约定：无 key 环境的降级路径）──
   const q = String(question || '');
-  // ★ N2：问"纪要/总结"→ 直接生成并回路径（@ai 生成纪要 的入口）
-  if (/纪要|总结|摘要/.test(q)) {
-    const r = await buildMinutes(roomNumber, { type: 'segment' });
-    return `${r.mock ? '[Mock] ' : ''}纪要已生成：${r.path} —— 要点节选：` +
-      (r.markdown.split('## 关键句节选')[1] || '').split('\n').filter((l) => l.startsWith('- ')).slice(0, 3).join('；');
+  /* ★ 09-24 实修「配了 key 反而生成不了纪要」：
+   *   「生成纪要」这类**动作型**请求原先写在 Mock 分支里——一旦配上 DeepSeek key，
+   *   LLM 分支抢先返回一段"好的，我来总结一下…"的漂亮话，**纪要文件根本没落盘**，
+   *   用户在聊天里看到的却是"AI 已答应"。能力与动作的错位，是最难自查的一类缺陷。
+   *   修法：动作意图在进 LLM 之前就被路由走（tools-first），聊天模型只负责聊天。 */
+  if (/纪要|会议总结|总结一下|摘要|行动项|待办清单/.test(q)) {
+    const r = await buildMinutes(roomNumber, { type: /终稿|最终/.test(q) ? 'final' : 'segment' });
+    const picks = (r.markdown.split('## 关键句节选')[1] || '')
+      .split('\n').filter((l) => l.startsWith('- ')).slice(0, 3).join('；');
+    return {
+      text: `纪要已生成：${r.path}${r.mock ? '（[Mock] 本地模板）' : '（LLM 撰写）'}${picks ? ' —— 要点节选：' + picks : ''}`,
+      mock: r.mock, file: r.file, path: r.path, usage: { totalTokens: 0 },
+    };
   }
-  let ans;
-  if (/你是谁|介绍.*自己|hello|hi|你好/i.test(q)) {
-    ans = `我是本房间的 AI 助理（🤖），${dur} 分钟前入会，一直在听：当前 ${members.length} 人在场。问"谁发言最多/会议多久/最近说了什么"都能答；配置 DEEPSEEK_API_KEY 后我会更聪明。`;
-  } else if (/谁|发言|说话/.test(q)) {
-    ans = `按服务器发言统计：${talkTxt}。`;
-  } else if (/多久|时长|开.*久/.test(q)) {
-    ans = `这场会已开约 ${dur} 分钟（${members.length} 人在场）。`;
-  } else if (/多少人|几个人|在线/.test(q)) {
-    ans = `当前 ${members.length} 人在场${room && room.aiBot ? '（含我）' : ''}。`;
-  } else if (/字幕|说了|提到|刚才/.test(q)) {
-    ans = capTail.slice(-3).map((e) => `${e.name}："${e.text}"`).join('；') || '字幕账本还是空的——请大家打开「💬 字幕」。';
-  } else {
-    ans = `我在听（${members.length} 人在场，字幕 ${capTail.length} 条）。目前是 [Mock] 模式：可以问我"谁发言最多/会议多久/刚才说了什么"；配 DEEPSEEK_API_KEY 后可自由问答。`;
-  }
-  return '[Mock] ' + ans;
+
+  const messages = [
+    { role: 'system', content: '你是简易腾讯会议的 AI 会议助理，以参会者身份入会。用简短中文回答（不超过120字），基于给的会议上下文，不要编造上下文里没有的内容。' },
+    { role: 'user', content: `会议上下文：\n${context}\n\n成员提问：${question}` },
+  ];
+  // ── 降级路径（AI 双轨约定）：无 key / 超时 / 限流都走这里，输出带 [Mock] 前缀 ──
+  const mockAnswer = () => {
+    const s = String(question || '');
+    if (/你是谁|介绍.*自己|hello|hi|你好/i.test(s)) {
+      return `我是本房间的 AI 助理（🤖），${dur} 分钟前入会，一直在听：当前 ${members.length} 人在场。问"谁发言最多/会议多久/最近说了什么"都能答；配置 DEEPSEEK_API_KEY 后我会更聪明。`;
+    }
+    if (/谁|发言|说话/.test(s)) return `按服务器发言统计：${talkTxt}。`;
+    if (/多久|时长|开.*久/.test(s)) return `这场会已开约 ${dur} 分钟（${members.length} 人在场）。`;
+    if (/多少人|几个人|在线/.test(s)) return `当前 ${members.length} 人在场${room && room.aiBot ? '（含我）' : ''}。`;
+    if (/字幕|说了|提到|刚才/.test(s)) {
+      return capTail.slice(-3).map((e) => `${e.name}："${e.text}"`).join('；') || '字幕账本还是空的——请大家打开「💬 字幕」。';
+    }
+    return `我在听（${members.length} 人在场，字幕 ${capTail.length} 条）。目前是 [Mock] 模式：可以问我"谁发言最多/会议多久/刚才说了什么"；配 DEEPSEEK_API_KEY 后可自由问答。`;
+  };
+
+  /* ★ 09-24 流式：onDelta 存在就走 SSE 增量（打字机），否则一次性返回。
+   *   两条路径共用同一份 messages 和同一个 mockAnswer——"会降级"这件事不因换链路而失效。 */
+  const res = onDelta
+    ? await AI.streamLLM(messages, { label: 'ai-ask', temperature: 0.4, timeoutMs: 20000, maxTokens: 300, mock: mockAnswer }, onDelta)
+    : await AI.askLLM(messages, { label: 'ai-ask', temperature: 0.4, timeoutMs: 15000, maxTokens: 300, mock: mockAnswer });
+  return { text: (res.mock ? '[Mock] ' : '') + res.text, mock: res.mock, usage: res.usage, ms: res.ms };
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -1261,31 +1333,16 @@ async function llmPlan(goal) {
   const tools = '可用操作（JSON 数组，每项 {op,x?,y?,text?,key?,ms?}）：' +
     'move{x,y} click{x,y} dblclick{x,y}（坐标 0~1 归一化，桌面计算器图标≈{0.045,0.09}）' +
     'type{text} key{key} wait{ms}。最多 12 步。';
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 20000);
-  try {
-    const res = await fetch('https://api.deepseek.com/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-      body: JSON.stringify({
-        model: 'deepseek-chat',
-        messages: [
-          { role: 'system', content: '你是远程桌面 AI 操作员。只输出一个 JSON 数组（不要任何其他文字），表示完成目标的鼠标/键盘操作序列。' },
-          { role: 'user', content: `${tools}\n目标：${goal}` },
-        ],
-        temperature: 0.2,
-      }),
-      signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    const raw = (data.choices[0].message.content || '').replace(/```json|```/g, '').trim();
-    const plan = JSON.parse(raw);
-    if (!Array.isArray(plan)) throw new Error('LLM 计划不是数组');
-    return plan.slice(0, 12);
-  } finally {
-    clearTimeout(timer);
-  }
+  // ★ 09-24：改走统一 provider（自带 json 围栏清理 / 超时 / 降级），mock 钩子直接抛错
+  //   ——本函数的契约就是"拿不到 LLM 计划就抛"，降级交给调用方走 mockPlan（保持原设计）。
+  const res = await AI.askLLM([
+    { role: 'system', content: '你是远程桌面 AI 操作员。只输出一个 JSON 数组（不要任何其他文字），表示完成目标的鼠标/键盘操作序列。' },
+    { role: 'user', content: `${tools}\n目标：${goal}` },
+  ], { label: 'ai-op-plan', temperature: 0.2, timeoutMs: 20000, json: true, mock: () => { throw new Error('LLM 不可用'); } });
+  if (res.mock) throw new Error(res.reason || 'LLM 不可用');
+  const plan = JSON.parse(res.text);
+  if (!Array.isArray(plan)) throw new Error('LLM 计划不是数组');
+  return plan.slice(0, 12);
 }
 
 // 主流程：连入 → join-room → remote-request（真实授权）→ 执行 → release
@@ -1330,7 +1387,7 @@ async function runAiOperator(roomNumber, hostId, goal) {
 
   // 计划：LLM 优先，Mock 兜底（双轨）
   let plan = null;
-  if (process.env.DEEPSEEK_API_KEY) {
+  if (AI.aiEnabled()) {                       // ★ 09-24：统一判断（三处来源之一有 key 就行）
     try { plan = await llmPlan(goal); } catch (e) { plan = null; }
   }
   const isMock = !plan;
@@ -1384,33 +1441,15 @@ function loadCaptions(roomNumber) {
   return out.sort((a, b) => (a.ts || 0) - (b.ts || 0));
 }
 
-// LLM 纪要（有 key 才走；失败抛错由调用方降级 Mock）
+// LLM 纪要（有 key 才走；失败抛错由调用方降级 Mock）——★ 09-24 改走统一 provider
 async function llmMinutes(seg) {
   const transcript = seg.slice(-200).map((e) => `${e.name}: ${e.text}`).join('\n');
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 30000);
-  try {
-    const res = await fetch('https://api.deepseek.com/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-      body: JSON.stringify({
-        model: 'deepseek-chat',
-        messages: [
-          { role: 'system', content: '你是会议纪要助手。基于会议字幕输出 markdown，只含三个小节：## 要点（不超过6条）## 待办（可执行的动作项，没有就写"（无）"）## 结论（一句话）。不要编造字幕里没有的内容。' },
-          { role: 'user', content: `会议字幕：\n${transcript}` },
-        ],
-        temperature: 0.3,
-      }),
-      signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    const text = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-    if (!text) throw new Error('empty completion');
-    return text.trim();
-  } finally {
-    clearTimeout(timer);
-  }
+  const res = await AI.askLLM([
+    { role: 'system', content: '你是会议纪要助手。基于会议字幕输出 markdown，只含三个小节：## 要点（不超过6条）## 待办（可执行的动作项，没有就写"（无）"）## 结论（一句话）。不要编造字幕里没有的内容。' },
+    { role: 'user', content: `会议字幕：\n${transcript}` },
+  ], { label: 'ai-minutes', temperature: 0.3, timeoutMs: 30000, maxTokens: 900, mock: () => { throw new Error('LLM 不可用'); } });
+  if (res.mock) throw new Error(res.reason || 'LLM 不可用');
+  return res.text;
 }
 
 // 纪要合成器：type='segment'|'final'；since=只统计该时刻之后（分段用）
@@ -1430,7 +1469,7 @@ async function buildMinutes(roomNumber, opts = {}) {
 
   let body = null;
   let isMock = false;
-  if (process.env.DEEPSEEK_API_KEY && seg.length) {
+  if (AI.aiEnabled() && seg.length) {
     try { body = await llmMinutes(seg); } catch (e) { body = null; }
   }
   if (!body) {
@@ -2393,17 +2432,36 @@ io.on('connection', (socket) => {
     ok(callback, { aiBot: setAiBot(socket.roomNumber, false) === true });
   });
 
+  /* ★ 09-24 体验修复：以前 bot 不在房里的回答是冷冰冰的一句 fail(……需要先点 AI 助理按钮)。
+   *   提问的人脑子里是"问 AI"，不是"先去按某个按钮"——自动邀请一次，才是符合直觉的助手。
+   *   其余校验（不在房间 / 空问题）保持严格 fail，不放水。 */
   socket.on('ai-ask', async (payload = {}, callback) => {
     const roomNumber = socket.roomNumber;
     const room = roomNumber && rooms.get(roomNumber);
     if (!room) return fail(callback, '先进入房间再向 AI 助理提问');
-    if (!room.aiBot) return fail(callback, 'AI 助理不在房间里（点控制坞「🤖 AI 助理」邀请入会）');
+    if (!room.aiBot) {
+      setAiBot(roomNumber, true); // 见上注：助理缺位时自动入会（与点「🤖 AI 助理」完全同一条链路）
+      logEvent('info', 'ai-auto-join', { roomNumber, by: socket.id, why: 'ai-ask' });
+    }
     const question = String(payload.question || '').trim().slice(0, 300);
     if (!question) return fail(callback, '问题不能为空');
-    const answer = await aiBrain(roomNumber, question);
-    io.to(roomNumber).emit('chat-message', { from: 'ai-bot', name: '🤖 AI 助理', text: answer, ts: Date.now() });
-    logEvent('info', 'ai-ask', { roomNumber, by: socket.id, qLen: question.length });
-    ok(callback, { answer });
+    const streamId = `ai-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    ok(callback, { started: true, streamId });   // 先回执（前线立即可渲染"思考中"气泡）
+
+    /* ★ 流式打字机：每个增量立刻广播给全房（ai-stream），最后补一条完整 chat-message
+     *   作为"权威终态"——为什么两份？流可被网络丢弃、可被晚进房的人错过，
+     *   而 chat-message 走的是既有聊天台账（导出/去重/离线补帧都靠它）。
+     *   增量先行保证手感，终态兜底保证不丢——和字幕"容忍丢 / 问答不容忍丢"同一套双路哲学。 */
+    io.to(roomNumber).emit('ai-stream', { id: streamId, delta: '', done: false, start: true, mock: AI.aiEnabled() === false });
+    const r = await aiBrain(roomNumber, question, (delta) => {
+      io.to(roomNumber).emit('ai-stream', { id: streamId, delta, done: false });
+    });
+    io.to(roomNumber).emit('ai-stream', { id: streamId, delta: '', done: true, mock: !!r.mock });
+    io.to(roomNumber).emit('chat-message', {
+      from: 'ai-bot', name: '🤖 AI 助理', text: r.text, ts: Date.now(), streamId,
+      ai: { mock: !!r.mock, tokens: (r.usage && r.usage.totalTokens) || 0, file: r.file || null, path: r.path || null },
+    });
+    logEvent('info', 'ai-ask', { roomNumber, by: socket.id, qLen: question.length, mock: !!r.mock, tokens: (r.usage && r.usage.totalTokens) || 0 });
   });
 
   // ★ 09-19c N2：手动生成纪要（不需要 bot 在场——纪要吃的是字幕账本，人人可取）
@@ -2904,6 +2962,12 @@ io.on('connection', (socket) => {
     console.log(`\nSFU 版已启动: http://${listenOn}:${PORT}`);
     /* ★ 09-17c：探测类工作全部挪到 listen 之后、且不阻塞（用户能立刻打开页面）：
      *   ffmpeg 快探测（异步 500ms 超时）+ 可达性自检（announcedIp 与本机网卡比对） */
+    /* ★ 09-24 用眼睛先看一眼 AI 处在哪种轨道：这条日志是排障第一现场——
+     *   用户报告"AI 答得像模板"时，先看这里是 [Mock] 还是 LLM，省掉一半沟通。 */
+    const aiS = AI.getStats();
+    console.log(aiS.enabled
+      ? `🤖 AI 模式：LLM（DeepSeek ${AI.getSettings().model}）—— 问答/纪要/操作员全部走真模型`
+      : '🤖 AI 模式：[Mock] —— 未配置 DEEPSEEK_API_KEY（可写进项目根 .env），全部功能走本地规则降级，链路照样跑得通');
     probeFfmpeg();
     checkAnnouncedIp();
     if (httpsServer) {
@@ -3001,8 +3065,27 @@ async function runRecordSelfTest() {
     const size = fs.existsSync(file) ? fs.statSync(file).size : 0;
     if (size < 10000) throw new Error(`产物过小（${size} B），RTP 链路可能没通`);
     const probeBin = FFMPEG_BIN.replace(/ffmpeg(\.exe)?$/, (m) => (m.endsWith('.exe') ? 'ffprobe.exe' : 'ffprobe'));
-    const probeOut = require('child_process').execFileSync(probeBin,
-      ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file]).toString().trim();
+  /* ★ 09-24 实修「ffprobe EBUSY」（本项目自测真红过三次，而同一文件在 shell 里 ffprobe 秒出结果）：
+   *   罪魁不是文件锁，是 **spawnSync 本身**——Node 在 Windows 上的同步 spawn 与未排空的
+   *   子进程 stdio 管道/句柄相冲时会直接报 EBUSY（与文件是否可读无关，所以重试 6 次没救）。
+   *   改异步 execFile 之后该错误消失，顺带不再阻塞事件循环（服务器进程里更该这样）。
+   *   留一次重试给真正的瞬时锁，但下一次的重试必须**先 await 让出事件循环**。 */
+  const probeOnce = () => new Promise((resolve, reject) => {
+    require('child_process').execFile(probeBin,
+      ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file],
+      { timeout: 8000, windowsHide: true },
+      (err, stdout) => (err ? reject(err) : resolve(String(stdout || '').trim())));
+  });
+  let probeOut = '';
+  for (let i = 0; i < 3; i++) {
+    try {
+      probeOut = await probeOnce();
+      if (probeOut) break;
+    } catch (e) {
+      if (i === 2) throw new Error(`ffprobe 读取失败（3 次）：${e.message}`);
+      await sleep(500);
+    }
+  }
     const dur = parseFloat(probeOut);
     if (!(dur > 1)) throw new Error(`ffprobe 读出时长异常（${probeOut} 秒）`);
     console.log(`🧪 [TEST_RECORD] PASS —— 产物 ${(size / 1024).toFixed(1)} KB，时长 ${dur.toFixed(1)}s → ${file}`);

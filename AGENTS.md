@@ -407,6 +407,61 @@
 > **回归（本次实测）**：信令 **93/93**（+5 C1 全链路断言：无共享拒绝/受理/真实授权/
 > 输入序列含 16 字节帧/自动交还）+ 冒烟 **95/95**。
 
+> **09-24 AI 会议助理真上线 + 三处实修（按 `后续升级方向.md` 第 1 节主攻，本次有真 LLM key）**——
+> ① **密钥托管与统一 Provider（新文件 `sfu/ai/provider.js`）**：原来 server.js 里三份
+>   重复的 DeepSeek fetch（aiBrain 问答 / llmPlan 操作员计划 / llmMinutes 纪要）各写各的
+>   超时与降级，现在统一入口 `askLLM()` / `streamLLM()`；取值优先级 = `DEEPSEEK_API_KEY`
+>   环境变量 > 项目根 `.env`（新加，已入 .gitignore）> `sfu/config.json` 的 `ai.key`；
+>   **密钥永不下发浏览器**（`/config.json` 只给 `aiEnabled` 布尔值，有断言守着）；
+>   内置**用量账本**（调用/成功/失败/Mock/tokens/估算花费），已并入 `/metrics`
+>   （`sfu_ai_llm_*` 七组）。
+> ② **三条产品化升级**：**流式打字机**（新信令 `ai-stream`，SSE 增量边吐边渲染，终态再补一条
+>   chat-message 兜底去重——同"字幕容忍丢 / 问答不容忍丢"的双路哲学）；**助理缺位自动入会**
+>   （以前 @ai 要成员先点「🤖 AI 助理」按钮，答不了还 fail，反直觉）；**📝 纪要入口**
+>   （字幕条右侧按钮 → ai-minutes → 气泡里直接给 /minutes 下载链接）+ LLM/Mock 模式徽标与 token 用量。
+> ③ **教学三件套脚本落地**（路线图 1.0 的阶段 0/1/2）：`scripts/chat.js`（终端问答）、
+>   `scripts/summarize.js`（map-reduce 长文本纪要，导出 `summarize()`）、`scripts/agent.js`
+>   （手写 ReAct 工具循环，带三个只读工具）+ `npm run test:ai` **双轨自检**（Mock 轨永远跑、
+>   LLM 轨有 key 才跑，当前 **10/10**）；另有 `npm run ai:chat / ai:summarize / ai:agent`。
+> ④ **实修三个真 bug**（都是"复现过才敢改"）：
+>   - **announcedIp 漂移致命**：config.json 里 192.168.127.194，本机实际 192.168.209.194，
+>     旧版只打印告警、**仍用错 IP 通告浏览器**（跨机一律黑屏，且无任何运行时报错）→
+>     改为三层取值 + **自动回退本机真实网卡 IP**（私网优先），延迟满足可靠性而非可配置性；
+>   - **ffmpeg 探测误判**：500ms 超时在"启动同时拉 Worker 子进程"的机器上必然超时（真复现过一次），
+>     装了 ffmpeg 却宣布"未检测到"→ 超时放宽到 2.5s + 超时重试 + **区分 ENOENT（真没装）与超时**；
+>   - **test:record 稳定红 EBUSY**：罪魁**不是文件锁**而是 Windows 上 Node 的 `spawnSync`
+>     与未排空的子进程 stdio 相冲（同一文件在 shell 里 ffprobe 秒出）→ 改异步 `execFile` +
+>     三次重试，连跑 3 次全 PASS。
+>   - 顺带修一条 **AI 动作错位**：「@ai 生成纪要」原本写在 Mock 分支里，**配上 key 之后 LLM
+>     抢先答一句漂亮话，纪要文件根本没生成**（用户看到的是"AI 答应了"）→ 动作型意图在进 LLM
+>     之前先路由（tools-first）。
+> **回归（本次实测）**：冒烟 **118/118**（+11）+ 信令 **106/106**（+8，两条轨道都绿：
+> 有 key=LLM 轨、无 key=Mock 轨分别跑过）+ Mesh **33/33** + test:ai **10/10** + test:record PASS；
+> 导读 LEARN.md **5.28**；⚠️ 待人工验证：真浏览器打字机观感、跨机画面（announcedIp 自动纠偏后）、
+> 纪要质量（真开会 10 分钟）、操作员演示（有 key 后走 LLM 计划而非 Mock 脚本）。
+>
+> **09-23 G4 移动端/PWA ✅ + 毕设题目定名（"按后续升级方向升级 SFU 版"）**——
+> ① **题目定名**：《基于 WebRTC 与 Mediasoup 的智能多人视频会议系统》（README 头部；
+>   论文封面备选《基于 WebRTC 与大语言模型的智能多人视频会议系统的设计与实现》）；
+> ② **G4 三件套（client.js 第 32 步 + style.css 第 25 节，纯前端零依赖）**：
+>   **PWA 外壳**（manifest.webmanifest + sw.js cache-first/socket.io 绝不缓存/导航 network-first
+>   断网兜底；图标=墨底金框朱砂會 1024px 落 sfu/public/icons/；服务器 MIME 表补
+>   .webmanifest/.png/.svg/.json）；**移动端响应式**（≤980px 侧栏抽屉化——补真缺口：
+>   原来侧栏移出画布后没有任何开关能拉出来，sideBtn+sideScrim+body.side-open；
+>   ≤760px 控制坞 :has(.i) 收图标/网格 150px/字幕条上移/预览竖屏堆叠）；
+>   **低带宽模式**（「省流」开关把所有远端画面锁 simulcast 最低层，复用
+>   set-preferred-layers 服务器零改动；layer-changed 钩子把 ABR 升层纠回 0）；
+> ③ **顺手修三件**：F6 冒烟 flaky（绿幕逐像素循环让桩帧率 10→28ms/帧，固定 500ms 跨不过
+>   %24 刷新点，改轮询最多 3s）；updateLayerPicker 补 tile 空值守卫（D6 重连后迟到换层
+>   通知不再炸）；信令测试头部补记"起服务器要带 AI_OP_STEP_MS=20，否则 09-19g 假失败"；
+> **回归（本次实测）**：冒烟 **107/107**（+12）+ 信令 **98/98**；
+> 新坑 34（sw.js 注释里 `**/socket.io` 的 `*/` 提前终止块注释——坑 26 家族第三例，
+> node --check 抓到）；坑 35（冒烟桩 classList.toggle 不返回布尔，依赖返回值的代码
+> 语义反转——toggle 后要用 contains 读回）；⚠️ 待人工验证：手机真机（扫码进会/装主屏/
+> 横竖屏）、省流真实锁层、断网壳子渲染；另：本次"发布 Mesh 版为网页"落 publish-mesh/
+> （qwenwork.host 已上线），**工作区另有外来未提交改动 scripts/bench.js +
+> scripts/_patch-bench.py（之前会话残留，非本次产物，待作者处置）**。
+
 > **09-19 AI 主攻拍板 + 路线图重构（本次只动文档、不动代码）**——用户从 G 档 8 候选中拍板
 > **两条主线**：①纪要+问答（DeepSeek summarize + @AI 问答 + 值守 N2）②C1 AI 远程操作员
 > （ReAct 工具循环 × 控制协议，授权不豁免）；确立 **Mock+真测双轨**约定（无 key 降级 Mock 带
@@ -458,6 +513,10 @@
 | 25 | **E1/E2 一键跨电脑交付（09-15c/09-16c/09-16d）** | openrelay 免费 TURN 预置（config.example.json）+ `deploy/coturn/` 自建包；`npm run start:lan`：探局域网 IP → 备份旧配置 → 生成 config（0.0.0.0+announcedIp+HTTPS 自签+TURN）→ 自动 netsh 放行防火墙 → 打印三地址；`/config.json` 下发 `lanUrl` 让邀请链接跨机可用 | — | scripts/start-lan.js、deploy/coturn/*、start-lan.bat；实测：HTTPS `https://<局域网IP>:3443` 返回 200 |
 | 26 | **E4 性能基准数字（09-16c）** | 三档（4/8/16 路）媒体转发实测：16 发 16 收 8263 kbps、单核 6%、零丢包；ffmpeg 合成源 → PlainTransport → mediasoup 转发 → dgram 真收包统计（不依赖浏览器） | — | scripts/bench.js（`npm run bench`）、性能测试报告.md |
 | 27 | **过夜值守 C3-N1（09-17e，AI 线 L 线长跑，主版本独有）** | 睡前开字幕挂 ≥7h：账本溢出归档（内存热窗口 + `sfu/captions/cap-<房间>-<日期>.jsonl` 权威副本 = G2 的 LLM 输入）；network 指数退避 + 30s 看门狗自愈；值守统计/心跳；导出合并全档；`npm run soak` 耐久自测（默认 7h/可压缩/对账一条不丢） | 12 / 27 | sfu/public/client.js **第 30 步**、sfu/server.js `/api/captions`、scripts/soak.js（LEARN.md 5.19.5） |
+| 28 | **G4 移动端 / PWA（09-23，主版本独有，纯前端零依赖）** | PWA：manifest（.webmanifest 扩展名避开 /config.json 特殊路由）+ sw.js Service Worker（预热缓存/cache-first/socket.io 绝不碰/导航 network-first 断网兜底/版本号自清）+ 图标 icons/icon-1024.png + 服务器 MIME 表补四条；移动端：≤980px 侧栏抽屉（sideBtn 开关+sideScrim 遮罩+body.side-open 状态位——补真缺口：原侧栏移出画布后无开关）、≤760px 紧凑档（:has(.i) 图标化/网格 150px/字幕条上移/预览竖屏堆叠）；低带宽模式：「省流」开关所有远端画面锁 simulcast 最低层（复用 set-preferred-layers 服务器零改动；layer-changed 钩子纠回 ABR 升层） | — | client.js **第 32 步**、style.css 第 25 节、sfu/public/{manifest.webmanifest,sw.js,icons/}、sfu/server.js MIME 表（LEARN.md 5.27） |
+
+| 29 | **AI Bot 参会者 + N2 纪要 + C1 AI 远程操作员（09-19b/09-19c/09-19g，主版本独有）** | 以参会者身份入会（room-state `isBot`，服务端 ffmpeg astats 音频管线"听"响度）；N2 纪要 `buildMinutes`（字幕账本 + 待办关键词规则层 + LLM 双轨，落 `sfu/minutes/<房间>/`，值守定时分段 + 离开出终稿，`/minutes` 双白名单防穿越）；C1 操作员：服务器开真实 socket.io 控制端连自己，**授权链路与人类完全同一套、绝不豁免**，计划-执行型 agent 把目标翻成 remote-input 序列（服务器端 16 字节帧编码） | 27 | sfu/server.js AI 基建块 + `buildMinutes` + `runAiOperator`、sfu/public/client.js AI 按钮/`@ai`/AI 操作按钮 |
+| 30 | **AI Provider 双轨 + 流式助理（09-24，主版本独有，本次重点）** | 新文件 `sfu/ai/provider.js` 收口三处 LLM 调用（`askLLM`/`streamLLM`，DeepSeek 走 Node 内置 fetch、零新依赖）；密钥三来源（env > 项目根 `.env` > `sfu/config.json` 的 `ai.key`）且**永不下发浏览器**；**AI 双轨**：无 key/超时/限流 → 本地规则兜底并带 `[Mock]` 标记；用量账本（调用/错误/tokens/估算花费）并入 `/metrics`（`sfu_ai_llm_*`）；前端三项：**流式打字机**（`ai-stream` 增量 + 终态 chat-message 去重）、**助理缺位自动入会**、**📝 纪要入口** + LLM/Mock 徽标与 token 用量；教学脚本 `scripts/{chat,summarize,agent}.js` + `npm run test:ai` 双轨自检 | 27 | sfu/ai/provider.js、sfu/server.js（`aiBrain`/`llmPlan`/`llmMinutes`/`ai-ask`/`ai-stream`）、sfu/public/client.js AI 段、style.css 第 23 节、scripts/test-ai.js（LEARN.md **5.28**） |
 
 **双版本架构形态（主次已调换）**：**SFU 版（sfu/ 目录/3001，mediasoup 服务器转发，腾讯会议同款）为
 主版本/简历主打**；Mesh 版（根目录/3000，浏览器 P2P 直连）是教学对照版——先把 P2P 讲明白，
@@ -547,10 +606,14 @@ npm run start:sfu      # SFU 版服务器 → http://localhost:3001（要先 bui
 npm run start:demo     # 一键起两版（Mesh 3000 + SFU 3001）并打印地址
 npm run start:lan      # 局域网交付：探 IP → 生成 sfu/config.json（HTTPS 自签+announcedIp+TURN）→ 放行防火墙
 npm run build:sfu-vendor  # 一次性：打包 mediasoup-client → sfu/public/vendor/（改依赖后重跑）
-npm test               # Mesh 版信令回归（必须先起 3000）★ 2026-09-17 实测 33/33
-npm run test:sfu       # SFU 版信令回归（必须先起 3001）★ 2026-09-17 实测 67/67
-npm run test:smoke     # SFU 版**前端**无头冒烟（假 DOM/假 mediasoup，零依赖不用起服务器）★ 91/91
-npm run test:record    # D+2 服务器侧录制端到端自测（需已装 ffmpeg；产物落 sfu/recordings/）
+npm test               # Mesh 版信令回归（必须先起 3000）★ 2026-09-24 实测 33/33
+npm run test:sfu       # SFU 版信令回归（必须先起 3001，且 AI_OP_STEP_MS=20）★ 2026-09-24 实测 106/106（Mock 轨 / LLM 轨各跑一遍）
+npm run test:smoke     # SFU 版**前端**无头冒烟（假 DOM/假 mediasoup，零依赖不用起服务器）★ 118/118
+npm run test:ai        # AI 双轨自检（无 key 只跑 Mock 轨并提示，有 key 两条都跑）★ 10/10
+npm run ai:chat        # AI 脚本：终端一问一答（教学阶段 0）／--q "问题" 单发
+npm run ai:summarize   # AI 脚本：文本/文件/房间字幕 → markdown 纪要（--text/--file/--room）
+npm run ai:agent       # AI 脚本：手写 ReAct 工具循环（--goal "…" --maxsteps 6 --verbose）
+npm run test:record    # D+2 服务器侧录制端到端自测（需已装 ffmpeg；产物落 sfu/recordings/）★ 连跑 3 次 PASS
 npm run test:turn      # ICE 可达性实测（对 config 每个 STUN/TURN 手搓 STUN Binding，3s 超时）
 npm run soak          # C3-N1 服务器耐久自测（默认 7 小时过夜；--minutes 2 压缩自测；结束对账"一条不丢"）
 npm run bench          # E4 压力基准（4/8/16 路，约 1 分钟，独立 Worker，不用起 3001）
@@ -638,7 +701,8 @@ node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU �
 | C→S 应答 | `auth-register` / `auth-login` / `auth-verify` | `{ username, password, displayName? }` / `{ username, password }` / `{ username, token }` → 回 `{ user:{username,displayName}, token }` 或 `{ error }`（错密码与"用户名不存在"**统一提示**） | 09-16 登录注册（users.json + scrypt + 内存 token） |
 | C→S 应答 | `record-start` / `record-stop` | `record-start { memberId } 或 { producerId }` → 回 `{ recordId }`（跨房间目标被拒、无媒体走明确错误应答）；`record-stop { recordId }` → 回 `{ file }`（经 `/recordings/<file>` 下载） | D+2 服务器侧录制 |
 | 数据通道应用层（非信令） | `{type:'chat'}` / `{type:'react'}` / `{type:'annot', to, op, x, y, color}` / `{type:'board', op, ...}` / `{type:'caption', text}` | 三种频道 label：`chat`（聊天 + 表情 + 字幕）/ `annot`（带 `to` 定向头的屏幕批注）/ `board`（房间级白板，无定向头）；字幕**不做信令兜底**、聊天**双路径 + msgId 去重** | D+1 / F4 / F5 / F7 / 实时字幕 |
-| HTTP（非信令） | `GET /api/rooms` / `GET /dashboard` / `GET /config.json` / `GET /recordings/<file>` / `POST|GET /api/captions`（09-17e 值守归档：落盘/回读） | 观测快照 JSON / 面板页 / 下发 ICE + `lanUrl` / 录制产物下载（路径穿越已钳制、静态响应 `no-store`） | 观测面板、可达性、D+2 交付 |
+| HTTP（非信令） | `GET /api/rooms` / `GET /dashboard` / `GET /config.json` / `GET /recordings/<file>` / `GET /minutes/<房间>/<file>` / `GET /api/minutes?room=` / `POST|GET /api/captions`（09-17e 值守归档：落盘/回读） | 观测快照 JSON / 面板页 / 下发 ICE + `lanUrl` + `aiEnabled`（**只给布尔值，密钥绝不下发**） / 录制产物下载 / 纪要 md 下载（路径穿越均已钳制、静态响应 `no-store`） | 观测面板、可达性、D+2 交付、N2 纪要 |
+| C→S 应答 + S→C 广播 | `ai-join` / `ai-leave` / `ai-ask` / `ai-minutes` / `ai-op` | `ai-join`→`{aiBot}`（bot 以 `isBot` 虚拟成员进 room-state）；`ai-ask {question}`→**先回执** `{started,streamId}` 再 `ai-stream{id,delta,done}` 增量 + 终态 `chat-message{...,streamId,ai:{mock,tokens}}`（前端按 streamId 去重；助理缺位时自动邀请）；`ai-minutes {type,since}`→`{file,path,mock}`；`ai-op {goal}`→`{started}`（AI 以真实控制端走完整授权链路，不豁免） | 09-19b/c/g + **09-24 流式与双轨**（详见 `sfu/protocol.js` 的 AI 段契约） |
 
 ---
 
@@ -758,6 +822,49 @@ node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU �
     `typeof callback === 'function'` 守卫（对全部信令生效，一劳永逸）；新增信令时
     不再需要逐个防守，但也别绕开 helper 直接裸调 callback。
 
+34. **注释里的 `**/xxx` 序列会提前终止块注释**（09-23 sw.js 实修，坑 26 家族第三例）：
+    sw.js 文件头注释写了"**/socket.io 的请求绝不碰**"——`**/` 里的 `*/` 直接把块注释
+    闭合，剩余文字变裸 token，`node --check` 当场报 SyntaxError。规律同坑 26（CSS）：
+    **块注释里永远不要写出 `*/` 这个序列**（markdown 加粗 `**` + 路径 `/xxx` 开头正好拼出来）。
+
+35. **冒烟桩的 classList.toggle() 不返回布尔**（09-23 G4 实修）：真 DOM 的
+    `toggle()` 返回"现在是否有这个类"，桩里返回 undefined——`const open = el.classList.toggle('x')`
+    这种写法在真浏览器正常、在冒烟里走错分支且不报错（静默语义反转）。
+    修法：**toggle 之后再 contains 读回**，两端语义一致。另记：信令回归要
+    `AI_OP_STEP_MS=20 node sfu/server.js` 起服（默认 600ms/步 ×7 步 > 测试 2.5s 等待，
+    09-19g 那组会"假失败"，测试头部已补记）。
+
+36. **配置漂移 ≠ 报错：announcedIp 是典型的"沉默故障"**（09-24 实修）：
+    config.json 里躺着旧 IP 192.168.127.194、本机早已换成 192.168.209.194 时，
+    mediasoup **照旧把错 IP 写进 ICE candidate**，同机 localhost 一切正常，
+    **别的电脑/手机一律黑屏**，且没有任何异常可循——是最难排查的一类"沉默故障"。
+    修法：三层取值（env > config **且与本机网卡一致** > 自动挑对外 IPv4，私网优先），
+    漂移时**自动回退**并在启动日志里说明用了哪个、为什么。教训可以复用：
+    **本机相关的配置项要拿到"当前事实"面前核对一遍，而不是照抄配置**。
+
+37. **外部程序探测要区分"不存在"与"此刻没答上来"**（09-24 实修）：`ffmpeg -version`
+    给 500ms 超时，启动瞬间正在拉 mediasoup Worker 子进程的机器上必然超时 →
+    `err.killed=true` 被判成"未安装"，录制与 AI 听觉管线被**无误关闭**。
+    修法：超时放宽到 2.5s + 超时重试一次 + **ENOENT 才算真没装**。
+    同一批修复还揪出了 test:record 的稳定红：它不是文件锁，而是 **Windows 上 Node 的
+    `spawnSync` 与未排空的子进程 stdio 相冲时会直接返回 EBUSY**（同一文件在 shell 里
+    ffprobe 秒出结果，重试 6 次也没救）→ 改异步 `execFile` 立刻恢复。
+    教训：**在服务器进程里调用外部命令，优先异步，不要 `execFileSync`；
+    失败要看 errno（ENOENT / EBUSY / ENODEV），别一律当"功能不可用"**。
+
+38. **AI 功能最怕"动作被聊天抢答"**（09-24 实修）：`@ai 生成纪要` 原先写在 Mock 分支里，
+    配上 DeepSeek key 之后 LLM 分支抢先回一句"好的，我来总结一下…"，
+    **纪要文件根本没生成**，而用户看到的是"AI 答应了"——能力与动作错位，
+    比报错更难被发现。修法：**动作型意图在进 LLM 之前先路由**（tools-first），
+    聊天模型只负责聊天。同理也要注意：新加 AI 能力时，别把它藏在降级分支里。
+
+39. **AI 回归必须写成"双轨"**（09-24 确立）：脱离 key 与否决定了断言的措辞。
+    `test-sfu-signaling.js` 里凡是断言 `[Mock] 前缀 / mock === true` 的用例，
+    在有 key 的环境下会全红——那是**测试写死了环境**，不是代码错。
+    现在的做法：从 `/config.json` 读 `aiEnabled` 后两支断言分叉；真模型才跑的那部分
+    放进 `npm run test:ai`（无 key 自动 skip 并提示）。
+    **纪律：AI 相关断言不得假设"一定没有 key"**。
+
 
 ---
 
@@ -852,14 +959,19 @@ LEARN.md 第 4/5 节进度（✅=已完成，🔜=待做）：
    信令 **72/72** + 冒烟 **87/87** + soak 压缩 PASS；导读 **LEARN.md 5.19.5**；
    N2 定时纪要（LLM 分段总结+终稿）等 key；真 7h 过夜在 0.2 节人工清单。
 
-6. 🔜 **下一步 = `后续升级方向.md`（2026-09-19 重构）第 1 节「AI 会议助手主攻」**——用户拍板收敛为两条主线：
-   ①**纪要+问答**（`summarize.js` → 服务器 `minutes-generate`/`ai-ask` 信令 + @AI 聊天问答 + 值守 N2 联动）
-   ②**C1 AI 远程操作员**（`agent.js` 50 行 ReAct 工具循环 × 远程协助协议，授权链路完整不豁免）；
-   LLM 走 **DeepSeek API**（内置 fetch，零新依赖），测试执行 **Mock+真测双轨**（无 key 自动降级 Mock 带
-   `[Mock]` 标记，冒烟/信令永远跑 Mock，真 key 只跑 `npm run test:ai`）——这是全项目 AI 功能的统一约定。
-   前置 = AI 阶段 0~2（`chat.js`/`summarize.js`/`agent.js`，key 充 10 元）。
+6. 🔜 **下一步 = `后续升级方向.md` 第 1 节「AI 会议助手主攻」（2026-09-24 已大幅推进，剩三条尾巴）**——
+   **本次已完成**：阶段 0~2 三件套脚本（`scripts/chat.js` / `summarize.js`（map-reduce 长文本）/
+   `agent.js`（手写 ReAct 循环））+ **密钥托管与统一 provider**（`sfu/ai/provider.js`，env > `.env` >
+   `config.json` 的 `ai.key`，密钥永不下发）+ **流式打字机**（`ai-stream`）+ **📝 纪要入口** +
+   助理缺位自动入会 + LLM/Mock 徽标与 token 用量 + `/metrics` 的 `sfu_ai_llm_*` + `npm run test:ai`
+   双轨自检（10/10）；C1 AI 操作员（09-19g）在**有 key 后**已能走 LLM 计划（不再只有 Mock 脚本）。
+   **还剩**：① 0.2 节人工验证清单（打字机观感 / 真开会十分钟看纪要质量 / 操作员 LLM 计划演示 /
+   跨机画面）② 值守联动的**真 LLM 分段纪要**（现已连通，需一次 ≥1h 实测确认落盘与费用）
+   ③ 之后接新方向：E3 浏览器端 e2e（0.3 节）或 G 档备选池（该文件第 2 节）。
+   论文提纲/录屏用户明确押后。LLM 仍走 **DeepSeek API**（内置 fetch，零新依赖），
+   **Mock+真测双轨**为全项目 AI 功能的统一约定（见坑 39）。
    **另有真实剩余项**：① 0.2 节"做完但没实测"清单（浏览器人工验证，10 分钟就能补一批）；
-   ② E3 浏览器端 e2e（现只有零依赖冒烟 91 项）；③ 论文提纲/录屏（用户明确押后）。
+   ② E3 浏览器端 e2e（现只有零依赖冒烟 118 项）；③ 论文提纲/录屏（用户明确押后）。
    G 档其余六项（云部署/录制回放/PWA/安全/可观测/规模）压缩为该文件第 2 节备选池，做完主线再挑。
 7. 🔜 排错/优化：chrome://webrtc-internals
 

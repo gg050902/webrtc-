@@ -1,8 +1,12 @@
-# 🎥 简易版腾讯会议 · 多人 WebRTC 会议 —— SFU 版为主（腾讯会议同款架构）
+# 🎥 會 · 基于 WebRTC 与 Mediasoup 的智能多人视频会议系统
 
-一个**从零手写、带逐步教学**的视频会议项目：房间号创建/加入 + 多人实时音视频 + 屏幕共享 +
-群聊 + **入会密码** + **网络质量监控**。
-学完它，你能把 WebRTC 从信令到 P2P、从 Mesh 到 SFU（mediasoup 服务器转发）的整条链路**讲清楚、能过面试**。
+> **毕业设计题目**：《基于 WebRTC 与 Mediasoup 的智能多人视频会议系统》
+> （论文封面备选全称：《基于 WebRTC 与大语言模型的智能多人视频会议系统的设计与实现》；
+> "智能"来自已落地的 AI 会议助理线：实时字幕 → 会议纪要 → @AI 问答 → AI 远程操作员）
+>
+> 一个**从零手写、带逐步教学**的视频会议项目：房间号创建/加入 + 多人实时音视频 + 屏幕共享 +
+> 群聊 + **入会密码** + **网络质量监控**。
+> 学完它，你能把 WebRTC 从信令到 P2P、从 Mesh 到 SFU（mediasoup 服务器转发）的整条链路**讲清楚、能过面试**。
 
 > 目标：用一条**最简链路**（浏览器原生 WebRTC + Node.js/Socket.IO 信令 + mediasoup）跑通"像腾讯会议"的核心功能，
 > 并把每一步代码用**中文教学注释**写清楚，让你既能跑也能讲。
@@ -70,9 +74,12 @@
 | 📈 Prometheus 指标端点 | `GET /metrics` 输出 Prometheus 文本格式：房间/成员/Producer/Consumer 总数、每路媒体累计字节、录制数、进程 uptime/rss——Grafana 直接可抓 | 复用观测面板同一份 snapshotRooms() 数据源，零依赖手拼（G7 首刀，09-18，SFU 主版本） |
 | 📜 结构化日志（G7-②） | 关键事件 JSON Lines 落 `sfu/logs/app-日期.jsonl`（建房/销毁/成员进出/踢人/授权/录制起停），console 人读照旧——机器可检索（jq/脚本直吃） | logEvent 零依赖，只埋低频关键事件、绝不埋 3s/400ms tick（09-19，SFU 主版本） |
 | 🚨 值守告警（G7-③） | `npm run watch` 定时拉 /api/rooms + /metrics：服务拉不到/媒体健康分低/房间宽限告急/内存超限四规则告警，同类 5 分钟限流，可选企业微信/钉钉 webhook | 零依赖脚本 scripts/watch.js，一次 fetch POST 即接 webhook（09-19） |
+| 📱 移动端 / PWA（G4） | 手机可开会：侧栏抽屉化（顶栏开关 + 遮罩）、控制坞收成图标、竖屏预览页堆叠；页面可**安装到主屏**（manifest + Service Worker，静态壳断网可开）；「省流」开关一键把所有远端画面锁到 simulcast 最低层（弱网/流量敏感场景） | manifest.webmanifest + sw.js（cache-first，socket.io 绝不缓存）+ client.js 第 32 步 + style.css 第 25 节；低带宽模式复用 set-preferred-layers 信令，服务器零改动（09-23，纯前端零依赖） |
 | 🤖 AI Bot 参会者（AI 线 C 档） | AI 助理以参会者身份入会：成员列表 🤖 行、控制坞一键邀请/送走；**服务端音频管线**（每路音频 PlainTransport→ffmpeg astats RTP 旁路，服务器第一次真正"听到"会议）；聊天 @ai 提问（DeepSeek 真 LLM / 无 key [Mock] 模板双轨），金边气泡广播 | 零依赖；管线是 N2 真转写的现成插入口（09-19b，SFU 主版本） |
 | 🖌️ 白板 v2「宣纸 editorial」 | 参考 recent.design igochi 案例：水墨五色板（墨/朱砂/鎏金/黛蓝/竹青）、暖纸白+渐晕+颗粒纸面、hairline 头部排版 | 纯 CSS 零依赖（09-19b） |
-| 📝 会议纪要（N2 骨架） | 分段+终稿 markdown 纪要：发言占比/关键句节选/待办线索（关键词规则抽取）；值守期间定时生成+送走 bot/房间销毁自动终稿；@ai 问"纪要"即得 | DeepSeek/[Mock] 双轨（零依赖可跑）；sfu/minutes/ 落盘、/minutes/ 下载、/api/minutes 列表（09-19c，SFU 主版本） |
+| 📝 会议纪要（N2，09-24 接通真 LLM） | 字幕账本 → markdown 纪要（要点/待办/结论）：字幕条右侧「📝 纪要」一键生成，落 `sfu/minutes/<房间>/`，气泡里直接给下载链接；另有值守定时分段 + 送走 bot/房间销毁自动终稿；`@ai 生成纪要` 同款 | LLM（DeepSeek）/[Mock] 双轨；`/minutes` 下载双白名单防穿越、`/api/minutes` 列表（09-19c 骨架 + 09-24 接通，SFU 主版本） |
+| ⌨️ AI 问答 · 流式打字机（09-24） | 聊天里 `@ai 问题`：AI 助理**边想边吐字**（不再憋 3~8 秒整段才出），气泡上标 LLM/[Mock] 来源与本次 token 用量；断网也丢不了——增量之后必补一条终态消息 | SSE 增量 `ai-stream` + 终态 chat-message 按 streamId 去重；统一 provider `sfu/ai/provider.js`（零 SDK，Node 内置 fetch） |
+| 🛠️ AI 教学三件套脚本（09-24） | `npm run ai:chat`（终端问答）/ `ai:summarize`（文本→纪要，长文本分段 map-reduce）/ `ai:agent`（手写 ReAct 工具循环）；既是路线图阶段 0~2 的学习产物，也是调 prompt 的离线实验室 | 零依赖；共用同一个 provider 与同一套双轨降级（`[Mock]` 标记） |
 | 📼 录制回放（G3） | /api/recordings 列表 + recordings.html 回放页（点开即播+下载）——D+2 从"能录"变"录了能看" | 零依赖暖墨页；dashboard 有入口（09-19c） |
 | 💬 字幕 Otter 式排版 | 字幕历史按说话人分组成段（段头名字+时间、段内逐句、最新句鎏金高亮）——Otter.ai 的转写排版节奏 | 纯前端重排（09-19b） |
 
@@ -180,6 +187,25 @@ npm run start:lan
 > 📊 **实时观测面板**：服务器跑起来后访问 `http://localhost:3001/dashboard`——
 > 房间/成员/每路媒体的实时码率与健康分/发言占比，2 秒自动刷新（零依赖手写面板）。
 
+### 🤖 打开 AI 会议助理（可选，30 秒配置）
+
+AI 助理（`@ai` 问答 / 📝 纪要 / 🛰️ 远程操作员）**没有密钥也能用**——会自动走本地规则降级，
+输出带 `[Mock]` 标记；配上 DeepSeek key 之后同一套链路立刻换成真模型：
+
+```bash
+# 项目根建 .env（已在 .gitignore 里，永远不会提交）
+echo "DEEPSEEK_API_KEY=sk-你的密钥" > .env
+npm run start:sfu      # 启动日志会写明：AI 模式 = LLM 还是 [Mock]
+npm run test:ai        # 双轨自检（有 key 跑满 10 项，无 key 跑 5 项并提示）
+```
+
+- 取值优先级：`DEEPSEEK_API_KEY` 环境变量 > 项目根 `.env` > `sfu/config.json` 的 `ai.key`；
+- **密钥的安全边界**：只在服务器进程里使用，**不会下发到浏览器**——`/config.json` 只给一个
+  `aiEnabled` 布尔值（有自动化断言守着这条线）；不要把它写进 `sfu/config.json` 以外的任何前端能读到的文件；
+- **花了多少钱**：`curl http://localhost:3001/metrics | grep sfu_ai_llm`
+  （calls / errors / prompt_tokens / completion_tokens / cost_cny）。一晚值守纪要 < 1 元的账，这样核。
+- 想撤销：删掉 `.env` 那一行即可，功能自动回到 `[Mock]` 轨道，不会报错。
+
 ## 🌐 跨网络部署（解决"只能本机/局域网玩"的硬边界）
 
 WebRTC 的可达性边界 = **信令可达 + 媒体可达 + 安全上下文**，三件事用一份配置解决：
@@ -278,15 +304,19 @@ webrtc/
 ## 🧪 运行回归测试
 
 ```bash
-npm run test:sfu   # SFU 主版本信令：需先 npm run start:sfu（连 localhost:3001）★ 本次实测 67/67
-npm test           # Mesh 对照版信令：需先 npm start（连 localhost:3000）★ 本次实测 33/33
-npm run test:smoke # SFU 前端无头冒烟（零依赖，不用起服务器）★ 本次实测 76/76
+npm run test:sfu   # SFU 主版本信令：需先起 3001（AI 操作员断言要 AI_OP_STEP_MS=20 node sfu/server.js）★ 2026-09-24 实测 106/106（有 key / 无 key 两条轨各跑一遍）
+npm test           # Mesh 对照版信令：需先 npm start（连 localhost:3000）★ 2026-09-24 实测 33/33
+npm run test:smoke # SFU 前端无头冒烟（零依赖，不用起服务器）★ 2026-09-24 实测 118/118
+npm run test:ai    # AI 双轨自检：无 key 只跑 Mock 轨并提示怎么配；有 key 两条都跑 ★ 10/10
 npm run test:record # D+2 服务器侧录制端到端自测（ffmpeg 当媒体源→mediasoup→落盘，需已装 ffmpeg）
 npm run test:turn  # ICE 可达性实测（对 config 里每个 STUN/TURN 手搓 STUN Binding，3s 超时）
 npm run bench      # E4 压力基准（4/8/16 路，约 1 分钟，独立 Worker，不用起 3001）
+npm run ai:chat    # AI 脚本：终端问答（也可 --q "问题" 单发）
+npm run ai:summarize # AI 脚本：文本/文件/房间字幕 → markdown 纪要（--text/--file/--room 123456）
+npm run ai:agent   # AI 脚本：手写 ReAct 工具循环（--goal "…" --maxsteps 6 --verbose）
 ```
 
-- SFU 版测试（**2026-09-17 实测：67 通过 / 0 失败**）：房间/密码复用 + mediasoup Router 能力 +
+- SFU 版测试（**2026-09-24 实测：106 通过 / 0 失败**；冒烟 **118/118**，AI 双轨 +11 项）：房间/密码复用 + mediasoup Router 能力 +
   Transport 创建与防重 + consume 错误路径 + 远程协助（授权/互斥/输入门禁/二进制与中文透传）+
   A/D 档（成员状态白名单、房主踢人、剪贴板门禁、文件配额、限时授权、切层错误路径）+
   D+ 档（`sctpParameters`/`produce-data`/`consume-data`、跨房间录制目标被拒、VP9 能力、
@@ -303,6 +333,13 @@ npm run bench      # E4 压力基准（4/8/16 路，约 1 分钟，独立 Worker
   媒体链路与 **simulcast 三层 encodings 接线**、成员列表/音量/换层、远程协助控制层采集
   （含触屏长按与双指）、文件分块、剪贴板、录制、设备切换、断线重连，以及 **F7 三条 SCTP 频道、
   F6 滤镜管线、实时字幕（识别→定稿→广播→续命→导出）、登录卡与昵称**。
+- **AI 双轨自检 `npm run test:ai`（2026-09-24 实测：10 通过 / 0 失败）**：
+  🚧 Mock 轨（零网络零费用，永远可跑）验"降级链路没断"——provider 判定、mock 钩子、
+  流式降级也分片喂出、离线纪要三小节、agent 不死循环；
+  🚀 LLM 轨（检测到 key 才跑，缺 key 自动 skip 提示）验"模型真在干活"——
+  答案不含 `[Mock]`、纪要事实取自输入、问答命中原文、操作员产出合法 JSON 计划、流式有增量。
+  结束后打印调用次数与**估算花费**（本次自检 5 次调用 ≈ ¥0.0028）。
+  服务器侧同样可核对：`curl http://localhost:3001/metrics | grep sfu_ai_llm`。
 - ✅ **环境自检 `npm run doctor`**：17 项 / 4 组（环境·配置·端口·跨网 ICE），每项都给"怎么修"；`node scripts/doctor.js --json` 出结构化结果。交付前先跑它，再按《部署手册.md》自查清单收尾。
   手动核对（`npm run test:turn` 验 ICE 可达、端口是否被占、ffmpeg 是否在 PATH）。
 
@@ -347,6 +384,9 @@ npm run bench      # E4 压力基准（4/8/16 路，约 1 分钟，独立 Worker
 | 33 | **去 AI 味·图标化与克制化（09-19e）** | 彩色 emoji 全面换单色线性 SVG（控制坞/顶栏/成员徽标/小按钮，ICONS 常量集+setIconBtn 同构）；渐变按钮/渐变字纯色化；玻璃只留真悬浮三处；圆角描边阴影收紧一档；白板色板带色名（墨/朱砂/鎏金/黛蓝/竹青） |
 | 34 | **SFU 深造：多 Worker + 信令压测（09-19f）** | mediasoup Worker 池（workerCount/MEDIASOUP_WORKERS，轮询分配新 Router，died 摘除+5s 补位，默认 1 行为不变）；实测 Workers×2 三房分到两核；npm run bench:signaling 信令压测（32 客户端/4 房实测 p95=6ms、广播放大 17.8×）；ping 探活信令；/metrics 加 sfu_workers |
 | 35 | **C1 AI 远程操作员（09-19g，AI 主攻线）** | AI 以**真实控制端**身份走与人类完全相同的授权链路（授权卡可拒绝/限时，被控端审计照记）→ LLM/[Mock] 双轨把目标翻成操作序列（移动/点击/双击/打字）→ 自动执行并交还控制权；入口=控制坞「🛰️ AI 操作」+ @ai"操作…"；演示：AI 自动打开计算器按 7×8 |
+| 36 | **G6 安全加固 + G7-④（09-19h）** | token 生命周期（AUTH_TTL_MS 可调/滑动续期/auth-refresh 信令/客户端每小时续期）+ register/login/join/chat 四处固定窗口限流 + /config.json 下发 authTtlMs + dashboard 历史曲线 localStorage 留存（刷新不丢）+ bench-signaling 监听器泄漏修复；信令 98/98 |
+| 37 | **G4 移动端 / PWA（09-23）** | manifest + Service Worker（可安装到主屏、静态壳离线兜底）+ 侧栏抽屉/控制坞图标化/竖屏预览（≤980/≤760 两档响应式）+ 低带宽模式（省流开关锁最低层，复用 set-preferred-layers，服务器零改动）；顺手修 F6 冒烟 flaky 与 updateLayerPicker 守卫；冒烟 107/107 + 信令 98/98 |
+| 38 | **AI 主攻收官（09-24）** | **真 DeepSeek key 接入**：`sfu/ai/provider.js` 收口三处 LLM 调用（askLLM/streamLLM，Node 内置 fetch 零 SDK），密钥三来源（env > `.env` > config 的 ai.key）且**永不下发浏览器**，用量账本并入 `/metrics`；教学三件套 `scripts/{chat,summarize,agent}.js` + `npm run test:ai` 双轨自检 10/10；产品化四项：**流式打字机**（ai-stream + 终态去重）、**助理缺位自动入会**、**📝 纪要入口**、LLM/Mock 徽标与 token 用量；**实修三 bug**：announcedIp 漂移自动纠偏（跨机黑屏元凶）、ffmpeg 探测超时误判 + test:record 的 spawnSync EBUSY、配了 key 反而生成不了纪要（动作被聊天抢答）；回归：冒烟 **118/118**、信令 **106/106**（Mock 轨/LLM 轨双绿）、Mesh 33/33、test:record 连跑 3 次 PASS |
 
 **下一步方向**（`后续升级方向.md` 是唯一权威）：
 - ✅ **A 档（A1~A7）与 D 档（D1~D6）已全部完成**（2026-09-11，SFU 主版本）；
@@ -362,7 +402,10 @@ npm run bench      # E4 压力基准（4/8/16 路，约 1 分钟，独立 Worker
 - ✅ **E 档已落地四项**：E1 TURN（openrelay 预置 + coturn 自建包）/ E2 HTTPS 自签一键部署（start:lan）/
   E4 压力基准数字（bench 三档）/ E5 演示包（start:demo + 5 分钟讲稿）；**只剩 E3 浏览器端 e2e 未做**
   （现有零依赖冒烟 76 项是可选的"零依赖版"，Playwright 属新依赖需拍板）；
-- 🔶 **C 档（与 AI 线汇合）**：**L1 实时字幕已落地**（09-17b，Web Speech API 零费用，不需要 LLM key）；A6 审计日志 + 字幕账本两份结构化输入就位，等 AI 阶段 0~2（LLM key）接 C1/C2；
+- 🔶 **C 档（与 AI 线汇合）**：**L1 实时字幕 ✅（09-17b）→ AI Bot 参会者 ✅（09-19b）→ N2 纪要 ✅（09-19c 骨架）
+  → C1 AI 远程操作员 ✅（09-19g）→ 09-24 接通真 DeepSeek**：统一 provider + 流式打字机 + 📝 纪要入口 +
+  教学三件套脚本 + `test:ai` 双轨自检 10/10（详见 `后续升级方向.md` 第 1 节），**主攻两条线全线贯通**；
+- ✅ **09-24 顺手修掉三个真 bug**（跨机可用性 / 录制自测 / AI 动作错位，见 `AGENTS.md` 坑 36~38）；
 - 🔜 **G 档 · 下一步新方向（2026-09-17 公布）**：云部署与多机 SFU 级联 / AI 会议助理落地 / 录制产物回放 /
   PWA 移动端 / 端到端自动化 / 安全加固 / 可观测性升级 / 规模与性能——8 个候选方向（含做法、难度、
   依赖代价与"零新依赖"铁律的冲突点）见 `后续升级方向.md` **G 档**；

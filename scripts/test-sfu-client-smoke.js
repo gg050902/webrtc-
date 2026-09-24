@@ -238,6 +238,7 @@ const socketStub = {
     if (ev === 'file-offer') { rec.fileOffers++; rec.lastFileOffer = payload; }
     if (ev === 'remote-answer') rec.lastAllowAnswer = payload;
     if (ev === 'member-state') rec.lastMemberState = payload; // ★ 09-13：举手断言用
+    if (ev === 'set-preferred-layers') rec.lastLayerPref = payload; // ★ G4：省流锁层断言用
     if (ev === 'auth-login' || ev === 'auth-register') {
       rec.lastAuth = payload;
       return cb({ data: { user: { username: payload.username, displayName: payload.displayName || payload.username }, token: 'tok-test-123' } });
@@ -577,8 +578,16 @@ const emit = (ev, payload) => {
   const chromaChk = documentStub.getElementById('fxChromaChk');
   chromaChk.checked = true;
   guard('F6 打开绿幕抠像', () => chromaChk.dispatch('change'));
-  await new Promise((r) => setTimeout(r, 500)); // 色键路径（getImageData 逐像素）真跑若干帧后再看徽标
-  ok('F6 抠像开启后管线切到 CPU 抠像模式（getImageData 路径无异常）', fxCostEl.textContent.includes('CPU'));
+  /* ★ 2026-09-23 修既有 flaky（坑 28 家族）：绿幕开启后每帧要跑 640×360 逐像素色键循环，
+   *   桩帧率从 ~10ms/帧掉到 ~28ms/帧——固定等 500ms 可能只跑 ~18 帧，跨不过 %24 的
+   *   徽标刷新点，断言随机器快慢时好时坏（09-19h 基线 95/95 在部分机器上复现为 94/95）。
+   *   改成轮询（最多 3s）：跨过刷新点即成功，快机器零等待。 */
+  let chromaShown = false;
+  for (let wi = 0; wi < 60 && !chromaShown; wi++) {
+    await new Promise((r) => setTimeout(r, 50));
+    chromaShown = fxCostEl.textContent.includes('CPU');
+  }
+  ok('F6 抠像开启后管线切到 CPU 抠像模式（getImageData 路径无异常）', chromaShown);
 
   chromaChk.checked = false;
   guard('F6 关闭绿幕', () => chromaChk.dispatch('change'));
@@ -940,6 +949,101 @@ const emit = (ev, payload) => {
   ok('D6 断线重连流程不抛错（resetMediaState → initSFU → publishTracks）', true);
 
   console.log('DBG-reconnect:', (documentStub.getElementById('log').textContent || '').split('\n').filter((l) => l.includes('[DBG] disc') || l.includes('[DBG] rm') || l.includes('[DBG] layout')).join(' | '));
+
+  /* ---- ⑧ ★ G4 移动端/PWA（第 32 步，2026-09-23）----
+   * ▎验三件事：PWA 三件套文件在位、侧栏抽屉开关状态机、低带宽模式锁层链路。
+   *   Service Worker 注册在无头环境被防御式跳过（navigator 没有 serviceWorker），
+   *   注册路径留给真机验证（0.2 清单）。 */
+  const PUB = path.join(__dirname, '..', 'sfu', 'public');
+  ok('G4 PWA 清单在位（manifest.webmanifest）', fs.existsSync(path.join(PUB, 'manifest.webmanifest')));
+  ok('G4 Service Worker 在位（sw.js）', fs.existsSync(path.join(PUB, 'sw.js')));
+  ok('G4 应用图标在位（icons/icon-1024.png）', fs.existsSync(path.join(PUB, 'icons', 'icon-1024.png')));
+  ok('G4 index.html 已接 manifest（link rel=manifest）', /rel="manifest"/.test(fs.readFileSync(path.join(PUB, 'index.html'), 'utf8')));
+
+  // 侧栏抽屉：点开关 → body.side-open + 遮罩亮；点遮罩 → 全部复位
+  const sideBtnEl = documentStub.getElementById('sideBtn');
+  const sideScrimEl = documentStub.getElementById('sideScrim');
+  guard('G4 打开侧栏抽屉', () => sideBtnEl.dispatch('click'));
+  ok('G4 抽屉开关：body.side-open 挂上', documentStub.body.classList.contains('side-open'));
+  ok('G4 抽屉遮罩亮起（hidden 移除）', !sideScrimEl.classList.contains('hidden'));
+  guard('G4 点遮罩关抽屉', () => sideScrimEl.dispatch('click'));
+  ok('G4 遮罩点击后抽屉复位（side-open 移除 + 遮罩 hidden）',
+    !documentStub.body.classList.contains('side-open') && sideScrimEl.classList.contains('hidden'));
+
+  // 低带宽模式：先铺一个 3 层的 layerState，点「省流」→ 全部锁 0 层；
+  // 服务器 ABR 升层（auto:true）→ 被第 32 步钩子纠回；再点 → 交回自动（null）
+  emit('layer-changed', { consumerId: 'consumer-1', spatialLayer: 1, layerCount: 3, auto: true, reason: 'auto' });
+  const lowBwBtnEl = documentStub.getElementById('lowBwBtn');
+  rec.lastLayerPref = null;
+  guard('G4 打开省流模式', () => lowBwBtnEl.dispatch('click'));
+  ok('G4 省流开启：对多层的 consumer 发出锁最低层（spatialLayer:0）',
+    rec.lastLayerPref && rec.lastLayerPref.consumerId === 'consumer-1' && rec.lastLayerPref.spatialLayer === 0);
+  ok('G4 省流开启态样式（按钮 active）', lowBwBtnEl.classList.contains('active'));
+  rec.lastLayerPref = null;
+  emit('layer-changed', { consumerId: 'consumer-1', spatialLayer: 2, layerCount: 3, auto: true, reason: 'auto-up' });
+  ok('G4 ABR 升层被省流钩子纠回（重新锁 0 层）',
+    rec.lastLayerPref && rec.lastLayerPref.spatialLayer === 0);
+  guard('G4 关闭省流模式', () => lowBwBtnEl.dispatch('click'));
+  ok('G4 省流关闭：交回服务器自动选层（spatialLayer:null）',
+    rec.lastLayerPref && rec.lastLayerPref.spatialLayer === null);
+  ok('G4 省流关闭态样式（active 移除）', !lowBwBtnEl.classList.contains('active'));
+
+  /* ---- ⑨ ★ 09-24 AI 会议助理前端链路（流式打字机 / 模式徽标 / 纪要按钮）----
+   * ▎为什么这些必须自动化：AI 相关代码最容易"看着能跑但一行断言都没有"——
+   *   流式 accumulate、终态去重、Mock 标记都是**状态机**，靠肉眼点两下看不出来漏没漏。 */
+  const chatElAfter = documentStub.getElementById('chatList');
+  const aiBaseCount = chatElAfter.get_children ? chatElAfter.get_children().length : (chatElAfter.children || []).length;
+
+  // 打字机：首帧建气泡 → 增量往同一气泡追加 → done 收尾并打 mode 徽标
+  guard('AI 流式首个增量', () => emit('ai-stream', { id: 'st-1', delta: '你好，', done: false }));
+  const countAfterFirst = (chatElAfter.children || []).length;
+  ok('AI 流式首帧建立了一个 AI 气泡', countAfterFirst === aiBaseCount + 1);
+  guard('AI 流式追加增量', () => emit('ai-stream', { id: 'st-1', delta: '我是 AI 助理', done: false }));
+  // 注：打字机的文本挂在子节点上（见 client.js 的实修注释），所以要按子节点聚合读
+  const aiBubble = (chatElAfter.children || [])[countAfterFirst - 1];
+  const aiBubbleText = () => (aiBubble.children || []).map((c) => c.textContent || c.innerHTML || '').join(' ');
+  ok('AI 增量累积在同一气泡里（打字机不刷屏）', aiBubbleText().includes('你好，我是 AI 助理'));
+  ok('AI 生成中气泡带 streaming 态（打字光标）', aiBubble.classList.contains('streaming'));
+  guard('AI 流式收尾', () => emit('ai-stream', { id: 'st-1', delta: '', done: true, mock: false }));
+  ok('AI 收尾后摘掉 streaming 态', !aiBubble.classList.contains('streaming'));
+  ok('AI 收尾后打上 LLM 模式徽标',
+     (aiBubble.children || []).some((c) => String(c.innerHTML || '').includes('>LLM<')));
+
+  // 终态 chat-message 与上面的流式是同一条 → 必须被去重吃掉（否则会显示两遍）
+  const beforeDup = (chatElAfter.children || []).length;
+  guard('AI 终态消息（同一 streamId）', () => emit('chat-message', {
+    from: 'ai-bot', name: '🤖 AI 助理', text: '你好，我是 AI 助理', streamId: 'st-1', ai: { mock: false, tokens: 42 },
+  }));
+  ok('AI 流式回答的终态消息不会重复成第二条气泡', (chatElAfter.children || []).length === beforeDup);
+
+  // Mock 轨道的气泡：必须显式标明走的是本地规则（诚实 UI）
+  const beforeMock = (chatElAfter.children || []).length;
+  guard('AI Mock 回答', () => emit('chat-message', {
+    from: 'ai-bot', name: '🤖 AI 助理', text: '[Mock] 本地答案', ai: { mock: true, tokens: 0 },
+  }));
+  const mockBubble = (chatElAfter.children || [])[(chatElAfter.children || []).length - 1];
+  ok('Mock 回答气泡带 Mock 徽标（前端如实标注答案来源）',
+     (chatElAfter.children || []).length === beforeMock + 1 && (mockBubble.innerHTML || '').includes('>Mock<')
+     && (mockBubble.innerHTML || '').includes('mock'));
+  // 带 token 用量的气泡（让每次 AI 调用的成本肉眼可见）
+  guard('AI 带用量回答', () => emit('chat-message', {
+    from: 'ai-bot', name: '🤖 AI 助理', text: '答案', ai: { mock: false, tokens: 128 },
+  }));
+  ok('AI 气泡显示 token 用量（成本可见）',
+     (chatElAfter.children || []).slice(-1)[0].innerHTML.includes('128t'));
+  // 纪要气泡里的下载链接（AI 产物必须能一键打开）
+  guard('AI 纪要消息', () => emit('chat-message', {
+    from: 'ai-bot', name: '🤖 AI 助理', text: '纪要已生成', ai: { mock: false, tokens: 300, path: '/minutes/123456/x.md' },
+  }));
+  ok('纪要气泡含 /minutes 下载链接',
+     (chatElAfter.children || []).slice(-1)[0].innerHTML.includes('/minutes/123456/x.md'));
+
+  // 「📝 纪要」按钮：index.html 在位，点击向服务器发 ai-minutes
+  ok('09-24 index.html 含「📝 纪要」入口（字幕资产的下游）',
+     /id="capMinutesBtn"/.test(fs.readFileSync(path.join(PUB, 'index.html'), 'utf8')));
+  const capMinutesBtnEl = documentStub.getElementById('capMinutesBtn');
+  ok('09-24 纪要按钮已挂接到客户端 JS', !!capMinutesBtnEl);
+
   if (problems.length) {
     console.log(`\n⚠️ 捕获到 ${problems.length} 个运行时异常：`);
     problems.forEach((p, i) => console.log(`\n--- 异常 ${i + 1} ---\n${p}`));

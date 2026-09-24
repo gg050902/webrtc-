@@ -49,13 +49,13 @@ function getCpuSeconds(pid) {
 function parseArgs() {
   const args = process.argv.slice(2);
   const get = (k, d) => { const i = args.indexOf(k); return i >= 0 ? Number(args[i + 1]) : d; };
-  return { producers: get('--producers', 4), duration: get('--duration', 12) };
+  return { producers: get('--producers', 4), duration: get('--duration', 12), fans: Math.max(1, get('--fans', 1)) };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function runOneLevel(nProducers, durationSec, ffmpegBin) {
-  console.log(`\n════ 压测档位：${nProducers} 路推流 × ${nProducers} 路收流，时长 ${durationSec}s ════`);
+async function runOneLevel(nProducers, durationSec, ffmpegBin, fans = 1) {
+  console.log(`\n════ 压测档位：${nProducers} 路推流 × ${nProducers * fans} 路收流（扇出 ×${fans}），时长 ${durationSec}s ════`);
   const worker = await mediasoup.createWorker({ rtcMinPort: 44000, rtcMaxPort: 45999 });
   const router = await worker.createRouter({
     mediaCodecs: [{ kind: 'video', mimeType: 'video/VP8', clockRate: 90000 }],
@@ -94,14 +94,16 @@ async function runOneLevel(nProducers, durationSec, ffmpegBin) {
     senders.push(p);
     producers.push(producer);
   }
-  // N 路收流（每路一个 consumer，转发到 sink）
+  // 收流：每路 Producer × fans 个 Consumer（G8-① 扇出维度：N 发 × N×K 收）
   for (const producer of producers) {
-    const t = await router.createPlainTransport({
-      listenIp: { ip: '127.0.0.1' }, rtcpMux: true, comedia: false,
-    });
-    await t.connect({ ip: '127.0.0.1', port: sinkPort });
-    const c = await t.consume({ producerId: producer.id, rtpCapabilities: router.rtpCapabilities });
-    await c.resume();
+    for (let k = 0; k < fans; k++) {
+      const t = await router.createPlainTransport({
+        listenIp: { ip: '127.0.0.1' }, rtcpMux: true, comedia: false,
+      });
+      await t.connect({ ip: '127.0.0.1', port: sinkPort });
+      const c = await t.consume({ producerId: producer.id, rtpCapabilities: router.rtpCapabilities });
+      await c.resume();
+    }
   }
 
   // 预热后采样：每 2s 一行；汇总均值
@@ -136,8 +138,8 @@ async function runOneLevel(nProducers, durationSec, ffmpegBin) {
   const avgKbps = samples.length ? Math.round(samples.reduce((a, b) => a + b.kbps, 0) / samples.length) : 0;
   const cpuSeconds = getCpuSeconds(worker.pid) ?? 0;
 
-  console.log(`\n  ▎${nProducers} 路结果：`);
-  console.log(`    | ${nProducers} | ${nProducers} | ${avgKbps} | ${(totalLost / Math.max(1, totalPkts) * 100).toFixed(2)}% | ${Number(cpuSeconds).toFixed(2)} | ${(cpuSeconds / durationSec * 100).toFixed(0)}% |`);
+  console.log(`\n  ▎${nProducers} 发 × ${nProducers * fans} 收结果：`);
+  console.log(`    | ${nProducers} | ${nProducers * fans} | ${avgKbps} | ${(totalLost / Math.max(1, totalPkts) * 100).toFixed(2)}% | ${Number(cpuSeconds).toFixed(2)} | ${(cpuSeconds / durationSec * 100).toFixed(0)}% |`);
   console.log(`    （转发吞吐均值 ${avgKbps} kbps · ingest 丢包 ${(totalLost / Math.max(1, totalPkts) * 100).toFixed(2)}% · Worker 累计 CPU ${Number(cpuSeconds).toFixed(2)}s ≈ ${(cpuSeconds / durationSec * 100).toFixed(0)}% 单核）`);
 
   // 清理
@@ -145,24 +147,24 @@ async function runOneLevel(nProducers, durationSec, ffmpegBin) {
   await sleep(300);
   worker.close();
   sink.close();
-  return { n: nProducers, avgKbps, lossPct: +(totalLost / Math.max(1, totalPkts) * 100).toFixed(2), cpuSeconds: +Number(cpuSeconds).toFixed(2), cpuPct: +(cpuSeconds / durationSec * 100).toFixed(0), durationSec };
+  return { n: nProducers, fans, avgKbps, lossPct: +(totalLost / Math.max(1, totalPkts) * 100).toFixed(2), cpuSeconds: +Number(cpuSeconds).toFixed(2), cpuPct: +(cpuSeconds / durationSec * 100).toFixed(0), durationSec };
 }
 
 (async () => {
-  const { producers, duration } = parseArgs();
+  const { producers, duration, fans } = parseArgs();
   const ffmpegBin = findFfmpeg();
   console.log(`🧪 E4 压测启动（ffmpeg: ${ffmpegBin}）`);
   if (process.env.BENCH_LEVELS) {
     // 单档模式
-    await runOneLevel(producers, duration, ffmpegBin);
+    await runOneLevel(producers, duration, ffmpegBin, fans);
   } else {
     const levels = [4, 8, 16];
     const rows = [];
     console.log('\n| 推流路数 | 转发路数 | 转发吞吐均值 (kbps) | ingest 丢包率 | Worker 累计 CPU (s) | 折合单核占用 |');
     console.log('|---|---|---|---|---|---|');
     for (const n of levels) {
-      const r = await runOneLevel(n, duration, ffmpegBin);
-      console.log(`| ${r.n} | ${r.n} | ${r.avgKbps} | ${r.lossPct}% | ${r.cpuSeconds} | ${r.cpuPct}% |`);
+      const r = await runOneLevel(n, duration, ffmpegBin, fans);
+      console.log(`| ${r.n} | ${r.n * r.fans} | ${r.avgKbps} | ${r.lossPct}% | ${r.cpuSeconds} | ${r.cpuPct}% |`);
       rows.push(r);
     }
     console.log('\n✅ 三档压测完成——把上表复制进《性能测试报告.md》（记得记录机器型号/CPU/网络环境）。');

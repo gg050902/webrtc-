@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<!-- ════════════════════════════════════════════════════════════════
+  workbench.html —— 远程协助工作台（被控端演示页 · H5 远程桌面 Phase 4）
+  ★ 2026-09-12 桌面化改版：从"三个小控件"升级成"一台伪桌面"，
+    让远程控制演示更像在控一台真电脑（回应"演示范围太小不像真控制"）。
+
+▎这个文件是什么？
+  被控端 A 的会议页面里会内嵌一个 <iframe src="workbench.html">，
+  它就是"被远程操作的桌面"。控制端 B 的鼠标键盘事件送达 A 后，
+  A 在**这个 iframe 的文档里**重放——画线、打字、拖图标、点计算器
+  真实发生，而且全都出现在 A 的屏幕共享画面里，所有参会者都能看到"谁在操作"。
+
+▎09-13 拟真升级（回应"伪桌面太假、看不出被控制的效果"）：
+    ⑨ 开机动画    —— 启动时的全屏 splash，营造"真开机"的仪式感
+    ⑩ 窗口最小化  —— 标题栏 — 键收起窗口，任务栏出现对应按钮，点击还原（真 OS 的窗口管理）
+    ⑪ 壁纸切换    —— 右键菜单"换壁纸"循环三套渐变（演示"改设置"这类操作）
+    ⑫ 实时字幕 HUD —— 右下角操作字幕面板：控制端每一步动作（点击/双击/滚轮/按键/输入）
+       都会变成一行字幕滚出。数据来源：会议页重放时向本文档 dispatch 的
+       'remote-activity' CustomEvent——本页依旧不知道 WebRTC 的存在。
+
+▎桌面上有什么（每个都对应一类"会被重放"的交互）？
+    ① 任务栏      —— 实时时钟 + "● 直播中"徽标（纯装饰，演示氛围组）
+    ② 桌面图标    —— 按住拖动（pointer 三件套）+ **双击打开窗口**（dblclick）
+    ③ 计算器窗口  —— 点按钮算数（pointerdown/up；证明"点击"能被精确重放）
+    ④ 音乐播放器  —— 播放/暂停切换、进度条拖拽定位、歌单点歌选曲
+    ⑤ 文件窗口    —— 列表**滚轮滚动**（滚轮重放）+ 点选文件高亮
+    ⑥ 右键菜单    —— 桌面上按右键弹出（button===2 重放；菜单项可点）
+    ⑦ 白板 canvas —— 鼠标拖动画线 + 滚轮调笔刷粗细（老三样保留）
+    ⑧ 记事本      —— 打字/退格/回车（键盘重放 + 中文整段插入）
+
+▎⭐ 重放安全守则（这个页面所有交互的**唯一**写法，先读再改）：
+  1) 只监听这些事件：pointerdown / pointermove / pointerup / pointerleave、
+     wheel、dblclick、keydown——它们恰好是会议页重放代码会合成的全部事件。
+  2) **绝不**依赖 native click：合成 pointerdown/up 浏览器不会自动补 click
+     （isTrusted=false 的合成事件没有"默认行为"），按钮逻辑必须写在
+     pointerdown 或 pointerup 里，而不是 click 里。
+  3) **绝不**用 <input>/<textarea> 做输入：合成按键不会触发浏览器
+     "自动插字符"的默认行为，落字靠会议页 execCommand('insertText') 代做，
+     而它只对 contenteditable 稳定（详情见老版注释，仍成立）。
+  4) **绝不**用 HTML5 拖放 API 和 CSS :active 做逻辑；坐标一律
+     e.clientX - getBoundingClientRect().left 现算，不用 e.offsetX。
+  5) **绝不**检查 isTrusted——合成事件 isTrusted=false，这是重放能工作的根基。
+  6) 合成 wheel 也不会自动滚页面：要滚动的列表自己监听 wheel 改 scrollTop。
+════════════════════════════════════════════════════════════════ -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>远程协助工作台 · 伪桌面</title>
+  <style>
+    /* 深色风格与会议主页一致（同一个人写的 UI 要像一个产品） */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+      background: #12151b;
+      color: #e8eaf0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px;
+      overflow: hidden; /* 内容一屏放下，不出滚动条（滚动会干扰共享画面） */
+      user-select: none; /* 拖拽时不选中文字（记事本单独恢复） */
+    }
+
+    /* ---- ① 任务栏：伪桌面的"氛围担当" ---- */
+    #taskbar {
+      flex-shrink: 0;
+      height: 34px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      background: #171b22;
+      border: 1px solid #2a2f3a;
+      border-radius: 8px;
+      padding: 0 12px;
+      font-size: 13px;
+      color: #9aa3b2;
+    }
+    #taskbar .brand b { color: #6fdc9b; }
+    #taskbar .live {
+      color: #ff8f8f;
+      font-size: 12px;
+    }
+    #taskbar .live i {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      background: #ff5f5f; margin-right: 5px;
+      animation: blink 1.2s infinite; /* 红点呼吸 = 有会话在进行 */
+    }
+    @keyframes blink { 50% { opacity: .25; } }
+    #taskbar .clock { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+    /* ---- ② 桌面区：图标 + 可开窗口 + 右键菜单的主舞台 ---- */
+    #desktop {
+      flex: 1 1 auto;
+      position: relative;
+      min-height: 220px;
+      border: 1px solid #2a2f3a;
+      border-radius: 10px;
+      overflow: hidden;
+      touch-action: none;
+      background:
+        radial-gradient(ellipse at 20% 15%, rgba(108,92,231,.25), transparent 55%),
+        radial-gradient(ellipse at 85% 80%, rgba(47,158,95,.18), transparent 55%),
+        linear-gradient(160deg, #161a23 0%, #10131a 100%);
+    }
+    #desktop .desk-hint {
+      position: absolute; right: 12px; bottom: 8px;
+      font-size: 12px; color: #6b7280; pointer-events: none;
+    }
+
+    /* 桌面图标：可拖拽 + 双击开窗（选中态有描边） */
+    .desk-icon {
+      position: absolute;
+      width: 72px;
+      padding: 8px 4px 6px;
+      text-align: center;
+      border-radius: 8px;
+      cursor: grab;
+      border: 1px solid transparent;
+    }
+    .desk-icon:hover { background: rgba(255,255,255,.05); }
+    .desk-icon.selected { border-color: #2f9e5f; background: rgba(47,158,95,.12); }
+    .desk-icon.dragging { cursor: grabbing; opacity: .85; }
+    .desk-icon .ico { font-size: 30px; line-height: 1.2; }
+    .desk-icon .ico-label { font-size: 12px; color: #cfd6e4; margin-top: 2px; }
+
+    /* 应用窗口：标题栏可拖动 + 右上角 ✕ 关闭（pointerdown） */
+    .win {
+      position: absolute;
+      min-width: 240px;
+      background: #171b22f2;
+      border: 1px solid #34405a;
+      border-radius: 10px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.55);
+      display: none;          /* 双击图标打开；.open 类切换 */
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .win.open { display: flex; }
+    .win-titlebar {
+      display: flex; align-items: center;
+      padding: 7px 10px;
+      background: #1d2330;
+      cursor: grab;
+      font-size: 13px; color: #cfd6e4;
+      touch-action: none;
+    }
+    .win-titlebar.dragging { cursor: grabbing; }
+    .win-close {
+      margin-left: auto;
+      width: 20px; height: 20px; line-height: 18px; text-align: center;
+      border-radius: 5px; color: #9aa3b2; cursor: pointer;
+      font-size: 13px;
+    }
+    .win-close:hover { background: #3a2530; color: #ff8f8f; }
+    .win-body { padding: 10px; font-size: 13px; }
+
+    /* ---- ③ 计算器 ---- */
+    #calcDisplay {
+      background: #101318; border: 1px solid #2a2f3a; border-radius: 8px;
+      padding: 8px 10px; margin-bottom: 8px;
+      font-size: 20px; text-align: right;
+      font-variant-numeric: tabular-nums;
+      min-height: 40px;
+      overflow: hidden; white-space: nowrap;
+    }
+    .calc-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 5px;
+    }
+    .calc-grid button {
+      padding: 8px 0;
+      font-size: 15px;
+      background: #232a38; color: #e8eaf0;
+      border: 1px solid #34405a; border-radius: 7px;
+      cursor: pointer;
+    }
+    .calc-grid button:enabled:active { background: #34405a; }
+    .calc-grid button.op { background: #1f3348; }
+    .calc-grid button.eq { background: #2f9e5f; border-color: #2f9e5f; }
+    .calc-grid button.clr { background: #3a2530; }
+
+    /* ---- ④ 音乐播放器 ---- */
+    #nowPlaying {
+      font-size: 13px; color: #cfd6e4; margin-bottom: 6px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    #musicProgress {
+      height: 10px; background: #101318; border: 1px solid #2a2f3a;
+      border-radius: 6px; margin-bottom: 8px;
+      position: relative; cursor: pointer; touch-action: none;
+    }
+    #musicProgressFill {
+      position: absolute; left: 0; top: 0; bottom: 0; width: 0%;
+      background: linear-gradient(90deg, #2f9e5f, #6fdc9b);
+      border-radius: 6px;
+    }
+    .music-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .music-row button {
+      padding: 5px 14px; font-size: 14px;
+      background: #232a38; color: #e8eaf0;
+      border: 1px solid #34405a; border-radius: 7px; cursor: pointer;
+    }
+    #musicTime { font-size: 12px; color: #9aa3b2; font-variant-numeric: tabular-nums; }
+    #songList {
+      list-style: none;
+      height: 72px; overflow-y: auto;
+      background: #101318; border: 1px solid #2a2f3a; border-radius: 8px;
+    }
+    #songList li {
+      padding: 5px 10px; font-size: 12px; color: #cfd6e4;
+      cursor: pointer; border-bottom: 1px solid #1a1f28;
+    }
+    #songList li.selected { background: rgba(47,158,95,.18); color: #6fdc9b; }
+    #songList .list-hint { color: #6b7280; padding: 5px 10px; font-size: 12px; }
+
+    /* ---- ⑤ 文件窗口 ---- */
+    #fileList {
+      list-style: none;
+      height: 120px; overflow-y: auto;
+      background: #101318; border: 1px solid #2a2f3a; border-radius: 8px;
+    }
+    #fileList li {
+      padding: 5px 10px; font-size: 12px; color: #cfd6e4;
+      cursor: pointer; border-bottom: 1px solid #1a1f28;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    #fileList li.selected { background: rgba(108,92,231,.22); color: #b3a6ff; }
+
+    /* ---- ⑥ 右键菜单（自定义，桌面上 button===2 弹出）---- */
+    #ctxMenu {
+      position: absolute;
+      display: none;           /* .open 切换 */
+      flex-direction: column;
+      min-width: 150px;
+      background: #171b22f8;
+      border: 1px solid #34405a;
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,.5);
+      z-index: 50;
+      overflow: hidden;
+    }
+    #ctxMenu.open { display: flex; }
+    #ctxMenu div {
+      padding: 7px 14px; font-size: 13px; color: #cfd6e4; cursor: pointer;
+    }
+    #ctxMenu div:hover { background: #232a38; }
+
+    /* ---- 底部行：白板 + 记事本 ---- */
+    #bottomRow {
+      flex-shrink: 0;
+      height: 170px;
+      display: flex;
+      gap: 8px;
+    }
+    #board {
+      flex: 1.4 1 0;
+      min-width: 0;
+      background: #1a1f28;
+      border: 1px solid #2a2f3a;
+      border-radius: 10px;
+      cursor: crosshair;
+      touch-action: none;
+    }
+    #notepad {
+      flex: 1 1 0;
+      min-width: 0;
+      overflow-y: auto;
+      background: #101318;
+      border: 1px solid #2a2f3a;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 14px;
+      line-height: 1.6;
+      outline: none;
+      cursor: text;
+      user-select: text; /* 记事本要能选中文字（「📋 复制选中」功能依赖它） */
+    }
+    #notepad:empty::before {
+      content: "✏️ 点这里打字试试（支持中文/英文，远程控制时由控制端代敲）…";
+      color: #6b7280;
+    }
+
+    /* ---- ⑨ 开机动画（纯 CSS，JS 1.6s 后移除）---- */
+    #boot {
+      position: fixed; inset: 0; z-index: 200;
+      background: radial-gradient(ellipse at 50% 40%, #1c2230 0%, #0b0e14 80%);
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 14px; color: #9aa3b2; font-size: 14px;
+      animation: bootOut .5s ease 1.1s forwards;
+    }
+    #boot .boot-logo { font-size: 52px; animation: bootPulse 1.1s ease infinite; }
+    @keyframes bootPulse { 50% { transform: scale(1.12); opacity: .75; } }
+    @keyframes bootOut { to { opacity: 0; visibility: hidden; } }
+
+    /* ---- ⑩ 窗口最小化按钮 + 任务栏窗口按钮 ---- */
+    .win-min {
+      margin-left: auto;
+      width: 20px; height: 20px; line-height: 16px; text-align: center;
+      border-radius: 5px; color: #9aa3b2; cursor: pointer; font-size: 13px;
+    }
+    .win-min:hover { background: #232a38; color: #ffcf6f; }
+    .win.mini { display: none; } /* 最小化 = 藏起来，任务栏按钮还在 */
+    #taskApps { display: flex; gap: 6px; }
+    .task-chip {
+      padding: 3px 10px; font-size: 12px; border-radius: 6px;
+      background: #232a38; border: 1px solid #34405a; color: #cfd6e4;
+      cursor: pointer;
+    }
+    .task-chip.active { background: #1f3348; border-color: #2f9e5f; color: #6fdc9b; }
+
+    /* ---- ⑫ 实时字幕 HUD ---- */
+    #hud {
+      position: absolute; right: 10px; top: 10px; z-index: 60;
+      width: 230px; max-height: 46%;
+      background: rgba(13,16,23,.88); border: 1px solid #2f9e5f66;
+      border-radius: 10px; padding: 8px 10px;
+      font-size: 12px; color: #cfd6e4;
+      backdrop-filter: blur(4px);
+      overflow: hidden;
+      transition: border-color .3s;
+    }
+    #hud.flash { border-color: #6fdc9b; box-shadow: 0 0 14px rgba(111,220,155,.35); }
+    #hud .hud-title { color: #6fdc9b; font-size: 11px; margin-bottom: 6px; letter-spacing: .5px; }
+    #hudLines { display: flex; flex-direction: column; gap: 3px; overflow: hidden; }
+    #hudLines div {
+      animation: hudIn .18s ease;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #aab3c5;
+    }
+    #hudLines div:first-child { color: #e8eaf0; }
+    @keyframes hudIn { from { opacity: 0; transform: translateY(-4px); } }
+
+    .wall-1 { background: radial-gradient(ellipse at 20% 15%, rgba(108,92,231,.25), transparent 55%), radial-gradient(ellipse at 85% 80%, rgba(47,158,95,.18), transparent 55%), linear-gradient(160deg, #161a23 0%, #10131a 100%); }
+    .wall-2 { background: radial-gradient(ellipse at 75% 20%, rgba(64,120,231,.3), transparent 55%), radial-gradient(ellipse at 15% 85%, rgba(220,90,140,.16), transparent 55%), linear-gradient(200deg, #141a26 0%, #0e1118 100%); }
+    .wall-3 { background: radial-gradient(ellipse at 50% 0%, rgba(255,166,77,.18), transparent 60%), radial-gradient(ellipse at 80% 90%, rgba(47,158,95,.2), transparent 55%), linear-gradient(180deg, #1a1a22 0%, #101018 100%); }
+  </style>
+</head>
+<body>
+
+  <!-- ① 任务栏 -->
+  <div id="taskbar">
+    <span class="brand">🖥️ <b>远程协助工作台</b></span>
+    <span class="live"><i></i>控制端的鼠标键盘在这里实时重放</span>
+    <span id="taskApps"></span><!-- ★ 09-13：已打开窗口的任务栏按钮（点击还原/最小化） -->
+    <span class="clock" id="clock">--:--:--</span>
+  </div>
+
+  <!-- ② 桌面区：图标 + 窗口 + 右键菜单 -->
+  <div id="desktop" class="wall-1">
+    <div class="desk-icon" id="icon-calc"   style="left: 26px; top: 24px;"><div class="ico">🧮</div><div class="ico-label">计算器</div></div>
+    <div class="desk-icon" id="icon-music"  style="left: 130px; top: 24px;"><div class="ico">🎵</div><div class="ico-label">音乐</div></div>
+    <div class="desk-icon" id="icon-files"  style="left: 234px; top: 24px;"><div class="ico">📁</div><div class="ico-label">文件</div></div>
+    <div class="desk-hint">按住图标拖动 · 双击打开 · 右键弹出菜单（远程时全都能被控制）</div>
+
+    <!-- ③ 计算器窗口 -->
+    <div class="win" id="win-calc" style="left: 320px; top: 30px;">
+      <div class="win-titlebar">🧮 计算器<span class="win-min" data-min="win-calc">—</span><span class="win-close" data-close="win-calc">✕</span></div>
+      <div class="win-body">
+        <div id="calcDisplay">0</div>
+        <div class="calc-grid" id="calcGrid">
+          <button class="clr">C</button><button>( )</button><button class="op">÷</button><button class="op">←</button>
+          <button>7</button><button>8</button><button>9</button><button class="op">×</button>
+          <button>4</button><button>5</button><button>6</button><button class="op">−</button>
+          <button>1</button><button>2</button><button>3</button><button class="op">＋</button>
+          <button>±</button><button>0</button><button>.</button><button class="eq">＝</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ④ 音乐播放器窗口 -->
+    <div class="win" id="win-music" style="left: 120px; top: 130px;">
+      <div class="win-titlebar">🎵 音乐<span class="win-min" data-min="win-music">—</span><span class="win-close" data-close="win-music">✕</span></div>
+      <div class="win-body">
+        <div id="nowPlaying">未在播放</div>
+        <div id="musicProgress"><div id="musicProgressFill"></div></div>
+        <div class="music-row">
+          <button id="playBtn">▶ 播放</button>
+          <span id="musicTime">0:00 / 0:00</span>
+        </div>
+        <ul id="songList">
+          <li class="list-hint">滚轮滚动列表 · 点歌即播（远程都能操作）</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- ⑤ 文件窗口 -->
+    <div class="win" id="win-files" style="left: 60px; top: 70px;">
+      <div class="win-titlebar">📁 文件<span class="win-min" data-min="win-files">—</span><span class="win-close" data-close="win-files">✕</span></div>
+      <div class="win-body">
+        <ul id="fileList"></ul>
+      </div>
+    </div>
+
+    <!-- ⑥ 右键菜单 -->
+    <div id="ctxMenu">
+      <div data-act="open-calc">打开 计算器</div>
+      <div data-act="open-music">打开 音乐</div>
+      <div data-act="open-files">打开 文件</div>
+      <div data-act="reset-icons">重置图标位置</div>
+      <div data-act="next-wall">🖼️ 换壁纸</div>
+    </div>
+  </div>
+
+  <!-- ⑫ 远程操作实时字幕 HUD：会议页重放每一步时 dispatch 'remote-activity' 过来 -->
+  <div id="hud">
+    <div class="hud-title">🎙️ 远程操作 · 实时字幕</div>
+    <div id="hudLines"><div style="color:#5d6575">等待控制端操作…</div></div>
+  </div>
+
+  <!-- ⑨ 开机动画（1.6 秒后由 JS 移除）-->
+  <div id="boot"><div class="boot-logo">🖥️</div><div>远程协助工作台 · 正在启动</div></div>
+
+  <!-- ⑦⑧ 底部：白板 + 记事本 -->
+  <div id="bottomRow">
+    <canvas id="board"></canvas>
+    <div id="notepad" contenteditable="true"></div>
+  </div>
+
+<script>
+/* ════════════════════════════════════════════════════════════════
+ * 工作台脚本：一台"伪桌面"。每个交互都只靠"标准 DOM 事件监听"实现，
+ * 且只使用重放安全的事件（守则见文件头注释第 1~6 条）。
+ * 注意本文件不连任何服务器、不知道 WebRTC 的存在——它就是个普通页面。
+ * "远程控制"是外面（会议页）把事件 dispatch 进来，这里照常响应。
+ * ════════════════════════════════════════════════════════════════ */
+
+/* ---- ① 任务栏时钟（本地跑的 setInterval，演示"这就是一台活着的电脑"）---- */
+const clockEl = document.getElementById('clock');
+function tickClock() {
+  clockEl.textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+}
+setInterval(tickClock, 1000);
+tickClock();
+
+/* ══════════ 通用工具 ══════════ */
+
+// 事件坐标 → 某元素内部的相对坐标（⭐重放安全：不用 e.offsetX，理由见文件头守则 4）
+function pointIn(el, e) {
+  const rect = el.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+// 把数值夹在 [min, max] 里（拖拽防出界的"夹取"）
+const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
+
+/* ══════════ ② 桌面图标：拖拽 + 双击开窗 ══════════
+ * ▎拖拽 = 老三样 pointerdown（记住抓取偏移）→ desktop 的 pointermove（移位）
+ *   → pointerup/leave（放手）。和旧版小球同一套写法。
+ * ▎双击开窗 = dblclick（会议页会重放 kind:'dblclick'）。注意**不能**用
+ *   两次 pointerdown 自己拼"双击"：控制端发来的本来就是 dblclick 事件。
+ */
+const desktop = document.getElementById('desktop');
+let iconDrag = null;   // { el, dx, dy } = 正在拖的图标 + 鼠标相对它的偏移
+
+for (const icon of document.querySelectorAll('.desk-icon')) {
+  icon.addEventListener('pointerdown', (e) => {
+    if (e.button === 2) return;           // 右键归右键菜单，别当拖拽
+    const p = pointIn(icon, e);
+    iconDrag = { el: icon, dx: p.x, dy: p.y };
+    icon.classList.add('dragging');
+    selectIcon(icon);
+    e.preventDefault();
+  });
+  // 双击 = 打开对应窗口（id 约定：icon-calc ↔ win-calc）
+  icon.addEventListener('dblclick', () => {
+    toggleWindow(icon.id.replace('icon-', 'win-'), true);
+  });
+}
+
+function selectIcon(icon) {
+  for (const i of document.querySelectorAll('.desk-icon')) i.classList.remove('selected');
+  icon.classList.add('selected');
+}
+
+desktop.addEventListener('pointermove', (e) => {
+  if (!iconDrag) return;
+  const p = pointIn(desktop, e);
+  const el = iconDrag.el;
+  // 图标新位置 = 鼠标位置 - 抓取偏移，再夹在桌面范围内
+  el.style.left = clamp(p.x - iconDrag.dx, 0, desktop.clientWidth - el.offsetWidth) + 'px';
+  el.style.top  = clamp(p.y - iconDrag.dy, 0, desktop.clientHeight - el.offsetHeight) + 'px';
+});
+const dropIcon = () => {
+  if (!iconDrag) return;
+  iconDrag.el.classList.remove('dragging');
+  iconDrag = null;
+};
+desktop.addEventListener('pointerup', dropIcon);
+desktop.addEventListener('pointerleave', dropIcon);
+
+/* ══════════ 窗口管理：打开/关闭/拖标题栏 ══════════ */
+let zTop = 10; // 点哪个窗口把它提到最上层（伪"聚焦"）
+
+const WIN_LABELS = { 'win-calc': '🧮 计算器', 'win-music': '🎵 音乐', 'win-files': '📁 文件' };
+
+function toggleWindow(id, open) {
+  const win = document.getElementById(id);
+  if (!win) return;
+  win.classList.toggle('open', open === undefined ? !win.classList.contains('open') : open);
+  if (win.classList.contains('open')) {
+    win.style.zIndex = ++zTop;
+    syncTaskChip(id);
+  } else {
+    removeTaskChip(id); // 关掉 = 任务栏按钮也消失（最小化的按钮还在，这是区别）
+  }
+}
+
+/* ★ 09-13 最小化/还原：真 OS 的窗口管理——藏窗口但任务栏保留按钮，
+ *   点击任务栏按钮在"最小化 ↔ 还原"间切换。全部 pointer 事件（守则 2）。 */
+function minimizeWin(id) {
+  const win = document.getElementById(id);
+  if (!win) return;
+  win.classList.add('mini');
+  syncTaskChip(id);
+}
+function restoreWin(id) {
+  const win = document.getElementById(id);
+  if (!win) return;
+  win.classList.remove('mini');
+  win.classList.add('open');
+  win.style.zIndex = ++zTop;
+  syncTaskChip(id);
+}
+function syncTaskChip(id) {
+  const win = document.getElementById(id);
+  const chip = ensureTaskChip(id);
+  chip.classList.toggle('active', win.classList.contains('open') && !win.classList.contains('mini'));
+}
+function ensureTaskChip(id) {
+  let chip = document.getElementById('chip-' + id);
+  if (!chip) {
+    chip = document.createElement('span');
+    chip.className = 'task-chip';
+    chip.id = 'chip-' + id;
+    chip.textContent = WIN_LABELS[id] || id;
+    chip.addEventListener('pointerdown', () => {
+      const w = document.getElementById(id);
+      if (w.classList.contains('mini')) restoreWin(id); else minimizeWin(id);
+    });
+    document.getElementById('taskApps').appendChild(chip);
+  }
+  return chip;
+}
+function removeTaskChip(id) {
+  const chip = document.getElementById('chip-' + id);
+  if (chip) chip.remove();
+}
+for (const minBtn of document.querySelectorAll('.win-min')) {
+  minBtn.addEventListener('pointerdown', (e) => {
+    minimizeWin(minBtn.dataset.min);
+    e.stopPropagation();
+  });
+}
+
+// ✕ 关闭按钮（pointerdown，不是 click——守则 2）
+for (const closeBtn of document.querySelectorAll('.win-close')) {
+  closeBtn.addEventListener('pointerdown', (e) => {
+    toggleWindow(closeBtn.dataset.close, false);
+    e.stopPropagation(); // 别让这次按下又触发桌面右键菜单的隐藏逻辑之外的东西
+  });
+}
+
+// 标题栏拖动窗口（和图标拖拽同一套三件套）
+let winDrag = null; // { win, dx, dy }
+for (const bar of document.querySelectorAll('.win-titlebar')) {
+  bar.addEventListener('pointerdown', (e) => {
+    if (e.target.classList.contains('win-close')) return; // 点 ✕ 不算拖
+    const win = bar.parentElement;
+    const p = pointIn(win, e);
+    winDrag = { win, dx: p.x, dy: p.y };
+    bar.classList.add('dragging');
+    win.style.zIndex = ++zTop;
+  });
+}
+desktop.addEventListener('pointermove', (e) => {
+  if (!winDrag) return;
+  const p = pointIn(desktop, e);
+  winDrag.win.style.left = clamp(p.x - winDrag.dx, -40, desktop.clientWidth - 60) + 'px';
+  winDrag.win.style.top  = clamp(p.y - winDrag.dy, 0, desktop.clientHeight - 30) + 'px';
+});
+const dropWin = () => {
+  if (!winDrag) return;
+  winDrag.win.querySelector('.win-titlebar').classList.remove('dragging');
+  winDrag = null;
+};
+desktop.addEventListener('pointerup', dropWin);
+desktop.addEventListener('pointerleave', dropWin);
+
+/* ══════════ ③ 计算器 ══════════
+ * ▎经典"立即执行"计算器模型：输入第二个操作数前把第一个和运算符存起来。
+ * ▎每个按钮的逻辑都写在 pointerdown 里（守则 2：不要指望 click）。
+ */
+const calcDisplay = document.getElementById('calcDisplay');
+let calcEntry = '0';   // 当前正在输入的数
+let calcAcc = null;    // 第一个操作数（按过运算符后存这里）
+let calcOp = null;     // 待执行的运算符
+let calcFresh = true;  // 刚算完/刚按过运算符 → 下一个数字从头开始输入
+
+function calcShow() { calcDisplay.textContent = calcEntry; }
+function calcInput(key) {
+  const ops = { '＋': (a, b) => a + b, '−': (a, b) => a - b, '×': (a, b) => a * b, '÷': (a, b) => (b === 0 ? NaN : a / b) };
+  if (key >= '0' && key <= '9') {
+    calcEntry = calcFresh || calcEntry === '0' ? key : calcEntry + key;
+    calcFresh = false;
+  } else if (key === '.') {
+    if (calcFresh) { calcEntry = '0.'; calcFresh = false; }
+    else if (!calcEntry.includes('.')) calcEntry += '.';
+  } else if (key === 'C') {
+    calcEntry = '0'; calcAcc = null; calcOp = null; calcFresh = true;
+  } else if (key === '←') {
+    calcEntry = calcEntry.length > 1 ? calcEntry.slice(0, -1) : '0';
+  } else if (key === '±') {
+    calcEntry = calcEntry.startsWith('-') ? calcEntry.slice(1) : (calcEntry === '0' ? '0' : '-' + calcEntry);
+  } else if (key === '( )') {
+    // 括号对这个简化模型太复杂 → 当"清空当前输入"用（演示按键仍然有效）
+    calcEntry = '0'; calcFresh = true;
+  } else if (ops[key]) {
+    if (calcOp && !calcFresh) calcEntry = String(ops[calcOp](calcAcc, parseFloat(calcEntry)));
+    calcAcc = parseFloat(calcEntry);
+    calcOp = key;
+    calcFresh = true;
+  } else if (key === '＝') {
+    if (calcOp) {
+      const r = ops[calcOp](calcAcc, parseFloat(calcEntry));
+      calcEntry = Number.isFinite(r) ? String(Math.round(r * 1e10) / 1e10) : '错误';
+      calcAcc = null; calcOp = null; calcFresh = true;
+    }
+  }
+  calcShow();
+}
+for (const btn of document.querySelectorAll('#calcGrid button')) {
+  btn.addEventListener('pointerdown', () => calcInput(btn.textContent));
+}
+
+/* ══════════ ④ 音乐播放器 ══════════
+ * ▎播放进度用 setInterval 自己走（本地计时器，不依赖任何远程事件）；
+ *   远程可操作的三件事：播放/暂停按钮、进度条拖拽定位、歌单点歌。
+ * ▎歌单滚动是**手动**的：合成 wheel 不会自动滚（守则 6），监听 wheel 改 scrollTop。
+ */
+const SONGS = [
+  { name: 'WebRTC Blues',     len: 213 },
+  { name: 'SCTP 夜航',        len: 187 },
+  { name: 'Simulcast 三重奏', len: 245 },
+  { name: 'DTLS 握手舞',      len: 198 },
+  { name: '弱网变奏曲',       len: 226 },
+  { name: 'SFU 之间',         len: 204 },
+  { name: 'DataChannel 之春', len: 232 },
+];
+const nowPlayingEl = document.getElementById('nowPlaying');
+const progressEl = document.getElementById('musicProgress');
+const progressFillEl = document.getElementById('musicProgressFill');
+const playBtn = document.getElementById('playBtn');
+const timeEl = document.getElementById('musicTime');
+const songListEl = document.getElementById('songList');
+const songItems = [];   // li 元素表（点歌高亮要用）
+let songIdx = 0;
+let playPos = 0;        // 已播秒数
+let playing = false;
+let playTimer = null;
+
+// 把歌单渲染出来（教学版直接内嵌数据）
+for (const [i, s] of SONGS.entries()) {
+  const li = document.createElement('li');
+  li.textContent = `${i + 1}. ${s.name} · ${fmtTime(s.len)}`;
+  li.addEventListener('pointerdown', () => selectSong(i, true));
+  songListEl.appendChild(li);
+  songItems.push(li);
+}
+
+function fmtTime(sec) {
+  sec = Math.round(sec);
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+}
+function selectSong(i, autoplay) {
+  songIdx = i; playPos = 0;
+  songItems.forEach((li, j) => li.classList.toggle('selected', j === i));
+  nowPlayingEl.textContent = `🎶 正在播放：${SONGS[i].name}`;
+  if (autoplay && !playing) togglePlay();
+  updateMusicUI();
+}
+function togglePlay() {
+  playing = !playing;
+  playBtn.textContent = playing ? '⏸ 暂停' : '▶ 播放';
+  if (playing) {
+    playTimer = setInterval(() => {
+      playPos += 0.25;
+      if (playPos >= SONGS[songIdx].len) selectSong((songIdx + 1) % SONGS.length, false);
+      updateMusicUI();
+    }, 250);
+  } else {
+    clearInterval(playTimer);
+  }
+}
+playBtn.addEventListener('pointerdown', togglePlay);
+
+function updateMusicUI() {
+  const len = SONGS[songIdx].len;
+  progressFillEl.style.width = (playPos / len * 100).toFixed(1) + '%';
+  timeEl.textContent = `${fmtTime(playPos)} / ${fmtTime(len)}`;
+}
+
+// 进度条拖拽定位：pointerdown 直接跳，按住 move 连续调（和图标拖拽同一套路）
+let seeking = false;
+progressEl.addEventListener('pointerdown', (e) => {
+  seeking = true;
+  seekTo(e);
+});
+progressEl.addEventListener('pointermove', (e) => { if (seeking) seekTo(e); });
+progressEl.addEventListener('pointerup', () => { seeking = false; });
+progressEl.addEventListener('pointerleave', () => { seeking = false; });
+function seekTo(e) {
+  const p = pointIn(progressEl, e);
+  const ratio = clamp(p.x / progressEl.clientWidth, 0, 1);
+  playPos = ratio * SONGS[songIdx].len;
+  updateMusicUI();
+}
+
+// 歌单滚轮 = 手动滚 scrollTop（守则 6）
+songListEl.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  songListEl.scrollTop += e.deltaY;
+}, { passive: false });
+
+/* ══════════ ⑤ 文件窗口 ══════════ */
+const fileNames = [
+  '立项说明书.pdf', 'SFU设计蓝图.md', '远程协助演示脚本.docx',
+  '弱网测试数据.xlsx', '面试要点速记.md', '会议录制-demo.webm',
+  '架构图-2026版.png', 'readme.txt',
+];
+const fileListEl = document.getElementById('fileList');
+for (const [i, name] of fileNames.entries()) {
+  const li = document.createElement('li');
+  li.textContent = `${i % 3 === 0 ? '📄' : i % 3 === 1 ? '📊' : '🖼️'} ${name}`;
+  li.addEventListener('pointerdown', () => {
+    for (const other of fileListEl.children) other.classList.remove('selected');
+    li.classList.add('selected');
+  });
+  fileListEl.appendChild(li);
+}
+// 滚轮滚动同理：合成 wheel 不带默认滚动行为，手动改 scrollTop
+fileListEl.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  fileListEl.scrollTop += e.deltaY;
+}, { passive: false });
+
+/* ══════════ ⑥ 右键菜单 ══════════
+ * ▎桌面任意处按右键（pointerdown 且 button===2）→ 菜单弹在鼠标处；
+ *   按左键 → 菜单收起。菜单项也是 pointerdown 触发（守则 2）。
+ */
+const ctxMenu = document.getElementById('ctxMenu');
+let wallIdx = 0; // ★ 09-13：当前壁纸编号（换壁纸循环用）
+desktop.addEventListener('pointerdown', (e) => {
+  if (e.button === 2) {
+    // 弹在鼠标处，并夹在桌面范围内（防止菜单被裁掉一半）
+    const p = pointIn(desktop, e);
+    ctxMenu.style.left = clamp(p.x, 0, desktop.clientWidth - 160) + 'px';
+    ctxMenu.style.top  = clamp(p.y, 0, desktop.clientHeight - 130) + 'px';
+    ctxMenu.classList.add('open');
+    ctxMenu.style.zIndex = ++zTop;
+  } else {
+    ctxMenu.classList.remove('open'); // 左键点别处 = 收菜单（桌面通用习惯）
+  }
+});
+// 浏览器原生右键菜单必须拦掉，否则自定义菜单弹不出来（对合成事件无副作用）
+desktop.addEventListener('contextmenu', (e) => e.preventDefault());
+for (const item of ctxMenu.children) {
+  item.addEventListener('pointerdown', (e) => {
+    e.stopPropagation(); // 别让"收菜单"的那条桌面监听器先跑
+    const act = item.dataset.act;
+    if (act.startsWith('open-')) toggleWindow('win-' + act.slice(5), true);
+    else if (act === 'next-wall') {
+      // ★ 09-13 换壁纸：三套渐变循环切（演示"改设置"类操作，远程可见）
+      wallIdx = (wallIdx + 1) % 3;
+      desktop.className = 'wall-' + (wallIdx + 1);
+    }
+    else if (act === 'reset-icons') {
+      const home = { 'icon-calc': [26, 24], 'icon-music': [130, 24], 'icon-files': [234, 24] };
+      for (const [id, [x, y]] of Object.entries(home)) {
+        const el = document.getElementById(id);
+        el.style.left = x + 'px';
+        el.style.top = y + 'px';
+      }
+    }
+    ctxMenu.classList.remove('open');
+  });
+}
+
+/* ══════════ ⑦ 白板画线（原样保留） ══════════
+ * ▎canvas 是"位图"，窗口变形后之前画的会模糊/消失。所以监听 resize，
+ *   把画布物理像素尺寸对齐 CSS 尺寸（×dpr 保清晰）。resize 时清空画板
+ *   （教学演示可接受，注释说清楚即可）。
+ */
+const board = document.getElementById('board');
+const ctx = board.getContext('2d');
+let brushWidth = 3;
+
+function fitBoard() {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = board.getBoundingClientRect();
+  board.width  = Math.max(1, Math.round(rect.width * dpr));
+  board.height = Math.max(1, Math.round(rect.height * dpr));
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+}
+window.addEventListener('resize', fitBoard);
+fitBoard();
+
+let drawing = false;
+let lastX = 0, lastY = 0;
+
+board.addEventListener('pointerdown', (e) => {
+  if (e.button === 2) return;             // 右键不画
+  drawing = true;
+  const p = pointIn(board, e);
+  lastX = p.x; lastY = p.y;
+  ctx.fillStyle = '#6fdc9b';
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, brushWidth / 2, 0, Math.PI * 2);
+  ctx.fill();
+});
+board.addEventListener('pointermove', (e) => {
+  if (!drawing) return;
+  const p = pointIn(board, e);
+  ctx.strokeStyle = '#6fdc9b';
+  ctx.lineWidth = brushWidth;
+  ctx.beginPath();
+  ctx.moveTo(lastX, lastY);
+  ctx.lineTo(p.x, p.y);
+  ctx.stroke();
+  lastX = p.x; lastY = p.y;
+});
+const stopDraw = () => { drawing = false; };
+board.addEventListener('pointerup', stopDraw);
+board.addEventListener('pointerleave', stopDraw);
+// 滚轮 = 调笔刷粗细（合成 wheel 的 preventDefault 无默认行为可拦，但监听器照常执行）
+board.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  brushWidth = Math.min(30, Math.max(1, brushWidth + (e.deltaY < 0 ? 1 : -1)));
+}, { passive: false });
+
+/* ══════════ ⑧ 记事本（原样保留） ══════════
+ * ▎这里只做焦点视觉反馈 + 阻止富文本粘贴。真正的插字/退格/回车
+ *   在会议页重放代码里（execCommand，键盘/中文整段两条来路）。
+ */
+const notepad = document.getElementById('notepad');
+notepad.addEventListener('focus', () => { notepad.style.borderColor = '#2f9e5f'; });
+notepad.addEventListener('blur',  () => { notepad.style.borderColor = '#2a2f3a'; });
+notepad.addEventListener('paste', (e) => {
+  e.preventDefault();
+  const text = (e.clipboardData || window.clipboardData).getData('text');
+  document.execCommand('insertText', false, text);
+});
+
+/* ══════════ ⑫ 实时字幕 HUD + ⑨ 开机动画收尾 ══════════
+ * ▎会议页每重放一步"动作类"输入（点击/双击/滚轮/按键/整段输入），都会往本文档
+ *   dispatch 一个 'remote-activity' CustomEvent。这里把它翻译成人话字幕滚出——
+ *   "被控制"从抽象的重放变成一行行看得见的操作记录（对观众也一样直观）。
+ * ▎注意：仍然只监听 DOM 事件，本页不知道 WebRTC / 远程控制协议的存在。
+ */
+const hud = document.getElementById('hud');
+const hudLines = document.getElementById('hudLines');
+const HUD_KINDS = {
+  'mousedown':  (d) => `🖱️ 点击${d.label ? ' → ' + d.label : ''}`,
+  'ctxmenu':    (d) => `🔍 右键${d.label ? ' → ' + d.label : ''}`,
+  'dblclick':   (d) => `⚡ 双击${d.label ? ' → ' + d.label : ''}`,
+  'wheel':      (d) => `🌀 滚轮 ${d.delta > 0 ? '↓' : '↑'}${d.label ? ' → ' + d.label : ''}`,
+  'keydown':    (d) => `⌨️ 按键 ${d.key}`,
+  'input-text': (d) => `⌨️ 输入「${d.text}」`,
+};
+document.addEventListener('remote-activity', (e) => {
+  const detail = (e && e.detail) || {};
+  const fmt = HUD_KINDS[detail.kind];
+  if (!fmt) return;
+  const line = document.createElement('div');
+  const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  line.textContent = `${t}  ${fmt(detail)}`;
+  hudLines.prepend(line); // 最新在最上
+  while (hudLines.children.length > 9) hudLines.lastChild.remove();
+  hud.classList.add('flash'); // 面板边框闪一下 = 有新动作
+  setTimeout(() => hud.classList.remove('flash'), 350);
+});
+// 开机动画：1.6 秒后把 splash 从 DOM 里拿掉（CSS 动画 1.1s 起淡出）
+setTimeout(() => { const b = document.getElementById('boot'); if (b) b.remove(); }, 1600);
+</script>
+</body>
+</html>

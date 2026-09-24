@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" href="data:," /><!-- 占位图标：消掉 favicon.ico 404 噪音 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>简易腾讯会议 Demo · 多人版</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="container">
+    <!-- 左侧：主区 -->
+    <div class="main-col">
+      <header>
+        <h1>🎥 简易腾讯会议（多人 Mesh 版 · 最多 3 人）</h1>
+        <div class="badges">
+          <!-- 房间号徽标：进房后才显示，点击复制邀请链接（房间号输出在这里） -->
+          <span id="roomBadge" class="badge room hidden" title="点击复制邀请链接">🏠 房间号 ------</span>
+          <span id="memberCount" class="badge idle">👥 1 人</span>
+          <span id="connBadge" class="badge idle">未连接服务器</span>
+          <!-- 网络质量徽标：进会后每 3 秒刷新一次（getStats 监控，见 client.js 第 16 步） -->
+          <span id="netBadge" class="badge idle">📶 网络 --</span>
+          <!-- ★ 09-15 同构补齐：P2P 连接方式（直连/STUN穿墙/TURN中继） -->
+          <span id="connType" class="badge idle hidden">🔗 --</span>
+        </div>
+      </header>
+
+      <!-- 房间面板：没进房间时显示（两条路：创建拿号 / 凭号加入；密码可选） -->
+      <div class="room-panel" id="roomPanel">
+        <button id="createBtn" class="btn primary" disabled>创建房间</button>
+        <span class="room-sep">或</span>
+        <input id="roomInput" class="room-input" inputmode="numeric" maxlength="6"
+               placeholder="输入 6 位房间号" disabled />
+        <!-- 房间密码框：创建者填 = 给新房间上锁；加入者填 = 开锁的密码。留空 = 无密码 -->
+        <input id="roomPasswordInput" class="room-input pwd" maxlength="20"
+               placeholder="房间密码（可选）" disabled />
+        <button id="joinRoomBtn" class="btn" disabled>加入房间</button>
+      </div>
+
+      <!-- 视频网格：自己的画面固定在第一格，其他人由 JS 动态插入 -->
+      <div class="video-grid" id="videoGrid">
+        <!-- ★ 升级 D2：说话人指示器（Mesh 版 = 浏览器端音量分析）
+             .video-box 上由 JS 切换 .speaking 类（发光边框），
+             里面的 .vol-bar 是那个每秒抖动的音量条（宽度跟着音量走）。 -->
+        <div class="video-box self" id="selfBox">
+          <video id="localVideo" autoplay playsinline muted></video>
+          <div class="video-label">我（本地预览）</div>
+          <div class="vol-bar"><i></i></div>
+        </div>
+        <!-- 其他人：由 client.js 的 createPeerFor 动态创建，塞进这个网格 -->
+      </div>
+
+      <!-- 控制按钮 -->
+      <div class="controls">
+        <button id="leaveBtn" class="btn danger" disabled>离开房间</button>
+        <button id="shareBtn" class="btn" disabled>共享屏幕</button>
+        <!-- ★ H5 远程桌面：允许远程协助开关（被控端用）。
+             只在"正在共享屏幕"时出现；打开 = 页面切到工作台模式（见下方 workbenchArea） -->
+        <button id="assistBtn" class="btn assist hidden" disabled>🖱️ 允许远程协助</button>
+        <button id="muteBtn" class="btn" disabled>静音</button>
+        <button id="camBtn" class="btn" disabled>关摄像头</button>
+        <!-- ★ 升级 D3 设备切换：两个下拉框，用 enumerateDevices() 填充。
+             切换 = getUserMedia 拿新轨 + 对每条 pc 的 sender.replaceTrack(新轨)，
+             和屏幕共享同一套原理 —— 换设备不用重新协商（教学点）。 -->
+        <label class="dev-label">📷
+          <select id="camSelect" class="dev-select" disabled title="切换摄像头"></select>
+        </label>
+        <label class="dev-label">🎤
+          <select id="micSelect" class="dev-select" disabled title="切换麦克风"></select>
+        </label>
+      </div>
+
+      <!-- ★ H5 远程桌面（Phase 4）：被控端工作台容器。
+           打开「允许远程协助」后进入"工作台模式"：藏起视频网格/控制区/日志，
+           显示这个区域 —— 里面的 iframe(workbench.html) 铺满视口，
+           它就是被共享出去的"可被遥控桌面"。 -->
+      <div id="workbenchArea" class="workbench-area hidden">
+        <div class="wb-toolbar">
+          <span>
+            <span id="wbStatus">✅ 远程协助已开启，等待成员请求控制…</span>
+            <!-- ★ 升级 A6：限时授权倒计时（服务器广播的 expiresAt 驱动；不限时则隐藏） -->
+            <span id="wbExpire" class="ctl-expire hidden">⏳ --</span>
+          </span>
+          <span class="wb-toolbar-btns">
+            <!-- ★ 升级 A3：把被控端工作台里的选区/剪贴板反向发给控制端 -->
+            <button id="wbClipBtn" class="btn">📋 把剪贴板发给控制端</button>
+            <!-- ★ 升级 A6：审计日志（控制事件环形缓冲，只存在被控端浏览器里） -->
+            <button id="wbAuditBtn" class="btn">📜 审计日志</button>
+            <!-- 收回控制：正在被控时显示，结束当前控制但保持工作台 -->
+            <button id="wbReclaimBtn" class="btn danger hidden">收回控制</button>
+            <!-- 关闭远程协助：收起工作台回到会议视图（共享继续） -->
+            <button id="wbAssistOffBtn" class="btn">关闭远程协助</button>
+            <!-- 停止共享：与主控制区「停止共享」等效（这里不离手就能点） -->
+            <button id="wbStopShareBtn" class="btn">停止共享</button>
+          </span>
+        </div>
+        <!-- 工作台 iframe：src 指向同源演示页（白板/文本框/拖球），事件重放目标 -->
+        <iframe id="workbenchFrame" src="workbench.html" title="远程协助工作台"></iframe>
+      </div>
+
+      <!-- 信令流程日志：重点观察对象 -->
+      <div class="log-panel">
+        <div class="log-title">📋 信令流程日志（看这里理解 Mesh 建连原理）</div>
+        <pre id="log"></pre>
+      </div>
+    </div>
+
+    <!-- 右侧：聊天侧边栏（群聊走 DataChannel，P2P 直达，不经服务器） -->
+    <aside class="chat-sidebar">
+      <!-- ★ 升级（成员列表·轻量版）：聊天区上方一块成员列表。
+           数据全来自本地已有的 peers 字典 + 服务器已发的 room-members/new-member/peer-left，
+           **不需要任何新的服务器事件**；🎤/🔇 与说话高亮跟 D2 的音量分析联动。 -->
+      <div class="member-panel">
+        <div class="member-title">👥 成员列表 <span id="memberCount2" class="member-count">1 人</span></div>
+        <div id="memberList" class="member-list"></div>
+      </div>
+      <div class="chat-title">💬 会议聊天</div>
+      <div class="chat-messages" id="chatList"></div>
+      <div class="chat-input-bar">
+        <textarea id="chatInput" rows="1" placeholder="给对方发条消息…（Enter 发送）"></textarea>
+        <button id="chatSendBtn" class="btn send">发送</button>
+      </div>
+    </aside>
+  </div>
+
+  <!-- ★ H5 远程桌面（Phase 1）：被控端授权卡片（点"允许/拒绝"后隐藏）
+       注意：必须放在 <script src="client.js"> 之前，client.js 加载时要立刻能找到它 -->
+  <div id="remoteAskBox" class="remote-ask hidden">
+    <div class="remote-ask-text" id="remoteAskText">有人想控制你的屏幕</div>
+    <!-- ★ 升级 A6 限时授权：允许之前先选"给多久"。默认 60 秒（最小授权原则：
+         演示/面试都能讲"为什么默认不选不限时"——权限给得越久风险越大）。 -->
+    <div class="remote-ask-dur">
+      <label>授权时长：
+        <select id="remoteDuration">
+          <option value="60000" selected>60 秒</option>
+          <option value="300000">5 分钟</option>
+          <option value="0">不限</option>
+        </select>
+      </label>
+    </div>
+    <div class="remote-ask-btns">
+      <button id="remoteAllowBtn" class="btn primary">允许</button>
+      <button id="remoteDenyBtn" class="btn danger">拒绝</button>
+      <!-- ★ 升级 A6：拉黑 = 以后这个人再申请，本地直接自动回 blocked，连卡片都不弹 -->
+      <button id="remoteBlockBtn" class="btn" title="以后这个人的控制申请一律自动拒绝">🚫 不再允许 TA</button>
+    </div>
+  </div>
+
+  <!-- ★ 升级 A4：文件传输（控制端 → 被控端，走 ctrl_ DataChannel）
+       offer 阶段：被控端看到"某某想发文件 xxx（1.2MB）"，点接受才开始传 -->
+  <div id="fileAskBox" class="remote-ask hidden">
+    <div class="remote-ask-text" id="fileAskText">有人想发文件给你</div>
+    <div class="remote-ask-btns">
+      <button id="fileAcceptBtn" class="btn primary">接受</button>
+      <button id="fileDenyBtn" class="btn danger">拒绝</button>
+    </div>
+  </div>
+
+  <!-- ★ 升级 A4：文件传输进度 / 收到的文件下载区（藏在右上角，不挡操作） -->
+  <div id="filePanel" class="file-panel hidden"></div>
+
+  <!-- ★ 升级 A6：审计日志面板（被控端专用）。
+       为什么是"面板"而不是"发去服务器"？——审计必须由被控端自己掌握：
+       日志一落服务器就变成"平台在监视"，被控端的知情权/删除权就没了；
+       本方案日志只存在被控端浏览器内存里，刷新即清空，可随时导出、随时关闭。 -->
+  <div id="auditPanel" class="audit-panel hidden">
+    <div class="audit-head">
+      <span class="audit-title">📜 控制事件审计日志（仅本机）</span>
+      <span class="audit-btns">
+        <button id="auditExportBtn" class="btn">导出 .txt</button>
+        <button id="auditClearBtn" class="btn">清空</button>
+        <button id="auditCloseBtn" class="btn danger">关闭</button>
+      </span>
+    </div>
+    <div id="auditList" class="audit-list"></div>
+    <div class="audit-foot" id="auditFoot">共 0 条</div>
+  </div>
+
+  <!-- 轻提示 toast：控制权结果等一次性反馈（不用 alert，避免被浏览器拦截） -->
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- ★ H5 远程桌面（Phase 4）：远程光标（被控端用）。
+       控制端鼠标移动时，被控端这颗"假光标"跟着走——
+       因为合成事件不会移动系统真实光标，必须自己画一颗给被控端看。
+       pointer-events:none 保证它永远不挡真实点击。 -->
+  <div id="remoteCursor" class="remote-cursor hidden">🖱️</div>
+
+  <!-- 注意顺序：先加载 socket.io 库，再加载我们的业务代码 -->
+  <script src="vendor/socket.io.min.js"></script>
+  <script src="client.js"></script>
+</body>
+</html>

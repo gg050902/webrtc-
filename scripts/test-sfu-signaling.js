@@ -2,7 +2,10 @@
 // 验证：房间/密码（复用）+ Router 能力 + Transport 创建/防重 + consume 的错误路径。
 // （produce/consume 的真实媒体需要浏览器摄像头，无法命令行模拟——
 //   这里能证明 mediasoup Worker/Router/Transport 在服务器端真的能建起来）
-// 运行：先起服务器（node sfu/server.js），再 npm run test:sfu
+// 运行：先起服务器，再 npm run test:sfu
+//   ★ 2026-09-23 补记：AI 操作员那组断言（09-19g）等计划执行 2.5s，而默认步进
+//     AI_OP_STEP_MS=600（7 步要 4.2s）——起服务器必须带加速变量，否则那组会假失败：
+//     AI_OP_STEP_MS=20 node sfu/server.js
 const { io } = require('C:/Users/27418/Desktop/webrtc/node_modules/socket.io-client');
 const URL = 'http://localhost:3001';
 
@@ -453,6 +456,11 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('09-18 /metrics 返回 Prometheus 文本（含 rooms/members 与 bytes 计数）',
      met.code === 200 && met.text.includes('# TYPE sfu_rooms_total gauge') &&
      met.text.includes('sfu_producer_bytes_total') && /sfu_members_total \d+/.test(met.text));
+  // ★ 09-24 AI 用量可观测：调用次数/错误数/tokens/估算花费在同一份 metrics 面上
+  ok('09-24 /metrics 含 AI 用量指标（调用/错误/tokens/花费 四组齐备）',
+     met.text.includes('sfu_ai_llm_enabled') && met.text.includes('sfu_ai_llm_calls_total')
+     && met.text.includes('sfu_ai_llm_errors_total') && met.text.includes('sfu_ai_llm_prompt_tokens_total')
+     && met.text.includes('sfu_ai_llm_cost_cny'));
 
   // --- ★ 09-19：G7-② 结构化日志（JSONL）---
   const fsLog = require('fs');
@@ -477,13 +485,30 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   const aiRow = aiState && (aiState.members || []).find((m) => m.id === 'ai-bot');
   ok('09-19 ai-join 后 room-state 注入 isBot 虚拟成员（🤖 AI 助理）',
      !!aiRow && aiRow.isBot === true && aiRow.name.includes('AI'));
+  /* ★ 09-24 AI 双轨（路线图 1.3）：信令回归必须**在两种环境下都成立**——
+   *   服务器可能配了 DeepSeek key（走 LLM），也可能没配（走 [Mock] 本地规则）。
+   *   断言因此分叉：正文要求"非空、来自相应轨道"，具体措辞不写死。
+   *   AI_ENABLED 从 /config.json 读（服务器只下发布尔值，绝不回显密钥——下面有断言守着）。 */
+  const aiCfg = await httpReq('GET', 'http://localhost:3001/config.json');
+  const AI_ENABLED = aiCfg.code === 200 && JSON.parse(aiCfg.text).aiEnabled === true;
+  console.log(`  （AI 双轨：服务器当前为 ${AI_ENABLED ? 'LLM 真模型轨道' : '[Mock] 本地规则轨道'}）`);
+  ok('09-24 /config.json 只下发 aiEnabled 布尔值，**绝不回显密钥**',
+     aiCfg.code === 200 && !/sk-|api[-_]?key|DEEPSEEK_API_KEY|da218d81/i.test(aiCfg.text));
+
   const aiAskP = waitEvent(A.s, 'chat-message');
+  const aiStreamDeltas = [];
+  A.s.on('ai-stream', (p) => { if (p && p.delta) aiStreamDeltas.push(p.delta); });
   const aiAns = await request(A.s, 'ai-ask', { question: '你好，你是谁？' });
-  ok('09-19 ai-ask 应答含答案（无 key 环境 = [Mock] 前缀）',
-     !!aiAns.data && !!aiAns.data.answer && aiAns.data.answer.includes('[Mock]'));
-  const aiMsg = await Promise.race([aiAskP, sleep(1500).then(() => null)]);
-  ok('09-19 ai-ask 的回答以 chat-message(from=ai-bot) 广播全房',
-     !!aiMsg && aiMsg.from === 'ai-bot');
+  ok('09-24 ai-ask 先回执 streamId（流式握手，前端据此立气泡）',
+     !!aiAns.data && typeof aiAns.data.streamId === 'string' && aiAns.data.streamId.startsWith('ai-'));
+  const aiMsg = await Promise.race([aiAskP, sleep(8000).then(() => null)]);
+  ok(`09-19 ai-ask 终态 ${AI_ENABLED ? 'LLM' : '[Mock]'} 答案广播全房（from=ai-bot）`,
+     !!aiMsg && aiMsg.from === 'ai-bot' && aiMsg.text.length > 4);
+  ok(`09-24 ai-ask 答案确由${AI_ENABLED ? '真模型（无 [Mock] 标记）' : '本地规则（带 [Mock] 标记）'}生成`,
+     !!aiMsg && (AI_ENABLED ? !aiMsg.text.includes('[Mock]') : aiMsg.text.includes('[Mock]')));
+  ok('09-24 ai-ask 广播带 ai 元信息（前端据此画 LLM/Mock 徽标与 token 用量）',
+     !!aiMsg && !!aiMsg.ai && typeof aiMsg.ai.mock === 'boolean' && typeof aiMsg.ai.tokens === 'number');
+  ok('09-24 流式 ai-stream 到达接收端（打字机的数据源）', aiStreamDeltas.length > 0);
   let aiErr = null;
   try { await request(A.s, 'ai-ask', { question: '' }); } catch (e) { aiErr = e.message; }
   ok('09-19 ai-ask 空问题被拒（错误路径正确）', !!aiErr);
@@ -492,9 +517,18 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   const aiState2 = await Promise.race([aiState2P0, sleep(800).then(() => null)]);
   ok('09-19 ai-leave 后 room-state 不再含 bot',
      aiState2 && !(aiState2.members || []).some((m) => m.isBot));
-  aiErr = null;
-  try { await request(A.s, 'ai-ask', { question: '在吗' }); } catch (e) { aiErr = e.message; }
-  ok('09-19 bot 不在房时 ai-ask 被拒（明确提示）', !!aiErr);
+  /* ★ 09-24 体验改版：bot 不在房时不再冷冰冰地 fail，而是**自动邀请入会**——
+   *   提问者的心智模型是"问 AI"，不是"先去按某个按钮"。断言随之改为验证这条自动链路。 */
+  const aiAutoState = waitEvent(A.s, 'room-state');
+  const aiAutoMsg = waitEvent(A.s, 'chat-message');
+  const aiAutoAsk = await request(A.s, 'ai-ask', { question: '在吗' });
+  ok('09-24 ai-ask 时助理缺位 → 自动邀它入会（不再要求成员先点按钮）',
+     !!aiAutoAsk.data && aiAutoAsk.data.started === true);
+  const aiAutoRow = await Promise.race([aiAutoState.then((s) => (s.members || []).find((m) => m.id === 'ai-bot')), sleep(800).then(() => null)]);
+  ok('09-24 自动邀请后 room-state 真的含 bot 成员', !!aiAutoRow && aiAutoRow.isBot === true);
+  const aiAutoAns = await Promise.race([aiAutoMsg, sleep(8000).then(() => null)]);
+  ok('09-24 自动邀请后问题照常作答（不会因为缺这一步把提问吞掉）',
+     !!aiAutoAns && aiAutoAns.from === 'ai-bot' && aiAutoAns.text.length > 2);
 
   // --- ★ 09-19c：N2 纪要（手动生成/下载/列表）+ G3 录制列表 ---
   // 先给房间塞 3 条字幕（N2 的原料走 /api/captions 权威副本）
@@ -507,12 +541,18 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
     ],
   });
   const minAck = await request(A.s, 'ai-minutes', { type: 'segment' });
-  ok('09-19c ai-minutes 生成纪要（返回文件路径，无 key 环境 mock=true）',
-     !!minAck.data && !!minAck.data.file && minAck.data.file.endsWith('.md') && minAck.data.mock === true);
+  ok(`09-19c ai-minutes 生成纪要（返回文件路径，${AI_ENABLED ? 'LLM' : 'Mock'} 轨道）`,
+     !!minAck.data && !!minAck.data.file && minAck.data.file.endsWith('.md')
+     && minAck.data.mock === !AI_ENABLED);
   const minDown = await httpReq('GET', 'http://localhost:3001' + minAck.data.path);
-  ok('09-19c 纪要可经 /minutes/<room>/<file> 下载且含统计与待办线索',
-     minDown.code === 200 && minDown.text.includes('# 会议纪要') &&
-     minDown.text.includes('## 待办线索') && minDown.text.includes('TURN'));
+  ok('09-19c 纪要可经 /minutes/<room>/<file> 下载且含标题与生成器注记',
+     minDown.code === 200 && minDown.text.includes('# 会议纪要')
+     && (AI_ENABLED ? minDown.text.includes('由 DeepSeek 撰写') : minDown.text.includes('本地模板生成')));
+  // ★ 09-24：LLM 轨道下正文少了"待办线索"结构化小节，但它仍用到了同一份字幕原料——
+  //   因此这里要求**至少出现原文里的关键事实**（TURN），证明答案取自账本而非编造。
+  const whom = ['TURN', '部署手册', '李四'].filter((k) => minDown.text.includes(k));
+  ok(`09-24 ${AI_ENABLED ? 'LLM' : 'Mock'} 纪要内容取自字幕账本（命中原文线索 ${whom.join('/') || '无'}）`,
+     whom.length > 0);
   const minList = await httpReq('GET', `http://localhost:3001/api/minutes?room=${ROOM}`);
   ok('09-19c /api/minutes 列表含刚生成的文件', minList.code === 200 &&
      JSON.parse(minList.text).some((x) => x.name === minAck.data.file));

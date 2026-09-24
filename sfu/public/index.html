@@ -2,10 +2,14 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <link rel="icon" href="data:," /><!-- 占位图标：消掉 favicon.ico 404 噪音 -->
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>简易腾讯会议 Demo · SFU 版（mediasoup）</title>
-  <link rel="stylesheet" href="style.css?v=20260919g" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存 -->
+  <link rel="icon" href="icons/icon-1024.png" /><!-- ★ G4：真图标替换占位符（消 favicon 404 + 标签页好看） -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <!-- ★ G4 移动端/PWA（第 32 步）：manifest 让浏览器知道"这是个可安装的应用"
+       （名字/图标/主题色），配合 sw.js 提供"安装到主屏 + 壳子离线可用"。 -->
+  <link rel="manifest" href="manifest.webmanifest" />
+  <meta name="theme-color" content="#14100a" />
+  <title>會 · 智能多人视频会议（WebRTC SFU）</title>
+  <link rel="stylesheet" href="style.css?v=20260923" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存 -->
 </head>
 <body>
   <!-- ★ F3 升级（2026-09-12）：加入前预览页 —— "进会先把设备检查好"（腾讯会议同款流程）。
@@ -90,6 +94,10 @@
         <!-- ★ 09-13 可达性：到服务器的连接方式（host=直连 / srflx=STUN穿墙 / relay=TURN中继），
              让"网络可达性"这个硬边界看得见（client.js 第 13 步从 getStats 候选里读） -->
         <span id="connType" class="badge idle hidden">--</span>
+        <!-- ★ G4 移动端（第 32 步）：成员/聊天侧栏的抽屉开关。
+             桌面（>980px）布局里侧栏常驻显示，这个按钮由 CSS 隐藏；
+             小屏时侧栏被移出画布，必须给它一个"拉出来"的入口。 -->
+        <button id="sideBtn" class="btn mini side-btn" title="成员 / 聊天"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 4v16M13 5H4M13 12H4M13 19H4"/></svg><span>成员/聊天</span></button>
       </div>
     </header>
 
@@ -147,6 +155,9 @@
                placeholder="识别不可用？在这里打字回车 = 手动字幕" />
         <button id="capManualSend" class="btn mini" title="把输入框内容作为一条字幕广播给全房">发送</button>
         <button id="capExportBtn" class="btn mini" title="导出字幕记录（txt，含时间戳与说话人）">⬇ 记录</button>
+        <!-- ★ 09-24 AI 会议助理：「📝 纪要」一键把字幕账本交给 LLM 出结构化纪要
+             （要点/待办/结论），产物落在服务器 /minutes/<房间号>/ 下，气泡里可直接打开。 -->
+        <button id="capMinutesBtn" class="btn mini" title="由 AI 把这场会的字幕账本整理成 markdown 纪要（要点/待办/结论）">📝 纪要</button>
       </div>
 
       <!-- ★ 09-17c 字幕诊断卡：自检失败的每一条都给出"具体原因 + 怎么修"，
@@ -213,6 +224,10 @@
         <button id="capBtn" class="btn" disabled title="实时字幕：识别自己的麦克风转文字并广播（Web Speech API）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="13" rx="2.5"/><path d="M7 11.5h4M13.5 11.5h3.5M7 15h7"/></svg><span>字幕</span></button>
         <!-- ★ 09-13 F4：表情回应（走 D+1 SCTP 数据通道广播，全房表情飞屏） -->
         <span class="ctl-sep" aria-hidden="true"></span>
+        <!-- ★ G4 低带宽模式（第 32 步）：把所有远端画面锁到最低清晰度层（simulcast 第 1 层）。
+             弱网/流量敏感场景一键省流——复用 D1 的 set-preferred-layers 手动锁层信令，
+             服务器侧零改动；"自动"交还时逐个发 spatialLayer:null。 -->
+        <button id="lowBwBtn" class="btn" disabled title="低带宽模式：所有远端画面锁定最低清晰度层（弱网/流量敏感场景）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v9M8 9.5l4 4 4-4"/><path d="M5 19.5h14"/></svg><span>省流</span></button>
         <div class="react-bar" id="reactBar" title="表情回应：经 SFU 数据通道广播给全房">
           <button class="react-btn" data-emoji="👍" title="赞">👍</button>
           <button class="react-btn" data-emoji="❤️" title="喜欢">❤️</button>
@@ -375,6 +390,10 @@
 
   <!-- ★ A4：隐藏的文件选择框（点成员列表里的 📎 触发） -->
   <input type="file" id="fileInput" class="hidden" />
+
+  <!-- ★ G4 移动端（第 32 步）：侧栏抽屉的遮罩——小屏打开抽屉后，点遮罩 = 关抽屉。
+       桌面布局下永远 hidden（CSS 里也仅在 ≤980px 且 body.side-open 时显示）。 -->
+  <div id="sideScrim" class="side-scrim hidden"></div>
 
   <!-- 轻提示 toast：控制权结果等一次性反馈（不用 alert，避免被浏览器拦截） -->
   <div id="toast" class="toast hidden"></div>

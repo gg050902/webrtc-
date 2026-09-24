@@ -1,3 +1,7 @@
+# 密钥（★ 09-24：DeepSeek API key 放 .env，绝不入库）
+.env
+.env.*
+
 # 依赖
 node_modules/
 

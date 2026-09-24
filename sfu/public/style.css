@@ -1473,3 +1473,122 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
 .room-hero:hover, .auth-card:hover { border-color: var(--border-strong); }
 /* 印章字重轻一点(别抢戏) */
 .brand-logo { font-weight: 600; }
+
+/* ────────── 25. ★ G4 移动端 / PWA（第 32 步，2026-09-23）──────────
+   目标：手机也能体面地开会。三件事：
+   ① 侧栏抽屉化——≤980px 时侧栏移出画布（第 14 节已有），这里补上"拉出来"的
+     开关（.side-btn 只在小屏显示）+ .side-open 状态 + 遮罩（.side-scrim）；
+   ② 控制坞与网格适配——≤760px 时按钮收成"图标为主"、网格列变窄、间距收紧；
+   ③ 低带宽模式按钮态——.active 金色描边（开启时一眼可见）。
+   注意：桌面（>980px）一行都不生效——开关按钮 display:none，其余规则全在媒体查询里。 */
+.side-btn { display: none; }   /* 桌面：侧栏常驻，开关没有存在的意义 */
+.lowBwBtn-on { }               /* （占位：按钮态走下面的 .btn.active 通用规则） */
+
+/* 侧栏抽屉遮罩：小屏 + body.side-open 时显示（点它关抽屉） */
+.side-scrim {
+  position: fixed; inset: 0;
+  z-index: 39;                 /* 比侧栏(40)低一层：盖住舞台但不盖抽屉 */
+  background: rgba(8, 5, 2, .5);
+}
+
+/* ---- ≤980px：侧栏抽屉 + 顶栏开关 ---- */
+@media (max-width: 980px) {
+  .side-btn { display: inline-flex; align-items: center; }   /* 小屏才亮出开关 */
+  .side-btn .i { margin-right: 4px; }
+  .side-btn.active { border-color: var(--accent-border); color: var(--accent); }
+  /* 抽屉打开：侧栏滑入（第 14 节的 translateX(100%) 被这条压回 0；
+     同为单类选择器，后写的赢——就是"响应式层盖在基础层之上"） */
+  body.side-open .sidebar { transform: translateX(0); }
+  body.side-open .side-scrim.hidden { display: block; }      /* 坑 24 家族：遮罩有 display，显式补 .hidden 组合 */
+  /* 打开抽屉时舞台别跟着滚（手机上抽屉是浮层，背景冻结更稳） */
+  body.side-open { overflow: hidden; }
+}
+
+/* ---- ≤760px：单手可用的紧凑档 ---- */
+@media (max-width: 760px) {
+  /* 顶栏：徽标太多塞不下——房间号/连接徽标缩小字号，品牌副标题让位（第 14 节已隐藏 .brand-sub） */
+  .brand-name { font-size: 14px; }
+  .badge { font-size: 10px; padding: 3px 8px; }
+  .side-btn span { display: none; }   /* 开关收成纯图标 */
+  .side-btn .i { margin-right: 0; }
+
+  /* 网格：手机竖屏两列刚好；格子间距收紧 */
+  .video-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px; }
+  .video-label { font-size: 10px; }
+  .view-btn { font-size: 11px; padding: 4px 10px; }
+
+  /* 控制坞：按钮收成"图标为主"——带 SVG 图标的按钮隐藏文字（:has 支持 Chrome 105+，
+     老浏览器自动退化为"完整文字"，可用性不受影响）；emoji 文案按钮（AI 操作/协助）保留文字 */
+  .controls { flex-wrap: wrap; justify-content: center; gap: 6px; padding: 8px 10px; bottom: 8px; }
+  .controls .btn:has(.i) span { display: none; }
+  .controls .btn:has(.i) .i { margin-right: 0; width: 17px; height: 17px; }
+  .controls .dev-select { max-width: 96px; font-size: 11px; }
+  .react-bar { gap: 2px; }
+  .react-btn { width: 30px; height: 30px; font-size: 15px; }
+
+  /* 字幕条/诊断卡上移避开换行的控制坞（控制坞变两层后大约 88~110px 高） */
+  .caption-bar { bottom: 128px; max-width: 94%; padding: 8px 12px; gap: 8px; font-size: 13px; }
+  .cap-diag { bottom: 186px; width: 94%; }
+  .cap-history { width: 94%; }
+
+  /* 日志面板：手机上让位给画面（默认收矮，想看再点开） */
+  .app { grid-template-rows: 52px 1fr 84px; }
+  .log-panel pre { font-size: 10px; max-height: 44px; }
+
+  /* 预览页：竖屏时上下堆叠（视频在上、检查项在下） */
+  .prejoin-main { flex-direction: column; }
+  .prejoin-video-wrap { max-width: 100%; }
+
+  /* 授权卡/文件卡：占满宽度，按钮换行 */
+  .remote-ask { width: calc(100vw - 24px); }
+  .remote-ask-btns { flex-wrap: wrap; }
+}
+
+/* 低带宽模式开启态：金色描边 + 微光，和"自动选层"区分开 */
+#lowBwBtn.active {
+  border-color: var(--accent-border);
+  color: var(--accent);
+  background: var(--accent-muted);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   23 ★ 09-24 AI 会议助理 UI：模式徽标 / 流式打字机 / 纪要下载
+   设计纪律（与全站一致）：单色克制，只用 accent 与 fg 两类 token，
+   不引新色；所有新类都是"加成"，不动任何既有类名与布局。
+   ══════════════════════════════════════════════════════════════ */
+
+/* 模式徽标：LLM=实色强调，Mock=描边弱化（一眼看出"这条到底谁写的"） */
+.msg-ai-mode {
+  margin-left: 5px; padding: 1px 6px;
+  font-size: 9px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--accent); background: var(--accent-muted);
+  border: 1px solid var(--accent-border); border-radius: 999px;
+}
+.msg-ai-mode.mock { color: var(--fg-faint); background: transparent; border-color: var(--border); }
+.msg-ai-tok { margin-left: 5px; font-family: var(--mono); font-size: 9px; color: var(--fg-faint); }
+
+/* 纪要下载链接：与 bot 气泡同源的金调，虚线下划线呼应"文档"意象 */
+.msg-link {
+  display: inline-block; margin-top: 6px;
+  font-size: 11px; color: var(--accent); text-decoration: none;
+  border-bottom: 1px dashed var(--accent-border); padding-bottom: 1px;
+}
+.msg-link:hover { border-bottom-style: solid; }
+
+/* 流式气泡：打字中的呼吸光标 + 生成时不抢眼的柔光 */
+.msg.bot.streaming { opacity: .92; }
+.msg.bot.streaming .msg-text.typing::after {
+  content: ''; display: inline-block; width: 6px; height: 1em;
+  margin-left: 3px; vertical-align: -2px;
+  background: var(--accent); opacity: .8;
+  animation: aiCaret .9s steps(2, start) infinite;
+}
+@keyframes aiCaret { 0%, 49% { opacity: .8; } 50%, 100% { opacity: .1; } }
+
+/* AI 助理按钮的 Mock 态：降饱和 + 虚线边（"没接真模型"要看得出来） */
+#aiBtn.ai-mock { border-style: dashed; opacity: .85; }
+#aiBtn.ai-mock:hover { opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  .msg.bot.streaming .msg-text.typing::after { animation: none; }
+}

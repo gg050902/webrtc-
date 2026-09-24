@@ -1,0 +1,26 @@
+{
+  "name": "會 · 基于 WebRTC 与 Mediasoup 的智能多人视频会议系统",
+  "short_name": "會 · 会议",
+  "description": "浏览器直接开会的视频会议系统：SFU 转发、屏幕共享、协作白板、实时字幕、AI 纪要与问答。",
+  "lang": "zh-CN",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#14100a",
+  "theme_color": "#14100a",
+  "icons": [
+    {
+      "src": "icons/icon-1024.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-1024.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
