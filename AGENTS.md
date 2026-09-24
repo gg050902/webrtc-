@@ -495,6 +495,56 @@
 > 导读 LEARN.md **5.28**；⚠️ 待人工验证：真浏览器打字机观感、跨机画面（announcedIp 自动纠偏后）、
 > 纪要质量（真开会 10 分钟）、操作员演示（有 key 后走 LLM 计划而非 Mock 脚本）。
 >
+> **09-24 账号上真数据库 + 门禁边界修正 + 优雅退出（本次只改文档、不动代码）**——
+> ① **存储层：Node 内置 `node:sqlite`（零新依赖）**：新增 `sfu/store.js` 取代 `sfu/users.json`——
+>   库文件优先级 `DB_FILE` 环境变量 > `config.json` 的 `dbFile` > 默认 `sfu/data/meeting.db`；
+>   `PRAGMA journal_mode = WAL`（读不挡写、写不挡读）；两张表 `users(username PK, salt, hash, display_name,
+>   role, created_at)` + `audit(id PK AUTOINCREMENT, ts, kind, actor, detail)`（+ `idx_audit_ts`）；
+>   导出 `getUser/createUser/listUsers/setUserRole/setPassword/deleteUser/countUsers/hasAdmin/appendAudit/
+>   listAudit/integrityCheck/closeDb` 与常量 `DB_FILE/LEGACY_USERS_FILE`。
+>   **旧 users.json 首次启动自动整表迁移**——**原样保留 salt/hash、绝不重新哈希**，搬完把旧文件改名
+>   `users.json.imported-<YYYYMMDD>` 备份保留不删。实况：迁移 69 个账号（其中 **61 个是测试脚本历史遗留垃圾账号**
+>   `a_XXXXXX`/显示名"爱丽丝"），清理前整库备份 `sfu/data/backup-<时间戳>-before-cleanup.db`，**现库中 9 个账号**；
+>   首个管理员 **`Guoge`**（此前库里 0 个 admin，导致 `/dashboard`、`/metrics` 对所有人 401）。
+> ② **口令方案抽成单一实现 `sfu/password.js`**：`SALT_BYTES/KEY_LEN/newSalt/hashPassword/verifyPassword/randomPassword`，
+>   方案 `scrypt(password, salt, 32) → hex`（每账号 16 字节随机盐），校验用 `crypto.timingSafeEqual`。
+>   原本 server.js 与 scripts/admin.js 各"照抄"一份，参数一漂移就导致 CLI 建的账号在网页上**永远登不上**、
+>   还只报"用户名或密码不对"；现两边 require 同一份，**用结构消除漂移（而非靠"记得同步改"）**。
+> ③ **管理员 CLI `scripts/admin.js`**（`admin:list/grant/revoke/adduser/passwd/purge`，注意 `--` 透传参数）：
+>   `purge` **默认只干跑、显式 `--yes` 才真删**；`deleteUser` 内置**拒绝删除库里唯一管理员**的安全闸；
+>   `passwd` 是"忘记密码"的本地可信通道（教学版无邮件重置）；角色存在库里，但 token 带的是"签发那一刻的角色"，
+>   **提权后需重新登录**新 token 才是 admin（换来 HTTP 门禁"零数据库查询"）。
+> ④ **★ HTTP 门禁边界（本轮最重要的修正）**：接口分两类——
+>   **甲类·观测**（`/api/rooms`、`/metrics`、`/api/recordings`）上 `requireAdmin`；
+>   **乙类·内容**（`/api/captions`、`/api/minutes`、`/minutes/<6位房>/<文件>.md`、`/recordings/<文件名>`）
+>   **刻意开放**（能力 = 房间号/文件名）。理由：本产品允许**游客进会**，而字幕归档由 `client.js` **自动**调用
+>   （游客没 token）——若给乙类加门禁，游客的字幕归档会**静默失效**（功能坏了却只在控制台留一行日志）；
+>   **第一版曾误加门禁，复核时发现这条已回退**。一句话：**安全不靠"拦所有人"，靠"能力（房间号）只发给在场的人"**。
+>   token 取法：`Authorization: Bearer <token>`（首选）/ `?token=<token>`（浏览器地址栏、`<video src>` 兜底，
+>   代价是进 URL 历史与访问日志）。残余风险（诚实交代）：6 位房间号可枚举（10^6）、录像文件名含毫秒时间戳
+>   属**弱能力**；生产做法 = join 下发房间内令牌 + 录像短时效签名 URL，本教学版未实现。
+>   `/dashboard` 页本身不设门禁（否则页面都打不开、没法提示去登录），它调的 `/api/rooms` 才受门禁。
+> ⑤ **自签证书 SAN 自愈**：浏览器早已不看 CN（RFC 6125），自签必须带 SAN——改为"**证书缺失 / 无 SAN /
+>   SAN 未覆盖当前局域网 IP**"三种都重新生成（修 DHCP IP 漂移导致"只判有没有 SAN 就永不重签"），
+>   SAN 写入**所有**检测到的本机 IPv4（WLAN + 有线）并保留旧证书已有 IP。实测 SAN：
+>   `DNS:localhost, IP:127.0.0.1, IP:192.168.74.194, IP:192.168.116.194`（10 年期自签，`sfu/tls/`）；
+>   顺带修正 `config.json` 漂移的 `announcedIp`（`192.168.127.194` → `192.168.74.194`；取值优先级
+>   `MEDIASOUP_ANNOUNCED_IP` > `config.json`（须是本机某网卡 IP） > 自动探测，配过期私网 IP 会告警并自动改用真实网卡 IP）。
+> ⑥ **优雅退出（此前完全没注册信号处理器）**：`SIGINT`/`SIGTERM`/`uncaughtException` → 关所有 Worker →
+>   停收新连接 → `store.closeDb()`（做 WAL checkpoint）→ 正常退出；**幂等**（连按两次 Ctrl+C 第二次直接退）+
+>   **5 秒保险丝**兜底。否则 Ctrl+C = 进程暴毙 → Worker 变孤儿继续占 40000-49999 端口、WAL 堆积、录制中的 ffmpeg 被硬切；
+>   顺带用 `shuttingDown` 标志修掉"正常退出却被当成 Worker 崩溃"的日志噪声。Windows 上外部投递不了 SIGTERM
+>   （无 POSIX 信号，`process.kill` 走 TerminateProcess 等于直接暴毙），故加自测钩子 `TEST_SHUTDOWN_AFTER_MS`
+>   （沿用 `TEST_RECORD` 约定）让这条路径可自动化验证。
+> ⑦ **测试隔离纪律（本次最关键的一条）**：账号类测试一律用 `DB_FILE` + `USERS_FILE_LEGACY` 指到临时目录，
+>   **绝不碰真实库**（`test-store` 有硬断言自证：真实 `sfu/users.json` 逐字节一致、`sfu/data/` 下没建库）；
+>   根因是此前测试直接往真实 `users.json` 注册账号、累积了 61 个垃圾账号；注册限流也挪到**写库之前**；
+>   另修 `test-sfu-signaling.js` 的 `httpReq` 默认带管理员 token、会掩盖"游客视角"回归的问题，加 `noAuth` 开关。
+> **回归（2026-09-24 实测，全绿 = 425 项）**：`test:store` **49/49**（36→49）、`test:shutdown` **9/9**（新增）、
+>   `test:sfu` **134/134**（127→134，新增门禁**边界**断言，含"游客无 token 也能归档字幕"端到端回归）、
+>   `npm test`（Mesh）**36/36**、`test:smoke` **136/136**、`test:agent` **16/16**、`test:publish` **30/30**、
+>   `test:e2e` **15/15**（退出码 0）；合计 **425**。导读新增 `LEARN.md` **5.33~5.37**。
+>
 > **09-23 G4 移动端/PWA ✅ + 毕设题目定名（"按后续升级方向升级 SFU 版"）**——
 > ① **题目定名**：《基于 WebRTC 与 Mediasoup 的智能多人视频会议系统》（README 头部；
 >   论文封面备选《基于 WebRTC 与大语言模型的智能多人视频会议系统的设计与实现》）；
@@ -670,9 +720,12 @@ npm run start:sfu      # SFU 版服务器 → http://localhost:3001（要先 bui
 npm run start:demo     # 一键起两版（Mesh 3000 + SFU 3001）并打印地址
 npm run start:lan      # 局域网交付：探 IP → 生成 sfu/config.json（HTTPS 自签+announcedIp+TURN）→ 放行防火墙
 npm run build:sfu-vendor  # 一次性：打包 mediasoup-client → sfu/public/vendor/（改依赖后重跑）
-npm test               # Mesh 版信令回归（必须先起 3000）★ 2026-09-24 实测 33/33
-npm run test:sfu       # SFU 版信令回归（必须先起 3001，且 AI_OP_STEP_MS=20）★ 2026-09-24 实测 106/106（Mock 轨 / LLM 轨各跑一遍）
-npm run test:smoke     # SFU 版**前端**无头冒烟（假 DOM/假 mediasoup，零依赖不用起服务器）★ 118/118
+npm test               # Mesh 版信令回归（必须先起 3000）★ 2026-09-24 实测 36/36
+npm run test:sfu       # SFU 版信令回归（必须先起 3001，且 AI_OP_STEP_MS=20）★ 2026-09-24 实测 134/134（Mock 轨 / LLM 轨各跑一遍；含门禁边界断言）
+npm run test:store     # ★ 09-24 账号存储层回归（node:sqlite：迁移保留 salt/hash / 改密换盐 / 删号安全闸 / 完整性）★ 49/49
+npm run test:shutdown  # ★ 09-24 优雅退出回归（关 Worker / 关库 WAL checkpoint / 幂等 / 5s 保险丝）★ 9/9
+npm run test:smoke     # SFU 版**前端**无头冒烟（假 DOM/假 mediasoup，零依赖不用起服务器）★ 2026-09-24 实测 136/136
+npm run admin:list     # ★ 09-24 管理员 CLI（另有 grant/revoke/adduser/passwd/purge；purge 默认干跑、`--yes` 才删）
 npm run test:ai        # AI 双轨自检（无 key 只跑 Mock 轨并提示，有 key 两条都跑）★ 10/10
 npm run ai:chat        # AI 脚本：终端一问一答（教学阶段 0）／--q "问题" 单发
 npm run ai:summarize   # AI 脚本：文本/文件/房间字幕 → markdown 纪要（--text/--file/--room）
@@ -685,9 +738,10 @@ npm run agent          # ★ 09-24b 启动被控端桌面代理（--room 123456�
 npm run test:agent     # ★ 09-24b 桌面代理端到端（真起 Chromium：抓屏 JPEG + 坐标注入 ±3px + 远程导航）★ 16/16
 npm run test:e2e       # ★ 09-24b 真机远程桌面 e2e（真双窗 + 390×844 手机视口双指/单指，出截图）
 npm run publish:mesh   # ★ 09-24b 一键发布 Mesh 版（生成 publish-mesh/ → 体检 → 可选 --tunnel/--bundle/--check）
-npm run test:publish   # ★ 09-24b 发布链回归（含 --check 过期闸：源码改了不重发必报错）★ 29/29
+npm run test:publish   # ★ 09-24b 发布链回归（含 --check 过期闸：源码改了不重发必报错）★ 2026-09-24 实测 30/30
 node --check public/client.js && node --check server.js      # 改完 Mesh 版 JS 查语法
 node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU 版 JS 查语法
+# ★ 09-24 全部回归合计 425 项全绿：SFU 134 + 存储 49 + 优雅退出 9 + 冒烟 136 + Mesh 36 + 代理 16 + 发布 30 + e2e 15
 ```
 
 - ✅ **`npm run doctor`**：环境自检（17 项 / 4 组：环境·配置·端口·跨网 ICE），失败项都给"怎么修"；`node scripts/doctor.js --json` 出结构化结果。换机器 / 交付前先跑一遍。

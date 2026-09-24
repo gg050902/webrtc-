@@ -2,6 +2,11 @@
   "port": 3001,
   "maxMembers": 8,
   "workerCount": 1,          // mediasoup Worker 进程数（SFU 深造：多核横向扩展，默认 1；多核机器可 2~4）
+  // ★ 09-24 账号数据库位置（node:sqlite）。不写则用默认 sfu/data/meeting.db；
+  //   环境变量 DB_FILE 优先级更高（测试脚本用它指到临时文件，避免写脏真实数据）。
+  "dbFile": "data/meeting.db",
+  // ★ 09-24 管理员钦定：填了它，这个用户名注册时直接是 admin（不填则"首个注册的账号"自动成为 admin）
+  "adminUsername": "your-admin-name",
   "listenIp": "0.0.0.0",
   "announcedIp": "192.168.1.10",
   "rtcMinPort": 40000,

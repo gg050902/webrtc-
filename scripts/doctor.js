@@ -98,7 +98,13 @@ function probeTcp(host, port, timeoutMs = 1200) {
 }
 
 /** get / post 的极简封装（自签证书允许忽略校验；永远 resolve，不抛） */
-function httpGetText(url, timeoutMs = 4000) {
+/* ★ 09-24 G8：/api/rooms、/metrics 等接口已加管理员门禁。
+ *   doctor 要能带 token 访问，否则健康快照永远拿不到（会被误判成"服务器不对"）。
+ *   token 来源：环境变量 ADMIN_TOKEN（会议页管理员登录后从 localStorage.wb_auth 里取）。 */
+const DOCTOR_ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
+const DOCTOR_AUTH_HEADERS = DOCTOR_ADMIN_TOKEN ? { Authorization: `Bearer ${DOCTOR_ADMIN_TOKEN}` } : {};
+
+function httpGetText(url, timeoutMs = 4000, headers = {}) {
   return new Promise((resolve) => {
     let req;
     try {
@@ -107,6 +113,7 @@ function httpGetText(url, timeoutMs = 4000) {
         agent: false,                 // 别复用连接池：否则 keep-alive 句柄会把进程挂住
         rejectUnauthorized: false,    // 自签开发证书 → 忽略校验（就要这个）
         timeout: timeoutMs,
+        headers,
       }, (res) => {
         let body = '';
         res.setEncoding('utf8');
@@ -626,8 +633,17 @@ const FIREWALL_HINT = [
 
   // C2 健康接口（只有 3001 真的在跑才问）
   if (mainUp) {
-    const api = await httpGetText(`http://127.0.0.1:${sfuPort}/api/rooms`);
-    if (api.ok && api.status === 200) {
+    const api = await httpGetText(`http://127.0.0.1:${sfuPort}/api/rooms`, 4000, DOCTOR_AUTH_HEADERS);
+    if (api.ok && api.status === 401) {
+      // ★ 09-24 G8：门禁上线后，"401 没带 token"和"接口坏了"必须分开报——否则会误导排查方向
+      add('C', 'C2-api', 'warn', `/api/rooms 需要管理员 token（HTTP 401）`,
+        {
+          detail: '该接口已加管理员门禁（能看到全房成员/媒体字节/控制权关系，属敏感信息）',
+          advice: `用管理员账号在会议页登录 → 控制台执行 JSON.parse(localStorage.wb_auth).token 取值 → `
+            + `再运行：ADMIN_TOKEN=<token> npm run doctor。还不是管理员就先 npm run admin:grant -- <用户名>`,
+          priority: 40,
+        });
+    } else if (api.ok && api.status === 200) {
       let snap = null;
       try { snap = JSON.parse(api.body); } catch (e) { /* 不是 JSON */ }
       if (snap && Array.isArray(snap.rooms)) {

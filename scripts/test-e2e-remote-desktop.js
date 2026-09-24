@@ -30,6 +30,20 @@ const OUT = path.join(os.tmpdir(), 'wb-rd-shots');
 fs.mkdirSync(OUT, { recursive: true });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/* ★ 09-24 测试数据隔离（任务 3）：本测试起真服务器 → 账号写进临时库，
+ *   绝不动开发者真实的 sfu/data/meeting.db 或历史 sfu/users.json。
+ *   USERS_FILE_LEGACY 指向不存在的临时路径 → 迁移绝不会改名真实 users.json。 */
+const TEST_DB_FILE = path.join(os.tmpdir(), `sfu-test-e2e-${process.pid}-${Date.now()}.db`);
+const TEST_LEGACY_USERS = path.join(os.tmpdir(), `sfu-test-e2e-legacy-${process.pid}.json`);
+function cleanupTestDb() {
+  for (const f of [TEST_DB_FILE, TEST_DB_FILE + '-wal', TEST_DB_FILE + '-shm']) {
+    // maxRetries：Windows 上子进程刚被 kill、句柄未释放时删库会 EBUSY，重试才删得掉
+    try { fs.rmSync(f, { force: true, recursive: true, maxRetries: 8, retryDelay: 150 }); }
+    catch (e) { /* 删不掉也不影响断言 */ }
+  }
+}
+process.on('exit', cleanupTestDb);
+
 /* 断言计数器。
  * ▎为什么要有这个？——一个只"打印 ✅/❌"的脚本是**没有结论**的：
  *   它不会失败，也就不会有人发现它失败了（本项目已经因此踩过"假通过"的坑）。
@@ -84,7 +98,7 @@ async function waitJs(cdp, expr, timeout = 20000, label = '') {
 
   console.log('① 起服务器…');
   serverProc = spawn(process.execPath, [path.join(__dirname, '..', 'sfu', 'server.js')], {
-    env: { ...process.env, AI_FORCE_MOCK: '1' },
+    env: { ...process.env, AI_FORCE_MOCK: '1', DB_FILE: TEST_DB_FILE, USERS_FILE_LEGACY: TEST_LEGACY_USERS },
     cwd: path.join(__dirname, '..'), stdio: ['ignore', 'ignore', 'pipe'],
   });
   serverProc.stderr.on('data', (d) => process.stderr.write('[server] ' + d));

@@ -9,8 +9,11 @@
 // ▎用法：
 //   npm run watch                          # 默认每 10 秒一轮，Ctrl+C 退出
 //   npm run watch -- --interval 30 --max-rss 400
+//   ADMIN_TOKEN=<token> npm run watch      # ★ 09-24：/api/rooms 与 /metrics 现在要管理员 token
 //   WATCH_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xx npm run watch
 //   （webhook = 一次 fetch POST，企业微信/钉钉机器人都能收）
+// ▎ADMIN_TOKEN 怎么拿：在会议页用管理员账号登录 → 浏览器控制台执行
+//   JSON.parse(localStorage.wb_auth).token 取值即可（这就是服务器签发的那个 token）。
 const args = process.argv.slice(2);
 const argOf = (name, dft) => {
   const i = args.indexOf(name);
@@ -20,6 +23,8 @@ const BASE = argOf('--url', 'http://localhost:3001');
 const INTERVAL = Math.max(5, parseInt(argOf('--interval', '10'), 10)) * 1000;
 const MAX_RSS = parseInt(argOf('--max-rss', '512'), 10) * 1048576;
 const WEBHOOK = process.env.WATCH_WEBHOOK_URL || null;
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;   // ★ 09-24 G8：接口门禁后必须带 token
+const AUTH_HEADERS = ADMIN_TOKEN ? { Authorization: `Bearer ${ADMIN_TOKEN}` } : {};
 const SCORE_MIN = 4;   // mediasoup 健康分 1~10，低于 4 = 媒体质量差
 
 const failing = { api: 0 };          // 连续失败计数（告警只报状态变化，不刷屏）
@@ -48,7 +53,16 @@ function alert(key, text) {
 async function tick() {
   let snap;
   try {
-    const res = await fetch(`${BASE}/api/rooms`);
+    const res = await fetch(`${BASE}/api/rooms`, { headers: AUTH_HEADERS });
+    /* ★ 09-24 G8：401 要单独判——否则会被当成"服务器挂了"连报三次假告警。
+     *   这是门禁上线后最容易踩的坑：**"我没权限"和"服务不可用"是两件事**，
+     *   混在一起会让人往完全错误的方向排查（去看进程，其实是没带 token）。 */
+    if (res.status === 401) {
+      alert('unauthorized', `接口返回 401：缺少或无效的管理员 token。`
+        + (ADMIN_TOKEN ? '当前 ADMIN_TOKEN 已失效（重新登录取新的）。' : '请用 ADMIN_TOKEN=<token> npm run watch 启动。')
+        + ' 取 token：会议页用管理员账号登录 → 控制台 JSON.parse(localStorage.wb_auth).token');
+      return;
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     snap = await res.json();
     if (failing.api > 0) console.log(`[${ts()}] ✅ 服务器恢复（连续失败 ${failing.api} 轮后）`);
@@ -76,10 +90,13 @@ async function tick() {
 
   // ④ 指标层面的进程内存（/metrics 是 G7-① 的成果，这里顺手消费）
   try {
-    const met = await (await fetch(`${BASE}/metrics`)).text();
-    const rss = met.match(/sfu_process_resident_memory_bytes (\d+)/);
-    if (rss && Number(rss[1]) > MAX_RSS) {
-      alert('rss', `服务器进程内存 ${(Number(rss[1]) / 1048576).toFixed(0)}MB 超过阈值 ${(MAX_RSS / 1048576).toFixed(0)}MB`);
+    const res = await fetch(`${BASE}/metrics`, { headers: AUTH_HEADERS });
+    if (res.status !== 401) { // 401 已在上面①处统一提示，这里不重复刷屏
+      const met = await res.text();
+      const rss = met.match(/sfu_process_resident_memory_bytes (\d+)/);
+      if (rss && Number(rss[1]) > MAX_RSS) {
+        alert('rss', `服务器进程内存 ${(Number(rss[1]) / 1048576).toFixed(0)}MB 超过阈值 ${(MAX_RSS / 1048576).toFixed(0)}MB`);
+      }
     }
   } catch (e) { /* metrics 拉不到单独不算告警（api 已覆盖） */ }
 }
@@ -87,5 +104,10 @@ async function tick() {
 console.log(`👀 watch 启动：每 ${INTERVAL / 1000}s 轮询 ${BASE}` +
   (WEBHOOK ? '，webhook 已配置' : '，webhook 未配置（设 WATCH_WEBHOOK_URL 启用）') +
   '。告警规则：服务拉不到 / 健康分<' + SCORE_MIN + ' / 宽限期<10s / rss 超限。Ctrl+C 退出。');
+if (!ADMIN_TOKEN) {
+  console.log('⚠️  未设置 ADMIN_TOKEN —— /api/rooms 与 /metrics 现在需要管理员身份，会一直 401。');
+  console.log('   用法：ADMIN_TOKEN=<token> npm run watch');
+  console.log('   取 token：会议页用管理员账号登录 → 控制台 JSON.parse(localStorage.wb_auth).token');
+}
 tick();
 setInterval(tick, INTERVAL);

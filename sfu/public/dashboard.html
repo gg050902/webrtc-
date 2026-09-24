@@ -83,13 +83,54 @@
 <body>
   <h1><span class="dot"></span>SFU 实时观测面板</h1>
   <div class="sub">数据每 2 秒刷新一次，来自服务器 <b>GET /api/rooms</b> · 码率 = 两次采样字节差 ÷ 时间差（和浏览器 getStats 同一个算法）</div>
-  <div class="sub" style="margin-top:-14px"><a href="/recordings.html" style="color:#d8b36a">📼 录制回放</a> · <a href="/" style="color:#d8b36a">会议页</a> · <a href="/metrics" style="color:#d8b36a">/metrics</a></div>
+  <div class="sub" style="margin-top:-14px"><a href="/recordings.html" style="color:#d8b36a">📼 录制回放</a> · <a href="/" style="color:#d8b36a">会议页</a> · <a href="/metrics" id="metricsLink" style="color:#d8b36a">/metrics</a></div>
 
   <div class="overview" id="overview"></div>
   <div id="rooms"><div class="empty"><div class="big">📡</div>还没有任何房间——先去 <a href="/" style="color:#d8b36a">会议页</a> 创建一个</div></div>
 
 <script>
 'use strict';
+/* ★ 09-24 G8：本页要调受保护接口，必须带管理员 token。
+ * ▎token 从哪来：沿用会议页登录后写进 localStorage 的那一份（键名 wb_auth，
+ *   值是 { username, token }）——**同一个键，不另起一个**，否则登录状态会各存各的、互不认账。
+ * ▎兜底：URL 上的 ?token=（比如别人把带 token 的面板链接直接发给你）。
+ *   ▎权衡：URL 里的 token 会进历史/日志，所以只在没有 localStorage 时用它。 */
+function getToken() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('wb_auth') || '{}');
+    if (saved && saved.token) return saved.token;
+  } catch (e) { /* 存坏了当没有 */ }
+  try { return new URLSearchParams(location.search).get('token') || ''; } catch (e) { return ''; }
+}
+const TOKEN = getToken();
+function authHeaders() { return TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {}; }
+// /metrics 这个链接是"浏览器直接打开"，发不出请求头 → 只能把 token 拼进 URL 兜底
+(function tokenizeMetricsLink() {
+  const a = document.getElementById('metricsLink');
+  if (a && TOKEN) a.href = '/metrics?token=' + encodeURIComponent(TOKEN);
+})();
+
+/* 401 引导卡片：不是报错崩溃，而是告诉人"这页要管理员身份、怎么去登录" */
+function showAuthGuide() {
+  document.getElementById('overview').innerHTML = '';
+  document.getElementById('rooms').innerHTML = `
+    <div class="room-card" style="max-width:620px;margin:40px auto;text-align:center">
+      <div style="font-size:40px;margin-bottom:10px">🔒</div>
+      <div style="font-size:17px;font-weight:700;margin-bottom:8px">观测面板需要管理员身份</div>
+      <div style="color:#8a8070;font-size:13px;line-height:1.8">
+        这个面板会暴露全部房间的成员、每路媒体字节数与控制权关系，所以只对管理员开放。<br>
+        请先用<b style="color:#d8cdb8">管理员账号</b>登录，再回到本页。
+      </div>
+      <div style="margin-top:18px">
+        <a href="/" style="display:inline-block;padding:9px 18px;border-radius:99px;background:#d8b36a;color:#14100a;text-decoration:none;font-weight:700">去登录 →</a>
+        <a href="/" style="display:inline-block;padding:9px 18px;color:#8a8070;text-decoration:none">回会议页</a>
+      </div>
+      <div style="color:#6f6758;font-size:12px;margin-top:16px">
+        还不是管理员？让管理员执行 <code>npm run admin:grant -- &lt;用户名&gt;</code>，然后重新登录。
+      </div>
+    </div>`;
+}
+
 /* ---- 采样历史：roomId -> [{t, bytes}]（最多留 60 个点，画折线用）---- */
 /* ★ 09-19h G7-④：历史留存——采样写 localStorage（环形 60 点），刷新页面曲线不丢。
  *   只存"字节累计值"（每房间一条），2s×60 点 ≈ 4KB，localStorage 完全无压力。 */
@@ -107,15 +148,23 @@ function persistHistory() {
 }
 
 async function poll() {
-  let data;
+  let resp;
   try {
-    const resp = await fetch('/api/rooms');
-    data = await resp.json();
+    resp = await fetch('/api/rooms', { headers: authHeaders() });
   } catch (e) {
     document.getElementById('overview').innerHTML =
       `<div class="stat"><div class="num">--</div><div class="lbl">服务器没连上</div></div>`;
     return;
   }
+  /* ★ 09-24 G8：401 = 没登录管理员。绝不能当"服务器挂了"或渲染空白，
+   *   而要给人一条明确的路（去登录）——"错误信息要可操作"是这项目的统一脾气。 */
+  if (resp.status === 401) { showAuthGuide(); return; }
+  if (!resp.ok) {
+    document.getElementById('overview').innerHTML =
+      `<div class="stat"><div class="num">${resp.status}</div><div class="lbl">接口返回异常</div></div>`;
+    return;
+  }
+  const data = await resp.json();
   render(data);
 }
 

@@ -17,6 +17,30 @@ const { spawn } = require('child_process');
 const nodePath = require('path');
 const URL = 'http://localhost:3001';
 
+/* ★ 09-24 测试数据隔离（任务 3）：本脚本会真注册账号，绝不能让它们落进
+ *   开发者真实的 sfu/data/meeting.db 或历史 sfu/users.json。
+ * ▎做法：把 DB_FILE 指到 os.tmpdir() 下的临时文件、并把 USERS_FILE_LEGACY 指到一个
+ *   **不存在**的临时路径（这样迁移逻辑找不到旧文件，也就绝不会去改名真实的 users.json）。
+ * ▎跑完删掉 db / wal / shm 三个文件。这是"测试不污染真实数据"的唯一可靠手段：
+ *   靠"记得别用真库"这种纪律是守不住的，得让**默认行为就是隔离的**。 */
+const os = require('os');
+const fsClean = require('fs');
+const TEST_DB_FILE = nodePath.join(os.tmpdir(), `sfu-test-sig-${process.pid}-${Date.now()}.db`);
+const TEST_LEGACY_USERS = nodePath.join(os.tmpdir(), `sfu-test-sig-legacy-${process.pid}.json`); // 故意不存在
+function cleanupTestDb() {
+  for (const f of [TEST_DB_FILE, TEST_DB_FILE + '-wal', TEST_DB_FILE + '-shm']) {
+    // ▎为什么要 maxRetries：Windows 上服务器子进程刚被 kill、句柄还没释放时删文件会 EBUSY，
+    //   单次 rmSync 会静默失败（留下垃圾）。给几秒线性退避重试，才真的"跑完删干净"。
+    try { fsClean.rmSync(f, { force: true, recursive: true, maxRetries: 8, retryDelay: 150 }); }
+    catch (e) { /* 实在删不掉也不影响断言 */ }
+  }
+}
+process.on('exit', cleanupTestDb);
+
+// ★ 09-24 G8：HTTP 接口已加管理员门禁 —— 本脚本的 HTTP 断言需要带 token。
+//   取 token 的办法：临时库是全新的，所以**第一个注册的账号自动是管理员**（见 sfu/store.js）。
+let adminToken = null;
+
 let serverProc = null;
 
 function pingServer() {
@@ -34,12 +58,21 @@ async function ensureServer() {
   if (await pingServer()) {
     console.log('⚠️  3001 端口已有服务器在跑 —— 本脚本直接用它。');
     console.log('   若那个服务器没带 AI_OP_STEP_MS=20 / AI_FORCE_MOCK=1，AI 那组断言可能假失败。');
-    console.log('   想跑确定性回归：先把它关掉，让本脚本自己起一个。\n');
+    console.log('   ★ 09-24 G8 起还有一条：HTTP 门禁断言依赖"本脚本注册的测试账号是管理员"。');
+    console.log('     若那个服务器用的是**已有管理员的正式库**，测试账号就只是普通用户，');
+    console.log('     /api/rooms、/metrics 等断言会因 401 而失败——那不是代码坏了，是环境不对。');
+    console.log('   想跑确定性回归：先把它关掉，让本脚本自己起一个（临时库 → 首个账号即管理员）。\n');
     return;
   }
   console.log('🚀 自起测试服务器（AI_OP_STEP_MS=20 加速 + AI_FORCE_MOCK=1 确定性轨道）…');
   serverProc = spawn(process.execPath, [nodePath.join(__dirname, '..', 'sfu', 'server.js')], {
-    env: { ...process.env, AI_OP_STEP_MS: '20', AI_FORCE_MOCK: '1' },
+    env: {
+      ...process.env,
+      AI_OP_STEP_MS: '20',
+      AI_FORCE_MOCK: '1',
+      DB_FILE: TEST_DB_FILE,               // ★ 任务 3：账号写进临时库，不碰真实数据
+      USERS_FILE_LEGACY: TEST_LEGACY_USERS, // ★ 指向不存在的路径 → 绝不迁移/改名真实 users.json
+    },
     cwd: nodePath.join(__dirname, '..'),
     stdio: ['ignore', 'ignore', 'pipe'],
   });
@@ -82,6 +115,24 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
     });
     authTtlMs = (JSON.parse(cfgBody).authTtlMs) || Infinity;
   } catch (e) { /* 拉不到按默认跳过 */ }
+
+  /* ★ 09-24 G8：先弄到一个管理员 token（HTTP 门禁断言的前置条件）。
+   * ▎临时库是全新的 → 第一个注册的账号被 store 自动设为 admin。 */
+  {
+    const admUser = `adm_${Math.random().toString(36).slice(2, 8)}`;
+    const adm = await client('ADMIN');
+    const reg = await request(adm.s, 'auth-register', { username: admUser, password: 'secret0', displayName: '管理员' });
+    adminToken = reg.data.token;
+    try { adm.s.close(); } catch (e) { /* ignore */ }
+    // 自证：这个 token 确实能过门禁（否则后面的 HTTP 断言会以"全 401"的形式假失败）
+    const probe = await new Promise((resolve) => {
+      require('http').get('http://localhost:3001/api/rooms',
+        { headers: { Authorization: 'Bearer ' + adminToken } },
+        (r) => { r.resume(); resolve(r.statusCode); }).on('error', () => resolve(0));
+    });
+    ok('09-24 G8 管理员 token 可过 HTTP 门禁（/api/rooms 200）', probe === 200);
+  }
+
   const A = await client('A');
 
   // --- A 创建房间：拿到号（同时验证 ack 应答）---
@@ -449,8 +500,18 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
 
   // --- ★ 09-13：/api/rooms 观测接口 + /dashboard 面板页（HTTP 层验证）---
   const http = require('http');
+  const getCode = (path, headers) => new Promise((resolve, reject) => {
+    http.get({ hostname: 'localhost', port: 3001, path, headers: headers || {} },
+      (r) => { r.resume(); resolve(r.statusCode); }).on('error', reject);
+  });
+  // ★ 09-24 G8：受保护接口不带 token 必须 401（门禁真的在拦，而不是形同虚设）
+  ok('09-24 G8 /api/rooms 不带 token → 401', (await getCode('/api/rooms')) === 401);
+  ok('09-24 G8 /metrics 不带 token → 401', (await getCode('/metrics')) === 401);
+  ok('09-24 G8 /api/rooms?token=<admin> 查询串兜底可过 → 200',
+     (await getCode(`/api/rooms?token=${encodeURIComponent(adminToken)}`)) === 200);
   const apiBody = await new Promise((resolve, reject) => {
-    http.get('http://localhost:3001/api/rooms', (r) => {
+    http.get({ hostname: 'localhost', port: 3001, path: '/api/rooms',
+      headers: { Authorization: 'Bearer ' + adminToken } }, (r) => {
       let b = '';
       r.on('data', (c) => (b += c));
       r.on('end', () => resolve(b));
@@ -461,20 +522,40 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('09-13 /api/rooms 返回观测快照（成员/媒体/计数/Worker PID 齐全）',
      !!roomSnap && Array.isArray(roomSnap.members) && Array.isArray(roomSnap.media) &&
      !!roomSnap.counts && typeof api.worker.pid === 'number');
-  const dashCode = await new Promise((resolve, reject) => {
-    http.get('http://localhost:3001/dashboard', (r) => resolve(r.statusCode)).on('error', reject);
-  });
-  ok('09-13 /dashboard 面板页可访问（200）', dashCode === 200);
+  // /dashboard 页面本身**不设门禁**（否则页面都打不开、没法提示"去登录"）——必须保持 200
+  ok('09-13 /dashboard 面板页可访问（200，页面本身不设门禁）', (await getCode('/dashboard')) === 200);
+
+  /* ★ 09-24 G8 复审：门禁的**边界**也必须断言。
+   * ▎为什么光测"带 token 能过"不够：那样即使门禁加过头、把游客的字幕归档一并拦死，
+   *   测试依然全绿——这正是第一版的风险（第一版曾给 /api/captions 也加了 requireAdmin，
+   *   而游客根本没有 token，结果是功能静默失效）。
+   * ▎这里正面锁定两类接口的**不同**待遇：该拦的必须拦、该放的必须放。 */
+  ok('09-24 G8 观测类 /api/recordings 不带 token → 401（跨房录像清单属观测信息）',
+     (await getCode('/api/recordings')) === 401);
+  ok('09-24 G8 内容类 /api/captions 不带 token → 200（游客的字幕归档不能被门禁误伤）',
+     (await getCode(`/api/captions?room=${ROOM}`)) === 200);
+  ok('09-24 G8 内容类 /api/minutes 不带 token → 200（会议内容，能力=房间号）',
+     (await getCode(`/api/minutes?room=${ROOM}`)) === 200);
+  ok('09-24 G8 内容类 /minutes/<房>/<文件> 不带 token → 404 而非 401（放行到业务层再判存在性）',
+     (await getCode(`/minutes/${ROOM}/nope.md`)) === 404);
+  ok('09-24 G8 内容类 /recordings/<文件> 不带 token → 404 而非 401（单文件靠文件名做能力）',
+     (await getCode('/recordings/nope.webm')) === 404);
 
   // --- ★ 09-17e：/api/captions 过夜值守归档（HTTP 层：落盘 / 回读 / 坏输入拒绝）---
   // （注意：本文件顶部 const URL='http://localhost:3001' 遮蔽了全局 URL 构造器，
   //   所以这里用手写正则拆 URL，别用 new URL(...)）
-  const httpReq = (method, url, body) => new Promise((resolve, reject) => {
+  /* ★ 09-24 G8 复审：默认带管理员 token（/metrics、/api/rooms 要它），
+   *   但加一个 noAuth 开关——用来**扮演游客**（无 token）验证"内容类接口没被门禁误伤"。
+   *   没有这个开关，全套断言都在管理员身份下跑，恰好会漏掉游客视角的回归。 */
+  const httpReq = (method, url, body, noAuth) => new Promise((resolve, reject) => {
     const m = String(url).match(/^http:\/\/([^:/]+):(\d+)(\/[^?]*)?(\?.*)?$/);
     if (!m) return reject(new Error('bad url: ' + url));
     const rq = http.request({
       hostname: m[1], port: m[2], path: (m[3] || '') + (m[4] || ''), method,
-      headers: body ? { 'Content-Type': 'application/json' } : {},
+      headers: {
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+        ...(!noAuth && adminToken ? { Authorization: 'Bearer ' + adminToken } : {}),
+      },
     }, (r) => {
       let b = '';
       r.on('data', (c) => (b += c));
@@ -491,6 +572,15 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('09-17e GET format=txt 回读全档（含刚归档的条目）', capTxt.code === 200 && capTxt.text.includes('归档对账第 3 条'));
   const capJson = await httpReq('GET', `http://localhost:3001/api/captions?room=${ROOM}&format=json`);
   ok('09-17e GET format=json 回读结构化全档（≥3 条）', capJson.code === 200 && JSON.parse(capJson.text).length >= 3);
+  /* ★ 09-24 G8 复审：**游客视角**的端到端回归 —— 不带 token 也能归档 + 回读。
+   *   这是本轮最容易被踩坏的一条：给内容类接口加 admin 门禁，会让游客的自动归档
+   *   （client.js 的 capSentryFlush）静默失败——用户只看到"导出少了历史段"，不知为何。 */
+  const capGuest = await httpReq('POST', 'http://localhost:3001/api/captions',
+    { room: ROOM, entries: [{ ts: Date.now(), from: 'guest-test', name: '游客', text: '游客归档回归' }] }, true);
+  ok('09-24 G8 游客（无 token）POST /api/captions 归档成功', capGuest.code === 200 && JSON.parse(capGuest.text).saved === 1);
+  const capGuestRead = await httpReq('GET', `http://localhost:3001/api/captions?room=${ROOM}&format=txt`, null, true);
+  ok('09-24 G8 游客（无 token）GET 回读得到自己刚归档的那条',
+     capGuestRead.code === 200 && capGuestRead.text.includes('游客归档回归'));
   const capBad = await httpReq('POST', 'http://localhost:3001/api/captions', { room: '../../etc', entries: capEntries });
   ok('09-17e 非法房间号被拒（400，路径穿越进不来）', capBad.code === 400);
   const capNoRoom = await httpReq('GET', 'http://localhost:3001/api/captions');

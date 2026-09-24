@@ -20,6 +20,11 @@ sfu/captions/
 sfu/minutes/
 sfu/logs/
 sfu/users.json
+# 迁移时对旧账号文件的改名备份（保留在磁盘，但不必入库）
+sfu/users.json.imported-*
+sfu/users.json.bak-*
+# ★ 09-24：账号/审计的 SQLite 运行时数据（meeting.db + 迁移产生的 .db-wal/.db-shm 一并挡住）
+sfu/data/
 sfu/config.json
 sfu/tls/
 *.log

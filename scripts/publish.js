@@ -304,38 +304,87 @@ function which(bin) {
   }
 }
 
-async function tunnel(port) {
-  step(4, '开公网隧道（把本机服务映射成一个公网地址）');
+/* ★ 09-24 升级：--tunnel 从"打印指引"变成"真把地址拿回来"。
+ * ▎目标只有一个：把本机 127.0.0.1:<port> 变成一个**公网、受信任的 https 地址**。
+ *   受信任是关键——自签证书要手动信任、浏览器先警告一次；隧道发的是 Cloudflare 的
+ *   受信任证书，所以"手机打开即用、零警告"。
+ * ▎★ 必须讲清的边界（不讲清用户会白折腾）：
+ *   隧道在传输层只承载 **HTTP / WebSocket** —— 也就是"网页 + 信令"。
+ *     · Mesh 版：音视频是 **P2P 直达**（浏览器之间直接连，不经过服务器）→ 过隧道能通 ✅
+ *     · SFU 版：音视频是 **UDP**（浏览器→服务器 40000-49999 端口直达）→ 隧道过不去 ❌
+ *   所以"发布公网给外人开完整会议"要发 Mesh 版；本脚本发的正是 Mesh 版，这条隧道就是给它用的。 */
 
-  // 依次探测常见隧道工具，谁在就用谁（都零依赖：不需要 npm 装包）
-  if (which('cloudflared')) {
-    pass('发现 cloudflared（Cloudflare Tunnel：免费、免注册，推荐）');
-    console.log(C.dim(`  ▸ 正在开隧道，公网地址会打印在下面（形如 https://xxx.trycloudflare.com）`));
-    const p = spawn('cloudflared', ['tunnel', '--url', `http://127.0.0.1:${port}`], { stdio: 'inherit' });
-    p.on('exit', (c) => process.exit(c || 0));
-    return;
-  }
-  if (which('ngrok')) {
-    pass('发现 ngrok');
-    console.log(C.dim('  ▸ 正在开隧道（首次用要 ngrok config add-authtoken ...）'));
-    const p = spawn('ngrok', ['http', String(port)], { stdio: 'inherit' });
-    p.on('exit', (c) => process.exit(c || 0));
-    return;
-  }
+/* cloudflared 免费隧道地址的形态：https://<随机单词>.trycloudflare.com
+ * ▎为什么用正则从一堆日志里"捞"地址？cloudflared 启动时会刷十几行带时间戳的日志，
+ *   真正的地址夹在中间一闪而过；用户手抄错一个字符，手机就打不开。
+ *   正则只认 trycloudflare.com，避免误抓日志里出现的其它 URL。 */
+const CF_TUNNEL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
 
+/* 解析到地址后统一走这里打印（cloudflared / ngrok 两条路共用同一段"怎么用"说明） */
+function printTunnelReady(url, port) {
+  console.log('');
+  console.log(C.ok('  ════════════════════════════════════════════════════════'));
+  console.log(`   ${C.bold('🌍 公网地址（受信任 https，不会有安全警告）：')}`);
+  console.log(`   ${C.bold(C.ok(url))}`);
+  console.log(C.ok('  ════════════════════════════════════════════════════════'));
+  console.log(`  ▸ ${C.bold('把这个地址发给别人 / 手机')}，直接打开即可 —— 受信任证书，${C.bold('不会')}有「不安全」警告。`);
+  console.log(C.dim('  ▸ 手机实测三步：① 手机浏览器打开该地址 → ② 弹窗「允许使用摄像头 / 麦克风」点允许'));
+  console.log(C.dim('     → ③ 输入房间号加入（或直接点对方发的邀请链接）。能看到对方画面即成功。'));
+  console.log(C.dim('  ▸ 隧道进程要一直开着：关掉这个窗口，上面的公网地址随即失效。'));
+  printTunnelBoundary();
+  console.log('');
+}
+
+/* 边界提醒：无论走哪条路都要打印（隧道能做什么、不能做什么） */
+function printTunnelBoundary() {
+  console.log('');
+  console.log(C.warn('  ⚠️ 边界（务必知道，否则会白折腾）：'));
+  console.log(C.warn('     · 隧道只承载 HTTP / WebSocket —— 也就是"网页 + 信令"。'));
+  console.log(C.warn('     · Mesh 版音视频是 P2P 直达（不经服务器）→ 过隧道能通 ✅'));
+  console.log(C.warn('     · SFU 版音视频是 UDP（浏览器→服务器 40000-49999 端口直达）→ 隧道过不去 ❌'));
+  console.log(C.warn('       所以"发布公网给外人开会"要发 Mesh 版；本脚本发的正是 Mesh 版。'));
+  console.log(C.dim('       SFU 版请只在本机 / 局域网用：npm run start:lan → https://<内网IP>:3443'));
+  console.log('');
+  console.log(C.dim('  ▸ 另外：隧道只解决"网页能打开"。Mesh 版两台不同网络的电脑要真能传音视频，'));
+  console.log(C.dim('     还得有 TURN（上面第 2 步已配）。开会后看页面顶部「🔗 连接方式」：'));
+  console.log(C.dim('     显示"直连/STUN"最好；显示"TURN 中继"说明走中继（能通，但流量过 TURN 服务器）。'));
+}
+
+/* 自签证书的"正确使用姿势"——给"不装隧道、走局域网自签 https"的人
+ * ▎为什么这段必须写进脚本输出？因为自签证书的坑不在服务器端（服务器会照常启动），
+ *   全在**访问端**：浏览器警告要手动点过、iOS 还要手动信任。用户不知道这两步，
+ *   会以为"服务没起来"，其实是自己卡在证书页。 */
+function printSelfSignedGuide() {
+  console.log('');
+  console.log(C.bold('  ▸ 不想装隧道也行：局域网自签 https 的正确使用姿势（npm run start:lan）'));
+  console.log(C.dim('     ① 浏览器一定会提示「不安全 / 连接不是私密连接」——这是自签证书的正常现象'));
+  console.log(C.dim('        （不是被攻击）。点「高级 → 继续前往」就能进去。'));
+  console.log(C.dim('     ② Android 一般能直接跳过这一步；iOS Safari 更麻烦，必须手动信任：'));
+  console.log(C.dim('        设置 → 通用 → VPN与设备管理 / 关于本机 → 证书信任设置 → 打开该证书的开关。'));
+  console.log(C.dim('        不做这一步，Safari 会一直连不上，且看不出原因。'));
+  console.log(C.warn('     ③ 结论：自签只适合自己在局域网演示；要给别人 / 手机无障碍访问，'));
+  console.log(C.warn('        请用隧道拿受信任证书（cloudflared，零警告）。'));
+}
+
+/* 没装任何隧道工具时的"可一键复制"指引（不再只是打印三条路） */
+function printNoToolGuide(port) {
   fail('本机没有隧道工具（cloudflared / ngrok 都没装），没开成公网地址');
   console.log('');
-  console.log(C.bold('  三条可选路（按省事程度排）：'));
-  console.log(`   1. Cloudflare Tunnel ${C.ok('（最推荐：免费、免注册、一条命令）')}`);
-  console.log(C.dim('      winget install --id Cloudflare.cloudflared     # 装'));
-  console.log(C.dim(`      cloudflared tunnel --url http://127.0.0.1:${port}   # 跑，会吐出 https://xxx.trycloudflare.com`));
-  console.log('   2. ngrok：需注册账号拿 authtoken（免费版地址每次变）');
-  console.log('   3. 部署到有公网 IP 的云主机：见《部署手册.md》场景 C（systemd + Let\'s Encrypt）');
+  console.log(C.bold('  装 cloudflared（两条路，选一条；命令可直接复制）：'));
+  console.log('   ① 最省事（Windows 自带包管理器 winget）：');
+  console.log(`      ${C.ok('winget install --id Cloudflare.cloudflared')}`);
+  console.log('   ② 不想装包管理器：直接下单个 cloudflared.exe（免安装，放哪都能用）');
+  console.log(C.dim('      https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe'));
+  console.log(C.dim('      下载后改名为 cloudflared.exe，放到 scripts/ 目录或任意 PATH 目录，重跑本条命令即可。'));
   console.log('');
-  console.log(C.warn('  ⚠️ 媒体提醒：隧道只解决"网页能打开"，音视频是 P2P 的，'));
-  console.log(C.warn('     两台不同网络的电脑要真能开会，还得有 TURN（上面第 2 步已配）。'));
-  console.log(C.warn('     判断方法：开会后看页面顶部「🔗 连接方式」——显示"直连/STUN"最好，'));
-  console.log(C.warn('     显示"TURN 中继"说明走中继（能通，但流量过 TURN 服务器）。'));
+  console.log(C.dim(`   装好后也可以手动跑：cloudflared tunnel --url http://127.0.0.1:${port}`));
+  console.log(C.dim('   或再跑一次 node scripts/publish.js --tunnel，脚本会自动发现并解析出公网地址。'));
+  console.log('');
+  console.log(C.bold('  另外两条路：'));
+  console.log('   3. ngrok：需注册账号拿 authtoken（免费版地址每次变）');
+  console.log('   4. 部署到有公网 IP 的云主机：见《部署手册.md》场景 C（systemd + Let\'s Encrypt）');
+  printTunnelBoundary();
+  printSelfSignedGuide();
   console.log('');
   console.log(`  ${C.bold('本地就能看的地址')}：http://localhost:${port}（同机浏览器同样能验证全部功能）`);
   console.log(`  ${C.bold('局域网给同学看')}：http://<你的内网IP>:${port}`);
@@ -344,6 +393,90 @@ async function tunnel(port) {
     console.log(C.dim('  ▸ 注意：publish-mesh/ 目前靠父目录的 node_modules 跑（本机可用）。'));
     console.log(C.dim('    要上传到云主机，请用 --bundle 重新生成（会把依赖拷进去）。'));
   }
+}
+
+/* 起 cloudflared：从它自己的输出里解析出公网地址，醒目打印
+ * ▎为什么用 pipe 而不是 inherit？inherit 让 cloudflared 直接接管终端，脚本就抓不到
+ *   它的输出了——也就没法"把地址捞出来、醒目地打印一行"。用 pipe 自己转发，
+ *   既保留日志（连不上时这是唯一线索），又能拿到地址。 */
+function startCloudflared(port) {
+  console.log(C.dim(`  ▸ 正在开隧道：cloudflared tunnel --url http://127.0.0.1:${port}`));
+  console.log(C.dim('    首次可能稍慢（要连 Cloudflare 分配域名）；地址解析出来会醒目打印，别急着关窗口。'));
+  const p = spawn('cloudflared', ['tunnel', '--url', `http://127.0.0.1:${port}`], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let found = false;
+  let buf = '';
+  const scan = (chunk) => {
+    buf += String(chunk);
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i);
+      buf = buf.slice(i + 1);
+      console.log(C.dim('  │ ' + line));
+      const m = line.match(CF_TUNNEL_RE);
+      if (m && !found) { found = true; printTunnelReady(m[0], port); }
+    }
+  };
+  p.stdout.on('data', scan);
+  p.stderr.on('data', scan);
+  p.on('error', (e) => {
+    fail(`启动 cloudflared 失败：${e.message}`);
+    printNoToolGuide(port);   // 探测到却起不来（例如只装了 .cmd 垫片）→ 退回安装/手动指引
+  });
+  p.on('exit', (c) => {
+    if (!found) fail(`cloudflared 提前退出（退出码 ${c}），没拿到公网地址。看上面的日志定位原因。`);
+    process.exit(c || 0);
+  });
+  // 兜底提醒：网络连不上 Cloudflare 时它会一直重试却不报错，给个时间窗告诉用户"卡住了"
+  setTimeout(() => {
+    if (!found) warn('20 秒还没解析到隧道地址——检查本机网络能否访问 Cloudflare，或看上面 cloudflared 的日志');
+  }, 20000);
+}
+
+/* 起 ngrok：地址不在 stdout，要问它的本地 API（127.0.0.1:4040）
+ * ▎为什么不用解析 stdout？ngrok 的公网地址显示在它的**交互式界面**里，不是稳定的日志行；
+ *   但它一定会把隧道信息挂到本地 API：GET http://127.0.0.1:4040/api/tunnels。 */
+function startNgrok(port) {
+  console.log(C.dim(`  ▸ 正在开隧道：ngrok http ${port}（首次用要先 ngrok config add-authtoken ...）`));
+  const p = spawn('ngrok', ['http', String(port)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const echo = (b) => process.stdout.write(C.dim('  │ ' + String(b)));
+  p.stdout.on('data', echo);
+  p.stderr.on('data', echo);
+  let found = false;
+  p.on('error', (e) => { fail(`启动 ngrok 失败：${e.message}`); printNoToolGuide(port); });
+  p.on('exit', (c) => { if (!found) fail(`ngrok 退出（退出码 ${c}）`); process.exit(c || 0); });
+  (async () => {
+    for (let i = 0; i < 20 && !found; i++) {
+      await sleep(500);
+      const r = await probe(4040, '/api/tunnels', 800);
+      if (!r || !r.body) continue;
+      try {
+        const j = JSON.parse(r.body);
+        const t = (j.tunnels || []).find((x) => /^https:/.test(String(x.public_url)));
+        if (t && t.public_url) { found = true; printTunnelReady(t.public_url, port); }
+      } catch (e) { /* 4040 还没起来，继续轮询 */ }
+    }
+    if (!found) warn('没能从 ngrok 本地 API（127.0.0.1:4040）读到公网地址——打开 http://127.0.0.1:4040 手动查看');
+  })();
+}
+
+async function tunnel(port) {
+  step(4, '开公网隧道（把本机服务映射成一个公网地址）');
+
+  // 依次探测常见隧道工具，谁在就用谁（都零依赖：不需要 npm 装包）
+  if (which('cloudflared')) {
+    pass('发现 cloudflared（Cloudflare Tunnel：免费、免注册、受信任证书，推荐）');
+    startCloudflared(port);
+    return;
+  }
+  if (which('ngrok')) {
+    pass('发现 ngrok');
+    startNgrok(port);
+    return;
+  }
+
+  printNoToolGuide(port);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

@@ -9,9 +9,60 @@
   <link rel="manifest" href="manifest.webmanifest" />
   <meta name="theme-color" content="#14100a" />
   <title>會 · 智能多人视频会议（WebRTC SFU）</title>
-  <link rel="stylesheet" href="style.css?v=20260923" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存 -->
+  <link rel="stylesheet" href="style.css?v=20260924" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存（本次为第 33 步横幅样式） -->
 </head>
 <body>
+  <!-- ★ 09-24（第 33 步）安全上下文提示横幅 —— 只在 http + IP 访问时出现。
+       ▎它回答的是真用户最常问的一句："为什么我手机 / 别人的电脑打开就用不了摄像头？"
+         根因**不是代码 bug**：浏览器只在**安全上下文**（https:// 或 localhost）才允许
+         getUserMedia（摄像头/麦克风）与 Service Worker。http://192.168.x.x 永远拿不到，
+         地址栏那句「不安全」也是同一条规则。两条解法都写在这里，命令可一键复制。
+       ▎显示条件（client.js 第 33 步）：window.isSecureContext === false —— 与
+         Service Worker 注册 / 字幕自检用同一套判断，且判"字段缺失按安全处理"。
+       ▎关闭状态存 localStorage（sfu_insecure_notice_dismissed），同一浏览器不再自动弹。 -->
+  <div id="insecureBanner" class="insecure-banner hidden" role="alert" aria-live="polite">
+    <div class="ib-head">
+      <span class="ib-icon">⚠️</span>
+      <span class="ib-title">摄像头 / 麦克风被浏览器禁用了</span>
+    </div>
+    <div class="ib-body">
+      当前是 <code>http</code> + <code>IP</code> 访问，浏览器只在<strong>安全上下文</strong>
+      （<code>https://</code> 或 <code>localhost</code>）才允许摄像头、麦克风与 Service Worker。
+      地址栏那句「不安全」也是同一条规则 —— 这不是代码 bug，是浏览器的安全底线。
+    </div>
+    <div class="ib-ways">
+      <div class="ib-way">
+        <div class="ib-way-head">① 局域网自签 https（自己在局域网演示用）</div>
+        <code id="ibCmd1" class="ib-cmd">npm run start:lan</code>
+        <button id="ibCopy1" class="btn ib-copy">复制命令</button>
+        <div class="ib-way-note">
+          会开 <code>https://&lt;局域网IP&gt;:3443</code>，摄像头即可用；但这是自签证书，
+          浏览器仍会提示一次「不是私密连接」，需点 <b>高级 → 继续前往</b>（也可直接双击
+          <code>start-lan.bat</code>）。Android 一般能直接跳过；
+          <b>iOS Safari 要手动信任</b>：设置 → 通用 → VPN与设备管理 / 关于本机 →
+          证书信任设置 → 打开该证书的开关，否则连不上。
+        </div>
+      </div>
+      <div class="ib-way">
+        <div class="ib-way-head">② 公网受信任 https（推荐：发给别人 / 手机看）</div>
+        <code id="ibCmd2" class="ib-cmd">cloudflared tunnel --url http://localhost:3001</code>
+        <button id="ibCopy2" class="btn ib-copy">复制命令</button>
+        <div class="ib-way-note">
+          一条命令拿到 <code>https://xxx.trycloudflare.com</code>，
+          <b>自动是受信任证书、无任何警告</b>，手机和别人的电脑都能直接打开。
+          没装 cloudflared 先装：<code>winget install --id Cloudflare.cloudflared</code>。
+          边界：隧道只走 HTTP / WebSocket（信令），<b>SFU 的媒体是 UDP 过不去</b> ——
+          要给别人开完整会议，请发布 Mesh 版：<code>node scripts/publish.js --tunnel</code>。
+        </div>
+      </div>
+    </div>
+    <div class="ib-foot">
+      <b>一句话结论</b>：自签证书只适合自己在局域网演示；要给别人 / 手机无障碍访问，
+      用隧道拿受信任证书（不会有「不安全」警告）。
+    </div>
+    <button id="insecureClose" class="ib-close" title="关闭（本浏览器不再自动提示）">✕</button>
+  </div>
+
   <!-- ★ F3 升级（2026-09-12）：加入前预览页 —— "进会先把设备检查好"（腾讯会议同款流程）。
        页面一打开它就盖在最上面：本地预览 + 选设备 + 麦克风试音条 + 预静音勾选。
        预览和会议用的是**同一条 localStream**（不多开一路摄像头），

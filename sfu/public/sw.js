@@ -122,6 +122,17 @@ self.addEventListener('fetch', (event) => {
   // 纪律一：socket.io 的长连接/轮询绝不缓存，直接放行给网络
   if (url.pathname.startsWith('/socket.io')) return;
 
+  /* ★ 09-24 G8：动态/受保护接口一律**不进 SW**（直接放行给网络）。
+   * ▎为什么要单独列这一条，而不是让它落到下面的 cache-first？
+   *   ① /api/rooms 是观测面板每 2s 轮询的**实时快照**。落到 cache-first 后，
+   *      第一次 200 就被缓存，之后永远命中缓存 → 面板"卡死在第一帧"，数据不再更新。
+   *   ② 这些路径现在加了管理员门禁。把带 token 拿到的 200 响应缓存下来，
+   *      会让"退出登录后本浏览器还能看到旧数据"（同设备，非跨用户，但依然不对）。
+   *   ③ /config.json 里的 ICE/TURN 是配置下发口，缓存了改配置就不生效。
+   */
+  const NETWORK_ONLY_PREFIXES = ['/api/', '/metrics', '/recordings/', '/minutes/', '/config.json'];
+  if (NETWORK_ONLY_PREFIXES.some((p) => url.pathname === p || url.pathname.startsWith(p))) return;
+
   // 纪律二：跨域请求（比如 DeepSeek API、TURN 探测）不归本站 SW 管
   if (url.origin !== self.location.origin) return;
 

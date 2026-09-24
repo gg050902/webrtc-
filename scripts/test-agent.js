@@ -25,12 +25,28 @@
 
 const { spawn } = require('child_process');
 const path = require('path');
+const os = require('os');
+const fs = require('fs');
 const { io } = require('C:/Users/27418/Desktop/webrtc/node_modules/socket.io-client');
 const { RemoteAgent } = require('../agent/index');
 const { findBrowserBin } = require('../agent/cdp');
 
 const SERVER = 'http://127.0.0.1:3001';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ★ 09-24 测试数据隔离（任务 3）：本测试会起真服务器，账号必须写进临时库，
+ *   绝不能污染开发者真实的 sfu/data/meeting.db 或历史 sfu/users.json。
+ *   USERS_FILE_LEGACY 指向不存在的临时路径 → 迁移逻辑绝不会去改名真实 users.json。 */
+const TEST_DB_FILE = path.join(os.tmpdir(), `sfu-test-agent-${process.pid}-${Date.now()}.db`);
+const TEST_LEGACY_USERS = path.join(os.tmpdir(), `sfu-test-agent-legacy-${process.pid}.json`);
+function cleanupTestDb() {
+  for (const f of [TEST_DB_FILE, TEST_DB_FILE + '-wal', TEST_DB_FILE + '-shm']) {
+    // maxRetries：Windows 上子进程刚被 kill、句柄未释放时删库会 EBUSY，重试才删得掉
+    try { fs.rmSync(f, { force: true, recursive: true, maxRetries: 8, retryDelay: 150 }); }
+    catch (e) { /* 删不掉也不影响断言 */ }
+  }
+}
+process.on('exit', cleanupTestDb);
 
 let pass = 0, fail = 0, skip = 0;
 const ok = (n, c) => { if (c) { pass++; console.log('  PASS  ' + n); } else { fail++; console.log('  FAIL  ' + n); } };
@@ -51,7 +67,7 @@ async function ensureServer() {
   if (await ping()) { console.log('⚠️  3001 已有服务器，复用它\n'); return; }
   console.log('🚀 自起测试服务器…');
   serverProc = spawn(process.execPath, [path.join(__dirname, '..', 'sfu', 'server.js')], {
-    env: { ...process.env, AI_FORCE_MOCK: '1' },
+    env: { ...process.env, AI_FORCE_MOCK: '1', DB_FILE: TEST_DB_FILE, USERS_FILE_LEGACY: TEST_LEGACY_USERS },
     cwd: path.join(__dirname, '..'),
     stdio: ['ignore', 'ignore', 'pipe'],
   });

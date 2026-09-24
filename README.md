@@ -65,7 +65,12 @@
 | 🎨 传统色美学 | 黛/苍/竹青/月白低饱和色板 + 衬线中文标题 + 宽字距英文小帽 + 星云噪点氛围层（纯 CSS） | 学 zhongguose.com 与 alteredqualia 手法，收敛进设计 token（09-15） |
 | ⏳ 房间 TTL 与房主迁移 | 人走光后房间保留 60s 宽限期（可配置），掉线重连不再 room-not-found；房主离开自动迁给最早进房者 | `scheduleRoomTtl`/`destroyRoom` + `joinedAt` 排序迁移（D+4，SFU 主版本） |
 | 🎬 演示包 | `npm run start:demo` 一键起两版；5 分钟演示讲稿（含 Q&A） | scripts/start-demo.js + 《演示脚本-5分钟.md》（E5） |
-| 👤 登录/注册 | 用户名+密码注册登录（游客可进）；昵称贯通成员列表与聊天气泡，登录态自动恢复 | users.json + 内置 scrypt 哈希（零依赖）；auth-register/login/verify 三信令 + token 存档（09-16，SFU 主版本） |
+| 👤 登录/注册 | 用户名+密码注册登录（游客可进）；昵称贯通成员列表与聊天气泡，登录态自动恢复 | node:sqlite 账号库 `sfu/data/meeting.db` + 内置 scrypt 哈希（零依赖；09-24 由旧 users.json 自动迁移、原样保留 salt/hash）+ auth-register/login/verify 三信令 + token 存档（09-16，SFU 主版本；09-24 换存储） |
+| 🛡️ 管理员门禁 · 观测类（09-24） | **甲类·观测**接口只对 admin 开放：`/api/rooms`（房间×成员×媒体字节×控制权全景）、`/metrics`（Prometheus 文本版）、`/api/recordings`（全服务器录像清单，跨房枚举）；带 token 两种方式——`Authorization: Bearer <token>`（脚本首选）/ `?token=<token>`（浏览器地址栏、`<video src>` 兜底，代价是 token 进 URL 历史与访问日志）；`/dashboard` 页面本身不设门禁（否则页面都打不开、没法提示去登录），它调的 `/api/rooms` 才受门禁 | 首个注册账号（或 `config.json` 的 adminUsername）自动成为 admin；token 里带 role；`scripts/watch.js`/`doctor.js`/`soak.js` 支持 `ADMIN_TOKEN` 环境变量（09-24，SFU 主版本） |
+| 🔓 内容类接口 · 刻意开放（09-24） | **乙类·内容**靠"能力 = 房间号/文件名"保护，**不加 admin 门禁**：`/api/captions`（字幕归档，POST 追加/GET 回读）、`/api/minutes` + `/minutes/<6位房号>/<文件名>.md`（纪要列表与正文）、`/recordings/<文件名>`（单个录像）。原因：本产品允许**游客进会**，而字幕归档是浏览器端 `client.js` **自动**调用的——加门禁会让游客的归档**静默失效**（功能坏了却只在控制台留一行日志）。核心：**安全靠"能力只发给在场的人"，不靠"拦所有人"** | 残余风险：6 位房间号可暴力枚举（10^6）、录像文件名含毫秒时间戳、属**弱能力**；生产做法 = join 时下发房间内令牌 + 录像短时效签名 URL（本教学版未实现）（09-24，SFU 主版本） |
+| 🗄️ 账号存储 · node:sqlite（09-24） | 账号从 JSON 文件换成 **Node 内置 `node:sqlite`**（**零新依赖**）：库文件优先级 `DB_FILE` 环境变量 > `config.json` 的 `dbFile` > 默认 `sfu/data/meeting.db`；开启 **WAL**（读不挡写、写不挡读）；两张表 users / audit + `idx_audit_ts` 索引；**旧 `users.json` 首次启动自动整表迁移**（原样保留 salt/hash、**绝不重新哈希**），旧文件改名 `users.json.imported-<日期>` 保留不删 | 口令方案抽成单一实现 `sfu/password.js`（scrypt + 每账号 16 字节随机盐 + `timingSafeEqual`），服务器与 CLI **require 同一份**——用结构消除"两处照抄、参数漂移导致 CLI 建的账号登不上"的隐患（09-24，SFU 主版本） |
+| 🛑 优雅退出（09-24） | `SIGINT`/`SIGTERM`/`uncaughtException` → 关所有 mediasoup Worker → 停收新连接 → `closeDb()` 做 WAL checkpoint → 退出；**幂等**（连按两次 Ctrl+C 第二次直接退）+ **5 秒保险丝**兜底。此前完全没注册信号处理器，Ctrl+C = 进程暴毙（Worker 变孤儿占 RTC 端口、WAL 堆积、正在录制的 ffmpeg 被硬切） | `shuttingDown` 标志顺带修掉"正常退出却被当成 Worker 崩溃"的日志噪声；自测钩子 `TEST_SHUTDOWN_AFTER_MS`（Windows 上投递不了 SIGTERM，靠它自动化验证）（`npm run test:shutdown` ★ 9/9，09-24，SFU 主版本） |
+| 🔐 自签证书 SAN 自愈（09-24） | 浏览器早已不看 CN（RFC 6125），自签证书必须带 **SAN**，否则手机常连"继续访问"都不给；且 DHCP 换 IP 后"只判有没有 SAN"永远不重签——现改为**证书缺失 / 无 SAN / SAN 未覆盖当前局域网 IP 三种都重新生成**，SAN 写入所有检测到的本机 IPv4 并保留旧证书已有 IP | 实测 `DNS:localhost, IP:127.0.0.1, IP:192.168.74.194, IP:192.168.116.194`（10 年期自签，`sfu/tls/`）；顺带修正漂移的 `announcedIp`（09-24，SFU 主版本） |
 | 🖌️ 协作白板（F7） | 全场共享一块白板：5 色深笔/撤销/清空，笔迹按人配色、实时同步 | 第三条 'board' SCTP 频道（与聊天/批注并存）+ 归一化事件溯源重放（09-15，SFU 主版本） |
 | ✏️ 协作批注（F5） | 共享屏幕上所有人可画笔迹（5 色/撤销/清空），笔迹按人配色、全房实时同步，共享者同步可见 | **独立 `annot` SCTP 数据频道**（与聊天频道并存互不挤占）+ `to` 定向头过滤 + 归一化坐标事件溯源重放（09-14，SFU 主版本） |
 | 📶 带宽估计 / 消息路径 | 「🔗 连接方式」徽标悬浮显示"可用带宽估计 ≈ X Mbps"（transport-cc）；聊天气泡 🛰️ = 走了数据通道路 | `getStats` 的 selected candidate-pair + appendChat 路径徽标（09-14，D+3 前置可视化） |
@@ -78,7 +83,7 @@
 | 📋 值守日报（AI 线 C1） | 字幕历史抽屉「📋 日报」一键生成 markdown 日报：时长/说话人占比条形图/每小时活跃分布/值守健康（识别器重启次数）——服务器归档+内存窗口合并全档，纯本地统计 | 零 LLM 零费用永远可用，与 N2（LLM 纪要）互为兜底；client.js 第 31 步（09-18，SFU 主版本） |
 | 📈 Prometheus 指标端点 | `GET /metrics` 输出 Prometheus 文本格式：房间/成员/Producer/Consumer 总数、每路媒体累计字节、录制数、进程 uptime/rss——Grafana 直接可抓 | 复用观测面板同一份 snapshotRooms() 数据源，零依赖手拼（G7 首刀，09-18，SFU 主版本） |
 | 📜 结构化日志（G7-②） | 关键事件 JSON Lines 落 `sfu/logs/app-日期.jsonl`（建房/销毁/成员进出/踢人/授权/录制起停），console 人读照旧——机器可检索（jq/脚本直吃） | logEvent 零依赖，只埋低频关键事件、绝不埋 3s/400ms tick（09-19，SFU 主版本） |
-| 🚨 值守告警（G7-③） | `npm run watch` 定时拉 /api/rooms + /metrics：服务拉不到/媒体健康分低/房间宽限告急/内存超限四规则告警，同类 5 分钟限流，可选企业微信/钉钉 webhook | 零依赖脚本 scripts/watch.js，一次 fetch POST 即接 webhook（09-19） |
+| 🚨 值守告警（G7-③） | `npm run watch` 定时拉 /api/rooms + /metrics：服务拉不到/媒体健康分低/房间宽限告急/内存超限四规则告警，同类 5 分钟限流，可选企业微信/钉钉 webhook；**09-24 起这两个接口要管理员 token → 用 `ADMIN_TOKEN=<token> npm run watch` 启动**，缺 token 时会明确提示而不是静默 401 | 零依赖脚本 scripts/watch.js，一次 fetch POST 即接 webhook（09-19，09-24 加门禁） |
 | 📱 移动端 / PWA（G4） | 手机可开会：侧栏抽屉化（顶栏开关 + 遮罩）、控制坞收成图标、竖屏预览页堆叠；页面可**安装到主屏**（manifest + Service Worker，静态壳断网可开）；「省流」开关一键把所有远端画面锁到 simulcast 最低层（弱网/流量敏感场景） | manifest.webmanifest + sw.js（cache-first，socket.io 绝不缓存）+ client.js 第 32 步 + style.css 第 25 节；低带宽模式复用 set-preferred-layers 信令，服务器零改动（09-23，纯前端零依赖） |
 | 🤖 AI Bot 参会者（AI 线 C 档） | AI 助理以参会者身份入会：成员列表 🤖 行、控制坞一键邀请/送走；**服务端音频管线**（每路音频 PlainTransport→ffmpeg astats RTP 旁路，服务器第一次真正"听到"会议）；聊天 @ai 提问（DeepSeek 真 LLM / 无 key [Mock] 模板双轨），金边气泡广播 | 零依赖；管线是 N2 真转写的现成插入口（09-19b，SFU 主版本） |
 | 🖌️ 白板 v2「宣纸 editorial」 | 参考 recent.design igochi 案例：水墨五色板（墨/朱砂/鎏金/黛蓝/竹青）、暖纸白+渐晕+颗粒纸面、hairline 头部排版 | 纯 CSS 零依赖（09-19b） |
@@ -176,7 +181,7 @@ Socket.IO 收发"信令消息"，媒体在 SFU 版由服务器转发、在 Mesh 
 | | 前端（浏览器） | 后端（Node.js 服务器） |
 |---|---|---|
 | **跑在哪** | 每位参会者自己的浏览器标签页里 | 一台常驻的电脑/云服务器（你本机即可演示） |
-| **代码位置（SFU 主版本）** | `sfu/public/`：`index.html` + `style.css` + `client.js`（**第 1~31 步**，28 = 滤镜，29 = 实时字幕，30 = 过夜值守，31 = 值守日报）+ `dashboard.html`（观测面板）+ `vendor/` | `sfu/server.js`（分区 A~E）+ `protocol.js` + `config.json`（可选配置） |
+| **代码位置（SFU 主版本）** | `sfu/public/`：`index.html` + `style.css` + `client.js`（**第 1~33 步**，28 = 滤镜，29 = 实时字幕，30 = 过夜值守，31 = 值守日报，32 = 移动端/PWA，33 = 安全上下文提示）+ `dashboard.html`（观测面板）+ `vendor/` | `sfu/server.js`（分区 A~E）+ `store.js` + `password.js` + `protocol.js` + `config.json`（可选配置） |
 | **对应 Mesh 对照版** | `public/`：`client.js`（第 1~16 步 + 第 19~25 步 = A/D 档同步升级） | `server.js`（根目录，信令邮局） |
 | **职责：采集** | `getUserMedia` 开摄像头/麦克风、`getDisplayMedia` 抓屏幕 | 不采集，只收浏览器送上来的媒体 |
 | **职责：信令** | 发 create-room / join-room / produce / consume 等事件 | Socket.IO 接收转发：房间号生成、密码校验、协商撮合 |
@@ -307,6 +312,59 @@ npm run start:sfu
 
 ---
 
+## 🗄️ 账号数据库 · 管理员 CLI · 可靠性（09-24）
+
+> 这一节把本轮"从演示到能交付"的工程改动集中讲清：账号换成真数据库、观测接口加门禁但内容接口刻意开放、
+> Ctrl+C 正确退出、自签证书修好手机。教学细节见 `LEARN.md` 5.33~5.37，排查步骤见《跨电脑连接-操作指南.md》第八节。
+
+### 存储层：Node 内置 SQLite（零新依赖）
+
+项目有"零依赖铁律"（生产依赖只有 mediasoup + socket.io），所以没有引入 better-sqlite3，
+而是用**本机 Node（v22.22.2）内置的 `node:sqlite`**——内置模块不算依赖。
+
+- **库文件位置优先级**：环境变量 `DB_FILE` > `sfu/config.json` 的 `dbFile` > 默认 `sfu/data/meeting.db`；
+- **WAL 日志模式**（`PRAGMA journal_mode = WAL`）：读不挡写、写不挡读——服务器"随时有人登录（读）、随时有人注册/审计（写）"正需要这个并发模型；
+- **两张表**：`users(username PK, salt, hash, display_name, role, created_at)`、`audit(id PK AUTOINCREMENT, ts, kind, actor, detail)` + `idx_audit_ts` 索引；
+- **自动迁移**：首次启动若 `sfu/users.json` 存在且 users 表为空 → 整表搬入，**原样保留 salt/hash（绝不重新哈希，否则老密码永久失效）**，搬完把旧文件改名 `users.json.imported-<YYYYMMDD>` 保留不删（留退路）；
+- **口令单一实现** `sfu/password.js`：`scrypt(password, salt, 32) → hex`，盐 16 字节随机、hex 存库，校验用 `crypto.timingSafeEqual`；服务器与 `scripts/admin.js` **require 同一份**——原先两边"照抄"，任一处参数漂移都会导致 CLI 建的账号在网页上永远登不上。
+
+### 管理员 CLI（`scripts/admin.js`）
+
+```bash
+npm run admin:list                               # 列出账号 + 角色
+npm run admin:grant   -- <用户名>                 # 提权 admin
+npm run admin:revoke  -- <用户名>                 # 降权 user
+npm run admin:adduser -- <用户名> [密码] [昵称]    # 新建账号（缺密码则随机生成并打印一次）
+npm run admin:passwd  -- <用户名> [新密码]         # 重置密码（缺密码则随机生成并打印一次）
+npm run admin:purge   -- [--yes] [--match <正则>]  # 清理测试垃圾账号（默认只干跑，--yes 才真删）
+```
+
+> ⚠️ `grant`/`revoke`/`adduser`/`passwd`/`purge` 后面要加 `--`：把参数透传给脚本，而不是被 npm 吃掉。
+
+几个能答辩讲的点：
+- **`admin:purge` 默认只干跑（dry-run）**：删除不可逆，必须显式 `--yes` 才真删——把"危险"变成一次主动表达，防止手滑；
+- **`deleteUser` 内置安全闸**：拒绝删除库里**唯一**的管理员（删了就再也没人进得了观测面板，而密码是不可逆哈希、没有"找回"）；
+- **`admin:passwd` 存在的原因**：没有它，一次忘记密码 = 永久锁死（教学版没有邮件重置通道，只能靠"能上这台机器的人"这条本地可信通道）；
+- **角色生效时机**：role 在库里，但 token 里带的是"发 token 那一刻的角色"，提权后要让对方**重新登录**——这是换来 HTTP 门禁"零数据库查询"的取舍。
+
+### HTTP 门禁的两类边界（本轮最重要的修正）
+
+| 类别 | 接口 | 是否 admin 门禁 | 理由 |
+|---|---|---|---|
+| **甲类·观测** | `/api/rooms`、`/metrics`、`/api/recordings` | ✅ 必须带管理员 token | 跨房聚合 / 实时全景，知道它 = 掌握全局，且与"是否参会"无关 |
+| **乙类·内容** | `/api/captions`、`/api/minutes`、`/minutes/<房号>/<文件>.md`、`/recordings/<文件名>` | ❌ **刻意开放**（能力 = 房间号 / 文件名） | 本产品允许游客进会，且字幕归档由 `client.js` **自动**调用——加门禁会让游客的字幕归档**静默失效**（功能坏了却只在控制台留一行日志） |
+
+**一句话**：**安全不靠"拦所有人"，靠"能力（房间号）只发给在场的人"**。
+**残余风险**（诚实交代）：6 位房间号可暴力枚举（10^6）、录像文件名含毫秒时间戳，故乙类属**弱能力**；
+生产做法是 join 时下发**房间内令牌**、录像用**短时效签名 URL**——本教学版未实现。
+
+### 优雅退出 与 证书 SAN 自愈
+
+- **优雅退出**：`SIGINT`/`SIGTERM`/`uncaughtException` → 关 Worker → 停收新连接 → `closeDb()`（WAL checkpoint）→ 退出；**幂等** + **5 秒保险丝**。Windows 上外部投递不了 `SIGTERM`（无 POSIX 信号，`process.kill` 走 TerminateProcess 等于直接暴毙），故加了自测钩子 `TEST_SHUTDOWN_AFTER_MS`（沿用 `TEST_RECORD` 约定）让这条路径可自动化验证。
+- **证书 SAN 自愈**：SAN 覆盖 `localhost`/`127.0.0.1` + 所有检测到的本机 IPv4；**证书缺失 / 无 SAN / SAN 未覆盖当前 IP** 三种情况都重新生成（DHCP IP 漂移自愈），并保留旧证书里已有的 IP。
+
+---
+
 ## 🧱 项目结构
 
 ```
@@ -324,14 +382,18 @@ webrtc/
 ├── 性能测试报告.md         # bench 三档实测数字表（4/8/16 路）
 ├── 演示脚本-5分钟.md       # 5 分钟演示讲稿（含 Q&A 弹药）
 ├── package.json            # scripts: start / start:sfu / start:demo / start:lan / test / test:sfu /
-│                           #          test:smoke / test:record / test:turn / bench / build:sfu-vendor
+│                           #          test:store / test:shutdown / test:smoke / test:record / test:turn /
+│                           #          admin:list|grant|revoke|adduser|passwd|purge / bench / build:sfu-vendor
 ├── server.js               # [Mesh 对照版] 信令邮局（3000）：静态托管 + 房间/密码 + 定向转发
 ├── start-lan.bat           # 一键局域网交付（探 IP + 生成配置 + HTTPS + 放行防火墙）
 ├── deploy/coturn/          # 自建 TURN 包（docker-compose.yml + turnserver.conf）
 ├── scripts/
-│   ├── test-signaling.js   # Mesh 信令回归（npm test，需先起 3000）★ 33/33
-│   ├── test-sfu-signaling.js  # SFU 信令回归（npm run test:sfu，需先起 3001）★ 67/67
-│   ├── test-sfu-client-smoke.js # SFU 前端无头冒烟（npm run test:smoke，零依赖不用起服务器）★ 76/76
+│   ├── test-signaling.js   # Mesh 信令回归（npm test，需先起 3000）★ 36/36
+│   ├── test-sfu-signaling.js  # SFU 信令回归（npm run test:sfu，需先起 3001）★ 134/134
+│   ├── test-sfu-client-smoke.js # SFU 前端无头冒烟（npm run test:smoke，零依赖不用起服务器）★ 136/136
+│   ├── test-store.js       # ★ 09-24 账号存储层回归（node:sqlite：迁移/改密/删号安全闸）★ 49/49
+│   ├── test-shutdown.js    # ★ 09-24 优雅退出回归（关 Worker/关库 checkpoint/幂等/5s 保险丝）★ 9/9
+│   ├── admin.js            # ★ 09-24 管理员 CLI（list/grant/revoke/adduser/passwd/purge，薄封装 store）
 │   ├── test-turn.js        # ICE 可达性实测（手搓 STUN Binding / TCP 探测）
 │   ├── bench.js            # E4 压力基准（4/8/16 路媒体转发实测）
 │   ├── start-demo.js       # 一键起两版并打印地址
@@ -339,7 +401,7 @@ webrtc/
 │   ├── publish.js          # ★ 09-24 一键发布公网链接（生成 publish-mesh/ → 体检 → 可选隧道；--tunnel/--bundle/--check）
 │   ├── test-agent.js       # ★ 09-24 桌面代理端到端（真浏览器/真画面/真注入）★ 16/16
 │   ├── test-e2e-remote-desktop.js # ★ 09-24 真机远程桌面 e2e（真双窗 + 手机视口，出截图）
-│   └── test-publish.js     # ★ 09-24 发布链回归（含 --check 过期闸）★ 29/29
+│   └── test-publish.js     # ★ 09-24 发布链回归（含 --check 过期闸）★ 30/30
 ├── agent/                  # ★ 09-24 真 OS 级远程桌面 · 被控端代理（零新依赖）
 │   ├── cdp.js              #   手写 CDP 客户端：驱动真实 Chromium（抓屏/注入输入）
 │   └── index.js            #   代理主体：agent-hello 进房 → 推帧 + 执行 remote-input
@@ -350,13 +412,16 @@ webrtc/
 └── sfu/                    # ★ 主版本（SFU：mediasoup 服务器转发，端口 3001）
     ├── server.js           #   后端：静态托管 + 房间/密码 + Worker/Router/Transport 媒体中枢（分区 A~E）
     ├── protocol.js         #   信令事件总表（改 server/client 前先看）
-    ├── config.example.json #   配置模板（端口/人数/监听 IP/announcedIp/ICE/HTTPS/roomTtlSec/videoSvc）
+    ├── config.example.json #   配置模板（端口/人数/监听 IP/announcedIp/ICE/HTTPS/roomTtlSec/videoSvc/dbFile/adminUsername）
     ├── config.json         #   实际配置（可缺省；start:lan 会自动生成；含 lanUrl 供邀请链接改写）
-    ├── users.json          #   登录注册的用户存储（scrypt 哈希，零依赖）
+    ├── store.js            #   账号/审计存储层（node:sqlite，零新依赖；WAL + 旧 users.json 自动迁移）
+    ├── password.js         #   口令方案唯一实现（scrypt + 随机盐 + timingSafeEqual；服务器与 CLI 共用）
+    ├── data/meeting.db     #   账号数据库（运行时生成；旧 users.json 首次启动自动迁入并改名备份）
+    ├── users.json          #   【历史】旧账号文件；迁移后改名为 users.json.imported-<日期>（保留不删）
     ├── recordings/         #   D+2 服务器侧录制产物（webm/mkv，经 /recordings/<file> 下载）
     ├── tls/                #   HTTPS 自签证书（https.enabled 时自动生成）
     └── public/             #   前端：几乎同 Mesh 版，多了 mediasoup-client
-        ├── index.html / style.css / client.js（**第 1~29 步**）
+        ├── index.html / style.css / client.js（**第 1~33 步**）
         ├── dashboard.html  #   实时观测面板（/dashboard，2s 轮询 /api/rooms）
         └── vendor/         # socket.io.min.js + mediasoup-client.js（本地打包，勿动）
 ```
@@ -392,9 +457,11 @@ webrtc/
 ## 🧪 运行回归测试
 
 ```bash
-npm run test:sfu   # SFU 主版本信令：需先起 3001（AI 操作员断言要 AI_OP_STEP_MS=20 node sfu/server.js）★ 2026-09-24 实测 106/106（有 key / 无 key 两条轨各跑一遍）
-npm test           # Mesh 对照版信令：需先 npm start（连 localhost:3000）★ 2026-09-24 实测 33/33
-npm run test:smoke # SFU 前端无头冒烟（零依赖，不用起服务器）★ 2026-09-24 实测 118/118
+npm run test:sfu   # SFU 主版本信令：需先起 3001（AI 操作员断言要 AI_OP_STEP_MS=20 node sfu/server.js）★ 2026-09-24 实测 134/134（含门禁边界断言：该拦的拦、该放的放）
+npm run test:store # 账号存储层 node:sqlite：迁移保留 salt/hash、改密、删号安全闸、完整性 ★ 2026-09-24 实测 49/49
+npm run test:shutdown # 优雅退出：关 Worker / 关库 checkpoint / 幂等 / 5s 保险丝 ★ 2026-09-24 实测 9/9
+npm test           # Mesh 对照版信令：需先 npm start（连 localhost:3000）★ 2026-09-24 实测 36/36
+npm run test:smoke # SFU 前端无头冒烟（零依赖，不用起服务器）★ 2026-09-24 实测 136/136
 npm run test:ai    # AI 双轨自检：无 key 只跑 Mock 轨并提示怎么配；有 key 两条都跑 ★ 10/10
 npm run test:record # D+2 服务器侧录制端到端自测（ffmpeg 当媒体源→mediasoup→落盘，需已装 ffmpeg）
 npm run test:turn  # ICE 可达性实测（对 config 里每个 STUN/TURN 手搓 STUN Binding，3s 超时）
@@ -403,29 +470,41 @@ npm run ai:chat    # AI 脚本：终端问答（也可 --q "问题" 单发）
 npm run ai:summarize # AI 脚本：文本/文件/房间字幕 → markdown 纪要（--text/--file/--room 123456）
 npm run ai:agent   # AI 脚本：手写 ReAct 工具循环（--goal "…" --maxsteps 6 --verbose）
 npm run publish:mesh # ★ 一键发布 Mesh 版：生成 publish-mesh/ → 体检 → （可选）开隧道（--tunnel/--bundle/--check）
-npm run test:publish # 发布链回归（含 --check 过期闸：源码改了不重新发布就必须报错）★ 29/29
+npm run test:publish # 发布链回归（含 --check 过期闸：源码改了不重新发布就必须报错）★ 2026-09-24 实测 30/30
 npm run agent        # ★ 启动被控端桌面代理（需 --room 123456；真机远程桌面的"被控端"）
 npm run test:agent   # 桌面代理端到端（真起 Chromium：验抓屏 JPEG + 坐标注入 + 远程导航）★ 16/16
-npm run test:e2e     # 真机远程桌面 e2e（真双窗 + 模拟手机双指滚动/单指点击，出截图）
+npm run test:e2e     # 真机远程桌面 e2e（真双窗 + 模拟手机双指滚动/单指点击，出截图）★ 2026-09-24 实测 15/15
+npm run admin:list   # 管理员 CLI：看库里有哪些账号 / 谁是 admin（另有 grant/revoke/passwd/adduser/purge）
 ```
 
-- SFU 版测试（**2026-09-24 实测：106 通过 / 0 失败**；冒烟 **118/118**，AI 双轨 +11 项）：房间/密码复用 + mediasoup Router 能力 +
+> ✅ **合计 425 项断言全绿**（2026-09-24 实测）：SFU 信令 134 + 存储层 49 + 优雅退出 9 + 冒烟 136 +
+> Mesh 36 + 桌面代理 16 + 发布链 30 + 真浏览器 e2e 15 = **425**。
+
+- SFU 版测试（**2026-09-24 实测：134 通过 / 0 失败**；冒烟 **136/136**）：房间/密码复用 + mediasoup Router 能力 +
   Transport 创建与防重 + consume 错误路径 + 远程协助（授权/互斥/输入门禁/二进制与中文透传）+
   A/D 档（成员状态白名单、房主踢人、剪贴板门禁、文件配额、限时授权、切层错误路径）+
   D+ 档（`sctpParameters`/`produce-data`/`consume-data`、跨房间录制目标被拒、VP9 能力、
   房主迁移、空房 TTL 宽限期内原号回归、`/api/rooms` 与 `/dashboard`）+ 09-16 **auth 8 项**
   （注册/重复注册/错密码统一提示/登录/token 恢复/伪造 token/昵称贯通 room-state）+
-  09-17b 字幕状态入册。
+  09-17b 字幕状态入册 + **09-24 门禁边界 8 项**（甲类该拦的拦、乙类该放的放，
+  含"游客无 token 也能归档字幕"的端到端回归）。
   ⚠️ **真实音视频、simulcast 三档、说话人检测、浏览器侧录制、触屏手势、滤镜与字幕需要浏览器人工验证**
   （命令行只到信令层）；清单见 `后续升级方向.md` 第 0.2 节。
-- Mesh 版测试（**2026-09-17 实测：33 通过 / 0 失败**）：建房拿号、凭号加入、room-not-found、
+- **账号存储层 `npm run test:store`（2026-09-24 实测：49 通过 / 0 失败）**：
+  建号/查询/改密换盐/删号（含"拒绝删除唯一管理员"安全闸）/完整性自检，以及**旧 `users.json` 迁移**
+  （断言原样保留 salt/hash、不重新哈希）+ **迁移不污染真实库**的硬断言自证（真实 `sfu/users.json`
+  逐字节一致、`sfu/data/` 下没被建库）。
+- **优雅退出 `npm run test:shutdown`（2026-09-24 实测：9 通过 / 0 失败）**：
+  用 `TEST_SHUTDOWN_AFTER_MS` 主动触发退出路径，验"关 Worker → 关库 WAL checkpoint → 退出"、
+  幂等、5 秒保险丝、以及正常退出不再被误报为 Worker 崩溃。
+- Mesh 版测试（**2026-09-24 实测：36 通过 / 0 失败**）：建房拿号、凭号加入、room-not-found、
   new-member 广播、offer/answer/ICE 定向转发、room-full 拒绝、peer-left、空房自动销毁、
   入会密码三关校验、远程协助全链路 + 限时授权（`expiresAt`/到期自动复位/无幽灵定时器/blocked 透传）。
-- **前端无头冒烟测试 `npm run test:smoke`（2026-09-17 实测：76 通过 / 0 失败，零依赖、不用起服务器）**：
+- **前端无头冒烟测试 `npm run test:smoke`（2026-09-24 实测：136 通过 / 0 失败，零依赖、不用起服务器）**：
   用最小 DOM + 假 mediasoup-client 把 `sfu/public/client.js` 真跑一遍——顶层执行、
   媒体链路与 **simulcast 三层 encodings 接线**、成员列表/音量/换层、远程协助控制层采集
   （含触屏长按与双指）、文件分块、剪贴板、录制、设备切换、断线重连，以及 **F7 三条 SCTP 频道、
-  F6 滤镜管线、实时字幕（识别→定稿→广播→续命→导出）、登录卡与昵称**。
+  F6 滤镜管线、实时字幕（识别→定稿→广播→续命→导出）、登录卡与昵称、移动端/PWA 与省流**。
 - **AI 双轨自检 `npm run test:ai`（2026-09-24 实测：10 通过 / 0 失败）**：
   🚧 Mock 轨（零网络零费用，永远可跑）验"降级链路没断"——provider 判定、mock 钩子、
   流式降级也分片喂出、离线纪要三小节、agent 不死循环；
@@ -492,6 +571,7 @@ npm run test:e2e     # 真机远程桌面 e2e（真双窗 + 模拟手机双指�
 | 37 | **G4 移动端 / PWA（09-23）** | manifest + Service Worker（可安装到主屏、静态壳离线兜底）+ 侧栏抽屉/控制坞图标化/竖屏预览（≤980/≤760 两档响应式）+ 低带宽模式（省流开关锁最低层，复用 set-preferred-layers，服务器零改动）；顺手修 F6 冒烟 flaky 与 updateLayerPicker 守卫；冒烟 107/107 + 信令 98/98 |
 | 38 | **AI 主攻收官（09-24）** | **真 DeepSeek key 接入**：`sfu/ai/provider.js` 收口三处 LLM 调用（askLLM/streamLLM，Node 内置 fetch 零 SDK），密钥三来源（env > `.env` > config 的 ai.key）且**永不下发浏览器**，用量账本并入 `/metrics`；教学三件套 `scripts/{chat,summarize,agent}.js` + `npm run test:ai` 双轨自检 10/10；产品化四项：**流式打字机**（ai-stream + 终态去重）、**助理缺位自动入会**、**📝 纪要入口**、LLM/Mock 徽标与 token 用量；**实修三 bug**：announcedIp 漂移自动纠偏（跨机黑屏元凶）、ffmpeg 探测超时误判 + test:record 的 spawnSync EBUSY、配了 key 反而生成不了纪要（动作被聊天抢答）；回归：冒烟 **118/118**、信令 **106/106**（Mock 轨/LLM 轨双绿）、Mesh 33/33、test:record 连跑 3 次 PASS |
 | 39 | **真 OS 级远程桌面 + 跨网一键发布 + SW 缓存纪律（09-24b）** | **B 档落地**：本地代理 `agent/`（零新依赖手写 **CDP** 客户端，`Page.startScreencast` 抓真屏 + `Input.*` 注入真输入）驱动真实 Chromium 窗口，控制端在网页里操作被控电脑真实浏览器；新信令 `agent-hello`/`remote-frame`/`remote-meta` + 复用 `remote-input`，三道闸门（身份/授权/体量，"信任≠免检查"）；**📱 手机控电脑**——控制台 canvas 全用 **Pointer Events**（单指=鼠标、双指=滚轮、中文整段 insertText）；**跨网 ICE 下发**（Mesh 版 `mesh.config.json` + `/config.json`）；**一键发布** `npm run publish:mesh`（生成 publish-mesh/ → 真起一次体检 → 可选 cloudflared/ngrok 隧道；`--check` 过期闸）；**坑 40**：Service Worker 缓存旧代码（cache-first 绕过 HTTP `no-store`，改业务代码 sw.js 不动就一直吃旧缓存 → 按资源性质分 cache-first/network-first + `?nosw=1` 逃生舱 + e2e 每次清 profile）；回归 `test:agent` 16/16、`test:e2e` 15 项全过、`test:publish` 29/29 |
+| 40 | **账号上真数据库 + 门禁边界修正 + 优雅退出（09-24）** | **存储层**：新增 `sfu/store.js`，用 Node 内置 `node:sqlite`（零新依赖）替换 JSON 文件——WAL 模式、users/audit 两表、旧 `users.json` **自动迁移（原样保留 salt/hash、绝不重新哈希）** + 旧文件改名备份；**口令单一实现** `sfu/password.js`（scrypt + 随机盐 + timingSafeEqual，服务器与 CLI 共用，消除"照抄漂移"）；**管理员 CLI** `scripts/admin.js`（list/grant/revoke/adduser/passwd/purge，purge 默认干跑、deleteUser 拒绝删唯一 admin）；**门禁边界修正**：观测类（`/api/rooms`/`/metrics`/`/api/recordings`）加 admin 门禁，内容类（captions/minutes/单录像是**刻意开放**——游客也在用字幕归档，加门禁会静默失效；安全靠"能力=房间号"）；**优雅退出**（SIGINT/SIGTERM→关 Worker→关库 checkpoint→退出，幂等 + 5s 保险丝，`TEST_SHUTDOWN_AFTER_MS` 自测钩子）；**证书 SAN 自愈**（缺失/无 SAN/未覆盖当前 IP 都重生成，修手机连不上）；**测试隔离**（账号测试一律 `DB_FILE` 指临时目录，硬断言不碰真实库）+ 修 `test:sfu` 默认带 token 掩盖游客视角的回归；回归：SFU 信令 **134/134**、存储 **49/49**、优雅退出 **9/9**、冒烟 **136/136**、Mesh **36/36**、代理 **16/16**、发布 **30/30**、e2e **15/15** = **合计 425 全绿** |
 
 **下一步方向**（`后续升级方向.md` 是唯一权威）：
 - ✅ **A 档（A1~A7）与 D 档（D1~D6）已全部完成**（2026-09-11，SFU 主版本）；
@@ -506,7 +586,7 @@ npm run test:e2e     # 真机远程桌面 e2e（真双窗 + 模拟手机双指�
 - ✅ **F 档 F4~F7 已全部完成**（表情飞屏/举手 09-13 → 批注 09-14 → 白板 09-15c → 滤镜/虚拟背景 09-17，SFU 主版本）；
 - ✅ **E 档已落地四项**：E1 TURN（openrelay 预置 + coturn 自建包）/ E2 HTTPS 自签一键部署（start:lan）/
   E4 压力基准数字（bench 三档）/ E5 演示包（start:demo + 5 分钟讲稿）；**只剩 E3 浏览器端 e2e 未做**
-  （现有零依赖冒烟 76 项是可选的"零依赖版"，Playwright 属新依赖需拍板）；
+  （现有零依赖冒烟 136 项 + `test:e2e` 15 项是可选的"零依赖版"，Playwright 属新依赖需拍板）；
 - 🔶 **C 档（与 AI 线汇合）**：**L1 实时字幕 ✅（09-17b）→ AI Bot 参会者 ✅（09-19b）→ N2 纪要 ✅（09-19c 骨架）
   → C1 AI 远程操作员 ✅（09-19g）→ 09-24 接通真 DeepSeek**：统一 provider + 流式打字机 + 📝 纪要入口 +
   教学三件套脚本 + `test:ai` 双轨自检 10/10（详见 `后续升级方向.md` 第 1 节），**主攻两条线全线贯通**；

@@ -8,6 +8,8 @@
 //   npm run soak                      # 正经过夜：默认 7 小时，早上看报告
 //   npm run soak -- --minutes 2      # 压缩自测（几分钟验证链路全通）
 //   node scripts/soak.js --hours 1 --rate 20 --url http://localhost:3001
+//   ADMIN_TOKEN=<token> npm run soak  # ★ 09-24：/api/rooms 与 /api/captions 现在要管理员 token
+// ▎ADMIN_TOKEN 怎么拿：会议页用管理员账号登录 → 控制台 JSON.parse(localStorage.wb_auth).token
 // ▎退出码：0 = 全程零错误且归档对账一致；1 = 有错误/对账不平（CI 或睡前自检可用）。
 // ▎心跳落盘：sfu/logs/soak-<启动时刻>.log（每 10 分钟一行 + 结束报告），早上可回放整夜。
 const path = require('path');
@@ -25,6 +27,9 @@ const HOURS = parseFloat(argOf('--hours', '7'));
 const MINUTES = parseFloat(argOf('--minutes', '0'));
 const RATE = Math.max(1, parseInt(argOf('--rate', '6'), 10)); // 每分钟模拟的字幕条数
 const DURATION_MS = Math.round((MINUTES > 0 ? MINUTES * 60000 : HOURS * 3600000));
+// ★ 09-24 G8：归档/快照接口已加管理员门禁，不带 token 会一路 401（看着像"服务器坏了"）
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
+const AUTH_HEADERS = ADMIN_TOKEN ? { Authorization: `Bearer ${ADMIN_TOKEN}` } : {};
 
 // ---- 状态台账 ---------------------------------------------------------------
 const state = {
@@ -80,10 +85,10 @@ const rss0 = process.memoryUsage().rss;
     try {
       const res = await fetch(`${URL_BASE}/api/captions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...AUTH_HEADERS },
         body: JSON.stringify({ room: String(roomNumber), entries }),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}${res.status === 401 ? '（需要 ADMIN_TOKEN）' : ''}`);
       const { saved } = await res.json();
       state.archived += saved;
       state.posts++;
@@ -94,8 +99,8 @@ const rss0 = process.memoryUsage().rss;
   };
   const healthOnce = async () => {
     try {
-      const res = await fetch(`${URL_BASE}/api/rooms`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const res = await fetch(`${URL_BASE}/api/rooms`, { headers: AUTH_HEADERS });
+      if (!res.ok) throw new Error(`HTTP ${res.status}${res.status === 401 ? '（需要 ADMIN_TOKEN）' : ''}`);
       const snap = await res.json();
       state.gets++;
       const mine = (snap.rooms || []).some((r) => String(r.roomNumber) === String(roomNumber));
@@ -138,9 +143,9 @@ const rss0 = process.memoryUsage().rss;
     // 对账：POST 累计的条数 == GET 回读的行数（值守"一条不丢"的核心断言）
     let back = -1;
     try {
-      const res = await fetch(`${URL_BASE}/api/captions?room=${roomNumber}&format=json`);
+      const res = await fetch(`${URL_BASE}/api/captions?room=${roomNumber}&format=json`, { headers: AUTH_HEADERS });
       if (res.ok) back = (await res.json()).length;
-      else throw new Error(`HTTP ${res.status}`);
+      else throw new Error(`HTTP ${res.status}${res.status === 401 ? '（需要 ADMIN_TOKEN）' : ''}`);
     } catch (err) {
       state.errors++;
       heartbeat(`❌ 归档回读失败：${err.message}`);

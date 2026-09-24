@@ -41,6 +41,10 @@ const { Server } = require('socket.io');
 const mediasoup = require('mediasoup');
 // ★ 09-24 AI Provider：所有 LLM 调用的唯一入口（密钥托管 + 双轨降级 + 用量记账）
 const AI = require('./ai/provider');
+/* ★ 09-24 账号存储层：node:sqlite（零新依赖的真数据库）
+ * ▎从"整文件 JSON 读写"换成 SQLite 的原因见 sfu/store.js 文件头。
+ * ▎require 即完成：建库建表 + PRAGMA WAL + 旧 users.json 自动迁移（都在 store.js 里）。 */
+const store = require('./store');
 
 /* ★ 09-13 可达性升级（对应路线图 E1/E2 的"自助版"）：配置文件 config.json
  * ▎硬边界是什么？这套系统之前只能"同机/同局域网"玩：
@@ -96,6 +100,84 @@ const MIME = {
   '.json': 'application/json; charset=utf-8',
 };
 
+/* ★ 09-24 G8-①：HTTP 层管理员门禁
+ * ▎要解决什么：/api/rooms、/metrics 这些接口此前**完全裸奔**——
+ *   任何人都能看到"哪个房间里有谁、每路媒体跑了多少字节、谁在远程控制谁"。
+ *   演示时没人管，但只要服务挂在公网上，这就是一份免费的情报面板。
+ *
+ * ▎★ 门禁边界（本节是复审后的最终版，答辩会被问，先讲清楚"为什么不是全加"）：
+ *   本服务把 HTTP 接口分**两类**，只有第一类上 admin 门禁——
+ *
+ *   【甲类·观测】跨房间聚合 / 实时全景。知道它 = 掌握全局，且与"是否参会"无关。
+ *     /api/rooms     房间×成员×媒体字节×控制权关系  → requireAdmin
+ *     /metrics       上面那堆的 Prometheus 文本版    → requireAdmin
+ *     /api/recordings 全服务器录像清单（跨房枚举）    → requireAdmin
+ *
+ *   【乙类·内容】单场会议的产物，**能力 = 房间号/文件名**（知道标识符才拿得到）。
+ *     这类**必须对非管理员开放**，否则功能就坏了：
+ *     /api/captions  字幕归档——client.js 自动 POST，游客也在用 → 开放
+ *     /api/minutes、/minutes/<房>/<文件>  纪要列表与正文      → 开放（AI 气泡里点的链接）
+ *     /recordings/<文件名>  单个录像文件                      → 开放（列表已拦，单文件靠文件名）
+ *   ▎核心理由一句话：**本产品允许游客进会**（登录卡有「游客进入」）。给乙类加 admin
+ *     门禁 = 游客的字幕归档静默失效，功能坏了还不报错——这比"少一层鉴权"更糟。
+ *     安全不靠"拦所有人"，靠"能力（房间号）只发给在场的人"。
+ *   ▎残余风险（诚实交代，已写进《项目说明》局限一节）：房间号 10^6 可枚举、
+ *     录像文件名的时间戳可估，故乙类属**弱能力**。生产做法：join 时下发房间内令牌
+ *     + 录像用短时效签名 URL。本教学版未实现，不假装已实现。
+ *
+ * ▎token 从哪取（两种都支持，各有各的场景）：
+ *   ① Authorization: Bearer <token> —— 首选。脚本 / Prometheus / curl 的标准姿势。
+ *   ② ?token=<token>              —— 兜底。浏览器直接打开 /metrics、/recordings/x.webm
+ *      这类"地址栏/资源标签"场景发不出自定义头（<video src> 也发不出）。
+ *      ▎权衡（必须讲清）：查询串会进浏览器历史、服务器访问日志、Referer——
+ *      所以它只是兜底，能发头就发头。真产品应该用短时效的"下载票据"换掉它。
+ * ▎返回值：{ ok: true, username } 或 { ok: false }（后者已把 401 写回响应）。
+ *   调用方一律写成 `if (!requireAdmin(req, res).ok) return;`——门禁是"写响应 + 返回状态"，
+ *   比"返回布尔让调用方自己写 401"更难漏。 */
+function extractAuthToken(req) {
+  const auth = req.headers && req.headers['authorization'];
+  if (typeof auth === 'string') {
+    const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
+    if (m) return m[1].trim();
+  }
+  try {
+    const t = new URL(req.url, 'http://localhost').searchParams.get('token');
+    return t || null;
+  } catch (e) { return null; }
+}
+function adminGateHtml(reason) {
+  // 401 页面给人看，所以是 HTML 而不是 JSON（浏览器直接打开 /metrics 时能看懂）
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>401 需要管理员身份</title></head>
+<body style="font-family:system-ui,'Microsoft YaHei',sans-serif;background:#14100a;color:#ece5d8;padding:40px;line-height:1.7">
+  <h1>🔒 401 需要管理员身份</h1>
+  <p>${reason || '这个接口只对管理员开放。'}</p>
+  <p>带 token 的两种方式：</p>
+  <ul>
+    <li><code>Authorization: Bearer &lt;token&gt;</code>（脚本 / Prometheus 抓取首选）</li>
+    <li><code>?token=&lt;token&gt;</code>（浏览器直接打开时的兜底，URL 会进历史/日志，尽量少用）</li>
+  </ul>
+  <p>token 从哪来：在会议页用管理员账号登录后，浏览器控制台执行
+     <code>JSON.parse(localStorage.wb_auth).token</code> 即可取到；</p>
+  <p>账号还不是管理员？让管理员执行 <code>npm run admin:grant -- &lt;用户名&gt;</code>。</p>
+  <p><a href="/" style="color:#d8b36a">← 回会议页登录</a> ·
+     <a href="/dashboard" style="color:#d8b36a">观测面板</a></p>
+</body></html>`;
+}
+function requireAdmin(req, res) {
+  const v = verifyToken(extractAuthToken(req));
+  if (!v || v.role !== 'admin') {
+    res.writeHead(401, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'WWW-Authenticate': 'Bearer realm="sfu-admin"',
+      'Cache-Control': 'no-store',
+    });
+    res.end(adminGateHtml(v ? '当前账号不是管理员（role=' + v.role + '）。' : '缺少或无效的管理员 token。'));
+    return { ok: false };
+  }
+  return { ok: true, username: v.username };
+}
+
 /* 请求处理器（命名函数）：HTTP 和 HTTPS 两个服务器共用同一份逻辑 */
 async function requestHandler(req, res) {
   // ★ 坑 15（Mesh 版当年踩过，SFU 复制时漏带了）：req.url 会带 "?room=xxx" 查询串，
@@ -111,12 +193,24 @@ async function requestHandler(req, res) {
    * ▎字节计数是**累计值**，面板页负责两次采样相减算出实时码率（画成曲线）。
    */
   if (pathname === '/api/rooms') {
+    // ★ 09-24 G8：管理员门禁（能看到全房成员/媒体字节/控制权关系，属敏感信息）
+    if (!requireAdmin(req, res).ok) return;
     handleApiRooms(res);
     return;
   }
 
   // ★ 09-17e 值守归档（C3-N1）：字幕账本的服务器权威副本——POST=追加，GET=回读全档
   if (pathname === '/api/captions') {
+    /* ★ 09-24 G8 复审修订：**这里刻意不加 admin 门禁** —— 它属"会议内容"类，不是"观测"类。
+     * ▎为什么：本接口由浏览器端 client.js **自动**调用（内存溢出时归档 POST、导出/日报回读 GET），
+     *   而本产品**允许游客模式进会**（登录卡上的「游客进入」，authGuestBtn），游客根本没有 token。
+     *   若在此加 requireAdmin，字幕归档会对所有非管理员**静默失效**——功能坏了却只在控制台
+     *   留一行日志，比直接报错更难发现。第一版曾在此加门禁，正是复核时发现这条而回退。
+     * ▎那靠什么保护：**能力 = 房间号**。6 位房间号本身就是这场会的暗号，
+     *   知道房号才能读写这场会的字幕——与"能进这场会"是同一道门，没有降低安全等级。
+     * ▎诚实边界（已写进《项目说明-发给老师.md》的局限一节）：房间号可被暴力枚举（10^6），
+     *   因此字幕对"知道房号的人"不设机密。生产做法是给每个成员发房间内令牌（join 时下发、
+     *   captions/minutes 校验），本教学版未实现。 */
     if (req.method === 'POST') {
       handleApiCaptions(req, res);
     } else {
@@ -128,12 +222,14 @@ async function requestHandler(req, res) {
 
   // ★ 09-18 G7 可观测性：Prometheus 文本格式的指标端点（/dashboard 的"机器读"版）
   if (pathname === '/metrics') {
+    if (!requireAdmin(req, res).ok) return;
     handleApiMetrics(res);
     return;
   }
 
   // ★ 09-19c G3 录制回放：录制产物列表（recordings.html 吃它；只报可播的 .webm/.mkv）
   if (pathname === '/api/recordings') {
+    if (!requireAdmin(req, res).ok) return;
     try {
       const dir = path.join(__dirname, 'recordings');
       const list = fs.existsSync(dir)
@@ -156,6 +252,7 @@ async function requestHandler(req, res) {
 
   // ★ 09-19c N2：纪要列表 + 纪要下载（房间号 6 位白名单 + 文件名白名单，路径穿越进不来）
   if (pathname === '/api/minutes') {
+    // ★ 09-24 G8 复审修订：归"会议内容"类，能力=房间号 → 不加 admin 门禁（理由同 /api/captions）
     const q = new URL(req.url, 'http://localhost').searchParams;
     const room = String(q.get('room') || '');
     if (!/^\d{6}$/.test(room)) {
@@ -175,6 +272,8 @@ async function requestHandler(req, res) {
     return;
   }
   if (pathname.startsWith('/minutes/')) {
+    // ★ 09-24 G8 复审修订：纪要正文 = 会议内容类（房间号 6 位白名单 + 文件名白名单已防穿越），不加 admin 门禁。
+    //   这是 AI 助理气泡里「📄 打开纪要」的落点——普通参会者和游客都要能点开。
     // /minutes/<6位房间>/<文件名>.md —— 两段白名单钳住路径穿越
     const parts = pathname.split('/').filter(Boolean); // ['minutes', room, file]
     const room = parts[1] || '';
@@ -219,6 +318,14 @@ async function requestHandler(req, res) {
 
   // ★ D+2：录制产物下载（只允许纯文件名，path.basename 天然防路径穿越）
   if (pathname.startsWith('/recordings/')) {
+    /* ★ 09-24 G8 复审修订：单个录制文件 = 内容类，能力 = 文件名（文件名形如
+     *   rec-<6位房号>-<毫秒时间戳>.webm），不加 admin 门禁。
+     * ▎为什么列表加了门禁、单个文件却不加：**列表是跨房聚合**（谁能看到"这台服务器上
+     *   有哪些会的录像"就是观测信息，必须拦）；而**单个文件**是"手里已经有这个地址"
+     *   的人才拿得到，与 /api/captions 同属"能力=标识符"模型。
+     * ▎诚实边界：文件名里的房号只有 6 位、时间戳可估，属**弱能力**。生产应换成
+     *   短时效签名 URL（signed ticket）。本条已写进《项目说明》的局限一节。
+     * ▎path.basename 仍保留——它防的是路径穿越，与门禁是两件事，不能因为开放就撤掉。 */
     const fileName = path.basename(pathname);
     const filePath = path.join(__dirname, 'recordings', fileName);
     if (fs.existsSync(filePath)) {
@@ -555,12 +662,52 @@ function handleCaptionRead(res, room, format) {
  */
 let httpsServer = null;
 const tlsCfg = CONFIG.https || {};
+
+/* ★ 09-24 G9：自签证书必须带 SAN —— 这是"手机用不了"的一大根因。
+ * ▎为什么必须 SAN：浏览器**早就不看 CN（Common Name）了**（RFC 6125，各家 2017 年起执行）。
+ *   一张只有 /CN=webrtc-sfu-dev 的证书，桌面 Chrome/Edge 报 ERR_CERT_COMMON_NAME_INVALID；
+ *   手机浏览器（尤其 iOS Safari）更严格——常常连"继续访问"都不给，直接连不上。
+ * ▎加了 SAN 之后：证书对 localhost / 127.0.0.1 / 本机局域网 IP 都算"名字匹配"，
+ *   手机至少能弹出"继续访问"的自签警告，点进去就有安全上下文（摄像头/麦克风才可用）。
+ * ▎SAN 里为什么要有局域网 IP：手机访问用的就是 https://192.168.x.x:3443，
+ *   不把这个 IP 写进去，SAN 一样对不上，等于没加。
+ */
+function inspectCertSan(file) {
+  /* 检测方式：用 Node 内置 X509Certificate 解析证书，读它的 subjectAltName。
+   * ▎为什么不"在证书文件里搜字符串"？——PEM 是 base64 编码，明文串根本搜不到，
+   *   那种写法会永远返回 false（然后每次启动都重签），是典型的"看起来能用其实没用"。
+   * ▎解析失败（文件损坏/半截）按"没有 SAN"处理 → 触发重新生成，正好自愈。
+   * ▎★ 09-24 追加：不仅要问"有没有 SAN"，还要问"**覆盖当前这个 IP 了吗**"。
+   *   原因是一次真复现：这台机器 DHCP 换过三次 IP（127.194 → 116.194 → 74.194），
+   *   而证书是**旧 IP 在的时候**签的——只判"有 SAN"就永远不重签，
+   *   于是手机连 https://192.168.74.194:3443 依旧证书不匹配。
+   *   所以这里把 SAN 里的 IP 抽出来交给调用方比对。 */
+  try {
+    const x = new (require('crypto').X509Certificate)(fs.readFileSync(file));
+    const san = x.subjectAltName || '';
+    const hasSan = san.includes('DNS:') || san.includes('IP Address:');
+    const ips = [...san.matchAll(/IP Address:\s*([0-9a-fA-F:.]+)/g)].map((m) => m[1]);
+    return { hasSan, san, ips };
+  } catch (e) { return { hasSan: false, san: '', ips: [] }; }
+}
 if (tlsCfg.enabled) {
   const certFile = tlsCfg.cert || path.join(__dirname, 'tls', 'dev-cert.pem');
   const keyFile = tlsCfg.key || path.join(__dirname, 'tls', 'dev-key.pem');
   try {
-    if (!fs.existsSync(certFile) || !fs.existsSync(keyFile)) {
-      if (tlsCfg.autoSelfSigned === false) throw new Error('证书文件不存在且已禁用自签');
+    const missing = !fs.existsSync(certFile) || !fs.existsSync(keyFile);
+    /* ★ 09-24：**旧证书没有 SAN 也要重新生成**，不能静默沿用——
+     *   否则用户遇到的是最难排查的一类问题："我明明按说明改了，为什么没生效？"
+     *   （证书是上次生成的、躺在盘上，代码改了也不会自动换新。） */
+    const sanInfo = missing ? { hasSan: false, san: '', ips: [] } : inspectCertSan(certFile);
+    const staleNoSan = !missing && !sanInfo.hasSan;
+    /* ★ 09-24 追加：**SAN 没覆盖当前局域网 IP 也要重签**（DHCP 漂移自愈）。
+     *   只判"有没有 SAN"是不够的：换过网络的开发机，证书里留着上一次的旧 IP，
+     *   手机上照样是证书不匹配。这里拿当前探测到的所有 IP 去比对，缺哪个就重签。 */
+    const lanIps = (detectLocalIps() || []);
+    const driftedIps = missing || !sanInfo.hasSan ? [] : lanIps.filter((ip) => !sanInfo.ips.includes(ip));
+    const staleIpDrift = driftedIps.length > 0;
+    if (missing || staleNoSan || staleIpDrift) {
+      if (tlsCfg.autoSelfSigned === false) throw new Error(staleNoSan || staleIpDrift ? '现有证书不含 SAN 或未覆盖当前 IP，且已禁用自签' : '证书文件不存在且已禁用自签');
       fs.mkdirSync(path.dirname(certFile), { recursive: true });
       /* 自签一张 10 年期开发证书。
        * ★ 09-17c（doctor 实测发现）：这台机器的 openssl **不在 PATH**（装在
@@ -581,11 +728,37 @@ if (tlsCfg.enabled) {
         catch (e) { /* 试下一个 */ }
       }
       if (!opensslBin) throw new Error('找不到 openssl（PATH 与 Git 目录都没有）');
-      execFileSync(opensslBin,
-        ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '3650',
-         '-subj', '/CN=webrtc-sfu-dev', '-keyout', keyFile, '-out', certFile],
-        { stdio: 'ignore' });
-      console.log(`🔑 已自动生成自签开发证书（sfu/tls/，用 ${opensslBin}）`);
+      // 局域网 IP 复用文件里已有的探测逻辑（detectLocalIps 是函数声明，会提升，此处可调用）
+      /* ★ 09-24：**把所有局域网 IP 都写进 SAN**，不只取第一个——
+       *   一台机器常见"WLAN 一个网段 + 有线一个网段"（本机就有 WLAN 192.168.74.x），
+       *   只写第一个的话，换另一张网卡访问就又不匹配了。多写几个的成本是 0。 */
+      const sanParts = ['DNS:localhost', 'IP:127.0.0.1'];
+      for (const ip of lanIps) sanParts.push(`IP:${ip}`);
+      // 把旧证书里**已有的** IP 也保留下来：万一你现在只是插着另一张网卡，
+      // 老网段将来还要用（比如回宿舍换回 Wi-Fi），保留可以让两边都能连。
+      for (const ip of sanInfo.ips) {
+        if (ip !== '127.0.0.1' && !sanParts.includes(`IP:${ip}`)) sanParts.push(`IP:${ip}`);
+      }
+      const sanValue = sanParts.join(',');
+      const baseArgs = ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '3650',
+        '-subj', '/CN=webrtc-sfu-dev'];
+      const why = missing ? '首次生成'
+        : staleNoSan ? '旧证书不含 SAN，已重新生成'
+        : `旧证书未覆盖当前 IP ${driftedIps.join('/')}（换过网络），已重新生成`;
+      try {
+        execFileSync(opensslBin,
+          [...baseArgs, '-addext', `subjectAltName=${sanValue}`, '-keyout', keyFile, '-out', certFile],
+          { stdio: 'ignore' });
+        console.log(`🔑 已自动生成自签开发证书（${why}；用 ${opensslBin}）`);
+        console.log(`   ▸ SAN：${sanParts.join(', ')}（浏览器早就不看 CN 了，手机能否连上全看这里）`);
+        if (!lanIps.length) console.log('   ⚠️ 没探测到局域网 IP，SAN 里只有 localhost/127.0.0.1 —— 手机按局域网 IP 访问仍会证书不匹配，可能连不上');
+      } catch (e) {
+        // 兜底：极老的 openssl（<1.1.1）不认 -addext。退回不写 SAN 的证书，但必须**明说**，
+        // 而不是悄悄生成一张手机连不上的证书（那样比报错更坑）。
+        execFileSync(opensslBin, [...baseArgs, '-keyout', keyFile, '-out', certFile], { stdio: 'ignore' });
+        console.log('🔑 已生成自签证书，但当前 openssl 不支持 -addext，未能写入 SAN');
+        console.log('   ⚠️ 无 SAN 的证书在手机上可能完全连不上（桌面浏览器可点"继续访问"）。建议升级 openssl（Git 自带的 1.1.1+ 即可）');
+      }
     }
     // 同一个请求处理器挂到 HTTPS 上：HTTP/HTTPS 行为完全一致，
     // socket.io 挂上它之后 wss 也自动可用（见第 D 部分开头的 io.attach）。
@@ -623,6 +796,10 @@ if (tlsCfg.enabled) {
 const workers = [];
 let workerIdx = 0;
 let worker = null;
+/* ★ 09-24：优雅退出标志。声明在这里（而不是文件末尾的退出段）是因为 Worker 的 'died'
+ *   处理器要读它——退出时 Worker 是我们主动关的，不该再被当成"崩溃"报错并触发补位。
+ *   放在 Worker 池之前声明，避免读到未初始化的 let（TDZ）。 */
+let shuttingDown = false;
 
 // 每个房间（Router）支持的编码。浏览器会从这里面挑一种来编码发送：
 //   opus = 音频；VP8/H264 = 视频（H264 带 profile 参数是 Chrome 常见要求）
@@ -715,6 +892,10 @@ async function startOneWorker() {
   w.on('died', () => {
     const i = workers.indexOf(w);
     if (i >= 0) workers.splice(i, 1);
+    /* ★ 09-24：优雅退出时**不报错也不补位**。
+     *   否则 Ctrl+C 关服务会打出一行 "❌ Worker 挂了" —— 一个正常的退出被渲染成故障，
+     *   演示时看到会以为程序崩了（这正是本次实跑时观察到的现象）。 */
+    if (shuttingDown) return;
     console.error('❌ mediasoup Worker 挂了，5 秒后自动补位...');
     logEvent('error', 'worker-died', { pid: w.pid, remaining: workers.length });
     setTimeout(() => startOneWorker().catch((e) => console.error('Worker 补位失败：', e.message)), 5000);
@@ -748,14 +929,18 @@ function pickWorker() {
 
 const rooms = new Map();
 
-/* ★ 09-16 基础功能补全：登录/注册（零依赖用户体系）
- * ▎存储：users.json（用户名 → scrypt 哈希 + 盐 + 昵称），演示规模直接整文件读写；
- *   密码**绝不存明文**——scrypt(+随机盐) 是 Node 内置 crypto，不引 bcrypt（零依赖铁律）。
+/* ★ 09-16 基础功能补全：登录/注册（用户体系）
+ * ★ 09-24 存储升级：原来的 sfu/users.json（整文件 JSON.parse/writeFileSync）已换成
+ *   node:sqlite 的 store 层（见 sfu/store.js）——调用点全部走 store，**不再有第二套实现**。
+ * ▎为什么值得升级：整文件读写有三个硬伤——① 每次登录都要读+解析全文件；
+ *   ② 写是"全量覆盖"，写一半崩掉文件就废；③ 想按 role 查账号只能自己遍历。
+ *   换 SQLite 后这些变成一句 SQL，且**没新增任何 npm 依赖**（node:sqlite 是 Node 内置）。
+ * ▎密码**绝不存明文**——scrypt(+随机盐) 是 Node 内置 crypto，不引 bcrypt（零依赖铁律）。
  * ▎token：登录/注册成功发一个随机 token（内存 Map），前端存 localStorage 自动恢复登录态；
  *   重启即失效是**教学取舍**（真实产品用数据库 + 长期 refreshToken），注释里讲清楚。
+ *   现在 token 里多带一个 role（管理员门禁要用），见下面 issueToken。
  * ▎身份的用途：昵称贯通成员列表/聊天气泡/工作台状态条；不登录也能玩（游客模式）。 */
 const crypto = require('crypto');
-const USERS_FILE = path.join(__dirname, 'users.json');
 /* ★ 09-19h G6-③ 限流（零依赖手写固定窗口计数器，~15 行）：
  * ▎防什么：撞库（login）/暴力猜 6 位房间号（join-room）/注册机刷号（register）/刷屏（chat）。
  * ▎用固定窗口而非令牌桶：实现最短、语义直白（"一分钟最多 N 次"），教学项目够用；
@@ -783,27 +968,42 @@ setInterval(() => {
  * ▎滑动续期：auth-verify / auth-refresh 命中即续期（真实产品的"活跃不掉线"语义）；
  *   auth-refresh = 显式续期信令（前端定时调，长期会话不中断）。 */
 const AUTH_TTL_MS = Number(process.env.AUTH_TTL_MS) || 24 * 3600 * 1000;
-const authTokens = new Map(); // token -> { username, expiresAt }
+const authTokens = new Map(); // token -> { username, role, expiresAt }
+/* ★ 09-24 G8-②：token 里带上 role —— HTTP 层门禁（requireAdmin）拿 token 就能判断是不是管理员，
+ *   不必再回查数据库。role 在**发 token 那一刻**从库里取（登录/注册时取一次），
+ *   所以用 admin:grant 改了角色后，已发的旧 token 仍是旧角色直到重新登录——
+ *   这是取舍：换来"每次 HTTP 请求零数据库查询"，代价是角色变更有轻微生效延迟。 */
 function issueToken(username) {
+  const u = store.getUser(username);
   const token = crypto.randomBytes(24).toString('hex');
-  authTokens.set(token, { username, expiresAt: Date.now() + AUTH_TTL_MS });
+  authTokens.set(token, { username, role: (u && u.role) || 'user', expiresAt: Date.now() + AUTH_TTL_MS });
   return token;
 }
-function validToken(token, username) {
+/* verifyToken —— 只凭 token 解析身份（HTTP 门禁用，不需要事先知道用户名）
+ * ▎返回 { username, role } 或 null（null = 不存在/已过期）。命中即滑动续期。 */
+function verifyToken(token) {
   const t = authTokens.get(token);
-  if (!t || t.username !== username) return false;
-  if (Date.now() > t.expiresAt) { authTokens.delete(token); return false; }
+  if (!t) return null;
+  if (Date.now() > t.expiresAt) { authTokens.delete(token); return null; }
   t.expiresAt = Date.now() + AUTH_TTL_MS; // 滑动续期：活跃会话不过期
-  return true;
+  return { username: t.username, role: t.role };
+}
+/* validToken —— 信令里的用法是"这个 token 是不是这个用户的"
+ * ▎返回值从"布尔"改成 { username, role } | null：调用点（auth-verify/auth-refresh）
+ *   原本就当布尔用（`!validToken(...)`），对象是真值、null 是假值，语义不变；
+ *   多出来的 role 让上层将来能顺手用。**改动向后兼容**，不需要改所有调用点。 */
+function validToken(token, username) {
+  const v = verifyToken(token);
+  return v && v.username === username ? v : null;
 }
 const clientIp = (socket) => (socket.handshake && socket.handshake.address) || 'unknown';
-function loadUsers() {
-  try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) { return {}; }
-}
-function saveUsers(users) { fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2)); }
-function hashPassword(password, salt) {
-  return crypto.scryptSync(String(password), salt, 32).toString('hex');
-}
+/* ★ 09-24：loadUsers/saveUsers 已删除（不留两套并行实现）。
+ *   现在所有账号读写一律走 store：store.getUser / store.createUser / store.setUserRole… */
+/* ★ 09-24 追加：口令哈希方案搬到 sfu/password.js，服务器与 scripts/admin.js **共用同一份**。
+ *   原因见那个文件头：两处各存一份实现时，任何一边改了参数，CLI 建的账号就登不上，
+ *   而且报错只会说"用户名或密码不对"，排查方向全被带偏。
+ *   这里解构出来，下面原有调用点（hashPassword(pw, salt)）一个字都不用改。 */
+const { hashPassword, newSalt, randomPassword } = require('./password');
 function validUsername(u) {
   return typeof u === 'string' && /^[a-zA-Z0-9_一-龥]{2,16}$/.test(u);
 }
@@ -1917,28 +2117,37 @@ io.on('connection', (socket) => {
     if (!callback) return;
     if (!validUsername(username)) return fail(callback, '用户名需 2~16 位（中英文/数字/下划线）');
     if (typeof password !== 'string' || password.length < 6) return fail(callback, '密码至少 6 位');
-    const users = loadUsers();
-    if (users[username]) return fail(callback, '用户名已被注册');
-    const salt = crypto.randomBytes(16).toString('hex');
-    users[username] = {
-      salt,
-      hash: hashPassword(password, salt), // 只存哈希：数据库泄露也拿不到原密码
-      displayName: (typeof displayName === 'string' && displayName.trim())
-        ? displayName.trim().slice(0, 16) : username,
-      createdAt: Date.now(),
-    };
-    saveUsers(users);
+    /* ★ 09-24 修顺序 bug：限流检查必须**先于**落库。
+     *   旧代码是"先 saveUsers 再 rateLimit"，于是被限流拒绝的注册请求**账号已经写进文件**了——
+     *   这正是 users.json 里堆了 69 个 a_xxxxxx 之类测试账号的元凶：测试反复跑，
+     *   每次都被限流挡在门外，但每条账号其实都已经落盘。先在内存里判、再落库，才对。 */
     if (!rateLimit(`reg:${clientIp(socket)}`, 30, 10 * 60000)) return fail(callback, '注册过于频繁，请稍后再试');
+    if (store.getUser(username)) return fail(callback, '用户名已被注册');
+    const salt = newSalt(); // ★ 09-24：盐的生成也统一走 sfu/password.js（同一个盐长度，不会漂移）
+    const dn = (typeof displayName === 'string' && displayName.trim())
+      ? displayName.trim().slice(0, 16) : username;
+    let created;
+    try {
+      // 只存哈希：数据库泄露也拿不到原密码。role 不传 → 由 store 决定（首个账号 / 配置钦定 → admin）
+      created = store.createUser({ username, salt, hash: hashPassword(password, salt), displayName: dn });
+    } catch (e) {
+      // 并发下唯一约束兜底（两个请求同时通过上面的 getUser 检查）
+      return fail(callback, '用户名已被注册');
+    }
     const token = issueToken(username);
-    bindIdentity(username, users[username].displayName);
-    logEvent('info', 'auth-register', { username });
-    console.log(`👤 注册成功: ${username}（昵称 ${users[username].displayName}）`);
-    ok(callback, { user: { username, displayName: users[username].displayName }, token });
+    bindIdentity(username, created.displayName);
+    logEvent('info', 'auth-register', { username, role: created.role });
+    try { store.appendAudit('auth-register', username, { role: created.role }); } catch (e) { /* 审计失败不挡注册 */ }
+    if (created.role === 'admin') {
+      console.log(`🛡️ 已把 ${username} 设为首个管理员`
+        + (created.autoAdmin ? '（系统还没有任何管理员，第一个注册的账号自动获得）' : '（config.json 的 adminUsername 指定）'));
+    }
+    console.log(`👤 注册成功: ${username}（昵称 ${created.displayName}）`);
+    ok(callback, { user: { username, displayName: created.displayName }, token });
   });
   socket.on('auth-login', ({ username, password } = {}, callback) => {
     if (!callback) return;
-    const users = loadUsers();
-    const u = users[username];
+    const u = store.getUser(username);
     // 用户不存在与密码错误给同一句提示：不向试探者泄露"用户名是否存在"
     if (!rateLimit(`login:${clientIp(socket)}`, 20, 60000)) return fail(callback, '尝试过于频繁，请一分钟后再试');
     if (!u || hashPassword(password, u.salt) !== u.hash) return fail(callback, '用户名或密码不对');
@@ -1949,8 +2158,7 @@ io.on('connection', (socket) => {
   });
   socket.on('auth-verify', ({ username, token } = {}, callback) => {
     if (!callback) return;
-    const users = loadUsers();
-    const u = users[username];
+    const u = store.getUser(username);
     if (!u || !validToken(token, username)) return fail(callback, '登录态已失效，请重新登录');
     bindIdentity(username, u.displayName);
     ok(callback, { user: { username, displayName: u.displayName } });
@@ -1958,8 +2166,7 @@ io.on('connection', (socket) => {
   // ★ 09-19h G6-①：显式滑动续期（前端每小时调一次，长期值守不掉线）
   socket.on('auth-refresh', ({ username, token } = {}, callback) => {
     if (!callback) return;
-    const users = loadUsers();
-    const u = users[username];
+    const u = store.getUser(username);
     if (!u || !validToken(token, username)) return fail(callback, '登录态已失效，请重新登录');
     ok(callback, { expiresAt: authTokens.get(token).expiresAt });
   });
@@ -3214,4 +3421,74 @@ async function runRecordSelfTest() {
     console.error(`🧪 [TEST_RECORD] FAIL —— ${err.message}`);
     if (process.env.TEST_RECORD_EXIT === '1') process.exit(1);
   }
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * 第 Z 部分：优雅退出（Ctrl+C / kill / 容器停止）
+ *
+ * ▎为什么必须做（这也是"一个完整项目该有的东西"里最常被漏掉的一件）：
+ *   在此之前，进程没有注册任何信号处理器 —— Ctrl+C 等于**直接暴毙**，后果有三：
+ *     ① mediasoup Worker 是独立的 C++ 子进程，父进程没了它会变**孤儿进程**，
+ *        继续占着 40000-49999 的 RTC 端口；下次启动就可能撞端口、起不来；
+ *     ② node:sqlite 的 WAL 不会做 checkpoint，meeting.db-wal 一直堆积
+ *        （数据不丢，但文件越来越大，且下次启动要重放）；
+ *     ③ 手头正在录制的 ffmpeg 被硬切，产物可能是个损坏文件。
+ * ▎设计要点：
+ *   · **幂等**：连按两次 Ctrl+C 不能卡住——第二次直接放弃优雅、立刻退出。
+ *   · **有硬超时兜底**：优雅流程最多 5 秒。真实系统里"退出卡死"比"退得不干净"更烦人，
+ *     所以必须有一条"到点强制结束"的保险丝（k8s 的 terminationGracePeriod 是同一思路）。
+ *   · **顺序**：先断媒体（Worker）→ 再停收新连接（server）→ 最后关库。
+ *     库必须最后关：前面几步可能还在写审计日志。
+ * ══════════════════════════════════════════════════════════════ */
+async function gracefulShutdown(signal) {
+  if (shuttingDown) {
+    console.log(`\n⚠️ 又收到 ${signal}，不再等待，直接退出。`);
+    process.exit(1);
+  }
+  shuttingDown = true;
+  console.log(`\n🛑 收到 ${signal}，正在优雅退出…`);
+
+  // 保险丝：5 秒还没退完就强制结束（unref 让这个定时器自己不阻止进程退出）
+  const hardTimer = setTimeout(() => {
+    console.error('⚠️ 优雅退出超时（5s），强制结束。');
+    process.exit(1);
+  }, 5000);
+  hardTimer.unref();
+
+  // ① 关所有 mediasoup Worker（splice 清空池子，避免补位逻辑再塞进来）
+  for (const w of workers.splice(0)) {
+    try { w.close(); } catch (e) { /* 已死/已关：忽略 */ }
+  }
+  // ② 停收新连接（已建立的连接会自然结束；不等它们，有 5s 保险丝兜着）
+  for (const s of [httpServer, httpsServer]) {
+    if (s) { try { s.close(); } catch (e) { /* 忽略 */ } }
+  }
+  // ③ 关库：显式 close 才会做 WAL checkpoint，把 -wal 收进主库
+  try { store.closeDb(); } catch (e) { /* 忽略 */ }
+
+  clearTimeout(hardTimer);
+  console.log('👋 已安全退出（Worker 已关、数据库已 checkpoint）。');
+  process.exit(0);
+}
+process.on('SIGINT', () => { gracefulShutdown('SIGINT'); });    // Ctrl+C
+process.on('SIGTERM', () => { gracefulShutdown('SIGTERM'); });  // kill / docker stop
+/* 未捕获异常也不该无声暴毙：打出真实堆栈再退，方便定位（但退出路径仍走优雅那条）。
+ * ⚠️ 注意：不吞异常、不假装没发生——这是"崩溃要留证据"的底线。 */
+process.on('uncaughtException', (err) => {
+  console.error('💥 未捕获异常：', err && err.stack || err);
+  gracefulShutdown('uncaughtException');
+});
+
+/* ★ 09-24：优雅退出的**自测钩子**（沿用本项目 TEST_RECORD 的约定）。
+ * ▎为什么非要有它不可：**Windows 上外部根本投递不了 SIGTERM**——Windows 没有 POSIX 信号，
+ *   `process.kill(pid,'SIGTERM')` 走的是 TerminateProcess（等于直接暴毙），
+ *   Git Bash 的 `timeout` 同理。所以"用 timeout 杀一下看日志"在这台机器上
+ *   **测不出任何东西**：它只能证明"进程会死"，证明不了"退得干净"。
+ *   用环境变量把这条路径主动触发一次，`npm run test:shutdown` 才能真正断言它。
+ * ▎为什么 unref()：让这个定时器不阻止进程退出——它的职责只是"到点踢一脚"。 */
+if (process.env.TEST_SHUTDOWN_AFTER_MS) {
+  setTimeout(() => {
+    console.log('🧪 [TEST_SHUTDOWN] 主动触发优雅退出');
+    gracefulShutdown('TEST_SHUTDOWN');
+  }, Number(process.env.TEST_SHUTDOWN_AFTER_MS) || 3000).unref();
 }

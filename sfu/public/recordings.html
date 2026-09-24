@@ -68,16 +68,46 @@
     </div>
   </div>
   <script>
+    /* ★ 09-24 G8：录制产物现在是受保护资源（只对管理员开放）。
+     * ▎token 取自会议页登录后写下的同一份 localStorage（键 wb_auth），不另起键。
+     * ▎列表接口能带 Authorization 头；但 <video src> 和 <a download> 发不出自定义头，
+     *   所以它们的 URL 只能拼 ?token= —— 这正是服务端支持查询串兜底的原因。
+     *   ▎权衡：URL 里的 token 会进浏览器历史/服务器日志，仅作兜底。 */
+    const token = (() => {
+      try { return (JSON.parse(localStorage.getItem('wb_auth') || '{}') || {}).token || ''; }
+      catch (e) { return ''; }
+    })();
+    const withToken = (url) => token ? url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token) : url;
+
+    function showAuthGuide() {
+      const listEl = document.getElementById('list');
+      listEl.innerHTML = `
+        <div class="empty" style="text-align:left;padding:28px 20px;line-height:1.9">
+          <div class="big" style="text-align:center">🔒</div>
+          <div style="text-align:center;font-size:15px;font-weight:700;margin-bottom:8px">录制回放需要管理员身份</div>
+          <div style="color:#8a8070;font-size:13px">
+            录制文件里可能有会议画面与声音，所以只对管理员开放。<br>
+            请先用管理员账号登录，再回到本页。
+          </div>
+          <div style="margin-top:16px;text-align:center">
+            <a href="/" style="color:#d8b36a">去登录 →</a>
+          </div>
+        </div>`;
+    }
+
     (async () => {
       const listEl = document.getElementById('list');
       let items = [];
+      let res;
       try {
-        const res = await fetch('/api/recordings');
-        items = await res.json();
+        res = await fetch('/api/recordings', { headers: token ? { Authorization: 'Bearer ' + token } : {} });
       } catch (e) {
         listEl.innerHTML = '<div class="empty"><div class="big">⚠️</div>列表加载失败</div>';
         return;
       }
+      if (res.status === 401) { showAuthGuide(); return; }
+      try { items = await res.json(); } catch (e) { items = []; }
+      if (!Array.isArray(items)) items = [];
       if (!items.length) {
         listEl.innerHTML = '<div class="empty"><div class="big">📼</div>还没有录制——进会议点成员行的 ⏺ 录一段</div>';
         return;
@@ -99,14 +129,16 @@
           listEl.querySelectorAll('.item').forEach((x) => x.classList.remove('active'));
           row.classList.add('active');
           const v = document.getElementById('video');
-          v.src = '/recordings/' + encodeURIComponent(it.name);
+          // ★ 受保护资源：必须带 token（video/download 发不出请求头，只能走查询串）
+          const mediaUrl = withToken('/recordings/' + encodeURIComponent(it.name));
+          v.src = mediaUrl;
           v.classList.remove('hidden');
           v.play().catch(() => {}); // 自动播失败（浏览器策略）就等用户手点
           const meta = document.getElementById('meta');
           meta.classList.remove('hidden');
           meta.textContent = '';
           const a = document.createElement('a');
-          a.href = v.src; a.download = it.name;
+          a.href = mediaUrl; a.download = it.name;
           a.textContent = '⬇ 下载 ' + it.name;
           const t = document.createElement('span');
           t.textContent = fmt(it.size) + ' · ' + new Date(it.mtime).toLocaleString();

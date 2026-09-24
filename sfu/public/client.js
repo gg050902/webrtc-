@@ -189,6 +189,21 @@ const lowBwBtn = $('lowBwBtn');
 const capManualInput = $('capManualInput');
 const capManualSend = $('capManualSend');
 
+/* ★ 09-24（第 33 步，2026-09-24）安全上下文提示横幅元素（与 index.html 一一对应）
+ *   起因：用户把网址发到手机 / 别人的电脑，会出现"地址栏不安全 + 摄像头拿不到"两个现象，
+ *   看起来像"手机功能没做"，其实根因是浏览器只在安全上下文（https/localhost）才给摄像头。
+ *   这一组元素就是把这个原因和两种解法直接摊在页面上（逻辑见文件末尾"第 33 步"）：
+ *     insecureBanner  = 横幅容器（默认 .hidden，只在非安全上下文显示）
+ *     insecureCloseBtn= 关闭按钮（关闭后写 localStorage，不再自动弹）
+ *     ibCmd1 / ibCopy1= 解法①『局域网自签 https』的命令与"复制命令"按钮
+ *     ibCmd2 / ibCopy2= 解法②『公网受信任隧道』的命令与"复制命令"按钮 */
+const insecureBanner = $('insecureBanner');
+const insecureCloseBtn = $('insecureClose');
+const ibCmd1 = $('ibCmd1');
+const ibCopy1 = $('ibCopy1');
+const ibCmd2 = $('ibCmd2');
+const ibCopy2 = $('ibCopy2');
+
 /* ──────────────────────────────────────────────────────────────
  * 第 2 步：日志工具
  * ────────────────────────────────────────────────────────────── */
@@ -255,14 +270,34 @@ async function startLocalMedia() {
       roomInput.value = pendingRoom;
     }
   } catch (err) {
-    log(`❌ 拿不到摄像头/麦克风：${err.name}（可在预览页直接进入，稍后重试）`);
+    /* ★ 09-24（第 33 步）：把"错误名"和"真正原因"分开说 —— 这是本步最容易被忽略的一处。
+     *   ⚠️ 坑：http + IP 下 getUserMedia 抛的是 **NotAllowedError**，和"用户点了拒绝"**同名**！
+     *   用户一看 NotAllowedError 会以为是自己没授权，跑去系统权限/浏览器权限里白找一圈，
+     *   其实真凶是安全上下文（浏览器根本不让他调用设备）。两者必须分开讲。
+     *   判断沿用项目既有写法（isSecureContext !== false，桩环境无字段按安全处理）。 */
+    const insecure = isInsecureContext();
+    if (insecure) {
+      log(`❌ 拿不到摄像头/麦克风：${err.name} —— 但真正原因**不是权限**，是安全上下文`);
+      log('   当前是 http + IP 访问，浏览器**禁用**了摄像头/麦克风（地址栏的「不安全」也是这个原因）。');
+      log('   这不是设备问题，也不是你点了"拒绝"。解法见页面顶部横幅，任选其一：');
+      log('   ① 局域网自签 https：npm run start:lan  （浏览器会警告一次，点"高级 → 继续前往"）');
+      log('   ② 公网受信任 https：cloudflared tunnel --url http://localhost:3001  （零警告，手机可直接开）');
+    } else {
+      log(`❌ 拿不到摄像头/麦克风：${err.name}（可在预览页直接进入，稍后重试）`);
+    }
     // ★ F3：取不到媒体也允许进房（只订阅别人的画面、不发布自己）——预览页给出提示
     createBtn.disabled = false;
     joinRoomBtn.disabled = false;
     roomInput.disabled = false;
     roomPasswordInput.disabled = false;
     preVideoHintEl.classList.remove('hidden');
-    if (pjStatusEl) pjStatusEl.textContent = `摄像头/麦克风不可用（${err.name}），可直接进入会议`;
+    if (pjStatusEl) pjStatusEl.textContent = insecure
+      ? '摄像头/麦克风被浏览器禁用（非安全上下文：请用 https 或 localhost —— 见页面顶部提示）'
+      : `摄像头/麦克风不可用（${err.name}），可直接进入会议`;
+    // 把"解法入口"再露一次：横幅没被关过就弹出来；关过则退成一条 toast 指路（不强行弹回，尊重用户选择）
+    if (insecure && !openInsecureNotice()) {
+      showToast('⚠️ 摄像头被浏览器禁用（http + IP，非设备问题）——解法见下方「流程日志」', 'error');
+    }
   }
 }
 
@@ -5677,24 +5712,44 @@ function updateAgentHint() {
   if (agentCmdEl && myRoom) agentCmdEl.textContent = `node agent/index.js --room ${myRoom}`;
 }
 
-rdBtn('agentCopy', () => {
-  const t = (agentCmdEl && agentCmdEl.textContent) || '';
+/* ★ 09-24：一键复制（agentCopy 与安全提示横幅共用一套实现）
+ * ▎为什么要把原先内联在 agentCopy 里的逻辑抽出来？因为第 33 步的安全提示横幅又有两处要
+ *   复制（start:lan / cloudflared）——同一套"现代 API 优先、选中兜底"的分支抄三遍，
+ *   改一处就得改三处，是典型会漂移的副本。抽成一个函数，三处按钮都调它。
+ * ▎降级链（真实浏览器里踩过的坑）：
+ *   ① 优先用 navigator.clipboard.writeText（异步、要求页面聚焦）；
+ *   ② 它可能**根本不存在**——尤其在 http + IP 页面里（又是安全上下文规则！），
+ *      所以必须有兜底，否则"复制"按钮点了没反应，用户只会觉得坏了；
+ *   ③ 兜底 = 用 Range 选中文本 + 提示 Ctrl+C（命令块本身 user-select: all，手动也好选）。 */
+function copyTextToClipboard(text, fallbackEl, okMsg) {
+  const t = String(text || '').trim();
   if (!t) return;
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(t).then(
-      () => showToast('✅ 命令已复制，粘到终端回车即可'),
-      () => showToast('复制失败，请手动选中这行命令复制', 'error'),
+      () => showToast(okMsg || '✅ 已复制到剪贴板'),
+      () => selectTextWithHint(fallbackEl),
     );
   } else {
-    try {                                       // 降级：选中文本，用户 Ctrl+C
+    selectTextWithHint(fallbackEl);
+  }
+}
+
+/* 复制降级：选中目标文本并提示 Ctrl+C（无剪贴板 API / 复制被拒时走这里） */
+function selectTextWithHint(el) {
+  try {
+    if (el) {
       const r = document.createRange();
-      r.selectNodeContents(agentCmdEl);
+      r.selectNodeContents(el);
       const sel = window.getSelection();
       sel.removeAllRanges();
       sel.addRange(r);
-      showToast('已选中命令，按 Ctrl+C 复制', 'info');
-    } catch (e) { showToast('请手动复制这行命令', 'error'); }
-  }
+    }
+    showToast('已选中命令，按 Ctrl+C 复制', 'info');
+  } catch (e) { showToast('复制失败，请手动选中这行命令复制', 'error'); }
+}
+
+rdBtn('agentCopy', () => {
+  copyTextToClipboard((agentCmdEl && agentCmdEl.textContent) || '', agentCmdEl, '✅ 命令已复制，粘到终端回车即可');
 });
 
 rdBtn('agentHow', () => {
@@ -5707,6 +5762,92 @@ rdBtn('agentHow', () => {
   log('   权限方面没有任何特殊待遇：走的是和人类完全相同的授权链路，服务器不认识"代理特权"。');
   showToast('📋 说明已打到下方「流程日志」里', 'info');
 });
+
+/* ══════════════════════════════════════════════════════════════════════════════════
+ * 第 33 步 ★ 2026-09-24 安全上下文提示横幅（回答"为什么手机 / 别人的电脑用不了"）
+ * ══════════════════════════════════════════════════════════════════════════════════
+ *
+ * ▎先把"真凶"说透（这是本步存在的全部理由）：
+ *   用户把 http://192.168.x.x:3001 发给别人、或用手机打开，会稳定看到两个现象：
+ *     ① 浏览器地址栏显示「不安全」；② 摄像头 / 麦克风拿不到（看起来像"手机功能没做"）。
+ *   根因**不是代码 bug**，是浏览器的安全规则：只有在**安全上下文**（https:// 或 localhost）
+ *   下，浏览器才允许 getUserMedia（摄像头/麦克风）与 Service Worker。纯 IP 的 http 页面
+ *   永远拿不到 —— 这条规则的意义是"否则任意网页都能偷开你的摄像头"。
+ *   所以"修"它的方向只有一个：把访问方式变成安全上下文。具体两条路：
+ *     ① 局域网自签 https（npm run start:lan）——最快，但证书是自签的，浏览器**一定会**
+ *        提示一次「不是私密连接」，要点"高级 → 继续前往"；手机上 iOS Safari 还要去
+ *        「设置 → 通用 → VPN与设备管理 / 关于本机 → 证书信任设置」里手动信任，比较麻烦。
+ *     ② 公网受信任 https（Cloudflare Tunnel）——拿到 https://xxx.trycloudflare.com，
+ *        这是**受信任证书、零警告**，手机和别人的电脑都能直接打开。
+ *   一句话结论：自签只适合自己在局域网演示；要给别人 / 手机无障碍访问，用隧道拿受信任证书。
+ *   ⚠️ 边界（必须诚实地讲）：隧道只承载 HTTP / WebSocket，也就是"网页 + 信令"。
+ *      Mesh 版媒体是 P2P 直达，过隧道能通；**SFU 版媒体是 UDP，过不去隧道** ——
+ *      所以"发布公网给外人开完整会议"要发 Mesh 版（node scripts/publish.js --tunnel）。
+ *
+ * ▎为什么判断写成 `window.isSecureContext !== false` 而不是 `=== false`？
+ *   因为无头测试桩（scripts/test-sfu-client-smoke.js）没有这个字段。沿用本项目既有写法
+ *   （Service Worker 注册处、第 29 步字幕自检 capPreflight）——"字段缺失时按安全处理"，
+ *   这样桩环境不会误报。真实浏览器里该字段**一定存在**，所以也不会漏报。
+ *
+ * ▎为什么关闭状态要记本地存储？
+ *   横幅是"解释 + 指路"，不是每次都要念一遍。用户读过、点了关闭之后，同一浏览器就别再自动弹，
+ *   否则就从"教学提示"变成了"扰民的弹窗"。教学提示的第一原则：该出现时出现，用户说不要就闭嘴。
+ * ══════════════════════════════════════════════════════════════════════════════════ */
+
+const INSECURE_DISMISS_KEY = 'sfu_insecure_notice_dismissed';   // 本地存储键：关过就不再自动弹
+
+/* 是否处于"非安全上下文"——沿用既有写法：字段缺失（测试桩）按安全处理 */
+function isInsecureContext() {
+  return window.isSecureContext === false;
+}
+
+function insecureNoticeDismissed() {
+  try { return localStorage.getItem(INSECURE_DISMISS_KEY) === '1'; }
+  catch (e) { return false; }                 // 隐私模式下读不了 localStorage，按"没关过"处理
+}
+function dismissInsecureNotice() {
+  try { localStorage.setItem(INSECURE_DISMISS_KEY, '1'); }
+  catch (e) { /* 隐私模式写不了，忽略：本次会话仍然记在内存里靠"已隐藏"生效 */ }
+}
+
+/* 显示横幅：尊重"用户已关闭"；返回 true 表示这次真的显示了。
+ * 被 startLocalMedia 的 catch 复用（摄像头失败时再露一次解法入口）。 */
+function openInsecureNotice() {
+  if (!isInsecureContext() || !insecureBanner) return false;
+  if (insecureNoticeDismissed()) return false;
+  if (insecureBanner.classList) insecureBanner.classList.remove('hidden');
+  return true;
+}
+
+/* 页面加载时调用一次：只有"非安全上下文 + 没关过"才弹 */
+function initInsecureNotice() {
+  if (!isInsecureContext()) return;            // https / localhost：什么都不做（不打扰）
+  if (insecureNoticeDismissed()) {
+    log('ℹ️ 当前是 http + IP 访问（浏览器会禁用摄像头/麦克风）；安全提示横幅此前已被关闭，不再自动弹出');
+    return;
+  }
+  if (insecureBanner && insecureBanner.classList) insecureBanner.classList.remove('hidden');
+  log('⚠️ 检测到非安全上下文（http + IP）：浏览器会禁用摄像头 / 麦克风 —— 页面顶部横幅给出了两种解法');
+
+  // 两个命令的"复制命令"按钮：复用 copyTextToClipboard（与 agentCopy 同一套实现，不重复造轮子）
+  const copyPairs = [
+    [ibCopy1, ibCmd1, '✅ 已复制，粘到终端回车即可（也可以直接双击 start-lan.bat）'],
+    [ibCopy2, ibCmd2, '✅ 已复制，粘到终端回车即可（需先装 cloudflared）'],
+  ];
+  for (const [btn, cmd, msg] of copyPairs) {
+    if (btn && btn.addEventListener) {
+      btn.addEventListener('click', () => copyTextToClipboard((cmd && cmd.textContent) || '', cmd, msg));
+    }
+  }
+
+  if (insecureCloseBtn && insecureCloseBtn.addEventListener) {
+    insecureCloseBtn.addEventListener('click', () => {
+      if (insecureBanner && insecureBanner.classList) insecureBanner.classList.add('hidden');
+      dismissInsecureNotice();
+      log('已关闭安全提示横幅（本浏览器不再自动弹出；清站点数据或换浏览器会再出现）');
+    });
+  }
+}
 
 /* ------------------------------------------------------------------------------
  * 启动：页面一加载就打开摄像头
@@ -5721,3 +5862,6 @@ logTitle.addEventListener('click', () => {
 });
 
 startLocalMedia();
+// ★ 第 33 步：非安全上下文时弹出安全提示横幅。放在 startLocalMedia 之后调用，
+//   这样"正在连接信令服务器/本地媒体就绪"这类首行日志仍在最上面，横幅日志不会抢戏。
+initInsecureNotice();
