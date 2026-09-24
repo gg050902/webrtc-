@@ -208,6 +208,11 @@ async function requestHandler(req, res) {
       // ★ 09-24 AI 模式：**只下发布尔值**——前端据此显示「LLM / Mock」状态灯。
       //   密钥本身绝不下发（连末四位都不给）：浏览器是公开可下载的资源，任何回显都是泄露。
       aiEnabled: AI.aiEnabled(),
+      // ★ 09-24 真远程桌面：告诉前端"本服务器支持桌面代理（agent/index.js）"。
+      //   前端据此决定要不要显示「🖥️ 控制电脑」按钮和 agent 相关指引。
+      remoteDesktop: true,
+      // 代理启动命令模板：前端把它显示在页面上，用户复制到终端就能起代理（省得记参数）
+      agentCommand: `node agent/index.js --room ${'{房间号}'}`,
     }));
     return;
   }
@@ -1521,6 +1526,9 @@ function broadcastRoomState(roomNumber) {
     sharing: !!(m.state && m.state.sharing),
     hand: !!(m.state && m.state.hand),     // ★ 09-13 F4：举手（要发言）
     caption: !!(m.state && m.state.caption), // ★ 09-17b：实时字幕开关（成员列表 💬）
+    // ★ 09-24 真远程桌面：是不是桌面代理（前端据此显示 🖥️ 徽标 + "控制电脑"按钮）
+    agent: m.isAgent === true,
+    agentInfo: m.isAgent ? (m.agentInfo || null) : null,
   }));
   // ★ 09-19 AI Bot 参会者（C 档）：bot 在场时以虚拟成员身份出现在快照里——
   //   它没有 socket/媒体，muted/camOff 都是"是"（它不推流，只"听"：见下方音频管线）
@@ -1862,6 +1870,11 @@ io.on('connection', (socket) => {
    */
   socket.username = null;      // ★ 09-16：登录后的用户名（游客为 null）
   socket.displayName = null;   // ★ 09-16：昵称（未设置时前端回退"成员 xxxx"）
+  // ★ 09-24 真远程桌面：这台连接是不是"被控端桌面代理"（agent/index.js 起的本地程序）。
+  //   打这个标记的唯一目的是**区分机器和人**：成员列表显示 🖥️ 徽标、控制按钮换文案、
+  //   画面帧通道只认代理。所有别的权限（进房校验/授权链路）与人类一模一样，没有任何特权。
+  socket.isAgent = false;
+  socket.agentInfo = null;     // { platform, browser } —— 只是给 UI 显示"被控的是什么机器"
   socket.sendTransport = null;
   socket.recvTransport = null;
   socket.producers = new Map(); // producerId -> Producer（我上传的）
@@ -1958,7 +1971,12 @@ io.on('connection', (socket) => {
 
     if (members.size >= MAX_MEMBERS) {
       socket.emit('room-full', { max: MAX_MEMBERS });
-      return;
+      /* ★ 09-24 修 bug：这里原来只 `return;`（返回 undefined），而调用方
+       *   （join-room / agent-hello）照旧回"进房成功"—— 于是出现**假成功**：
+       *   桌面代理打印"已就绪"，房间里却根本没有它这个成员，控制端也找不到它。
+       *   假成功是最阴的一类 bug：UI 说成功、实际没生效，用户只能靠"怎么没反应"猜。
+       *   教训：**凡是"我做了某事"的函数，必须把成败如实返回给调用方**。 */
+      return false;
     }
 
     // 进房前先把"媒体中枢 Router"准备好（第 1 个人负责把它建出来）
@@ -1995,6 +2013,7 @@ io.on('connection', (socket) => {
         dataProducerId: dp.id,
         label: dp.label,
       })),
+      agent: m.isAgent === true, // ★ 09-24：让新人一眼看出"这台是机器代理，可以控它电脑"
     }));
     socket.emit('room-members', { roomNumber, members: memberList });
 
@@ -2006,6 +2025,8 @@ io.on('connection', (socket) => {
 
     // ④ ★ F2：房间有人了就开始"量网"定时器（幂等；成员列表的网络点用）
     startNetLevelBroadcaster(roomNumber);
+
+    return true;   // ★ 09-24：明确回报"真的进成了"（见上面满员分支的说明）
   };
 
   /* ---- 房间相关事件（从 Mesh 版复制，逻辑几乎没变）---- */
@@ -2049,8 +2070,54 @@ io.on('connection', (socket) => {
       if (callback) return fail(callback, '密码不对');
       return;
     }
-    await joinRoom(roomNumber);
-    if (callback) ok(callback, { roomNumber });
+    const joined = await joinRoom(roomNumber);
+    // ★ 09-24：joinRoom 现在会如实返回成败——满员时要明确报错，不能"假成功"
+    if (callback) return joined ? ok(callback, { roomNumber }) : fail(callback, '房间已满');
+  });
+
+  /* ---- 事件 5.4b：★ 09-24 真远程桌面 —— 被控端"桌面代理"进房 ----
+   *
+   * ▎它解决什么？浏览器受安全沙箱限制，**不能**移动真实光标、敲真实键盘、截别的程序。
+   *   所以真远程桌面必须有一个跑在被控电脑上的本地程序（agent/index.js）。
+   *   这个事件就是那个本地程序的"报到"入口。
+   *
+   * ▎为什么不直接复用 join-room？（面试可讲的一个设计取舍）
+   *   因为房间里从此有两种成员：**人**和**机器**。UI 要区分（🖥️ 徽标、"控制电脑"按钮文案），
+   *   画面通道也不同（代理推的是 CDP 抓来的 JPEG 帧，不是 WebRTC 视频轨）。
+   *   让服务器在报到时就打上标记，快照广播时带出去——前端照单渲染，不猜。
+   *   （同 D4 的思路：状态放唯一权威处，别让每个客户端自己拼。）
+   *
+   * ▎安全：房间存在性 / 密码 / 人数上限，三道校验和 join-room 一字不差。
+   *   **没有任何"代理特权"**——它只是"一个会自动应答授权的成员"。
+   *   甚至可以说：agent 是房间里**权限最小**的成员，因为它不能推音视频、不能踢人、
+   *   不能发聊天，只做"被控"这一件事。
+   */
+  socket.on('agent-hello', async ({ roomNumber, password, name, platform, browser } = {}, callback) => {
+    if (socket.roomNumber) return fail(callback, '已在房间里');
+    if (!/^\d{6}$/.test(roomNumber || '')) return fail(callback, '房间号格式不对');
+    if (!rateLimit(`join:${socket.id}`, 20, 60000)) return fail(callback, '请求过于频繁');
+    const room = rooms.get(roomNumber);
+    if (!room) { socket.emit('room-not-found', { roomNumber }); return fail(callback, '房间不存在'); }
+    if (room.password && room.password !== (password || '')) {
+      socket.emit('room-wrong-password', { roomNumber }); return fail(callback, '密码不对');
+    }
+    if (room.members.size >= MAX_MEMBERS) {
+      socket.emit('room-full', { max: MAX_MEMBERS }); return fail(callback, '房间已满');
+    }
+
+    socket.isAgent = true;
+    socket.agentInfo = {
+      platform: String(platform || '').slice(0, 40),
+      browser: String(browser || '').slice(0, 40),
+    };
+    // 名字统一加 🖥️ 前缀：房间列表里"人"和"机器"一眼可辨（前端还会再画个徽标）
+    socket.displayName = '🖥️ ' + (String(name || '').trim().slice(0, 20) || '桌面代理');
+
+    const agJoined = await joinRoom(roomNumber);
+    if (!agJoined) return fail(callback, '房间已满');   // ★ 09-24：满员要明确报错（防"假成功"）
+    logEvent('info', 'agent-joined', { roomNumber, memberId: socket.id, name: socket.displayName });
+    console.log(`🖥️ 桌面代理进房：${socket.displayName}（${socket.agentInfo.browser || '未知浏览器'}）→ 房间 ${roomNumber}`);
+    ok(callback, { roomNumber, memberId: socket.id });
   });
 
   // 聊天（SFU 版方案 A：走服务器广播——见 SFU-BLUEPRINT.md 5.4）
@@ -2198,6 +2265,59 @@ io.on('connection', (socket) => {
     if (!ctl || ctl.controllerId !== socket.id || ctl.hostId !== to) return; // 门禁
 
     io.to(to).emit('remote-input', { event }); // 定向转发给被控端
+  });
+
+  /* ---- 事件 5.6b：★ 09-24 真远程桌面 —— 画面帧回传（方向刚好和 remote-input 相反）
+   *
+   * ▎方向：被控端（桌面代理）→ 服务器 → 控制端。
+   *   remote-input 是"控制端 → 被控端"（发指令），这条是"被控端 → 控制端"（回画面）。
+   *   两条合起来才构成闭环，也正好是真实远程桌面产品的最小骨架。
+   *
+   * ▎为什么不让 agent 直接把画面推给控制端？
+   *   SFU 架构下浏览器之间没有直连（这正是 SFU 的定义），画面只能经服务器转。
+   *   顺带好处：服务器**看得见**这条通道 —— 能限流、能计费、能审计，
+   *   这是"中心化"换来的一种安全能力（Mesh 版 P2P 就给不了）。
+   *
+   * ▎三道门禁（比 remote-input 更严，因为这条通道流量大得多）：
+   *   ① **身份闸**：发的人必须是桌面代理（isAgent）——人类浏览器没理由往这条通道灌数据；
+   *   ② **授权闸**：必须是登记在册的"被控端"，且 to 必须正好是那一位控制端
+   *      （防止代理把画面转给房间里的第三者围观）；
+   *   ③ **体量闸**：单帧 ≤ 900KB + 帧率限流 120 帧/秒 —— 防"合法身份灌流量"。
+   *      ★ 注意这里的原则：**即使是被控端自己起的可信程序，也不给超额权限**。
+   *        信任 ≠ 免检查，这是纵深防御（defense in depth）的基本要求。
+   */
+  socket.on('remote-frame', ({ to, frame } = {}) => {
+    const roomNumber = socket.roomNumber;
+    if (!roomNumber || !to || !socket.isAgent) return;                   // ① 身份闸
+    const isBinary = Buffer.isBuffer(frame) || ArrayBuffer.isView(frame) || frame instanceof ArrayBuffer;
+    if (!isBinary) return;                                               // 只收二进制（比 base64 省 33% 带宽）
+    const len = frame.byteLength || frame.length || 0;
+    if (len === 0 || len > 900 * 1024) return;                           // ③ 大小闸
+    if (!rateLimit(`frame:${socket.id}`, 120, 1000)) return;              // ③ 帧率闸
+    const ctl = remoteCtl.get(roomNumber);
+    if (!ctl || ctl.hostId !== socket.id || ctl.controllerId !== to) return; // ② 授权闸
+    // volatile：控制端网络跟不上时**直接丢帧**，而不是在服务器内存里排队 ——
+    //   实时画面宁可掉帧也不能延迟，这是所有实时系统的共同取舍（背压决策）。
+    io.to(to).volatile.emit('remote-frame', { frame });
+  });
+
+  /* remote-meta：被控端回报"当前页面的 URL / 标题 / 视口尺寸"。
+   * ▎用途：控制端的地址栏要显示**真实地址**（像真的浏览器一样），
+   *   视口尺寸则让前端能把归一化坐标算得更准。
+   * ▎频率很低（只在导航/窗口变化时发），所以走普通 emit（不 volatile）——
+   *   状态类消息不能丢，丢一帧画面无所谓，丢一次 URL 会让地址栏停在旧地址。 */
+  socket.on('remote-meta', ({ to, url, title, viewport } = {}) => {
+    const roomNumber = socket.roomNumber;
+    if (!roomNumber || !to || !socket.isAgent) return;
+    const ctl = remoteCtl.get(roomNumber);
+    if (!ctl || ctl.hostId !== socket.id || ctl.controllerId !== to) return;
+    io.to(to).emit('remote-meta', {
+      url: String(url || '').slice(0, 500),
+      title: String(title || '').slice(0, 200),
+      viewport: viewport && typeof viewport.width === 'number'
+        ? { width: Math.round(viewport.width), height: Math.round(viewport.height) } : null,
+      ts: Date.now(),
+    });
   });
 
   /* ---- 事件 5.7：★ D4 升级（2026-09-11）—— 成员状态上报 + 踢人 ----

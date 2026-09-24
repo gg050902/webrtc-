@@ -80,8 +80,19 @@ function getSettings() {
   };
 }
 
-/** 是否配置了真 LLM（用于 /config.json 下发——只给布尔值，不给 key） */
+/** 是否配置了真 LLM（用于 /config.json 下发——只给布尔值，不给 key）
+ *
+ * ★ 09-24 补：AI_FORCE_MOCK=1 时**一律走本地兜底**，无论有没有 key。
+ *   为什么需要这个开关？（这是"测试确定性"的必修课）
+ *     自动化测试里断言"AI 任务在 2.5 秒内完成并交还控制权" —— 走真 LLM 时，
+ *     同样一句话的网络往返可能是 1.8 秒也可能 9 秒（模型负载、限流、长尾延迟）。
+ *     于是测试会时绿时红 —— 这种"flaky test"比测试失败更糟糕：
+ *     它会让团队学会"红了重跑一次就行"，真出问题时没人当回事。
+ *   正确做法：**测试只测自己的代码，不测外部服务的速度**。真 LLM 的连通性
+ *   另有 test-ai.js 的 LLM 轨道专门验证（那个是"探活"，不是"断言性能"）。
+ */
 function aiEnabled() {
+  if (process.env.AI_FORCE_MOCK === '1') return false;
   return !!getApiKey();
 }
 
@@ -186,6 +197,8 @@ async function streamLLM(messages, opts = {}, onDelta) {
     return { text, mock: true, ms: Date.now() - started, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, reason };
   };
 
+  // ★ 09-24：测试轨道强制 Mock（不走网络，结果确定）——见 aiEnabled() 的说明
+  if (process.env.AI_FORCE_MOCK === '1') return fail('forced-mock');
   const key = getApiKey();
   if (!key) return fail('no-key');
 

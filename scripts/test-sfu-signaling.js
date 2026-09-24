@@ -2,12 +2,56 @@
 // 验证：房间/密码（复用）+ Router 能力 + Transport 创建/防重 + consume 的错误路径。
 // （produce/consume 的真实媒体需要浏览器摄像头，无法命令行模拟——
 //   这里能证明 mediasoup Worker/Router/Transport 在服务器端真的能建起来）
-// 运行：先起服务器，再 npm run test:sfu
-//   ★ 2026-09-23 补记：AI 操作员那组断言（09-19g）等计划执行 2.5s，而默认步进
-//     AI_OP_STEP_MS=600（7 步要 4.2s）——起服务器必须带加速变量，否则那组会假失败：
-//     AI_OP_STEP_MS=20 node sfu/server.js
+// 运行：npm run test:sfu
+//   ★ 2026-09-23 补记：AI 操作员那组断言（09-19g）要等计划执行完，而默认步进
+//     AI_OP_STEP_MS=600（7 步要 4.2s）—— 所以脚本必须让服务器跑在加速模式。
+//   ★ 2026-09-24 重构：**脚本自己管服务器**（下面 ensureServer）。
+//     起因是一次真实事故：手动起的服务器忘了带 AI_OP_STEP_MS，那组断言假失败，
+//     排查了半天才发现"不是代码坏了，是环境没带对"。
+//     教训：**回归脚本要能一条命令跑完，环境差异必须由脚本自己消除**——
+//     否则"怎么跑"这件事会靠口口相传，迟早出错。
+//     顺带把 AI 强制到确定性轨道（AI_FORCE_MOCK=1）：测试只测自己的代码，
+//     不测外部 LLM 的网络速度（真 LLM 的连通性由 test:ai 那个专门轨道负责）。
 const { io } = require('C:/Users/27418/Desktop/webrtc/node_modules/socket.io-client');
+const { spawn } = require('child_process');
+const nodePath = require('path');
 const URL = 'http://localhost:3001';
+
+let serverProc = null;
+
+function pingServer() {
+  return new Promise((resolve) => {
+    const req = require('http').get('http://localhost:3001/config.json', (r) => {
+      r.resume();
+      resolve(r.statusCode === 200);
+    });
+    req.on('error', () => resolve(false));
+    req.setTimeout(1500, () => { req.destroy(); resolve(false); });
+  });
+}
+
+async function ensureServer() {
+  if (await pingServer()) {
+    console.log('⚠️  3001 端口已有服务器在跑 —— 本脚本直接用它。');
+    console.log('   若那个服务器没带 AI_OP_STEP_MS=20 / AI_FORCE_MOCK=1，AI 那组断言可能假失败。');
+    console.log('   想跑确定性回归：先把它关掉，让本脚本自己起一个。\n');
+    return;
+  }
+  console.log('🚀 自起测试服务器（AI_OP_STEP_MS=20 加速 + AI_FORCE_MOCK=1 确定性轨道）…');
+  serverProc = spawn(process.execPath, [nodePath.join(__dirname, '..', 'sfu', 'server.js')], {
+    env: { ...process.env, AI_OP_STEP_MS: '20', AI_FORCE_MOCK: '1' },
+    cwd: nodePath.join(__dirname, '..'),
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  serverProc.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
+  for (let i = 0; i < 80; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+    if (await pingServer()) { console.log('✅ 测试服务器已就绪\n'); return; }
+  }
+  throw new Error('测试服务器启动超时（看上面 [server] 输出）');
+}
+
+function stopServer() { if (serverProc) { try { serverProc.kill(); } catch (e) { /* ignore */ } serverProc = null; } }
 
 let pass = 0, fail = 0;
 const ok = (n, c) => { if (c) { pass++; console.log('  PASS  ' + n); } else { fail++; console.log('  FAIL  ' + n); } };
@@ -28,6 +72,7 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
 });
 
 (async () => {
+  await ensureServer();   // ★ 09-24：一条命令跑完全套，环境差异由脚本自己抹平
   // G6：读服务器 token TTL（决定过期路径断言是否实测）
   try {
     const cfgBody = await new Promise((resolve, reject) => {
@@ -637,13 +682,21 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   if (!botReq) { ok('09-19g 后续：授权/输入/释放（依赖上一步，未达）', false); }
   // 被控端允许（与人类授权完全同一条信令；限时 8s 防泄漏）
   else A.s.emit('remote-answer', { to: botReq.from, ok: true, durationMs: 8000 });
-  await sleep(2500); // 等计划执行（AI_OP_STEP_MS 环境变量加速；Mock 计划 7 步）
+  // ★ 09-24 改：等"自动交还"事件，而不是死等固定时长。
+  //   固定 sleep 在慢机器 / 慢 LLM 上必然假失败，而假失败的代价最大——
+  //   明明代码是对的，界面红一片，于是大家学会"红了重跑"，真问题就没人看了。
+  //   事件驱动 + 超时上限，才是稳定的写法。
+  const handedBackP = new Promise((res) => {
+    const h = (p) => { if (p.controllerId === null) { A.s.off('remote-state', h); res(true); } };
+    A.s.on('remote-state', h);
+  });
+  const handedBack = await Promise.race([handedBackP, sleep(8000).then(() => false)]);
   A.s.off('remote-input', onInput);
   ok('09-19g 被控端收到 AI 的 remote-input 序列（≥5 条，含 16 字节帧）',
      inputs.length >= 5 &&
      inputs.some((p) => p.event && (p.event.byteLength === 16 || p.event.length === 16)));
   ok('09-19g 任务完成后 AI 自动交还控制权（remote-state 出现过 controllerId=null）',
-     aiStates.some((p) => p.controllerId === null));
+     handedBack && aiStates.some((p) => p.controllerId === null));
 
   // --- D1：对不存在的 Consumer 切层 → 走错误路径而不是崩服务 ---
   let layerErr = null;
@@ -771,7 +824,165 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('09-16 昵称贯通 room-state（成员列表显示昵称）',
      (auState.members.find((m) => m.id === AU.id) || {}).name === '爱丽丝');
 
+  /* ================= ★ 09-24 真远程桌面（桌面代理 agent / 画面帧通道）=================
+   * ▎这一组测的是"真控"这条新链路的**安全闸门**，而不只是"能跑通"。
+   *   因为画面通道是一条"被控端 → 控制端"的大流量单向管道，一旦门禁写漏，
+   *   后果是"房间里任何人都能看到你屏幕"或"任何人能往你屏幕上灌垃圾"。
+   *   所以下面每个闸门都单独测：身份闸 / 授权闸 / 体量闸 / 撤权即断。
+   */
+  console.log('\n--- 09-24 真远程桌面 ---');
+
+  // 腾位置：房间上限 8 人，本段要同时站住"代理 + 控制端 + 观察者"三个连接。
+  // 前面几组的客户端都已经测完，先把它们请出去（顺带也是一次真实的成员清退）。
+  // 用"取值函数 + 逐个 try"是为了容忍某个变量在当前作用域不存在——测试脚本反而不能因此崩掉。
+  for (const get of [() => C, () => D, () => H, () => I, () => M, () => AU]) {
+    try { const c = get(); if (c && c.s) c.s.disconnect(); } catch (e) { /* 不在作用域，跳过 */ }
+  }
+  await sleep(900);
+
+  const getJson = (p) => new Promise((resolve, reject) => {
+    require('http').get('http://localhost:3001' + p, (r) => {
+      let b = ''; r.on('data', (c) => (b += c)); r.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { reject(e); } });
+    }).on('error', reject);
+  });
+
+  const cfgNow = await getJson('/config.json');
+  ok('09-24 /config.json 声明支持桌面代理（前端据此显示「控制电脑」入口）', cfgNow.remoteDesktop === true);
+  ok('09-24 /config.json 下发代理启动命令模板（用户复制即用）', /agent\/index\.js/.test(cfgNow.agentCommand || ''));
+
+  /* ① 超员闸 —— 这一条是"补写的守门测试"，因为写它的时候真的抓到了一个 bug：
+   *   原来 joinRoom() 满员只 `return`（返回 undefined），调用方却照旧回"进房成功"
+   *   → **假成功**：代理打印"已就绪"，房间里却找不到它，控制端也无从下手。
+   *   假成功比崩溃更难查（不报错、只是"怎么没反应"），所以必须有个测试盯着它。 */
+  const curCount = await new Promise((res) => {
+    // ★ 必须排除 isBot：AI 助理是**虚拟成员**（在快照里、但不占 socket 名额），
+    //   算进人数就会多算一个 → 后面填充少一个 → "满房"测不出来（这个坑真踩了）。
+    const h = (p) => { F.s.off('room-state', h); res(p.members.filter((m) => !m.isBot).length); };
+    F.s.on('room-state', h);
+    F.s.emit('member-state', { patch: {} });   // 空 patch 也会触发一次快照广播
+  });
+  const fillers = [];
+  for (let i = curCount; i < 8; i++) {
+    const f = await client('fill' + i);
+    f.s.emit('join-room', { roomNumber: ROOM });
+    fillers.push(f);
+    await sleep(150);
+  }
+  await sleep(500);
+
+  const FULL3 = await client('FULL3');
+  let joinFullErr = null;
+  FULL3.s.emit('join-room', { roomNumber: ROOM }, (r) => { joinFullErr = r; });
+  await sleep(500);
+  ok('09-24 房间满时 join-room 明确失败（守门：修掉"假成功"这个真 bug）',
+     !!joinFullErr && !!joinFullErr.error);
+
+  const FULL4 = await client('FULL4');
+  let agentFullErr = null;
+  FULL4.s.emit('agent-hello', { roomNumber: ROOM, name: 'x' }, (r) => { agentFullErr = r; });
+  await sleep(500);
+  ok('09-24 房间满时 agent-hello 同样明确失败（代理吃同一条人数上限）',
+     !!agentFullErr && !!agentFullErr.error);
+  FULL3.s.disconnect(); FULL4.s.disconnect();
+
+  // 腾位置：把填充连接请出去，让代理正常进房（房间上限 8 人，前面测试已经占了不少）
+  for (const f of fillers) { try { f.s.disconnect(); } catch (e) { /* ignore */ } }
+  await sleep(800);
+
+  // ② 代理报到：agent-hello（不是 join-room —— 房间要区分"人"和"机器"）
+  const AG = await client('AG');
+  let agAck = null;
+  AG.s.emit('agent-hello', {
+    roomNumber: ROOM, name: '测试机', platform: 'win32', browser: 'Edg/test',
+  }, (r) => { agAck = r; });
+  await sleep(700);
+  ok('09-24 agent-hello 进房成功（返回房间号）',
+     !!agAck && !agAck.error && !!(agAck.data && agAck.data.roomNumber === ROOM));
+
+  // ③ 快照必须带 agent 标记 + 🖥️ 前缀名（前端靠它渲染徽标和按钮文案）
+  //    观察者用 F（A 在房主迁移那组已经退场了，这里不能再拿它当观察点）
+  const agRowP = new Promise((res) => {
+    const h = (p) => { const row = p.members.find((m) => m.id === AG.id); if (row) { F.s.off('room-state', h); res(row); } };
+    F.s.on('room-state', h);
+  });
+  AG.s.emit('member-state', { patch: { muted: false } });   // 触发一次快照广播
+  const agRow = await Promise.race([agRowP, sleep(3000).then(() => null)]);
+  ok('09-24 成员快照带 agent 标记（前端显示 🖥️ 徽标）', !!agRow && agRow.agent === true);
+  ok('09-24 代理名字带 🖥️ 前缀（人/机一眼可辨）', !!agRow && /^🖥️/.test(agRow.name || ''));
+
+  // ④ 代理也没有特权：房间不存在照样被拒（三道校验和 join-room 一样）
+  const AG2 = await client('AG2');
+  let agBad = null;
+  AG2.s.emit('agent-hello', { roomNumber: '000000' }, (r) => { agBad = r; });
+  await sleep(500);
+  ok('09-24 agent-hello 房间不存在被拒（代理无特权）', !!agBad && !!agBad.error);
+  AG2.s.disconnect();
+
+  /* ⑤ 走真实授权链路：控制端申请 → 代理应答（一个字都没豁免）
+   *   控制端用一条**新连接** CTL 而不是复用 B —— 因为要确保"控制端"和"观察者/第三人"
+   *   是两个不同的人，否则授权闸那几条断言就测不出"画面会不会漏给别人"。 */
+  const CTL = await client('CTL');
+  let ctlJoined = null;
+  CTL.s.emit('join-room', { roomNumber: ROOM }, (r) => { ctlJoined = r; });
+  await sleep(700);
+  ok('09-24 控制端能正常进房（代理不占用别人的进房权）', !!ctlJoined && !ctlJoined.error);
+
+  const agentReqP = waitEvent(AG.s, 'remote-request');
+  CTL.s.emit('remote-request', { to: AG.id });
+  const agentReq = await Promise.race([agentReqP, sleep(3000).then(() => null)]);
+  ok('09-24 控制端能向代理申请控制（复用同一张授权信令）', !!agentReq && agentReq.from === CTL.id);
+  AG.s.emit('remote-answer', { to: CTL.id, ok: true, durationMs: 20000 });
+  await sleep(400);
+
+  const frames = [];
+  CTL.s.on('remote-frame', (p) => frames.push(p));
+
+  // ⑥ 身份闸：人类冒充代理灌画面 → 必须被丢
+  CTL.s.emit('remote-frame', { to: CTL.id, frame: new Uint8Array(1024) });
+  await sleep(400);
+  ok('09-24 身份闸：非代理发画面帧被丢弃（人类冒充不了代理）', frames.length === 0);
+
+  // ⑦ 授权闸：代理把画面发给"不在控制关系里的第三人"（F 在房间但不是控制端）→ 必须被丢
+  AG.s.emit('remote-frame', { to: F.id, frame: new Uint8Array(512) });
+  await sleep(400);
+  ok('09-24 授权闸：画面不会旁路流给第三人（to 必须正好是控制端）', frames.length === 0);
+
+  // ⑧ 正常路径：授权通过 → 代理的帧抵达控制端（真控闭环打通）
+  AG.s.emit('remote-frame', { to: CTL.id, frame: new Uint8Array(2048).fill(7) });
+  await sleep(500);
+  ok('09-24 正常路径：代理画面帧抵达控制端（真控闭环打通）',
+     frames.length === 1 && (frames[0].frame.byteLength || frames[0].frame.length) === 2048);
+
+  // ⑨ 体量闸：超过 900KB 的帧被丢（防"合法身份灌流量"——信任≠免检查）
+  //    ★ 帧大小要卡在"超过业务上限 900KB"和"socket.io 单消息上限 1MB"之间。
+  //      一开始图省事用了 1MB，结果 socket.io 自己先把连接掐了 ——
+  //      那测到的就不是我们的闸门，而是传输层的保护（测错东西比测失败更危险）。
+  AG.s.emit('remote-frame', { to: CTL.id, frame: new Uint8Array(950 * 1024) });
+  await sleep(500);
+  ok('09-24 体量闸：超过 900KB 的帧被丢弃', frames.length === 1);
+  ok('09-24 超大帧不会掐断代理连接（一条坏消息不该搞死整条通道）', AG.s.connected === true);
+
+  // ⑩ 元信息通道：代理回报真实 URL/标题/视口 → 控制端地址栏显示真实地址
+  let meta = null;
+  CTL.s.on('remote-meta', (p) => { meta = p; });
+  AG.s.emit('remote-meta', {
+    to: CTL.id, url: 'https://example.com/a', title: '示例页', viewport: { width: 1280, height: 800 },
+  });
+  await sleep(400);
+  ok('09-24 代理回报真实 URL/标题/视口（地址栏显示真实状态）',
+     !!meta && meta.url === 'https://example.com/a' && !!meta.viewport && meta.viewport.width === 1280);
+
+  // ⑪ 撤权即断：释放控制后画面通道立刻关闭（不能"撤了还留个后门"）
+  const beforeRelease = frames.length;
+  AG.s.emit('remote-release');
+  await sleep(400);
+  AG.s.emit('remote-frame', { to: CTL.id, frame: new Uint8Array(256) });
+  await sleep(400);
+  ok('09-24 撤权后画面通道立即关闭（授权撤了就不该再有帧）', frames.length === beforeRelease);
+
   // 清理
+  AG.s.disconnect();
+  CTL.s.disconnect();
   A.s.disconnect();
   AU.s.disconnect();
   B.s.disconnect();
@@ -782,5 +993,6 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   I.s.disconnect();
   M.s.disconnect();
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
+  stopServer();
   process.exit(fail ? 1 : 0);
-})().catch(e => { console.error('异常:', e.message); process.exit(1); });
+})().catch(e => { console.error('异常:', e.message); stopServer(); process.exit(1); });

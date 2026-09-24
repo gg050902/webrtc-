@@ -22,7 +22,10 @@
     "test:ai": "node scripts/test-ai.js",
     "ai:chat": "node scripts/chat.js",
     "ai:summarize": "node scripts/summarize.js",
-    "ai:agent": "node scripts/agent.js"
+    "ai:agent": "node scripts/agent.js",
+    "test:agent": "node scripts/test-agent.js",
+    "agent": "node agent/index.js",
+    "cdp": "node agent/cdp.js"
   },
   "dependencies": {
     "mediasoup": "^3.26.0",
