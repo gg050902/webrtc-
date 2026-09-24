@@ -1,24 +1,106 @@
 // 信令服务器测试（房间化 + 入会密码版）：模拟多个客户端，验证建房/凭号加入/定向转发/
 // 满员/离开/房间号回收，以及"带密码的房间"的创建、错误密码拒绝、正确密码放行
-const { io } = require('C:/Users/27418/Desktop/webrtc/node_modules/socket.io-client');
-const URL = 'http://localhost:3000';
+//
+// ★ 09-24 测试设施修正：这个脚本以前**要求你先手动 `npm start`**，
+//   否则第一句就报 "异常: websocket error" —— 新人看到这句话完全不知道该怎么办
+//   （不是代码错，是环境没起）。SFU 版的对应测试早就改成"自己起服务器"了，
+//   这里补齐同一套做法：能连就复用，连不上就自己拉起、跑完自己收掉。
+//   教训：测试的报错要指向**真正的原因**，一句裸露的 "websocket error" 不是。
+const path = require('path');
+const fs = require('fs');
+const { spawn } = require('child_process');
+const { io } = require('socket.io-client');
+
+/* ★ 端口要"和服务器用同一套规则算"，不能写死。
+ *   ▎踩过：我给 Mesh 版加了 mesh.config.json（端口可配）之后，这份测试仍然
+ *     硬编码探测 3000。恰好工作区里留着一份 port=18099 的配置，于是服务器起在
+ *     18099、测试在 3000 干等 8 秒，报出"自动拉起服务器失败"——
+ *     看起来像服务器坏了，其实是**测试和服务对"端口是多少"的理解不一致**。
+ *   ▎教训：任何"从外部推断系统状态"的地方（测试、脚本、监控），
+ *     都必须走和系统**同一套解析规则**，而不是复制一份常量。
+ *     这份规则要和根 server.js 里的一致：环境变量 PORT > mesh.config.json > 默认 3000。 */
+function resolvePort() {
+  if (process.env.PORT) return Number(process.env.PORT);
+  try {
+    const cfgPath = path.join(__dirname, '..', 'mesh.config.json');
+    if (fs.existsSync(cfgPath)) {
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+      if (cfg && cfg.port) return Number(cfg.port);
+    }
+  } catch (e) { /* 配置坏了就用默认端口，别让解析失败挡住测试 */ }
+  return 3000;
+}
+const PORT = resolvePort();
+const URL = `http://localhost:${PORT}`;
 
 let pass = 0, fail = 0;
 const ok = (n, c) => { if (c) { pass++; console.log('  PASS  ' + n); } else { fail++; console.log('  FAIL  ' + n); } };
+
+/* 自管服务器：返回 proc，null 表示复用了别人已经起好的服务。
+ * ▎为什么不无脑起一个？用户可能正开着 `npm start` 在用——
+ *   我们再起一个会撞端口（EADDRINUSE）又留下一堆报错。先探再起，最省事。 */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function pingServer() {
+  return new Promise((resolve) => {
+    const req = require('http').get(URL + '/config.json', (r) => { r.resume(); resolve(r.statusCode === 200); });
+    req.on('error', () => resolve(false));
+    req.setTimeout(1200, () => { req.destroy(); resolve(false); });
+  });
+}
+async function ensureServer() {
+  if (await pingServer()) { console.log(`  ▸ 复用已在运行的服务（localhost:${PORT}）`); return null; }
+  console.log(`  ▸ 本地没有服务在跑，自动拉起一个（端口 ${PORT}）…`);
+  const proc = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
+    cwd: path.join(__dirname, '..'), stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let errText = '';
+  proc.stderr.on('data', (d) => { errText += d; });
+  proc.on('error', (e) => { errText += 'spawn 失败：' + e.message + '\n'; });
+  for (let i = 0; i < 48; i++) { await sleep(250); if (await pingServer()) return proc; }
+  // ▎失败时把**子进程说的话**带出来（EADDRINUSE 之类一看就懂），
+  //   再补一句"最可能的三种原因"，别只丢一句"失败"让人干瞪眼。
+  throw new Error(`自动拉起服务器失败（12 秒内没能响应 ${URL}/config.json）`
+    + (errText ? '\n  [ server 输出 ] ' + errText.trim() : '\n  （server 没有任何输出，可能没起来）')
+    + `\n  常见原因：① 端口 ${PORT} 被别的程序占了（换个 mesh.config.json 的 port 再试）`
+    + '\n            ② 根目录 mesh.config.json 里的 port 和这里不一致'
+    + '\n            ③ 依赖没装：npm i');
+}
+let serverProc = null;
 
 // client(): 建立连接，resolve 为 { s: socket, id: 连接id }
 //   ★ 注意 socket.io 客户端的 id 要等 connect 之后拿，所以在这里固化下来
 function client(name) {
   return new Promise((resolve, reject) => {
     const s = io(URL, { transports: ['websocket'], reconnection: false });
-    s.on('connect', () => resolve({ s, id: s.id }));
-    s.on('connect_error', reject);
-    setTimeout(() => reject(new Error(name + ' timeout')), 5000);
+    // ★ 超时定时器要记得清：不清的话每个 client 都留一个 5 秒的定时器，
+    //   会让测试进程在全部跑完后还多挂 5 秒才退出（小毛病，但很烦人）
+    const timer = setTimeout(() => reject(new Error(name + ' timeout')), 5000);
+    s.on('connect', () => { clearTimeout(timer); resolve({ s, id: s.id }); });
+    s.on('connect_error', (e) => { clearTimeout(timer); reject(e); });
   });
 }
 const waitEvent = (s, ev) => new Promise(r => s.once(ev, r));
 
 (async () => {
+  serverProc = await ensureServer();
+
+  // ★ 09-24 跨网部署：/config.json 必须把 ICE（含 TURN）下发给浏览器。
+  //   这是"一键发布之后，两台不同网络的电脑能不能连上"的配置入口——
+  //   它错了，发布出去也是白搭，所以放在最前面当门禁。
+  {
+    const cfg = await new Promise((resolve) => {
+      const req = require('http').get(URL + '/config.json', (r) => {
+        let b = ''; r.on('data', (d) => { b += d; }); r.on('end', () => resolve({ status: r.statusCode, headers: r.headers, body: b }));
+      });
+      req.on('error', () => resolve({ status: 0, body: '' }));
+    });
+    ok('GET /config.json 可用（前端据此拿 ICE 配置）', cfg.status === 200);
+    let json = null; try { json = JSON.parse(cfg.body); } catch (e) { /* 下面判 */ }
+    ok('/config.json 是合法 JSON 且带 iceServers', !!(json && Array.isArray(json.iceServers) && json.iceServers.length));
+    ok('/config.json 带 no-store（改了 TURN 配置刷新即生效）',
+      String(cfg.headers && cfg.headers['cache-control'] || '').includes('no-store'));
+  }
+
   const A = await client('A');
   const B = await client('B');
 
@@ -343,5 +425,16 @@ const waitEvent = (s, ev) => new Promise(r => s.once(ev, r));
   C2.s.disconnect();
 
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
+  if (serverProc) { try { serverProc.kill(); } catch (e) { /* ignore */ } }  // 自己起的自己收
   process.exit(fail ? 1 : 0);
-})().catch(e => { console.error('异常:', e.message); process.exit(1); });
+})().catch(e => {
+  // ★ 报错要说清"是什么坏了"：连不上服务时给一句能照做的提示，
+  //   而不是把 socket.io 的原始错误原样丢出去（新人看不懂）
+  console.error('异常:', e.message);
+  if (/websocket|timeout|ECONNREFUSED/i.test(String(e.message))) {
+    console.error('  ▸ 看起来是连不上信令服务（localhost:3000）。本脚本会尝试自动拉起，');
+    console.error('    若仍失败：先手动 `npm start` 起服务，再跑 `npm test`。');
+  }
+  if (serverProc) { try { serverProc.kill(); } catch (err) { /* ignore */ } }
+  process.exit(1);
+});

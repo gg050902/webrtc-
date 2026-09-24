@@ -24,6 +24,10 @@
     "ai:summarize": "node scripts/summarize.js",
     "ai:agent": "node scripts/agent.js",
     "test:agent": "node scripts/test-agent.js",
+    "test:e2e": "node scripts/test-e2e-remote-desktop.js",
+    "publish:mesh": "node scripts/publish.js",
+    "publish:tunnel": "node scripts/publish.js --tunnel",
+    "test:publish": "node scripts/test-publish.js",
     "agent": "node agent/index.js",
     "cdp": "node agent/cdp.js"
   },

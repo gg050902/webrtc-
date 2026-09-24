@@ -249,4 +249,47 @@ module.exports = {
   AI_STREAM: 'ai-stream', // S→C { id, delta, done, mock? }（流式增量；done=true 为收尾帧）
   AI_MINUTES: 'ai-minutes', // C→S { type:'segment'|'final', since? } 应答 { file, path, mock }
   AI_OP: 'ai-op',         // C→S { goal } 应答 { started, goal }（后续走既有远程协助五信令）
+
+  /* ══ ★ 09-24 真 OS 级远程桌面（被控端 = 本机 agent 程序，不是网页）══
+   * ▎为什么"真远程桌面"必须有一个本地程序？（面试讲点）
+   *   浏览器的安全模型决定了**网页没有权限**移动真实光标、敲真实键盘、截别的程序窗口——
+   *   这不是技术不足，是设计如此（否则任何网页都能偷看你屏幕、替你点"确认支付"）。
+   *   所以商业远程桌面（AnyDesk / 向日葵 / TeamViewer）无一例外都要装"被控端"。
+   *   本项目把这一层做成零新依赖的 Node 程序 `agent/`：用 **CDP（Chrome DevTools
+   *   Protocol，就是 F12 背后那套协议）** 驱动一个真实 Chromium 窗口——
+   *   `Page.startScreencast` 抓真画面、`Input.dispatchMouseEvent` / `Input.insertText` 注入真输入。
+   *   ⚠️ 能力边界要诚实：CDP 只控 **Chromium 窗口内部**，控不了开始菜单/记事本/Excel
+   *   （那要 Win32 SendInput 等系统级 API），定位是 **"远程浏览器工作区"**。
+   *
+   * ▎与既有远程协助的关系：**同一条授权链路，只换了个"被控端实现"**。
+   *   agent 进房照样要走 remote-request → 授权卡 → remote-answer（登记进 remoteCtl），
+   *   一字不差；服务器不认识什么"agent 特权"，只认登记在册的控制关系。
+   *   于是"人控制人"与"人控制电脑"共用一套协议，前端也只维护一份采集逻辑。
+   *
+   * ▎方向：remote-input 是"控制端 → 被控端"（发指令），下面两条是"被控端 → 控制端"
+   *   （回画面 / 回地址栏）——两条合起来才是闭环，也正好是真实远程桌面的最小骨架。 */
+  AGENT_HELLO: 'agent-hello', // C→S { roomNumber, password?, name?, platform?, browser? } 应答 { roomNumber, memberId }
+  //   ▎为什么不用 join-room？房间要区分"人"和"机器"：收到后服务器置 `socket.isAgent=true`、
+  //     显示名统一加 "🖥️ " 前缀、写 agentInfo{platform,browser}，让成员列表一眼看出
+  //     "这台是机器代理、可以被控"。三道校验（房间存在 / 密码 / 人数上限）与 join-room
+  //     一字不差 —— **代理没有任何特权**，人数满了它照样被拒（防"假成功"，09-24 修）。
+  REMOTE_FRAME: 'remote-frame', // 被控端(agent)→S→控制端 { to, frame:Buffer|ArrayBuffer }；S 侧 io.to(to).volatile.emit('remote-frame', { frame })
+  //   ▎二进制 JPEG 帧（比 base64 省 ~33% 带宽）。三道闸门，缺一不可：
+  //     ① 身份闸：发的人必须 socket.isAgent（人类浏览器没理由往这条通道灌数据，冒充不了代理）；
+  //     ② 授权闸：必须是登记在册的被控端，且 to 正好是那一位控制端（不会旁路给第三人围观）；
+  //     ③ 体量闸：单帧 > 900KB 丢弃 + 120 帧/秒限流（防"合法身份灌流量"）。
+  //   原则一句话：**信任 ≠ 免检查**（纵深防御——即使是被控端自己起的可信程序，也不给超额权限）。
+  //   volatile：控制端网络跟不上时直接丢帧、不在服务器内存里排队 —— 实时画面宁可掉帧不可延迟。
+  REMOTE_META: 'remote-meta', // 被控端(agent)→S→控制端 { to, url, title, viewport:{width,height}|null, ts }
+  //   ▎用途：控制端的"地址栏"显示**对方浏览器的真实 URL / 标题**（不做假），视口尺寸让前端把
+  //     归一化坐标算得更准。频率很低（只在导航 / 窗口变化时发），所以走普通 emit（不 volatile）——
+  //     状态类消息不能丢：丢一帧画面无所谓，丢一次 URL 会让地址栏停在旧地址。
+  //     受 ① 身份闸 + ② 授权闸约束（它天然只有一行文本，无需体量闸）。
+  // ── 控制端 → 被控端：**复用既有的 REMOTE_INPUT**（契约见上方第 130~138 行）──
+  //   agent 与人类被控端共用同一条线格式（服务器不解析、原样透传）：
+  //     鼠标/滚轮 = 16 字节二进制帧 [0]kind [1]flags [2..3]预留 [4..7]x(F32) [8..11]y(F32) [12..15]wheel(I32)
+  //     键盘/文本 = JSON { kind:'keydown'|'keyup'|'input-text' }
+  //   agent 在此基础上多了两种**走老通道的新语义**（服务器只需是合法对象，不解析内容）：
+  //     { kind:'navigate', url }  地址栏 → 真导航（Page.navigate，能开任意真实网站）
+  //     { kind:'window', state }  最大化 / 还原 / 最小化 / 全屏（Browser.setWindowBounds）
 };

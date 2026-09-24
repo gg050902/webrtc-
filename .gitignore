@@ -2,6 +2,12 @@
 .env
 .env.*
 
+# ★ 09-24 跨网发布配置：可能含 TURN 的 username/credential，绝不入库
+#   （根目录这份是你的真配置；publish-mesh 下那份由 scripts/publish.js 生成）
+mesh.config.json
+publish-mesh/mesh.config.json
+publish-mesh/package-lock.json
+
 # 依赖
 node_modules/
 

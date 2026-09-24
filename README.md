@@ -18,13 +18,18 @@
 
 ---
 
-## 📦 想跨电脑连？三条路（详见《部署手册.md》）
+## 📦 想跨电脑连？几条路（详见《部署手册.md》《跨电脑连接-操作指南.md》）
 
 | 场景 | 一句话 | 命令/入口 |
 |---|---|---|
 | 局域网两台电脑 | **0 元三步走**：服务器机复制邀请链接 → 微信发对方 → 打开即入房（《跨电脑连接-操作指南.md》） | `start-lan.bat` 或 `npm run start:lan` |
 | 跨网络（不同 WiFi） | 需 TURN：配置已预置 openrelay（含 TCP 回退），先实测可达性 | `npm run test:turn` |
 | 公网云主机 | systemd 常驻 + 自建 coturn | 《部署手册.md》场景 C |
+| **一键发布公网链接** | 一条命令：**生成发布包 → 体检 → 可选开隧道拿公网地址**（三段拆开，不装隧道工具也能跑完前两段） | `npm run publish:mesh`（可选 `--tunnel` / `--bundle` / `--check`） |
+| **内网穿透（无公网 IP）** | cloudflared 隧道最推荐（免费免注册，`--tunnel` 会自动探测）；其次 ngrok / 云主机 | `npm run publish:mesh --tunnel`（需先装 cloudflared 或 ngrok） |
+
+> ⚠️ **一句话记住边界**：隧道只解决"**网页能打开**"；音视频在 Mesh 版是 **P2P** 的，
+> 两台不同网络的电脑要**真能开会，还得有 TURN**（发布脚本第 2 步会写进 `mesh.config.json` 并体检报警）。
 
 ## 🚀 功能一览（当前已完成 · 以 SFU 主版本为准）
 
@@ -82,14 +87,20 @@
 | 🛠️ AI 教学三件套脚本（09-24） | `npm run ai:chat`（终端问答）/ `ai:summarize`（文本→纪要，长文本分段 map-reduce）/ `ai:agent`（手写 ReAct 工具循环）；既是路线图阶段 0~2 的学习产物，也是调 prompt 的离线实验室 | 零依赖；共用同一个 provider 与同一套双轨降级（`[Mock]` 标记） |
 | 📼 录制回放（G3） | /api/recordings 列表 + recordings.html 回放页（点开即播+下载）——D+2 从"能录"变"录了能看" | 零依赖暖墨页；dashboard 有入口（09-19c） |
 | 💬 字幕 Otter 式排版 | 字幕历史按说话人分组成段（段头名字+时间、段内逐句、最新句鎏金高亮）——Otter.ai 的转写排版节奏 | 纯前端重排（09-19b） |
+| 🖥️ 真 OS 级远程桌面（B 档） | 控制端在**网页里**操作被控电脑上**真实的浏览器窗口**：开任意真实网站、点真实按钮、滚真实页面，地址栏显示对方真实 URL | 本地代理 `agent/`：手写 **CDP** 客户端（`Page.startScreencast` 抓屏 + `Input.*` 注入真输入，零新依赖）；新信令 `agent-hello`/`remote-frame`/`remote-meta` + 复用 `remote-input`；三道闸门（身份/授权/体量），原则"**信任 ≠ 免检查**"（09-24，SFU 主版本） |
+| 📱 手机控电脑 | 手机上也能控被控电脑：单指 = 鼠标（移动/点击/拖拽），**双指 = 滚轮**，中文整段输入绕开 IME；成员行有 `🖥️` 前缀 +「可被控」徽标 +「控制电脑」按钮 | 控制台 canvas 交互**全部用 Pointer Events**（一套逻辑覆盖鼠标/触摸/触控笔，自己维护"当前几根手指"账本）；隐藏 IME 捕获框整段转发 + CDP `Input.insertText`（09-24，真机实测双指滚动让被控端 `scrollY 0→1000`） |
+| 🚀 一键发布公网链接 | 一条命令把 Mesh 版打成"别人点开就能进"的发布包：生成 → 体检 → 可选开隧道拿公网地址 | `scripts/publish.js`（`npm run publish:mesh`）：白名单拷贝 + **每次清空重建（副本永不漂移）** + 真起一次验证 `/config.json` 下发 TURN + `--tunnel`/`--bundle`/`--check`（09-24） |
+| 🧊 跨网 ICE 下发（Mesh） | Mesh 版"跨网连不上"的根因是 ICE 打洞：把 ICE 从代码挪进 `mesh.config.json`，由服务器 `/config.json` 下发 | 根 `server.js` 加 `/config.json` 路由（带 `no-store`）+ 启动 ICE 自检；根 `public/client.js` 加 `ICE_SERVERS`/`iceReady`，建 peer 前一律 `await iceReady`（09-24） |
+| 📴 Service Worker 缓存纪律 | 修掉"改了代码刷新不生效"：会变的资源（client.js/style.css/页面）改 **network-first**，不变的 vendor 才 cache-first；加 `?nosw=1` 逃生舱 | `sfu/public/sw.js` 按资源性质分两路 + 缓存名 `meeting-v1 → v2`；根因"SW 不看 HTTP 缓存头"（09-24） |
 
 > **本表最后一栏的字母 = 升级编号**（A3/A4/A6 = 远程协助深化；D1~D6 = 会议本体 + SFU 深究；
 > D+1~D+4 = SFU 深水区；E1/E2/E4/E5 = 工程化与可交付；F1~F7 = 对齐商业产品的产品体验，
-> 参考声网形态、零 SDK 自研；L1 = AI 线实时字幕），
+> 参考声网形态、零 SDK 自研；L1 = AI 线实时字幕；**B 档 = 真 OS 级远程桌面（09-24b）**），
 > A 档 + D 档于 **2026-09-11**、F 档于 **2026-09-12 ~ 09-17**、D+ 档于 **09-12 ~ 09-15**、
 > E 档于 **09-14 ~ 09-16** 以 **SFU 主版本**实现（Mesh 对照版同步可行部分）；
 > 教学导读见 `LEARN.md` 第 **2.13 节**（A 档）、**5.8 节**（D 档）、**5.9~5.19 节**
-> （F/D+/E/C 档逐项导读），路线图与**下一步新方向（G 档）**见 `后续升级方向.md`。
+> （F/D+/E/C 档逐项导读）、**5.29~5.32 节**（09-24b：CDP 远程桌面 / Pointer Events / SW 缓存坑 / 一键发布），
+> 路线图与**下一步新方向（G 档）**见 `后续升级方向.md`。
 
 > **Mesh 对照版差异**（为什么它叫"教学版"）：媒体/聊天走浏览器 **P2P 直连**（不经服务器，服务器
 > 只是信令邮局），人数上限 3；屏幕共享是 `replaceTrack` 换轨。SFU 版把这两点都换成了
@@ -100,6 +111,60 @@
 > 这也是面试讲"两种数据通道取舍"的最佳素材。
 
 技术栈：`Node.js` + `Socket.IO`（信令）+ `mediasoup`（SFU 媒体中枢）+ 浏览器原生 WebRTC + 原生 JavaScript（零前端框架）。
+
+---
+
+## 🖥️ 真 OS 级远程桌面（控制端在网页里，操作被控电脑上真实的浏览器窗口）
+
+> 与上文「H5 远程协助」的区别：那是**网页控网页**（被控端是同一个工作台页面，事件重放）；
+> 这是**网页控真机**——被控端跑一个本地代理 `agent/`，它驱动**真实的 Chromium 窗口**，
+> 控制端在网页里就能打开任意真实网站、点真实按钮、滚真实页面、看真实地址栏。
+
+**为什么必须要一个本地代理？（面试必答）**
+浏览器的安全模型**不允许网页**移动真实光标、敲真实键盘、截别的程序窗口——这不是技术不足，
+是设计如此（否则任何网页都能偷看你的屏幕、替你点"确认支付"）。所以商业远程桌面（AnyDesk /
+向日葵 / TeamViewer）无一例外都要在被控电脑上装"被控端"。本项目把这一层做成**零新依赖**的
+Node 程序（Node 22 内置 `fetch`/`WebSocket`，不引任何 npm 包）：
+
+| 文件 | 干什么 | 关键实现 |
+|---|---|---|
+| `agent/cdp.js`（约 470 行） | 手写的 **CDP（Chrome DevTools Protocol，就是 F12 背后那套协议）** 客户端：启动真实 Chromium（Edge/Chrome，`BROWSER_BIN` 可指定）→ `--remote-debugging-port` 连上去 | `Page.startScreencast` 抓屏（**帧变化才推 + `screencastFrameAck` 自带背压**）、`Input.dispatchMouseEvent` / `Input.insertText` / `Input.dispatchKeyEvent` 注入真实输入 |
+| `agent/index.js`（约 430 行） | 被控端代理主体：连 socket.io 信令 → `agent-hello` 进房 → 收到授权后推画面帧 + 执行输入指令 | 零新依赖（复用根目录 `node_modules` 里的 socket.io-client）；命令行 `--room --server --password --name --url --port --profile --quality --fps --minutes --auto-allow --headless` |
+
+```bash
+npm run agent                              # = node agent/index.js
+node agent/index.js --room 123456          # 连本机 3001；被控机终端会弹确认，按 y 才放行
+node agent/index.js --room 123456 --auto-allow   # 演示用自动放行（有风险，文档已写明）
+```
+
+> ⚠️ **能力边界要诚实说**：CDP 只能控制 **Chromium 浏览器窗口内部**，控不了开始菜单 /
+> 记事本 / Excel（那需要 Win32 `SendInput` 等系统级 API，不在"零新依赖"约束内）。
+> 所以本模块定位是 **"远程浏览器工作区"**——但对"远程协助 / 远程演示 / 远程帮人操作"这个场景，
+> 浏览器已经是 90% 的战场。
+
+**安全模型：三道闸门**（原则一句话：**信任 ≠ 免检查**）
+
+1. **身份闸**：只有 `socket.isAgent` 的代理才允许发画面帧——人冒充不了代理；
+2. **授权闸**：帧只能发给"当前登记的 host→controller 这一对"，不会旁路给房间里第三人围观；
+3. **体量闸**：单帧 > 900KB 直接丢弃 + 120 帧/秒限流，且用 `volatile` 发（**宁可丢帧不排队**，避免积压）。
+
+协议侧新增 `agent-hello` / `remote-frame` / `remote-meta` 三个事件，控制输入**复用既有的
+`remote-input`**（见 `sfu/protocol.js` 的 09-24 段）；授权链路与人类被控端一字不差——agent 没有任何特权。
+
+**📱 手机控电脑（本次重点）**：控制台（`sfu/public/` 新增的全屏 `#rdConsole`：canvas 画画面 +
+地址栏 + 工具条 + 隐藏 IME 捕获框）的 canvas 交互**全部用 Pointer Events** 实现，一套逻辑覆盖
+鼠标 / 触摸 / 触控笔：
+
+- **单指 = 鼠标**（移动 / 点击 / 拖拽）；
+- **双指 = 滚轮**（两指中点的位移换算滚动）；
+- **中文输入**走隐藏输入框整段转发 + 远端 CDP `Input.insertText`（绕开 IME 组合态的坑）。
+
+成员列表里代理成员带 `🖥️` 前缀与「可被控」徽标，附「控制电脑」按钮。
+
+> **真机实测（本次）**：真浏览器双窗口验证——被控端真实 URL 变成 `https://example.com/`；
+> 坐标换算逐像素精确（视口 1254×707，期望 627,297 = 实际 627,297）；手机双指滑动后被控端
+> 页面**真的滚了**（`scrollY 0 → 1000`）；手机单指点击触发被控端真实按钮。
+> 自动化回归：`npm run test:agent`（16/16）、`npm run test:e2e`（端到端 15 项全过，出截图）。
 
 ---
 
@@ -225,6 +290,21 @@ npm run start:sfu
 **验证连接方式**：会议页顶部新增「🔗 连接方式」徽标（直连 / STUN 穿墙 / TURN 中继），
 从 `getStats()` 的 ICE 候选类型实时读出——部署是否生效一眼可见。
 
+**Mesh 对照版也同一套做法（09-24）**：Mesh 是 P2P，媒体不经服务器，所以"跨网连不上"的根因
+是 **ICE 打洞**（不是服务器）。原来根 `public/client.js` 把 ICE 硬编码成只有一条 Google STUN
+→ 严格 NAT（公司网 / 4G / 酒店 WiFi）必然打不通。现在把 ICE **从代码里挪到配置里**、由服务器下发：
+
+- 根 `server.js` 新增可选 `mesh.config.json`（`port` / `host` / `iceServers` / `publicUrl`；
+  优先级：环境变量 `PORT`/`HOST` > `mesh.config.json` > 默认值），新增 `/config.json` 路由下发
+  `iceServers` / `arch` / `maxMembers`（带 `Cache-Control: no-store`），静态资源也加 `no-store`，
+  启动时打印 **ICE 自检**（STUN 几条 / TURN 几条，无 TURN 时警告）；
+- 根 `public/client.js` 新增 `ICE_SERVERS` + `iceReady`（启动 `fetch('config.json', {cache:'no-store'})`，
+  失败回落默认 STUN），**所有建 peer 的地方都改成 `await iceReady` 再建**——避免"第一条 peer 用错配置"的时序坑；
+- 这与 SFU 版已有的 `/config.json` 是**同一份经验的第二次应用**；一键发布（`npm run publish:mesh`）
+  正是靠它把 TURN 配置带到底层浏览器。
+
+> ⚠️ `mesh.config.json` 可能含 TURN 的 `username`/`credential`，已加入 `.gitignore`（根目录与 `publish-mesh/` 两处）。
+
 ---
 
 ## 🧱 项目结构
@@ -255,7 +335,15 @@ webrtc/
 │   ├── test-turn.js        # ICE 可达性实测（手搓 STUN Binding / TCP 探测）
 │   ├── bench.js            # E4 压力基准（4/8/16 路媒体转发实测）
 │   ├── start-demo.js       # 一键起两版并打印地址
-│   └── start-lan.js        # 局域网交付（生成 sfu/config.json + HTTPS 入口）
+│   ├── start-lan.js        # 局域网交付（生成 sfu/config.json + HTTPS 入口）
+│   ├── publish.js          # ★ 09-24 一键发布公网链接（生成 publish-mesh/ → 体检 → 可选隧道；--tunnel/--bundle/--check）
+│   ├── test-agent.js       # ★ 09-24 桌面代理端到端（真浏览器/真画面/真注入）★ 16/16
+│   ├── test-e2e-remote-desktop.js # ★ 09-24 真机远程桌面 e2e（真双窗 + 手机视口，出截图）
+│   └── test-publish.js     # ★ 09-24 发布链回归（含 --check 过期闸）★ 29/29
+├── agent/                  # ★ 09-24 真 OS 级远程桌面 · 被控端代理（零新依赖）
+│   ├── cdp.js              #   手写 CDP 客户端：驱动真实 Chromium（抓屏/注入输入）
+│   └── index.js            #   代理主体：agent-hello 进房 → 推帧 + 执行 remote-input
+├── publish-mesh/           # ★ 09-24 由 publish.js 生成的发布包（白名单拷贝，勿手工改）
 ├── public/                 # [Mesh 对照版] 前端（P2P 直连用）
 │   ├── index.html / style.css / client.js（第 1~16 步 + 第 19~25 步 A/D 档同步）
 │   └── vendor/             # 本地 socket.io 客户端库（勿动）
@@ -314,6 +402,11 @@ npm run bench      # E4 压力基准（4/8/16 路，约 1 分钟，独立 Worker
 npm run ai:chat    # AI 脚本：终端问答（也可 --q "问题" 单发）
 npm run ai:summarize # AI 脚本：文本/文件/房间字幕 → markdown 纪要（--text/--file/--room 123456）
 npm run ai:agent   # AI 脚本：手写 ReAct 工具循环（--goal "…" --maxsteps 6 --verbose）
+npm run publish:mesh # ★ 一键发布 Mesh 版：生成 publish-mesh/ → 体检 → （可选）开隧道（--tunnel/--bundle/--check）
+npm run test:publish # 发布链回归（含 --check 过期闸：源码改了不重新发布就必须报错）★ 29/29
+npm run agent        # ★ 启动被控端桌面代理（需 --room 123456；真机远程桌面的"被控端"）
+npm run test:agent   # 桌面代理端到端（真起 Chromium：验抓屏 JPEG + 坐标注入 + 远程导航）★ 16/16
+npm run test:e2e     # 真机远程桌面 e2e（真双窗 + 模拟手机双指滚动/单指点击，出截图）
 ```
 
 - SFU 版测试（**2026-09-24 实测：106 通过 / 0 失败**；冒烟 **118/118**，AI 双轨 +11 项）：房间/密码复用 + mediasoup Router 能力 +
@@ -340,6 +433,17 @@ npm run ai:agent   # AI 脚本：手写 ReAct 工具循环（--goal "…" --maxs
   答案不含 `[Mock]`、纪要事实取自输入、问答命中原文、操作员产出合法 JSON 计划、流式有增量。
   结束后打印调用次数与**估算花费**（本次自检 5 次调用 ≈ ¥0.0028）。
   服务器侧同样可核对：`curl http://localhost:3001/metrics | grep sfu_ai_llm`。
+- **桌面代理端到端 `npm run test:agent`（2026-09-24 实测：16 通过 / 0 失败）**：
+  真起 Chromium + 真跑服务器 + 真授权 + 真收 JPEG 帧 + 真注入 16 字节控制帧再回页面读坐标。
+  最严的一条是坐标：发归一化 (0.5, 0.5)，页面 `clientX` 必须**正好**等于视口宽一半（±3px）——
+  实测视口 1254×707，期望 (627,297) = 实际 (627,297)，跨分辨率都点得准。
+- **真机远程桌面 e2e `npm run test:e2e`（2026-09-24 实测：15 项全过）**：
+  真浏览器双窗口走完整流程（游客进会 → 创建房间 → 起 agent → 授权 → 收真画面 → 远程导航
+  到 `https://example.com/` → 切手机视口 390×844 试双指滚动与单指点击 → 退出控制），
+  截图落在临时目录 `wb-rd-shots/`。**它的 profile 每次清空**——否则测的是缓存不是代码（见 LEARN.md）。
+- **发布链回归 `npm run test:publish`（2026-09-24 实测：29 通过 / 0 失败）**：
+  验"生成 → 体检 → 过期闸"三段：发布包与源码逐字节一致、默认 ICE 含带凭证的 TURN、
+  `/config.json` 带 `no-store`、`--check` 在源码改动后**必须报错退出**（且只读、不重建）。
 - ✅ **环境自检 `npm run doctor`**：17 项 / 4 组（环境·配置·端口·跨网 ICE），每项都给"怎么修"；`node scripts/doctor.js --json` 出结构化结果。交付前先跑它，再按《部署手册.md》自查清单收尾。
   手动核对（`npm run test:turn` 验 ICE 可达、端口是否被占、ffmpeg 是否在 PATH）。
 
@@ -387,6 +491,7 @@ npm run ai:agent   # AI 脚本：手写 ReAct 工具循环（--goal "…" --maxs
 | 36 | **G6 安全加固 + G7-④（09-19h）** | token 生命周期（AUTH_TTL_MS 可调/滑动续期/auth-refresh 信令/客户端每小时续期）+ register/login/join/chat 四处固定窗口限流 + /config.json 下发 authTtlMs + dashboard 历史曲线 localStorage 留存（刷新不丢）+ bench-signaling 监听器泄漏修复；信令 98/98 |
 | 37 | **G4 移动端 / PWA（09-23）** | manifest + Service Worker（可安装到主屏、静态壳离线兜底）+ 侧栏抽屉/控制坞图标化/竖屏预览（≤980/≤760 两档响应式）+ 低带宽模式（省流开关锁最低层，复用 set-preferred-layers，服务器零改动）；顺手修 F6 冒烟 flaky 与 updateLayerPicker 守卫；冒烟 107/107 + 信令 98/98 |
 | 38 | **AI 主攻收官（09-24）** | **真 DeepSeek key 接入**：`sfu/ai/provider.js` 收口三处 LLM 调用（askLLM/streamLLM，Node 内置 fetch 零 SDK），密钥三来源（env > `.env` > config 的 ai.key）且**永不下发浏览器**，用量账本并入 `/metrics`；教学三件套 `scripts/{chat,summarize,agent}.js` + `npm run test:ai` 双轨自检 10/10；产品化四项：**流式打字机**（ai-stream + 终态去重）、**助理缺位自动入会**、**📝 纪要入口**、LLM/Mock 徽标与 token 用量；**实修三 bug**：announcedIp 漂移自动纠偏（跨机黑屏元凶）、ffmpeg 探测超时误判 + test:record 的 spawnSync EBUSY、配了 key 反而生成不了纪要（动作被聊天抢答）；回归：冒烟 **118/118**、信令 **106/106**（Mock 轨/LLM 轨双绿）、Mesh 33/33、test:record 连跑 3 次 PASS |
+| 39 | **真 OS 级远程桌面 + 跨网一键发布 + SW 缓存纪律（09-24b）** | **B 档落地**：本地代理 `agent/`（零新依赖手写 **CDP** 客户端，`Page.startScreencast` 抓真屏 + `Input.*` 注入真输入）驱动真实 Chromium 窗口，控制端在网页里操作被控电脑真实浏览器；新信令 `agent-hello`/`remote-frame`/`remote-meta` + 复用 `remote-input`，三道闸门（身份/授权/体量，"信任≠免检查"）；**📱 手机控电脑**——控制台 canvas 全用 **Pointer Events**（单指=鼠标、双指=滚轮、中文整段 insertText）；**跨网 ICE 下发**（Mesh 版 `mesh.config.json` + `/config.json`）；**一键发布** `npm run publish:mesh`（生成 publish-mesh/ → 真起一次体检 → 可选 cloudflared/ngrok 隧道；`--check` 过期闸）；**坑 40**：Service Worker 缓存旧代码（cache-first 绕过 HTTP `no-store`，改业务代码 sw.js 不动就一直吃旧缓存 → 按资源性质分 cache-first/network-first + `?nosw=1` 逃生舱 + e2e 每次清 profile）；回归 `test:agent` 16/16、`test:e2e` 15 项全过、`test:publish` 29/29 |
 
 **下一步方向**（`后续升级方向.md` 是唯一权威）：
 - ✅ **A 档（A1~A7）与 D 档（D1~D6）已全部完成**（2026-09-11，SFU 主版本）；
@@ -406,6 +511,10 @@ npm run ai:agent   # AI 脚本：手写 ReAct 工具循环（--goal "…" --maxs
   → C1 AI 远程操作员 ✅（09-19g）→ 09-24 接通真 DeepSeek**：统一 provider + 流式打字机 + 📝 纪要入口 +
   教学三件套脚本 + `test:ai` 双轨自检 10/10（详见 `后续升级方向.md` 第 1 节），**主攻两条线全线贯通**；
 - ✅ **09-24 顺手修掉三个真 bug**（跨机可用性 / 录制自测 / AI 动作错位，见 `AGENTS.md` 坑 36~38）；
+- ✅ **09-24b B 档「真 OS 级远程桌面」落地**（原"毕设才开、违背零依赖需拍板"，本次以零新依赖达成）：
+  本地代理 `agent/`（手写 CDP 客户端驱动真实 Chromium）+ 手机控电脑（Pointer Events）+ 一键发布
+  `npm run publish:mesh` + Mesh 版跨网 ICE 下发 + Service Worker 缓存纪律（坑 40）——详见
+  `LEARN.md` 5.29~5.32 与 `AGENTS.md` 09-24b 条目；
 - 🔜 **G 档 · 下一步新方向（2026-09-17 公布）**：云部署与多机 SFU 级联 / AI 会议助理落地 / 录制产物回放 /
   PWA 移动端 / 端到端自动化 / 安全加固 / 可观测性升级 / 规模与性能——8 个候选方向（含做法、难度、
   依赖代价与"零新依赖"铁律的冲突点）见 `后续升级方向.md` **G 档**；
@@ -414,6 +523,8 @@ npm run ai:agent   # AI 脚本：手写 ReAct 工具循环（--goal "…" --maxs
 > ⚠️ **人工验证提醒**：本次升级的**真实音视频效果**（simulcast/SVC 三档协商、说话人高亮、
 > 浏览器侧 D5 录制产物、服务器侧 D+2 录制回放、触屏手势、剪贴板权限、滤镜与绿幕抠像、
 > 实时字幕识别、跨机 HTTPS/TURN）命令行验不了，请开浏览器按 `后续升级方向.md` 第 0.2 节清单逐条确认。
+> 09-24b 三条新功能另有待人工验证项：**真机手机端参与会议的真实观感**、**cloudflared 真实开隧道**
+> （本机未装，`--tunnel` 只验证了"探测 + 给指引"）、**跨运营商真机跨网通话**——同样记在 0.2 清单。
 
 ---
 

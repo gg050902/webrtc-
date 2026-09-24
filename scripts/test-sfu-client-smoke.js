@@ -56,10 +56,16 @@ function makeEl(id) {
   const listeners = new Map();
   const el = {
     id, children: [], style: {}, dataset: {}, files: [], value: '',
-    textContent: '', innerHTML: '', className: '', disabled: false, checked: false,
+    textContent: '', innerHTML: '', disabled: false, checked: false,
     scrollTop: 0, scrollHeight: 0, offsetWidth: 1, srcObject: null,
     videoWidth: 640, videoHeight: 360, readyState: 4,
     isContentEditable: false, tagName: 'DIV',
+    /* ★ 09-24：className 与 classList 必须是**同一份真相**（真实 DOM 就是这样）。
+     *   原先桩里 className 是独立字符串、classList 是另一个 Set，
+     *   于是"用 className 赋类、再用 classList.contains 查"的代码在测试里查不到类名，
+     *   断言失败了却怪不到代码头上 —— 桩不真实，就是在骗自己（或者冤枉好代码）。 */
+    get className() { return [...this.classList._s].join(' '); },
+    set className(v) { this.classList._s = new Set(String(v == null ? '' : v).split(/\s+/).filter(Boolean)); },
     classList: {
       _s: new Set(),
       add(...c) { c.forEach((x) => this._s.add(x)); },
@@ -159,6 +165,8 @@ const rec = {
   dataMessageHandler: null, // ★ D+1：订阅成功后挂上的"收到 SCTP 消息"回调
   canvasOps: 0,             // ★ 09-14：2D 桩的作画次数（批注断言用）
   capInstances: [], capStarts: 0, capStops: 0, // ★ 09-17：字幕识别器桩的记录
+  remoteInputPayloads: [],  // ★ 09-24：remote-input 的完整载荷（要验 16 字节帧/navigate 命令）
+  remoteRequestTo: null,    // ★ 09-24：remote-request 的目标成员 id
 };
 class FakeProducer {
   constructor(id, appData) { this.id = id; this.appData = appData; this.closed = false; }
@@ -232,7 +240,8 @@ const socketStub = {
   off() {}, once(ev, fn) { this.on(ev, fn); },
   emit(ev, payload, cb) {
     rec.emits.push(ev);
-    if (ev === 'remote-input') rec.remoteInputs++;
+    if (ev === 'remote-input') { rec.remoteInputs++; rec.remoteInputPayloads.push(payload); }
+    if (ev === 'remote-request') rec.remoteRequestTo = payload && payload.to;   // ★ 09-24
     if (ev === 'clipboard-sync') rec.clipboardSends++;
     if (ev === 'file-chunk') rec.fileChunks++;
     if (ev === 'file-offer') { rec.fileOffers++; rec.lastFileOffer = payload; }
@@ -1043,6 +1052,112 @@ const emit = (ev, payload) => {
      /id="capMinutesBtn"/.test(fs.readFileSync(path.join(PUB, 'index.html'), 'utf8')));
   const capMinutesBtnEl = documentStub.getElementById('capMinutesBtn');
   ok('09-24 纪要按钮已挂接到客户端 JS', !!capMinutesBtnEl);
+
+  /* ════════════════════════════════════════════════════════════════
+   * ★ 09-24 真远程桌面（控制端控制台）—— 前端契约断言
+   *   ▎这一组守的是"两条控制路径不能串"：控制代理 = 真远程桌面控制台（canvas + 真注入），
+   *     控制人类 = 工作台重放（iframe + 合成事件）。串了会出很难查的怪象：
+   *     比如授权通过却打开了错误的界面，或者关掉之后画面还在偷偷刷新。
+   * ════════════════════════════════════════════════════════════════ */
+  console.log('\n--- 09-24 真远程桌面（前端）---');
+
+  const RD = 'AGENTMEMBERID8888';
+  guard('代理在场快照', () => emit('room-state', {
+    members: [
+      { id: socketStub.id, name: '我', owner: true },
+      { id: PEER, name: '普通成员', owner: false },
+      { id: RD, name: '🖥️ 我的电脑', owner: false, agent: true, agentInfo: { platform: 'win32', browser: 'Edg/153' } },
+    ],
+  }));
+
+  // 桩的 textContent='' 不清 children，渲染是累加的 → 取"最后一次渲染出来的那一行"
+  const rowsWith = (cls) => (documentStub.getElementById('memberList').children || []).filter((r) => r.classList.contains(cls));
+  const agentRow = rowsWith('agent-row').slice(-1)[0];
+  ok('09-24 代理成员渲染成独立 agent-row（人/机一眼可辨）', !!agentRow);
+  const agentBtn = agentRow && (agentRow.children || []).find((c) => c.classList.contains('m-ctrl-btn'));
+  ok('09-24 代理行带「控制电脑」按钮', !!agentBtn);
+
+  const humanRow = (documentStub.getElementById('memberList').children || [])
+    .filter((r) => String(r.dataset.id) === PEER).slice(-1)[0];
+  const humanBtn = humanRow && (humanRow.children || []).find((c) => c.classList.contains('m-ctrl-btn'));
+  ok('09-24 人类成员行**没有**「控制电脑」按钮（两条控制路径不混淆）', !!humanRow && !humanBtn);
+
+  // 点「控制电脑」→ 走的是和人类一模一样的 remote-request 授权链路（没有第二条捷径）
+  rec.emits.length = 0;
+  rec.remoteRequestTo = null;
+  if (agentBtn) guard('点控制电脑', () => agentBtn.dispatch('click'));
+  ok('09-24 点「控制电脑」发出 remote-request（授权链路一字未改）', rec.emits.includes('remote-request'));
+  ok('09-24 remote-request 的目标正是那台代理（不会发错人）', rec.remoteRequestTo === RD);
+
+  // 授权成功且对象是代理 → 打开远程桌面控制台（而不是工作台重放模式）
+  const rdEl = documentStub.getElementById('rdConsole');
+  rdEl.classList.add('hidden');
+  guard('授权回执', () => emit('remote-answer', { from: RD, ok: true }));
+  ok('09-24 代理授权后打开远程桌面控制台（不是工作台重放）', !rdEl.classList.contains('hidden'));
+  ok('09-24 打开控制台时给 body 挂 rd-mode（后台页面不再滚动）',
+     documentStub.body.classList.contains('rd-mode'));
+
+  // 真画面帧 → 状态更新（冒烟环境没有 createImageBitmap，走"只记状态"的降级分支 ——
+  // 这正是把绘制与状态分开写换来的好处：解码不可用时，逻辑依然可断言）
+  const rdStateEl = documentStub.getElementById('rdState');
+  rdStateEl.textContent = '';
+  guard('画面帧', () => emit('remote-frame', { frame: new ArrayBuffer(2048) }));
+  await new Promise((r) => setTimeout(r, 60));
+  ok('09-24 收到画面帧后状态转为「实时画面」（帧数放进 title，不拿数字困惑用户）',
+     /实时画面/.test(rdStateEl.textContent || '') && /1 帧/.test(rdStateEl.title || ''));
+
+  // 地址栏显示对方浏览器的真实 URL
+  const rdUrlEl = documentStub.getElementById('rdUrl');
+  guard('元信息', () => emit('remote-meta', { url: 'https://example.com/a', title: '示例' }));
+  ok('09-24 地址栏显示对方真实 URL（remote-meta 回传，不是假的）', rdUrlEl.value === 'https://example.com/a');
+
+  // 地址栏回车 → navigate 命令（复用 remote-input 通道 = 复用同一道服务器门禁）
+  rec.remoteInputPayloads.length = 0;
+  rdUrlEl.value = 'bilibili.com';
+  guard('地址栏回车', () => rdUrlEl.dispatch('keydown', { key: 'Enter' }));
+  const navMsg = rec.remoteInputPayloads.find((p) => p && p.event && p.event.kind === 'navigate');
+  ok('09-24 地址栏回车发出 navigate 命令（能远程开任意真实网站）',
+     !!navMsg && navMsg.event.url === 'bilibili.com' && navMsg.to === RD);
+
+  // 工具条「最大化」→ window/maximized
+  rec.remoteInputPayloads.length = 0;
+  guard('最大化', () => documentStub.getElementById('rdMax').dispatch('click'));
+  const winMsg = rec.remoteInputPayloads.find((p) => p && p.event && p.event.kind === 'window');
+  ok('09-24 工具条可远程最大化对方窗口（真·全屏桌面感）', !!winMsg && winMsg.event.state === 'maximized');
+
+  // 鼠标：canvas 上的操作 → 16 字节二进制帧，坐标是归一化 0.5（桩 rect 是 640×360，点在正中）
+  rec.remoteInputPayloads.length = 0;
+  guard('canvas 点击', () => {
+    const c = documentStub.getElementById('rdCanvas');
+    c.dispatch('pointerdown', { clientX: 320, clientY: 180, button: 0 });
+    c.dispatch('pointerup', { clientX: 320, clientY: 180, button: 0 });
+  });
+  const binFrame = rec.remoteInputPayloads.map((p) => p && p.event).find((e) => e && e.byteLength === 16);
+  ok('09-24 canvas 上的鼠标操作打成 16 字节帧（与远程协助同一套线格式）', !!binFrame);
+  if (binFrame) {
+    const dv = new DataView(binFrame);
+    ok('09-24 帧内 kind=mousedown(4) 且坐标已归一化到 0.5',
+       dv.getUint8(0) === 4 && Math.abs(dv.getFloat32(4) - 0.5) < 0.02 && Math.abs(dv.getFloat32(8) - 0.5) < 0.02);
+  } else {
+    ok('09-24 帧内 kind=mousedown(4) 且坐标已归一化到 0.5', false);
+  }
+
+  // 撤权 → 控制台自动收起（不留一屏"定格画面"骗人）
+  guard('控制结束', () => emit('remote-ended', { reason: 'released' }));
+  ok('09-24 控制结束后控制台自动关闭', rdEl.classList.contains('hidden'));
+  ok('09-24 控制结束后 body 的 rd-mode 摘掉', !documentStub.body.classList.contains('rd-mode'));
+
+  // 关掉之后再来的帧必须丢弃（"关了还偷偷接着画"是最容易留的后门）
+  rdStateEl.textContent = '';
+  guard('关门后的帧', () => emit('remote-frame', { frame: new ArrayBuffer(1024) }));
+  await new Promise((r) => setTimeout(r, 50));
+  ok('09-24 控制台关闭后丢弃画面帧（不再更新状态）', rdStateEl.textContent === '');
+
+  // 房间里已经有代理 → "怎么启动代理"的指引卡片收起（别对着已经用上的人唠叨）
+  ok('09-24 房内有代理时收起「怎么启动代理」指引',
+     documentStub.getElementById('agentHint').classList.contains('hidden'));
+  ok('09-24 指引卡片里的启动命令带真实房间号（复制即用）',
+     String(documentStub.getElementById('agentCmd').textContent).includes('--room'));
 
   if (problems.length) {
     console.log(`\n⚠️ 捕获到 ${problems.length} 个运行时异常：`);

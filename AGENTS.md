@@ -407,6 +407,61 @@
 > **回归（本次实测）**：信令 **93/93**（+5 C1 全链路断言：无共享拒绝/受理/真实授权/
 > 输入序列含 16 字节帧/自动交还）+ 冒烟 **95/95**。
 
+> **09-24b 三条新功能：真 OS 级远程桌面（B 档）+ 跨网一键发布 + SW 缓存纪律（代码已落地并已验证，本次同步文档）**——
+> ① **B 档「真 OS 级远程桌面」✅（原"毕设才开、违背零依赖需拍板"作废）**：新增本地代理
+>   `agent/`——`agent/cdp.js`（约 470 行，**手写 CDP 客户端**：启动真实 Chromium，`--remote-debugging-port`
+>   连上，`Page.startScreencast` 抓屏 / `Input.dispatchMouseEvent`·`insertText`·`dispatchKeyEvent` 注入真输入；
+>   零新 npm 依赖，用 Node 22 内置 `fetch`/`WebSocket`）+ `agent/index.js`（约 430 行，被控端主体，
+>   复用根 `node_modules` 的 socket.io-client；CLI `--room --server --password --name --url --port
+>   --profile --quality --fps --minutes --auto-allow --headless`；`npm run agent` 或
+>   `node agent/index.js --room 123456`）。**为什么必须有本地程序**：浏览器安全模型不允许网页移动
+>   真实光标 / 敲真实键盘 / 截别的窗口——所以商业远程桌面全要装被控端。CDP 只控 **Chromium 窗口内部**
+>   （控不了开始菜单/记事本，定位"远程浏览器工作区"，边界已写进文档）。
+> ② **新信令 + 三道闸门**（`sfu/protocol.js` 09-24 段 + `sfu/server.js`）：`agent-hello`（代理进房，
+>   置 `socket.isAgent=true`、名字加 `🖥️ ` 前缀、写 agentInfo；三道校验与 join-room 一字不差，
+>   **代理无特权**、人数满同样被拒）/ `remote-frame`（被控端→S→控制端，二进制 JPEG，`volatile` 发）/
+>   `remote-meta`（真实 URL/标题/视口，普通 emit，状态消息不能丢）+ 控制输入**复用既有 `remote-input`**
+>   （16 字节帧格式不变，agent 新增 `navigate`/`window` 两种走老通道的新语义）。
+>   **服务端三道闸**：① 身份闸（`isAgent` 才准发帧，人冒充不了代理）② 授权闸（帧只发给登记的
+>   host→controller 这一对，不旁路第三人）③ 体量闸（单帧 >900KB 丢 + 120 帧/秒限流 + volatile 不排队）；
+>   原则一句话 **"信任 ≠ 免检查"**。授权链路与人类被控端**完全同构**（服务器不认识 agent 特权）。
+> ③ **📱 手机控电脑（本次重点）**：`sfu/public/` 新增全屏 `#rdConsole`（canvas 画画面 + 地址栏 +
+>   工具条 + 隐藏 IME 捕获框）；成员列表代理行带 `🖥️` 前缀 +「可被控」徽标 +「控制电脑」按钮。
+>   canvas 交互**全部用 Pointer Events**（一套逻辑覆盖鼠标/触摸/触控笔）：单指=鼠标、**双指=滚轮**
+>   （两指中点位移换算；自己维护"当前几根手指"账本，第 2 指落下时撤销第 1 指已发的 mousedown，
+>   否则远端一直"按住"）、中文走隐藏输入框整段转发 + CDP `Input.insertText`（绕开 IME）。
+>   **真机实测**：双窗验证被控端真实 URL 变 `https://example.com/`、坐标逐像素精确
+>   （视口 1254×707，期望 627,297 = 实际 627,297）、手机双指让被控端 `scrollY 0→1000`、单指点击触发真实按钮。
+> ④ **跨网一键发布 + ICE 下发**：根因澄清——Mesh 版是 **P2P**，"跨网连不上"的根因是 **ICE 打洞**
+>   不是服务器（原来 `public/client.js` 把 ICE 硬编码成一条 Google STUN，严格 NAT 必挂）。
+>   修法：根 `server.js` 加可选 `mesh.config.json`（`port`/`host`/`iceServers`/`publicUrl`，优先级
+>   环境变量 > 文件 > 默认）+ `/config.json` 路由下发（带 `no-store`）+ 启动 ICE 自检（无 TURN 警告）；
+>   根 `public/client.js` 加 `ICE_SERVERS`/`iceReady`（`fetch('config.json',{cache:'no-store'})`，失败回落
+>   默认 STUN），**建 peer 前一律 `await iceReady`**（防"第一条 peer 用错配置"时序坑）。
+>   新增 `scripts/publish.js`（`npm run publish:mesh`）四段：**生成**（白名单拷贝 + 写 package.json，
+>   **每次清空重建、副本永不漂移**）→ **写 mesh.config.json**（默认 openrelay 公共 TURN）→ **体检**
+>   （真起一次 PORT=18081 验 `/config.json` 下发含 TURN 的 ICE、首页/client.js 可访问、带 no-store）→
+>   可选 `--tunnel`（探 cloudflared > ngrok，都没有就打印三条路）/`--bundle`（把 socket.io 拷进发布包）/
+>   `--check`（只读自检、过期退出码 1）。⚠️ **隧道只解决"网页能打开"，音视频是 P2P 的，要真开会还得有 TURN**。
+> ⑤ **★ 坑 40：Service Worker 缓存旧代码**（本次最有教学价值）：改了 `sfu/public/client.js`/`style.css`
+>   刷新死活不生效，服务器发了 `no-store`、DevTools 也是 200，页面还跑旧代码——根因 **SW 完全不看
+>   HTTP 缓存头**：旧 `sw.js` 把 client.js/style.css/workbench.html 一并 cache-first 预热，绕过了
+>   `no-store`；且 SW 只在 **sw.js 自身字节变化**时重装，业务代码天天改、sw.js 不动，旧缓存一直管着页面
+>   （"记得 bump 版本"寄希望于人的纪律——被忘了）。修法：按资源性质分两路——**不变的**（vendor/图标/
+>   manifest）cache-first，**会变的**（client.js/style.css/页面）**network-first**（在线永远最新）；
+>   版本语义随之清楚（改业务代码**不用** bump，换 vendor 才 bump），缓存名 `meeting-v1→v2`；
+>   client.js 加**逃生舱** `?nosw=1`（当场注销所有 SW + 清 Cache Storage + 重载）。
+>   **测试侧教训**：e2e 原本复用持久化 profile，而 **CDP 的 `Network.setCacheDisabled` 管不到 SW 的
+>   Cache Storage** → 测的是缓存不是代码；修法：每次运行前清空 profile 目录。
+> ⑥ **回归（本次实测）**：`npm run test:agent` **16/16**（真起 Chromium：抓屏 JPEG 魔数 + 归一化坐标
+>   ±3px + 真实点击 + 中文整段 + 滚动 + 远程导航 + 撤权停帧 + 无孤儿进程）+ `npm run test:e2e`
+>   **15 项全过**（真双窗 + 390×844 手机视口：双指滚动 `scrollY 0→1000`、单指点击、抽屉开合，
+>   截图落 `wb-rd-shots/`）+ `npm run test:publish` **29/29**（含 `--check` 过期闸"源码改了不重发必报错"）；
+>   导读 `LEARN.md` **5.29~5.32**；`sfu/protocol.js` 新增 09-24 段契约。
+> ⚠️ **待人工验证（命令行/自动化验不了，已进 `后续升级方向.md` 0.2）**：**真机手机端参与会议的真实观感**、
+>   **cloudflared 真实开隧道**（本机未装，`--tunnel` 只验证了"探测 + 给三条指引"）、
+>   **跨运营商真机跨网通话**（ICE/TURN 终极验收）、**手机控电脑真机触屏手感**。
+>
 > **09-24 AI 会议助理真上线 + 三处实修（按 `后续升级方向.md` 第 1 节主攻，本次有真 LLM key）**——
 > ① **密钥托管与统一 Provider（新文件 `sfu/ai/provider.js`）**：原来 server.js 里三份
 >   重复的 DeepSeek fetch（aiBrain 问答 / llmPlan 操作员计划 / llmMinutes 纪要）各写各的
@@ -576,6 +631,7 @@ webrtc/
 │       └── vendor/        #   socket.io.min.js + mediasoup-client.js（本地打包）
 ├── package.json           # scripts: start/start:sfu/start:demo/start:lan/test/test:sfu/test:smoke/
 │                          #          test:record/test:turn/bench/build:sfu-vendor（含 doctor）
+│                          #          ★ 09-24b 新增：agent/test:agent/test:e2e/publish:mesh/test:publish
 ├── scripts/
 │   ├── soak.js                 #   服务器耐久自测（C3-N1，默认 7h/可压缩）
 │   ├── test-signaling.js        # Mesh 信令回归（33 项，需先起 3000）
@@ -584,7 +640,15 @@ webrtc/
 │   ├── test-turn.js             # ICE 可达性实测（STUN Binding/TCP 探测）
 │   ├── bench.js                 # E4 压力基准（4/8/16 路）
 │   ├── start-demo.js            # 一键起两版
-│   └── start-lan.js             # 局域网交付（生成 config + HTTPS + 防火墙放行）
+│   ├── start-lan.js             # 局域网交付（生成 config + HTTPS + 防火墙放行）
+│   ├── publish.js               # ★ 09-24b 一键发布公网链接（生成→体检→可选隧道；--tunnel/--bundle/--check）
+│   ├── test-agent.js            # ★ 09-24b 桌面代理端到端（真 Chromium，16 项）
+│   ├── test-e2e-remote-desktop.js # ★ 09-24b 真机远程桌面 e2e（真双窗 + 手机视口，出截图）
+│   └── test-publish.js          # ★ 09-24b 发布链回归（29 项，含 --check 过期闸）
+├── agent/                       # ★ 09-24b 真 OS 级远程桌面 · 被控端代理（零新依赖）
+│   ├── cdp.js                   #   手写 CDP 客户端（驱动真实 Chromium：抓屏/注入输入）
+│   └── index.js                 #   代理主体（agent-hello 进房 → 推帧 + 执行 remote-input）
+├── publish-mesh/                # ★ 09-24b 由 publish.js 生成的发布包（白名单拷贝，勿手工改）
 └── public/
     ├── index.html         # 布局：左主区(房间面板[含密码框]/视频网格/控制/日志) + 右聊天侧边栏
     ├── style.css          # 两列布局 + 视频网格 + 聊天气泡 + 网络徽标三色
@@ -617,6 +681,11 @@ npm run test:record    # D+2 服务器侧录制端到端自测（需已装 ffmpe
 npm run test:turn      # ICE 可达性实测（对 config 每个 STUN/TURN 手搓 STUN Binding，3s 超时）
 npm run soak          # C3-N1 服务器耐久自测（默认 7 小时过夜；--minutes 2 压缩自测；结束对账"一条不丢"）
 npm run bench          # E4 压力基准（4/8/16 路，约 1 分钟，独立 Worker，不用起 3001）
+npm run agent          # ★ 09-24b 启动被控端桌面代理（--room 123456；真机远程桌面的被控端）
+npm run test:agent     # ★ 09-24b 桌面代理端到端（真起 Chromium：抓屏 JPEG + 坐标注入 ±3px + 远程导航）★ 16/16
+npm run test:e2e       # ★ 09-24b 真机远程桌面 e2e（真双窗 + 390×844 手机视口双指/单指，出截图）
+npm run publish:mesh   # ★ 09-24b 一键发布 Mesh 版（生成 publish-mesh/ → 体检 → 可选 --tunnel/--bundle/--check）
+npm run test:publish   # ★ 09-24b 发布链回归（含 --check 过期闸：源码改了不重发必报错）★ 29/29
 node --check public/client.js && node --check server.js      # 改完 Mesh 版 JS 查语法
 node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU 版 JS 查语法
 ```
@@ -630,6 +699,8 @@ node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU �
 - 人工验证 SFU：Chrome 2~8 窗口访问 3001 → 同上；**真实摄像头/共享/聊天需用户开浏览器验证**（命令行只能验信令）。
 - 浏览器内部调试：`chrome://webrtc-internals`（看真实 SDP/ICE）。
 - **改完前端 JS，浏览器要 Ctrl+F5 强刷**，否则读旧缓存（常见坑）。
+  ⚠️ **09-24b 起注意 Service Worker**：SW 会绕过 HTTP 缓存头缓存旧 client.js/style.css（见坑 40）——
+  强刷不一定够，必要时给地址加 `?nosw=1`（逃生舱：注销 SW + 清 Cache Storage + 重载）；跑 e2e 记得先清 profile。
 - mediasoup Worker 是原生模块：`npm run start:sfu` 首次启动会拉起编译好的 worker（进程名 mediasoup-worker）。
 
 ---
@@ -665,6 +736,14 @@ node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU �
 **DataChannel 铁律**：建连主动方 `pc.createDataChannel('chat_<rand>')`；对端 `pc.ondatachannel` 接收。
 **群聊广播**：遍历 `channels`，只给 `readyState === 'open'` 的通道 `send(text)`；
 消息是纯文本，接收端靠 channel 归属的 remoteId 判断发送者（UI 显示 shortId = id 后 4 位）。
+
+**★ 09-24b Mesh 版跨网 ICE 下发**：根 `server.js` 新增可选 `mesh.config.json`
+（`port`/`host`/`iceServers`/`publicUrl`；优先级 **环境变量 `PORT`/`HOST` > `mesh.config.json` > 默认值**）
++ `GET /config.json` 路由（下发 `iceServers`/`arch`/`maxMembers`，带 `Cache-Control: no-store`），
+启动时打印 ICE 自检（无 TURN 警告）；根 `public/client.js` 加 `ICE_SERVERS` + `iceReady`
+（`fetch('config.json',{cache:'no-store'})`，失败回落默认 STUN），**所有建 peer 处 `await iceReady` 再建**
+（防"第一条 peer 用错配置"）。根因：Mesh 是 P2P，"跨网连不上"是 **ICE 打洞**、不是服务器；
+原来 ICE 硬编码一条 Google STUN，严格 NAT 必挂。`mesh.config.json` 含 TURN 凭证已入 `.gitignore`。
 
 **SFU 版（sfu/）协议另有一套**：房间/密码事件沿用上表，但**媒体协商全部换成请求-应答**——
 `get-router-rtp-capabilities` / `create-webrtc-transport` / `transport-connect` / `produce` / `close-producer`
@@ -703,6 +782,7 @@ node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU �
 | 数据通道应用层（非信令） | `{type:'chat'}` / `{type:'react'}` / `{type:'annot', to, op, x, y, color}` / `{type:'board', op, ...}` / `{type:'caption', text}` | 三种频道 label：`chat`（聊天 + 表情 + 字幕）/ `annot`（带 `to` 定向头的屏幕批注）/ `board`（房间级白板，无定向头）；字幕**不做信令兜底**、聊天**双路径 + msgId 去重** | D+1 / F4 / F5 / F7 / 实时字幕 |
 | HTTP（非信令） | `GET /api/rooms` / `GET /dashboard` / `GET /config.json` / `GET /recordings/<file>` / `GET /minutes/<房间>/<file>` / `GET /api/minutes?room=` / `POST|GET /api/captions`（09-17e 值守归档：落盘/回读） | 观测快照 JSON / 面板页 / 下发 ICE + `lanUrl` + `aiEnabled`（**只给布尔值，密钥绝不下发**） / 录制产物下载 / 纪要 md 下载（路径穿越均已钳制、静态响应 `no-store`） | 观测面板、可达性、D+2 交付、N2 纪要 |
 | C→S 应答 + S→C 广播 | `ai-join` / `ai-leave` / `ai-ask` / `ai-minutes` / `ai-op` | `ai-join`→`{aiBot}`（bot 以 `isBot` 虚拟成员进 room-state）；`ai-ask {question}`→**先回执** `{started,streamId}` 再 `ai-stream{id,delta,done}` 增量 + 终态 `chat-message{...,streamId,ai:{mock,tokens}}`（前端按 streamId 去重；助理缺位时自动邀请）；`ai-minutes {type,since}`→`{file,path,mock}`；`ai-op {goal}`→`{started}`（AI 以真实控制端走完整授权链路，不豁免） | 09-19b/c/g + **09-24 流式与双轨**（详见 `sfu/protocol.js` 的 AI 段契约） |
+| C→S 应答 + S→C 定向 | `agent-hello` / `remote-frame` / `remote-meta`（★ 09-24b 真 OS 级远程桌面） | `agent-hello {roomNumber,password?,name?,platform?,browser?}`→`{roomNumber,memberId}`（置 `isAgent`、名加 `🖥️ ` 前缀；三道校验同 join-room，**代理无特权**、满员照样被拒）；`remote-frame {to,frame}` 被控端→S→控制端（二进制 JPEG，**三道闸**：①`isAgent` 身份闸 ②host→controller 授权闸 ③≤900KB + 120 帧/秒体量闸；`volatile` 发不排队）；`remote-meta {to,url,title,viewport}` 回真实地址/标题（普通 emit）；控制输入**复用 `remote-input`**（16 字节帧不变，agent 新增 `navigate`/`window` 走老通道新语义） | 真机远程桌面（本地代理 `agent/` + `sfu/public/` 的 `#rdConsole`，含手机 Pointer Events 单指/双指） |
 
 ---
 
@@ -864,6 +944,24 @@ node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU �
     现在的做法：从 `/config.json` 读 `aiEnabled` 后两支断言分叉；真模型才跑的那部分
     放进 `npm run test:ai`（无 key 自动 skip 并提示）。
     **纪律：AI 相关断言不得假设"一定没有 key"**。
+
+40. **★ Service Worker 会绕过 HTTP 缓存头，让"代码对了但页面跑旧的"**（09-24b 实修，本档最有教学价值）：
+    现象是改了 `sfu/public/client.js` / `style.css` 刷新死活不生效，服务器明明发了
+    `Cache-Control: no-store`、DevTools 里也是 200，页面跑的仍是旧代码。根因两层：
+    ① **SW 完全不看 HTTP 缓存头**——旧 `sw.js` 把 `./client.js`、`./style.css`、
+    `./workbench.html` 一并预热进 Cache Storage 然后 **cache-first** 返回，HTTP 层的
+    `no-store` 被整层绕过；② SW 只在 **sw.js 自身字节变化**时才重装，业务代码天天改、
+    sw.js 一动不动，旧缓存就一直管着页面（旧注释那句"记得 bump SW_CACHE_VERSION"
+    是寄希望于人的纪律，而纪律会被忘掉）。修法：**按资源性质分两路**——
+    不变的（vendor/图标/manifest）cache-first，会变的（client.js/style.css/页面）
+    **network-first**（在线永远最新=改完刷新即见），缓存只作断网兜底；版本语义随之清楚
+    （改业务代码**不用** bump，换 vendor 才 bump）；另加 **逃生舱** `?nosw=1`
+    （当场注销所有 SW + 清空 Cache Storage + 重载，用来一步排除"是不是缓存的锅"）。
+    **测试侧同源教训**：e2e 原本复用持久化浏览器 profile，而 **CDP 的
+    `Network.setCacheDisabled` 管不到 SW 的 Cache Storage**——于是测试测的是缓存而不是代码；
+    修法：**每次运行前清空 profile 目录**。
+    排查方法论：最后靠"让页面自己 fetch client.js 自证版本指纹"才定死是缓存问题——
+    **当"改了没生效"时，先让页面证明它加载的是哪一版，再谈改代码**。
 
 
 ---

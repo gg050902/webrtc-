@@ -115,6 +115,38 @@ let localStream = null;
 let cameraTrack = null;   // ★ 记录"原始摄像头轨"：切回摄像头时要换回来
 let sharingScreen = false; // 当前是否在共享屏幕
 
+/* ★ 09-24 跨网部署升级：ICE（STUN/TURN）改为"服务器下发 + 本地兜底"
+ *
+ * ▎这一步解决的是"跨网络连不上"最硬的那块：Mesh 版是 P2P，
+ *   能不能连上完全取决于 ICE 打洞。只带 STUN 时，双方都在严格 NAT
+ *   （公司网 / 4G/5G / 酒店 WiFi）就打不通；配上 TURN 才能一定连上。
+ *   以前 ICE 写死在这里（只一条 Google STUN），换环境就得改代码——
+ *   于是"发布到公网"这件事永远做不干净。现在改成启动时问服务器要。
+ *
+ * ▎拿不到怎么办？——**保持可用**：请求失败（离线 / 老服务器）就用默认 STUN，
+ *   绝不因为一个配置请求把整个会议卡住。这是"配置是增强，不是依赖"。
+ * ▎注意：下面所有建连都会 await iceReady，保证第一条 peer 用的就是正确配置。
+ */
+const ICE_FALLBACK = [{ urls: 'stun:stun.l.google.com:19302' }];
+let ICE_SERVERS = ICE_FALLBACK;
+const iceReady = fetch('config.json', { cache: 'no-store' })
+  .then((r) => (r.ok ? r.json() : null))
+  .then((cfg) => {
+    if (cfg && Array.isArray(cfg.iceServers) && cfg.iceServers.length) {
+      ICE_SERVERS = cfg.iceServers;
+    }
+    const stun = ICE_SERVERS.filter((s) => String(s.urls).startsWith('stun:')).length;
+    const turn = ICE_SERVERS.filter((s) => String(s.urls).startsWith('turn')).length;
+    log(`🧊 ICE 配置就绪：STUN ${stun} 条 / TURN ${turn} 条` +
+      (turn === 0 ? '（无 TURN：跨网络遇到严格 NAT 可能连不上）' : '（打洞失败可退回中继，跨网更稳）'));
+    return ICE_SERVERS;
+  })
+  .catch(() => {
+    log('🧊 没能取到服务器 ICE 配置，改用默认 STUN（不影响局域网/普通家庭宽带）');
+    return ICE_SERVERS;
+  });
+
+
 async function startLocalMedia() {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
@@ -543,10 +575,10 @@ function createPeerFor(remoteId) {
   });
 
   // ② 创建这条 P2P 连接（RTCPeerConnection）
+  //   ★ 09-24：ICE 来自服务器下发的配置（见上方 iceReady），
+  //     不再写死——这样"同一个前端 + 不同 TURN 配置"就能在任意网络环境部署。
   const pc = new RTCPeerConnection({
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-    ],
+    iceServers: ICE_SERVERS,
   });
 
   // 把本地媒体接进这条连接（对每个人都要接一次）
@@ -626,13 +658,16 @@ function createPeerFor(remoteId) {
  *   会出现"两个人同时问"的尴尬（这叫 glare 冲突）。
  *   约定"新人主动、老人被动"，就永远不会冲突。
  * ────────────────────────────────────────────────────────────── */
-socket.on('room-members', ({ roomNumber, members }) => {
+socket.on('room-members', async ({ roomNumber, members }) => {
   enterRoom(roomNumber); // 进房收尾（创建者和加入者都从这条消息拿到房间号）
 
   if (members.length === 0) {
     log('🏠 我是这个房间的第 1 个人，等别人用房间号进来');
   } else {
     log(`🏠 房间里现有老成员 ${members.length} 人，我作为新人主动连接他们`);
+    // ★ 09-24：建连前先等 ICE 配置到位——否则第一条 peer 会用到兜底的 STUN，
+    //   配了 TURN 的严格 NAT 环境就正好"第一条连不上"（最容易被忽略的时序坑）
+    await iceReady;
     members.forEach((remoteId) => connectToPeer(remoteId));
   }
 });
@@ -668,8 +703,9 @@ async function connectToPeer(remoteId) {
  * 服务器广播 new-member 时，我是老成员：
  * 只要创建连接（挂好 ontrack 等回调），然后等新人发 offer 过来。
  * ────────────────────────────────────────────────────────────── */
-socket.on('new-member', ({ id }) => {
+socket.on('new-member', async ({ id }) => {
   log(`🆕 新成员 ${shortId(id)} 加入了房间，为他准备连接...`);
+  await iceReady;      // ★ 同上：先等 ICE 配置，再建 peer
   createPeerFor(id);   // 只建连接，不发 offer（等对方开口）
 });
 
@@ -682,6 +718,7 @@ socket.on('new-member', ({ id }) => {
 socket.on('offer', async ({ from, offer }) => {
   log(`📥 收到成员 ${shortId(from)} 的 offer`);
   // 保险起见：如果还没为这个人建连接，现建一个
+  await iceReady;
   const peer = createPeerFor(from);
 
   await peer.pc.setRemoteDescription(offer);      // 记住对方能力

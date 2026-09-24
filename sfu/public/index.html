@@ -332,6 +332,18 @@
           <span id="ownerTag" class="role-tag hidden"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 17.5h15L18 9l-3.8 3.2L12 6l-2.2 6.2L6 9l-1.5 8.5z"/></svg>你是房主</span>
         </div>
         <div id="memberList" class="member-list"></div>
+        <!-- ★ 09-24 真远程桌面：把"怎么让这台电脑变成可被控的"直接写在页面上。
+             因为被控端代理必须是**本地程序**（浏览器的安全沙箱不允许网页驱动真实鼠标键盘），
+             用户得在自己电脑的终端跑一行命令 —— 那就把这行命令准备好，一键复制。 -->
+        <div id="agentHint" class="agent-hint hidden">
+          <div class="ah-title">🖥️ 想让别人操作这台电脑？</div>
+          <div class="ah-body">在本机终端运行下面这行命令，房间里就会出现一台「可被控的电脑」：</div>
+          <code id="agentCmd" class="ah-cmd">node agent/index.js --room ------</code>
+          <div class="ah-actions">
+            <button id="agentCopy" class="btn ah-copy">复制命令</button>
+            <button id="agentHow" class="btn ah-how">为什么不能在网页里做？</button>
+          </div>
+        </div>
       </div>
       <div class="chat-panel">
         <div class="chat-title">💬 会议聊天 <span class="chat-via">经服务器转发</span></div>
@@ -397,6 +409,34 @@
 
   <!-- 轻提示 toast：控制权结果等一次性反馈（不用 alert，避免被浏览器拦截） -->
   <div id="toast" class="toast hidden"></div>
+
+  <!-- ★ 09-24 真远程桌面（控制端）：全屏控制台
+       画面 = 被控端 CDP screencast 抓来的真 JPEG 帧；鼠标键盘 = 16 字节二进制帧经
+       remote-input 直达对方浏览器。地址栏显示的是**对方浏览器的真实地址**（remote-meta 回传）。
+       canvas 上不盖额外图层，坐标直接来自 canvas 自身的 boundingRect —— 少一层换算少一类偏差。 -->
+  <section id="rdConsole" class="rd-console hidden">
+    <header class="rd-bar">
+      <span class="rd-brand">🖥️ 远程桌面</span>
+      <button id="rdBack" class="btn rd-ibtn" title="后退">←</button>
+      <button id="rdReload" class="btn rd-ibtn" title="刷新对方页面">⟳</button>
+      <input id="rdUrl" class="rd-url" placeholder="输入网址后回车，例：bilibili.com" spellcheck="false" autocomplete="off">
+      <button id="rdGo" class="btn rd-ibtn" title="打开网址">前往</button>
+      <button id="rdMax" class="btn rd-ibtn" title="最大化对方浏览器窗口">⛶</button>
+      <span id="rdState" class="rd-state">连接中…</span>
+      <button id="rdRelease" class="btn danger">退出控制</button>
+    </header>
+    <div id="rdStage" class="rd-stage">
+      <canvas id="rdCanvas"></canvas>
+      <!-- 键盘捕获：视觉上不可见的输入框。中文/整段文本在这里攒成一段，
+           再一次性发给被控端做 insertText —— 绕开输入法的组合态问题。 -->
+      <textarea id="rdKeys" class="rd-keys" aria-hidden="true" tabindex="-1"></textarea>
+      <div id="rdHint" class="rd-hint"></div>
+    </div>
+    <footer class="rd-foot">
+      <span id="rdMeta" class="rd-meta">—</span>
+      <span class="rd-tips">鼠标 / 键盘 / 触屏直达对方电脑 · Esc 退出</span>
+    </footer>
+  </section>
 
   <!-- ★ 远程协助（A1）：远程光标（被控端用）。
        控制端鼠标移动时，被控端这颗"假光标"跟着走——

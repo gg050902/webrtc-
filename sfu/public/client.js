@@ -1634,8 +1634,17 @@ socket.on('remote-answer', ({ from, ok, reason, expiresAt }) => {
     remoteExpiresAt = expiresAt || null; // ★ A6：服务器给的到期时间戳（null = 不限时）
     log(`🎉 成员 ${shortId(from)} 已允许你控制他的屏幕！`
       + (expiresAt ? `（授权 ${Math.max(1, Math.round((expiresAt - Date.now()) / 1000))} 秒后到期）` : ''));
-    showToast(`✅ 成员 ${shortId(from)} 已允许你控制他的屏幕`);
-    enterControlMode(from); // 授权成功 → 进入控制模式（信令通即通道通）
+    // ★ 09-24：授权的对象决定用哪个控制台 ——
+    //   桌面代理 → 真远程桌面控制台（canvas 收真画面，输入注入真浏览器）；
+    //   人类成员 → 原来的工作台重放模式（控的是他页面里的模拟桌面）。
+    //   两者共用同一条 remote-request / remote-answer 授权链路，服务器一视同仁。
+    if (agentPeers.has(from)) {
+      showToast(`✅ 已连上成员 ${shortId(from)} 的电脑`);
+      openRemoteDesk(from, agentPeers.get(from));
+    } else {
+      showToast(`✅ 成员 ${shortId(from)} 已允许你控制他的屏幕`);
+      enterControlMode(from); // 授权成功 → 进入控制模式（信令通即通道通）
+    }
     startCountdown();       // ★ A6：控制层里的倒计时开始跑
   } else if (reason === 'busy') {
     log('❌ 对方正在被其他人控制中（busy），请稍后再试');
@@ -1665,6 +1674,7 @@ socket.on('remote-ended', ({ reason }) => {
   log(word);
   showToast(word, reason === 'expired' ? 'info' : '');
   stopCountdown();
+  if (rdHostId) closeRemoteDesk(false);   // ★ 09-24：远程桌面控制台跟着一起收（不留死画面）
   if (rcRole === 'host') auditPush('授权', `控制结束（${reason}）`);
 });
 
@@ -1675,6 +1685,8 @@ socket.on('remote-state', ({ hostId, controllerId, expiresAt }) => {
   // ★ A6：广播里带着"限时授权的到期时间戳"——任何一端都能算出还剩多久
   if (expiresAt) { remoteExpiresAt = expiresAt; startCountdown(); }
   if (!hostId || !controllerId) stopCountdown();
+  // ★ 09-24：控制关系一消失，远程桌面控制台自动收起（任何一处撤权都能兜住，幂等安全）
+  if ((!hostId || !controllerId) && rdHostId) closeRemoteDesk(false);
 
   // 先清掉所有视频框上的"控制中/被控中"角标（重建式更新，最不容易漏）
   for (const tile of tiles.values()) tile.box.classList.remove('rc-host', 'rc-ctrl');
@@ -2357,6 +2369,7 @@ function renderMembers(members) {
   ownerTag.classList.toggle('hidden', !(me && me.owner)); // 只有房主看到"你是房主"角标
 
   memberListEl.textContent = ''; // 重建式渲染（成员数很少，最不容易漏状态）
+  agentPeers.clear();            // ★ 09-24：代理名单跟着快照重建（离场的代理不能留在名单里）
   for (const m of members) {
     const isMe = m.id === socket.id;
     const row = document.createElement('div');
@@ -2366,6 +2379,27 @@ function renderMembers(members) {
       // ★ 09-19 AI Bot 行：无媒体无网络概念，一张安静的"机器同事"名牌
       row.classList.add('ai-bot-row');
       row.innerHTML = `<span class="m-id">${ICONS.bot} ${escapeHtml(m.name || 'AI 助理')}<span class="m-bot-note">聆听中…</span></span>`;
+      memberListEl.appendChild(row);
+      continue;
+    }
+    /* ★ 09-24 真远程桌面：桌面代理行。
+     * 和 AI Bot 行同一个思路 —— 成员列表里除了"人"，还有"机器"，
+     * 各给一种一眼可辨的样式，而不是糊成一行灰字让人猜。
+     * 按钮文案也不叫"请求控制"，叫「控制电脑」：因为对被控端是人的情况，
+     * 控的是他页面里的工作台；对代理，控的是他整台电脑的浏览器 —— 语义不同就别用同一个词。 */
+    if (m.agent) {
+      row.classList.add('agent-row');
+      row.innerHTML = `<span class="m-id" title="${escapeHtml(m.name || '')}">`
+        + `🖥️ ${escapeHtml(m.name || '桌面代理')}<span class="m-agent-note">可被控</span></span>`;
+      agentPeers.set(m.id, { name: m.name || '桌面代理', info: m.agentInfo || null });
+      if (!isMe) {
+        const cbtn = document.createElement('button');
+        cbtn.className = 'btn m-ctrl-btn';
+        cbtn.textContent = '控制电脑';
+        cbtn.title = '申请远程控制这台电脑的真实浏览器（能开网站、能登录、能操作）';
+        cbtn.addEventListener('click', () => requestRemoteControl(m.id));
+        row.appendChild(cbtn);
+      }
       memberListEl.appendChild(row);
       continue;
     }
@@ -2460,6 +2494,7 @@ function renderMembers(members) {
   }
   applyLevels(lastLevels); // 列表刚重建，把音量高亮补回去
   applyNetDots();          // ★ F2：网络质量点也补回去（等级数据存在 netLevelsById 里）
+  updateAgentHint();       // ★ 09-24：房间里有代理就收起"怎么启动代理"的指引卡片
 }
 
 function kickMember(id) {
@@ -5260,19 +5295,422 @@ lowBwBtn.addEventListener('click', () => {
 /* ---- ③ Service Worker 注册（PWA 外壳）----
  * ▎两个前置：浏览器支持 SW + 安全上下文（https / localhost）——
  *   纯 IP 的 http 页面注册不了（和 getUserMedia 同一条安全规则）。
- * ▎教学提示：注册后 DevTools → Application → Service Workers 可见；
- *   更新 sw.js 后要 bump sw.js 里的 SW_CACHE_VERSION，旧缓存才会被清。 */
+ * ▎教学提示：注册后 DevTools → Application → Service Workers 可见。
+ *   策略细节见 sw.js：vendor 类库 cache-first，client.js/style.css 等走
+ *   **network-first**（所以"改完刷新即见"不再受缓存影响）。 */
 if ('serviceWorker' in navigator && (window.isSecureContext !== false)) {
-  navigator.serviceWorker.register('sw.js').then(() => {
-    log('📦 PWA 外壳已就绪（可安装到桌面/主屏；静态壳离线可用）');
-  }).catch((err) => {
-    log(`⚠️ Service Worker 注册失败：${err.message}（不影响会议功能）`);
+  /* ★ 09-24 逃生舱：地址加 `?nosw=1` → 当场注销所有 SW 并清空 Cache Storage。
+   *   排查"改了代码不生效"时，第一步就该先按这个开关确认"是不是 SW 缓存的锅"，
+   *   比开 DevTools 一层层点 Application 快得多（运维思路：先缩小范围）。
+   *   注意：注销后当前这次加载仍归旧 SW 管，要再刷一次才彻底干净——所以下面
+   *   注销完直接 reload 一次，做到"一步到位"。 */
+  if (/[?&]nosw=1/.test(location.search)) {
+    (async () => {
+      try {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((r) => r.unregister()));
+        if (self.caches) {
+          const keys = await caches.keys();
+          await Promise.all(keys.map((k) => caches.delete(k)));
+        }
+        log(`🧹 已注销 ${regs.length} 个 Service Worker 并清空缓存，正在重载…`);
+        setTimeout(() => location.reload(), 400);
+      } catch (err) {
+        log(`⚠️ 注销 Service Worker 失败：${err.message}`);
+      }
+    })();
+  } else {
+    navigator.serviceWorker.register('sw.js').then(() => {
+      log('📦 PWA 外壳已就绪（可安装到桌面/主屏；静态壳离线可用）');
+    }).catch((err) => {
+      log(`⚠️ Service Worker 注册失败：${err.message}（不影响会议功能）`);
+    });
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════════
+ * ★ 09-24 真远程桌面（控制端控制台）—— 把"操作一台真电脑"做成一个正经工作台
+ * ══════════════════════════════════════════════════════════════════════════════════
+ *
+ * ▎和"远程协助（工作台重放）"的区别，一句话说清：
+ *   远程协助 = 控的是**对方页面里的一个 iframe 模拟桌面**（合成事件重放）；
+ *   远程桌面 = 控的是**对方电脑上真实的 Chromium 窗口**（CDP 注入真鼠标真键盘）。
+ *   前者是"教具"（讲清楚归一化坐标和事件重放），后者是"能真用"的东西
+ *   —— 能开真网站、能登录、能看视频、能填表单，这才对得起"远程桌面"四个字。
+ *
+ * ▎画面链路：被控端 CDP screencast → JPEG → socket.io 二进制 → 这里画进 canvas
+ * ▎输入链路：这里的 pointer/keyboard 事件 → 16 字节帧 → 服务器门禁转发 → CDP 注入
+ *   两条链路都复用项目里已有的约定（同一套帧格式、同一套授权门禁），没有另起炉灶。
+ *
+ * ▎顺手补上的移动端能力（用户明确要的"手机控电脑"）：
+ *   · pointer 事件本身就同时覆盖鼠标和触摸 → **单指即鼠标**，一行代码都不用多写；
+ *   · 双指捏合映射成滚轮 → 手机上能自然地滚动对方页面。
+ *   这也是"用 web 标准换来的便宜"：不选 pointer 而用 mousedown/touchstart 双份写，
+ *   这里就得写两套逻辑、还容易在两端行为不一致。
+ */
+
+const rdConsoleEl = $('rdConsole');
+const rdStageEl = $('rdStage');
+const rdCanvasEl = $('rdCanvas');
+const rdUrlEl = $('rdUrl');
+const rdStateEl = $('rdState');
+const rdMetaEl = $('rdMeta');
+const rdHintEl = $('rdHint');
+const rdKeysEl = $('rdKeys');
+const agentHintEl = $('agentHint');
+const agentCmdEl = $('agentCmd');
+
+// canvas 2d 上下文：测试环境（假 DOM）里没有 getContext，所以防御式取一次
+let rdCtx = null;
+try { rdCtx = rdCanvasEl && rdCanvasEl.getContext ? rdCanvasEl.getContext('2d') : null; } catch (e) { rdCtx = null; }
+
+const agentPeers = new Map();   // agentId → { name, info }（renderMembers 时重建）
+let rdHostId = null;            // 我正在控制的桌面代理 id（null = 没在控制）
+let rdFrames = 0;
+let rdDrawing = false;
+let rdPendingAb = null;         // 只留最新一帧：画面实时性 > 完整性（堆积只会看到"过去"）
+let rdMoveRaf = 0;
+let rdMovePending = null;
+let rdWheelAccum = 0;
+let rdWheelTimer = null;
+let rdWheelPos = null;
+// 注：双指滚动的状态（活跃指针账本 rdPointers / rdScrollMode）在下面的交互段里，
+// 它们只被那一处用到，就放在离用最近的地方 —— 状态的作用域能收窄就收窄。
+
+// rAF 帮手：假 DOM / 老环境没有 requestAnimationFrame 时退回 setTimeout
+const rdRaf = (cb) => (typeof requestAnimationFrame === 'function' ? requestAnimationFrame(cb) : setTimeout(cb, 16));
+
+function setRdState(t) { if (rdStateEl) rdStateEl.textContent = t; }
+
+/* 把 canvas 按画面比例塞进舞台（自己算尺寸而不是交给 CSS：canvas 不是替换元素，
+ * object-fit 对它无效；自己算的好处是 canvas 的 rect 就等于画面区 ——
+ * 后面算归一化坐标直接量 canvas 的 rect 就行，不会掉进"有黑边"的坑）。 */
+function rdFit() {
+  if (!rdCanvasEl || !rdStageEl || !rdCanvasEl.width) return;
+  const stage = rdStageEl.getBoundingClientRect ? rdStageEl.getBoundingClientRect() : null;
+  if (!stage || !stage.width || !stage.height) return;
+  const ar = rdCanvasEl.width / rdCanvasEl.height;
+  let w = stage.width - 16, h = w / ar;
+  if (h > stage.height - 16) { h = stage.height - 16; w = h * ar; }
+  rdCanvasEl.style.width = Math.max(64, Math.floor(w)) + 'px';
+  rdCanvasEl.style.height = Math.max(64, Math.floor(h)) + 'px';
+}
+
+/* 画一帧。优先 createImageBitmap（无 URL 生命周期、最快）；
+ * 环境不支持时降级为"只记状态不画"——保证逻辑（计数/状态/授权）在任何环境都可测。 */
+async function rdDrawFrame(ab) {
+  rdFrames++;
+  if (rdHintEl && rdFrames === 1) rdHintEl.classList.add('hidden');
+  try {
+    if (typeof createImageBitmap === 'function' && typeof Blob === 'function') {
+      const bmp = await createImageBitmap(new Blob([ab], { type: 'image/jpeg' }));
+      if (rdCanvasEl.width !== bmp.width || rdCanvasEl.height !== bmp.height) {
+        rdCanvasEl.width = bmp.width;
+        rdCanvasEl.height = bmp.height;
+        rdFit();
+      }
+      if (rdCtx) rdCtx.drawImage(bmp, 0, 0);
+      if (typeof bmp.close === 'function') bmp.close();
+    }
+  } catch (e) { /* 单帧解码失败忽略：下一帧就补上了 */ }
+}
+
+async function rdPumpFrames() {
+  if (rdDrawing) return;
+  rdDrawing = true;
+  try {
+    while (rdPendingAb) {
+      const ab = rdPendingAb;
+      rdPendingAb = null;
+      await rdDrawFrame(ab);
+    }
+  } finally {
+    rdDrawing = false;
+  }
+  /* 状态文案要回答"画面在不在动"，而不是报一个帧数 ——
+   * 用户看到"已收 2 帧"只会疑惑（2 帧算好还是不好？）。帧数放进 title 给想深究的人。*/
+  setRdState('✅ 实时画面');
+  if (rdStateEl) rdStateEl.title = `已接收 ${rdFrames} 帧 JPEG 画面（来自对方电脑的真实屏幕）`;
+}
+
+function rdSend(event) {
+  if (!rdHostId) return false;
+  socket.emit('remote-input', { to: rdHostId, event });
+  return true;
+}
+
+// 事件坐标 → 归一化 0~1（canvas 的 rect 就是画面区，见 rdFit 的说明）
+function rdNorm(e) {
+  if (!rdCanvasEl || !rdCanvasEl.getBoundingClientRect) return null;
+  const r = rdCanvasEl.getBoundingClientRect();
+  if (!r.width || !r.height) return null;
+  return {
+    nx: clamp01((e.clientX - r.left) / r.width),
+    ny: clamp01((e.clientY - r.top) / r.height),
+  };
+}
+
+function openRemoteDesk(hostId, info) {
+  rdHostId = hostId;
+  rdFrames = 0;
+  rdPendingAb = null;
+  if (rdConsoleEl) rdConsoleEl.classList.remove('hidden');
+  if (document.body && document.body.classList) document.body.classList.add('rd-mode');
+  if (rdHintEl && rdHintEl.classList) { rdHintEl.classList.remove('hidden'); rdHintEl.textContent = '正在等对方电脑的第一帧画面…'; }
+  if (rdMetaEl) rdMetaEl.textContent = (info && info.name) ? info.name : ('成员 ' + shortId(hostId));
+  if (rdUrlEl) rdUrlEl.value = '';
+  setRdState('🔄 正在接收画面…');
+  rdFit();
+  log(`🖥️ 远程桌面已打开：正在操作 ${shortId(hostId)} 的真实浏览器（画面 = 对方真屏幕）`);
+  showToast('🖥️ 已连上对方电脑，可以直接用鼠标键盘操作了');
+  // 键盘焦点立刻交给捕获框，让用户不用先点一下才能打字
+  setTimeout(() => { try { if (rdKeysEl && rdKeysEl.focus) rdKeysEl.focus(); } catch (e) { /* ignore */ } }, 150);
+}
+
+function closeRemoteDesk(sendRelease) {
+  const host = rdHostId;
+  if (sendRelease && host) socket.emit('remote-release');
+  rdHostId = null;
+  rdPendingAb = null;
+  rdWheelAccum = 0;
+  if (rdKeysEl) rdKeysEl.value = '';
+  if (rdConsoleEl) rdConsoleEl.classList.add('hidden');
+  if (document.body && document.body.classList) document.body.classList.remove('rd-mode');
+  if (host) log('🖥️ 已退出远程桌面');
+}
+
+/* ---- 画面：被控端推来的帧直接画出来 ---- */
+socket.on('remote-frame', ({ frame } = {}) => {
+  if (!rdHostId || !frame) return;
+  rdPendingAb = frame;      // 覆盖式缓冲：网络慢时只画最新，不排队播旧画面
+  rdPumpFrames();
+});
+
+/* ---- 元信息：对方浏览器的真实 URL / 标题（地址栏据此显示，不做假） ---- */
+socket.on('remote-meta', ({ url, title } = {}) => {
+  if (!rdHostId) return;
+  if (rdUrlEl && url) rdUrlEl.value = url;
+  if (rdMetaEl) rdMetaEl.textContent = (title ? title + ' · ' : '') + (url || '');
+});
+
+/* ---- 以下是控制台自身的交互（鼠标 / 触屏 / 键盘 / 地址栏）---- */
+if (rdCanvasEl && rdCanvasEl.addEventListener) {
+  /* ★ 09-24 补（真机抓到的 bug）：手机上一用双指，鼠标就乱点。
+   *   根因：pointerdown/move/up 是**按手指**派发的，双指就是两套 pointer 事件，
+   *   于是远端收到一串 mousedown/mouseup —— 表现为"想滚动，结果把页面上的东西拖走了"。
+   *   修法：自己维护一份"当前有几根手指"的账本（rdPointers），
+   *     · 第 1 根手指 → 鼠标（照旧）
+   *     · 第 2 根手指落下 → 进入滚动模式，并**撤销**第一根手指已发出的 mousedown
+   *       （补一个 mouseup，否则远端一直处于"按住"状态）
+   *     · 双指移动 → 用两指中点的位移换算滚轮
+   *   全部用 pointer 事件做，不再需要 touch 事件：一套逻辑覆盖鼠标 + 触摸 + 触控笔。
+   *   —— 这也是"选 web 标准"的回报：不用 mouse/touch 两套代码，就不会有两套行为不一致。 */
+  const rdPointers = new Map();   // pointerId → { x, y }（当前压在画面上的手指/鼠标）
+  let rdScrollMode = false;       // 双指滚动模式（此模式下不发鼠标事件）
+  let rdScrollMid = null;         // 上一帧两指中点
+  let rdMouseDownSent = false;    // 我是否已经发出过 mousedown（用于撤销）
+
+  const pointerMid = () => {
+    let sx = 0, sy = 0, n = 0;
+    for (const p of rdPointers.values()) { sx += p.x; sy += p.y; n++; }
+    return n ? { x: sx / n, y: sy / n } : null;
+  };
+  const scheduleWheel = () => { if (!rdWheelTimer) rdWheelTimer = setTimeout(flushWheel, 60); };
+  const normOf = (x, y) => {
+    const r = rdCanvasEl.getBoundingClientRect();
+    if (!r.width || !r.height) return null;
+    return { nx: clamp01((x - r.left) / r.width), ny: clamp01((y - r.top) / r.height) };
+  };
+
+  // 移动：时间节流（33ms ≈ 30fps 上限）。不节流的话一秒钟能发几百条，
+  // 把信令通道塞满，反而让点击变卡——"少发但发得准"比"多发"体验好。
+  let lastMoveAt = 0;
+  rdCanvasEl.addEventListener('pointermove', (e) => {
+    if (!rdHostId) return;
+    if (rdPointers.has(e.pointerId)) rdPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    // 双指滚动优先（此时一个鼠标事件都不能发，否则就是上面那个 bug）
+    if (rdScrollMode && rdPointers.size >= 2) {
+      const mid = pointerMid();
+      if (mid && rdScrollMid) {
+        const dy = rdScrollMid.y - mid.y;      // 双指上滑 = 内容上滚（跟手机习惯一致）
+        if (Math.abs(dy) >= 2) {
+          const p = normOf(mid.x, mid.y);
+          if (p) { rdWheelPos = p; rdWheelAccum += dy / 20; scheduleWheel(); } // 20px 手指 ≈ 滚轮一格
+        }
+      }
+      rdScrollMid = mid;
+      return;
+    }
+    if (rdScrollMode) return;    // 滚动收尾瞬间，别顺手又补一发移动
+
+    const now = Date.now();
+    if (now - lastMoveAt < 33) { rdMovePending = rdNorm(e); return; }  // 落下的这笔留到最后补发
+    lastMoveAt = now;
+    const p = rdNorm(e);
+    if (p) rdSend(encodeCtlFrame('mousemove', p.nx, p.ny));
+  });
+  // 手指/鼠标离开画面时，把最后那笔攒下的移动补发出去，避免"停在半路"
+  rdCanvasEl.addEventListener('pointerleave', (e) => {
+    rdPointers.delete(e.pointerId);
+    if (rdMovePending) { const p = rdMovePending; rdMovePending = null; rdSend(encodeCtlFrame('mousemove', p.nx, p.ny)); }
+  });
+
+  rdCanvasEl.addEventListener('pointerdown', (e) => {
+    if (!rdHostId) return;
+    e.preventDefault();                       // 阻止拖拽选中/长按菜单，全部行为都交给远端
+    rdPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (rdPointers.size >= 2) {
+      // 第二根手指落下 = 用户想滚动，不是想点击 → 撤销第一根手指造成的"按住"状态
+      if (rdMouseDownSent) {
+        const q = rdNorm(e);
+        if (q) rdSend(encodeCtlFrame('mouseup', q.nx, q.ny, 0, 0));
+        rdMouseDownSent = false;
+      }
+      rdScrollMode = true;
+      rdScrollMid = pointerMid();
+      return;
+    }
+
+    try { if (rdKeysEl && rdKeysEl.focus) rdKeysEl.focus(); } catch (err) { /* ignore */ }
+    const p = rdNorm(e);
+    if (!p) return;
+    rdMouseDownSent = true;
+    rdSend(encodeCtlFrame('mousedown', p.nx, p.ny, 0, e.button));   // 0左/1中/2右，和帧协议一致
+  });
+
+  const rdEndPointer = (e) => {
+    const wasScroll = rdScrollMode;
+    rdPointers.delete(e.pointerId);
+    if (rdPointers.size < 2) { rdScrollMode = false; rdScrollMid = null; }
+    // 滚动模式下的抬手不发 mouseup（那根手指的按下早已被撤销）；没发过按下也不发抬起
+    if (wasScroll || !rdMouseDownSent) return;
+    if (!rdHostId) return;
+    const p = rdNorm(e);
+    if (p) rdSend(encodeCtlFrame('mouseup', p.nx, p.ny, 0, e.button));
+    rdMouseDownSent = false;
+  };
+  rdCanvasEl.addEventListener('pointerup', rdEndPointer);
+  rdCanvasEl.addEventListener('pointercancel', rdEndPointer);   // 被系统打断（来电/手势）也要收尾
+
+  rdCanvasEl.addEventListener('dblclick', (e) => {
+    if (!rdHostId || rdScrollMode) return;
+    const p = rdNorm(e);
+    if (p) rdSend(encodeCtlFrame('dblclick', p.nx, p.ny));
+  });
+  rdCanvasEl.addEventListener('contextmenu', (e) => e.preventDefault());  // 右键要转发到远端，不弹本地菜单
+
+  // 滚轮：累加后按 60ms 合并发送（鼠标滚一次会触发十几条 wheel 事件，
+  // 合并成一条"滚了 N 格"既省信令，也让远端的滚动幅度符合直觉）
+  const flushWheel = () => {
+    rdWheelTimer = null;
+    const n = Math.round(rdWheelAccum);
+    rdWheelAccum = 0;
+    if (n && rdWheelPos) rdSend(encodeCtlFrame('wheel', rdWheelPos.nx, rdWheelPos.ny, n));
+  };
+  rdCanvasEl.addEventListener('wheel', (e) => {
+    if (!rdHostId) return;
+    e.preventDefault();
+    rdWheelPos = rdNorm(e) || rdWheelPos;
+    rdWheelAccum += -e.deltaY / 100;         // 帧里 wheel 的单位是"格"，一格 ≈ 100 CSS 像素
+    scheduleWheel();
+  }, { passive: false });
+}
+
+/* 键盘捕获：一个视觉上不可见的输入框 + "整段文本"转发。
+ * ▎为什么不像英文那样逐键发？中文输入法的组合态在远端重放会乱套
+ *   （拼音串、候选词都会被当成真按键）。攒成整段一次发，远端用 CDP insertText 落字，
+ *   中文、emoji、长文本全都稳。功能键（Enter/方向键）单独按 keydown 发。
+ *   —— 这套思路和远程协助（A2）里的 IME 捕获框完全一致，是同一份经验的第二次应用。 */
+if (rdKeysEl && rdKeysEl.addEventListener) {
+  rdKeysEl.addEventListener('input', () => {
+    const t = rdKeysEl.value;
+    rdKeysEl.value = '';                       // 立刻清空：它只是个"攒字"的桶
+    if (t && rdHostId) rdSend({ kind: 'input-text', text: t });
+  });
+  rdKeysEl.addEventListener('keydown', (e) => {
+    if (!rdHostId) return;
+    if (e.key === 'Escape') { closeRemoteDesk(true); return; }
+    if (e.key.length > 1 && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();                      // Enter/Backspace/方向键：走真按键
+      if (rdHostId) rdSend({ kind: 'keydown', key: e.key, code: e.code });
+      return;
+    }
+    if (e.ctrlKey || e.metaKey) {              // Ctrl+A/C/V/Z 这类组合键：交给远端执行
+      e.preventDefault();
+      if (rdHostId) rdSend({ kind: 'keydown', key: e.key, code: e.code, ctrlKey: e.ctrlKey, metaKey: e.metaKey });
+    }
+  });
+  rdKeysEl.addEventListener('keyup', (e) => {
+    if (rdHostId && e.key.length > 1) rdSend({ kind: 'keyup', key: e.key, code: e.code });
   });
 }
 
-/* ──────────────────────────────────────────────────────────────
+/* 地址栏 / 工具条 */
+if (rdUrlEl && rdUrlEl.addEventListener) {
+  const go = () => {
+    const u = String(rdUrlEl.value || '').trim();
+    if (!u || !rdHostId) return;
+    rdSend({ kind: 'navigate', url: u });
+    setRdState('🌐 正在打开 ' + u + ' …');
+  };
+  rdUrlEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+  const goBtn = $('rdGo');
+  if (goBtn && goBtn.addEventListener) goBtn.addEventListener('click', go);
+}
+const rdBtn = (id, fn) => { const el = $(id); if (el && el.addEventListener) el.addEventListener('click', fn); };
+rdBtn('rdBack', () => rdSend({ kind: 'back' }));
+rdBtn('rdReload', () => rdSend({ kind: 'refresh' }));
+rdBtn('rdMax', () => { rdSend({ kind: 'window', state: 'maximized' }); showToast('⛶ 已请求最大化对方窗口', 'info'); });
+rdBtn('rdRelease', () => closeRemoteDesk(true));
+
+// 窗口尺寸变了要重新排版画面（否则转屏后画面会溢出或缩成一条）
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', rdFit);
+
+/* ---- 桌面代理指引卡片（成员面板底部）---- */
+function updateAgentHint() {
+  if (!agentHintEl) return;
+  // 房间里已经有代理 → 收起（已经在用了，不需要再教怎么起）
+  const shouldHide = agentPeers.size > 0 || !myRoom;
+  if (agentHintEl.classList) agentHintEl.classList.toggle('hidden', shouldHide);
+  if (agentCmdEl && myRoom) agentCmdEl.textContent = `node agent/index.js --room ${myRoom}`;
+}
+
+rdBtn('agentCopy', () => {
+  const t = (agentCmdEl && agentCmdEl.textContent) || '';
+  if (!t) return;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(t).then(
+      () => showToast('✅ 命令已复制，粘到终端回车即可'),
+      () => showToast('复制失败，请手动选中这行命令复制', 'error'),
+    );
+  } else {
+    try {                                       // 降级：选中文本，用户 Ctrl+C
+      const r = document.createRange();
+      r.selectNodeContents(agentCmdEl);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(r);
+      showToast('已选中命令，按 Ctrl+C 复制', 'info');
+    } catch (e) { showToast('请手动复制这行命令', 'error'); }
+  }
+});
+
+rdBtn('agentHow', () => {
+  log('🖥️ 为什么必须在本地跑一个代理？');
+  log('   浏览器的安全底线：网页不能移动真实光标、不能敲真实键盘、不能截别的程序窗口。');
+  log('   这不是技术不足，是设计如此 —— 否则任何网页都能偷看你屏幕、替你点确认。');
+  log('   所以真远程桌面都得装"被控端"（AnyDesk / 向日葵 / TeamViewer 无一例外）。');
+  log('   本项目的被控端就是 agent/index.js：零新依赖，一条命令起来，');
+  log('   它用 CDP 驱动一个真实 Chromium 窗口 —— 抓真画面、注真鼠标键盘、开任意真实网站。');
+  log('   权限方面没有任何特殊待遇：走的是和人类完全相同的授权链路，服务器不认识"代理特权"。');
+  showToast('📋 说明已打到下方「流程日志」里', 'info');
+});
+
+/* ------------------------------------------------------------------------------
  * 启动：页面一加载就打开摄像头
- * ────────────────────────────────────────────────────────────── */
+ * ------------------------------------------------------------------------------ */
 if (!window.mediasoupClient) {
   log('❌ 找不到 mediasoup-client：请先执行 npm run build:sfu-vendor 生成 vendor/mediasoup-client.js');
 }

@@ -1592,3 +1592,216 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
 @media (prefers-reduced-motion: reduce) {
   .msg.bot.streaming .msg-text.typing::after { animation: none; }
 }
+
+/* ────────── 26. ★ 09-24 真远程桌面（第 26 步）──────────
+ * 两块 UI：① 成员面板底部的"怎么启动代理"指引卡片；② 控制端的全屏远程桌面控制台。
+ * 设计说明（用心处）：
+ *   · 控制台刻意做成"远程一台电脑"的样子 —— 顶部一条地址栏 + 工具，中间一整块屏幕，
+ *     底部一行状态。用户一眼就知道"我现在在操作别人的电脑"，不会和会议界面混淆。
+ *   · 画面区（canvas）用内阴影 + 细描边做出"屏幕沉在框里"的层次，
+ *     而不是一块平贴的图片（远程桌面最怕看起来像"在看一张截图"）。
+ *   · 地址栏用等宽字体：URL 是"数据"不是"文案"，等宽更好扫读，也更像真浏览器。
+ *   · 所有颜色都取自既有 token（暖墨 + 鎏金），新组件不会跳出整个设计语言。
+ */
+.agent-hint {
+  margin: 10px 0 2px;
+  padding: 12px 13px;
+  border: 1px dashed var(--accent-border);
+  border-radius: var(--radius);
+  background: var(--accent-muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.agent-hint .ah-title { font-weight: 600; color: var(--fg); margin-bottom: 4px; }
+.agent-hint .ah-body { color: var(--fg-muted); margin-bottom: 8px; }
+.agent-hint .ah-cmd {
+  display: block;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--accent);
+  background: var(--bg0);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  white-space: nowrap;
+  user-select: all;          /* 一键全选，省得用户手动拖着选 */
+}
+.agent-hint .ah-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.agent-hint .btn { font-size: 12px; padding: 5px 11px; }
+
+/* 成员列表里的"机器"行：和 AI Bot 行同一套语言（虚线 + 徽标） */
+.member-row.agent-row {
+  border: 1px dashed var(--accent-border);
+  background: linear-gradient(90deg, var(--accent-muted), transparent 70%);
+}
+.member-row.agent-row .m-agent-note {
+  margin-left: 6px;
+  font-size: 10.5px;
+  color: var(--ok);
+  border: 1px solid rgba(158, 207, 122, .35);
+  border-radius: 999px;
+  padding: 0 6px;
+  /* 徽标自己不许被压扁（真机截图里"可远程控制"被挤成了"可远程控…"）——
+   * 名字太长时应该截断名字（它有 title 提示），而不是截断状态徽标 */
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.member-row .m-ctrl-btn {
+  font-size: 11.5px;
+  padding: 4px 10px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+/* ── 控制台本体 ── */
+.rd-console {
+  position: fixed;
+  inset: 0;
+  /* ★ 层级要"卡在中间"，这个值不是随手写的（真机截图暴露过：原来写 90，被 .prejoin 的 100 盖住，
+   *   于是"控制台已打开"的断言全绿，人眼却只看到登录卡片 —— 断言查的是 class，看不到遮挡）：
+   *     > 100 要盖住房间面板 / 加入前预览页（进会后才可能远程控制）
+   *     < 120 授权卡片（.remote-ask）必须还能弹出来 —— 我在控别人时也可能收到别人的控制申请，
+   *            被自己的全屏控制台挡掉就是"看不见的拒绝"
+   *     < 150 提示条（.toast）也要能浮上来
+   *   一句话：全屏 ≠ 最大，正确定位比一味加大更重要。 */
+  z-index: 110;
+  display: flex;
+  flex-direction: column;
+  background:
+    radial-gradient(1200px 620px at 50% -12%, rgba(216, 179, 106, .10), transparent 62%),
+    var(--bg0);
+}
+body.rd-mode { overflow: hidden; }
+
+.rd-bar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 12px;
+  background: var(--glass-strong);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(12px);
+  flex-wrap: wrap;
+}
+.rd-brand {
+  font-family: var(--font-display);
+  font-size: 15px;
+  letter-spacing: .3px;
+  color: var(--fg);
+  margin-right: 4px;
+  white-space: nowrap;
+}
+.rd-ibtn { padding: 5px 10px; font-size: 14px; line-height: 1; }
+.rd-url {
+  flex: 1 1 240px;
+  min-width: 150px;
+  padding: 7px 11px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--fg);
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  outline: none;
+  transition: border-color .18s var(--ease), box-shadow .18s var(--ease);
+}
+.rd-url:focus { border-color: var(--accent-border); box-shadow: 0 0 0 3px var(--accent-muted); }
+.rd-state {
+  font-size: 12px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.rd-state::before {
+  content: '';
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 0 rgba(158, 207, 122, .55);
+  animation: rdPulse 2.1s var(--ease) infinite;
+}
+@keyframes rdPulse {
+  0%   { box-shadow: 0 0 0 0 rgba(158, 207, 122, .5); }
+  70%  { box-shadow: 0 0 0 7px rgba(158, 207, 122, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(158, 207, 122, 0); }
+}
+
+/* 画面舞台：屏幕居中，四周留出"桌面"的余白 */
+.rd-stage {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px;
+  min-height: 0;
+}
+.rd-stage canvas {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background: #0b0906;
+  box-shadow:
+    inset 0 0 0 1px rgba(0, 0, 0, .55),
+    inset 0 2px 18px rgba(0, 0, 0, .45),
+    0 16px 44px rgba(4, 2, 0, .6);
+  cursor: crosshair;
+  touch-action: none;        /* 手机上把触摸交给我们处理（否则会被浏览器的滚动/缩放吃掉） */
+}
+.rd-hint {
+  position: absolute;
+  color: var(--fg-muted);
+  font-size: 13px;
+  letter-spacing: .4px;
+  padding: 10px 18px;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  background: var(--glass);
+  pointer-events: none;
+}
+/* 键盘捕获框：必须在视口内、可聚焦，但完全看不见（display:none 无法聚焦） */
+.rd-keys {
+  position: fixed;
+  left: 0; top: 0;
+  width: 1px; height: 1px;
+  padding: 0; border: 0; outline: none; resize: none;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.rd-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  font-size: 12px;
+  color: var(--fg-faint);
+  border-top: 1px solid var(--border);
+  background: var(--glass);
+  flex-wrap: wrap;
+}
+.rd-foot .rd-meta {
+  font-family: var(--mono);
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 62vw;
+}
+.rd-foot .rd-tips { white-space: nowrap; }
+
+/* 小屏（手机当控制端）：工具栏换行、状态挪到第二行、地址栏占满 */
+@media (max-width: 760px) {
+  .rd-bar { gap: 6px; padding: 8px 9px; }
+  .rd-brand { font-size: 13px; }
+  .rd-url { flex: 1 1 100%; order: 5; font-size: 12px; }
+  .rd-state { order: 6; margin-left: auto; }
+  .rd-stage { padding: 6px; }
+  .rd-ibtn { padding: 5px 8px; font-size: 13px; }
+  .rd-foot .rd-meta { max-width: 100%; }
+  .rd-foot .rd-tips { display: none; }   /* 手机屏幕小，提示语让位给真实信息 */
+}

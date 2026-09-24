@@ -106,11 +106,17 @@ class Cdp {
   constructor(opts = {}) {
     this.bin = opts.bin || findBrowserBin();
     this.port = opts.port || 9333;
-    this.profile = opts.profile || path.join(os.tmpdir(), 'wb-remote-desktop-profile');
+    this.profile = opts.profile || path.join(os.tmpdir(), 'wb-remote-desktop-profile-' + this.port);
+    /* ↑ profile 里带端口号不是随手加的：**Chromium 同一个 user-data-dir 不能被两个实例共用**
+     *   （第二个实例会把参数交给已有实例然后自己退出，表现为"调试端口起不来"）。
+     *   有人会同时开"控制端浏览器 + 被控端浏览器"，用固定目录必然撞车 ——
+     *   按端口派生目录，就天然隔离了。真实产品也是每个实例一份独立 profile。 */
     this.windowSize = opts.windowSize || { width: 1280, height: 800 };
     this.headless = opts.headless === true;   // 默认可见：用户要"看见"被控的窗口
     this.startUrl = opts.startUrl || 'about:blank';
     this.log = opts.log || ((...a) => console.log(...a));
+    // 额外启动参数（比如测试时用 --use-fake-device-for-media-stream 造个假摄像头）
+    this.extraArgs = Array.isArray(opts.extraArgs) ? opts.extraArgs : [];
 
     this.proc = null;
     this.browserWs = null;      // 浏览器级连接：Browser.* 域（窗口管理）
@@ -202,6 +208,7 @@ class Cdp {
       '--disable-session-crashed-bubble',
       `--window-size=${this.windowSize.width},${this.windowSize.height}`,
       '--window-position=40,40',
+      ...this.extraArgs,
     ];
     if (this.headless) args.push('--headless=new', '--disable-gpu');
     args.push(this.startUrl);

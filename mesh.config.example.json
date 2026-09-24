@@ -1,0 +1,38 @@
+{
+  "_说明": [
+    "Mesh 版的可选配置。把它复制成 mesh.config.json（同名去掉 .example）就生效。",
+    "没有这个文件也能跑：默认端口 3000、ICE 只有一条公共 STUN（够家庭宽带互连）。",
+    "优先级：环境变量 PORT / HOST > mesh.config.json > 代码默认值。",
+    "★ 这个文件已加进 .gitignore（可能含 TURN 凭证，绝不入库）。"
+  ],
+
+  "_1_端口": "部署到云主机 / 内网穿透时常用。也可以不写这里，直接用 PORT=8081 node server.js",
+  "port": 3000,
+  "host": "0.0.0.0",
+
+  "_2_公网地址": "你发布出去的公网地址（只用于启动日志和页面提示，不参与逻辑）",
+  "publicUrl": null,
+
+  "_3_ICE": [
+    "★ 真正决定『两台不同网络的电脑能不能连上』的就是这一段。",
+    "只有 STUN：双方都在严格 NAT（公司网 / 4G / 5G / 酒店 WiFi）时打洞失败 → 音视频黑屏。",
+    "配上 TURN：打洞失败退回中继，一定能连上（代价是流量过 TURN 服务器）。",
+    "下面这份是 openrelay 的免费公共 TURN，演示/学习够用；",
+    "正式用请换成自建 coturn（deploy/coturn 里有 docker-compose，一条命令起一个），",
+    "把 urls/username/credential 换成你自己的。"
+  ],
+  "iceServers": [
+    { "urls": "stun:stun.l.google.com:19302" },
+    { "urls": "stun:stun1.l.google.com:19302" },
+    {
+      "urls": [
+        "turn:openrelay.metered.ca:80",
+        "turn:openrelay.metered.ca:443",
+        "turn:openrelay.metered.ca:443?transport=tcp",
+        "turns:openrelay.metered.ca:443"
+      ],
+      "username": "openrelayproject",
+      "credential": "openrelayproject"
+    }
+  ]
+}

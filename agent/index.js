@@ -48,6 +48,7 @@ function parseArgs(argv) {
     headless: false,
     autoAllow: false,
     port: 9333,
+    profile: '',            // 浏览器用户数据目录（留空 = 按端口自动派生，互不干扰）
     quality: 55,
     fps: 12,
     durationMs: 30 * 60 * 1000, // 单次授权时长，默认 30 分钟（和限时授权 A6 一致）
@@ -62,6 +63,7 @@ function parseArgs(argv) {
       case '--name': out.name = next() || out.name; break;
       case '--url': out.url = next() || out.url; break;
       case '--port': out.port = Number(next()) || 9333; break;
+      case '--profile': out.profile = next() || ''; break;
       case '--quality': out.quality = Math.max(20, Math.min(90, Number(next()) || 55)); break;
       case '--fps': out.fps = Math.max(2, Math.min(30, Number(next()) || 12)); break;
       case '--minutes': out.durationMs = Math.max(1, Number(next()) || 30) * 60 * 1000; break;
@@ -160,6 +162,7 @@ class RemoteAgent {
       port: this.cfg.port,
       headless: this.cfg.headless,
       startUrl: this.cfg.url,
+      profile: this.cfg.profile || undefined,   // 留空 = 按端口自动派生（见 cdp.js 的说明）
       log: (...a) => this.log(...a),
     });
     await this.cdp.launch();
@@ -403,9 +406,16 @@ class RemoteAgent {
 
         case 'keydown':
         case 'keyup':
-          // 功能键（Enter/Backspace/方向键…）走真按键；可打印单字符在下面走文本通道
           if (msg.key && msg.key.length > 1) {
+            // 功能键（Enter / Backspace / 方向键 / Tab…）——这些键"有副作用"，必须走真按键
             await this.cdp.key(msg.key, msg.kind === 'keydown' ? 'rawKeyDown' : 'keyUp', opt);
+          } else if (msg.key && msg.key.length === 1 && (msg.ctrlKey || msg.metaKey || msg.altKey) && msg.kind === 'keydown') {
+            // ★ 组合快捷键：Ctrl+A 全选 / Ctrl+C 复制 / Ctrl+V 粘贴 / Ctrl+Z 撤销…
+            //   远程协助里"全选再复制"是最常用的动作之一（用户拿对方网页上的资料）。
+            //   注意可打印字符**带修饰键**时不能当文本插入，得走 rawKeyDown，
+            //   否则 Ctrl+C 会在页面上真的打出一个 "c"（这个坑很经典）。
+            const mod = msg.ctrlKey ? 'ctrl' : msg.metaKey ? 'meta' : 'alt';
+            await this.cdp.shortcut(mod, msg.key);
           }
           break;
 

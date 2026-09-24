@@ -30,13 +30,54 @@ const fs = require('fs');
 const path = require('path');
 const { Server } = require('socket.io');
 
-// ★ 发布适配（QW Pages 托管约定）：端口与监听地址从环境变量读，
-//   托管方注入 PORT/HOST；本地直接 node server.js 时默认 8081 端口。
-const PORT = Number(process.env.PORT) || 8081;
-const HOST = process.env.HOST || '0.0.0.0';
+const PORT = 3000;
 // 房间最多几个人？Mesh 架构下 3 人 = 每人 2 条连接，够演示了
 // （4 人 = 每人 3 条连接，5 人 = 每人 4 条……人越多带宽越炸，这就是 Mesh 的局限）
 const MAX_MEMBERS = 3;
+
+/* ──────────────────────────────────────────────────────────────
+ * ★ 09-24 跨网部署升级：可选的 mesh.config.json（没有就用默认值）
+ *
+ * ▎为什么加这一层？——"跨网络连不上"的根因位就在这里。
+ *   Mesh 版是 P2P：媒体不经过服务器，所以**服务器能力再强也救不了 NAT**。
+ *   真正决定"两台不同网络的电脑能不能连上"的是浏览器的 ICE 配置：
+ *     · 只有 STUN  → 双方都在对称型/严格 NAT（公司网、4G/5G、酒店 WiFi）时打洞失败；
+ *     · 配上 TURN  → 打洞失败就退回中继，一定能连上（代价是流量过 TURN 服务器）。
+ *   而原来的实现把 ICE 硬编码在 public/client.js 里（只带一条 Google STUN），
+ *   想配 TURN 就只能改代码——改代码就不能"一键发布"，也不能一台机器一套配置。
+ *
+ * ▎所以：把 ICE 配置**从代码里挪到配置里**，由服务器通过 /config.json 下发。
+ *   这套做法和 SFU 版完全一致（对照着看 sfu/server.js 的 /config.json 路由），
+ *   是同一份经验的第二次应用。
+ *
+ * ▎配置项（都可不写）：
+ *   { "port": 8081,                 // 监听端口（部署/穿透时常用环境变量 PORT 覆盖）
+ *     "host": "0.0.0.0",            // 监听地址
+ *     "iceServers": [ ... ],        // STUN/TURN 列表，直接下发给浏览器
+ *     "publicUrl": "https://xxx"    // 你发布出去的公网地址（只用于页面提示，不参与逻辑）
+ *   }
+ *   ▎优先级：环境变量 PORT/HOST > mesh.config.json > 代码默认值。
+ * ────────────────────────────────────────────────────────────── */
+const CONFIG_FILE = path.join(__dirname, 'mesh.config.json');
+let CONFIG = {};
+try {
+  if (fs.existsSync(CONFIG_FILE)) {
+    CONFIG = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    console.log('📄 已加载 mesh.config.json');
+  }
+} catch (err) {
+  console.log(`⚠️ mesh.config.json 解析失败，改用默认值：${err.message}`);
+}
+const LISTEN_PORT = Number(process.env.PORT || CONFIG.port || PORT);
+const LISTEN_HOST = process.env.HOST || CONFIG.host || '0.0.0.0';
+
+// 默认 ICE：一条公共 STUN（够应付大多数家庭宽带互连）。
+// 严格 NAT 场景必须在 mesh.config.json 里补 TURN —— 见 README「跨网络部署」。
+const DEFAULT_ICE = [{ urls: 'stun:stun.l.google.com:19302' }];
+function iceServersForClient() {
+  const list = CONFIG.iceServers;
+  return Array.isArray(list) && list.length ? list : DEFAULT_ICE;
+}
 
 /* ──────────────────────────────────────────────────────────────
  * 第 A 部分：HTTP 服务器 —— 托管 public 目录的静态文件
@@ -47,6 +88,10 @@ const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js':   'text/javascript; charset=utf-8',
   '.css':  'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
+  '.png':  'image/png',
+  '.svg':  'image/svg+xml',
 };
 
 const httpServer = http.createServer((req, res) => {
@@ -54,6 +99,27 @@ const httpServer = http.createServer((req, res) => {
   //   直接当文件路径去找会 404——邀请链接（?room=6 位号）就全挂了。
   //   new URL(相对路径, 基准).pathname = 剥掉 query 后的纯路径。
   const pathname = new URL(req.url, 'http://localhost').pathname;
+
+  /* ★ 09-24：/config.json —— 把 ICE（STUN/TURN）下发给浏览器。
+   *   ▎为什么不让前端写死？同一个前端要能在"家里直连""公司走 TURN""云主机"
+   *     三种环境下跑，而环境差异只在配置。前端写死 = 换环境就得改代码重新发布。
+   *   ▎必须 no-store：浏览器缓存了旧 ICE 配置，你改了 TURN 地址也不生效
+   *     （这条教训本项目刚在 Service Worker 上踩过一次，同一个道理）。 */
+  if (pathname === '/config.json') {
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+    });
+    res.end(JSON.stringify({
+      version: 1,
+      arch: 'mesh',
+      iceServers: iceServersForClient(),
+      publicUrl: CONFIG.publicUrl || null,
+      maxMembers: MAX_MEMBERS,
+    }));
+    return;
+  }
+
   const urlPath = pathname === '/' ? '/index.html' : pathname;
   const filePath = path.join(__dirname, 'public', urlPath);
 
@@ -64,7 +130,11 @@ const httpServer = http.createServer((req, res) => {
       return;
     }
     const ext = path.extname(filePath);
-    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+    // ★ 静态资源禁缓存：和 SFU 版对齐（改了样式/脚本刷新即见，不吃启发式缓存）
+    res.writeHead(200, {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      'Cache-Control': 'no-store',
+    });
     res.end(data);
   });
 });
@@ -391,8 +461,17 @@ io.on('connection', (socket) => {
  * 启动
  * ────────────────────────────────────────────────────────────── */
 
-httpServer.listen(PORT, HOST, () => {
-  console.log(`\n服务已启动: http://localhost:${PORT}（监听 ${HOST}）`);
+httpServer.listen(LISTEN_PORT, LISTEN_HOST, () => {
+  console.log(`\n服务已启动: http://localhost:${LISTEN_PORT}`);
   console.log(`打开 2~3 个浏览器窗口：第 1 个点「创建房间」拿房间号，`);
-  console.log(`其余窗口输入房间号点「加入房间」，即可测试多人会议。\n`);
+  console.log(`其余窗口输入房间号点「加入房间」，即可测试多人会议。`);
+  // ★ 跨网自检：启动即把"这台机器打算怎么打洞"说清楚，
+  //   省得连不上时还得回去翻代码看 ICE 到底配了什么。
+  const ice = iceServersForClient();
+  const stun = ice.filter((s) => String(s.urls).startsWith('stun:')).length;
+  const turn = ice.filter((s) => String(s.urls).startsWith('turn')).length;
+  console.log(`\n🧊 ICE 配置：STUN ${stun} 条 / TURN ${turn} 条` +
+    (turn === 0 ? '（⚠️ 无 TURN：双方都在严格 NAT 时会连不上，见 README「跨网络部署」）' : ''));
+  if (CONFIG.publicUrl) console.log(`🔗 公网地址：${CONFIG.publicUrl}`);
+  console.log(`🌐 监听：${LISTEN_HOST}:${LISTEN_PORT}（配置来源：${fs.existsSync(CONFIG_FILE) ? 'mesh.config.json' : '代码默认值'}）\n`);
 });
