@@ -87,6 +87,115 @@ const USE_LLM = require('../sfu/ai/provider').aiEnabled();
     assert(new B.Retriever([]).search('随便', 5).length === 0, '空索引应返回 []');
     assert(new B.Retriever(LONG_MEETING).search('', 5).length === 0, '空查询应返回 []');
   });
+
+  /* ══════════ 五之二、检索召回与"抗幻觉"（★ 09-25）══════════   * ▎这一组来自一次**实测驱动的改造**：用真实语料一跑就发现，原文注释里
+   *   "任意查询都能擦边命中"这句承诺**没有兑现**——
+   *     「交付时间定在 11 月 20 日」这条语料上，
+   *     「啥时候交货？」❌ 无命中、「钱够吗？」❌ 无命中（"钱"与"预算"不共字）。
+   *   用户不会照抄原话提问，于是明明会上说过，AI 却答"没提到"——最伤信任的一种失败。
+   *   修法：① **查询侧同义词扩展**（钱→预算、交货→交付）；② **单字兜底**并严格降权；
+   *         ③ 新增**资格判据**，保证兜底不会把"没提过的话题"也凑出一条证据。
+   *   这一组的两个方向都要守：**该召回的必须召回**，**不该召回的必须落空**。 */
+  console.log('\n── 五之二、检索召回与抗幻觉（同义改写 / 单字兜底 / 资格判据）──');
+  const RECALL_CAPS = [];
+  for (let i = 0; i < 55; i++) RECALL_CAPS.push({ name: '王五', text: `闲聊第 ${i} 条：今天天气不错`, ts: 1000 + i });
+  RECALL_CAPS.push({ name: '张三', text: '先说结论：交付时间定在 11 月 20 日，这个日期不能再动了', ts: 2000 });
+  RECALL_CAPS.push({ name: '李四', text: '好的我记下了', ts: 2010 });
+  RECALL_CAPS.push({ name: '李四', text: '压测报告我负责，周五之前提交', ts: 2020 });
+  RECALL_CAPS.push({ name: '张三', text: 'TURN 账号密码记得轮换，下周一之前完成', ts: 2030 });
+  RECALL_CAPS.push({ name: '张三', text: '预算总盘子是 999 万，走 A 方案', ts: 2040 });
+
+  await T('查询侧同义词扩展：只加说法、不改原查询', () => {
+    const ex = B.expandQuerySynonyms('钱够吗？');
+    assert(ex.startsWith('钱够吗？'), '应保留原查询在最前，实际 ' + ex);
+    assert(/预算/.test(ex), '「钱」应扩展到「预算」，实际 ' + ex);
+    assert(B.expandQuerySynonyms('今天天气不错') === '今天天气不错', '没命中任何同义词时应原样返回');
+  });
+
+  await T('★ 口语化改写真能召回（这是本轮改造的核心价值）', () => {
+    const r = new B.Retriever(RECALL_CAPS);
+    const cases = [
+      ['啥时候交货？', /11\s*月\s*20/, '交货→交付'],
+      ['什么时候能上线？', /11\s*月\s*20/, '上线→发布/交付'],
+      ['钱够吗？', /999/, '钱→预算'],
+      ['截止日期是哪天？', /11\s*月\s*20/, '截止日期→交付时间'],
+    ];
+    for (const [q, re, why] of cases) {
+      const hits = r.search(q, 3);
+      assert(hits.length > 0, `「${q}」应能召回（${why}），实际无命中`);
+      assert(re.test(hits[0].text), `「${q}」Top1 应是相关那条，实际 Top1=${hits[0].text.slice(0, 30)}`);
+    }
+  });
+
+  await T('★ 会议里没提过的话题 → 必须落空（抗幻觉在检索层的闸门）', () => {
+    const r = new B.Retriever(RECALL_CAPS);
+    for (const q of ['今天股市涨了多少？', '你叫什么名字？', '这道题的解法是什么？', '外太空探索有什么进展？', '明天的电影票买了吗？', '隔壁部门的团建去哪']) {
+      const n = r.search(q, 3).length;
+      assert(n === 0, `「${q}」不该有命中（会诱导 AI 胡说），实际命中 ${n} 条`);
+    }
+  });
+
+  await T('共享到"有信息量的词"就算命中——哪怕话题不同（这是有意的取舍）', () => {
+    /* ⚠️ 这条断言**故意写成"应该命中"**，与上一条看似矛盾，其实是一致的：
+     *   「量子计算机的采购预算」和语料里的「预算总盘子是 999 万」**共享了「预算」**，
+     *   所以召回它是**正确**的——检索层的职责是"找出可能有用的原话"，
+     *   而不是替 LLM 判断"用户问的量子计算机预算和项目预算是不是一回事"。
+     *   ▎为什么不把门槛提到"共享 2 个 bigram"来躲开这种情况：
+     *     那会误杀「啥时候交货」（只共享一个「交付」但完全正确）。
+     *     **错杀正确召回（AI 说"没提到"）比多给一条弱证据更伤信任**；
+     *     弱证据由下游 LLM 兜住——系统提示明确要求证据不足时必须说"没提到"。
+     *   这个取舍是**量出来的**：我用真实语料比过两种门槛，一个 bag-of-ngrams
+     *   模型无法区分"下周X"的具体日次这类差异，只能选一侧并说明理由。 */
+    const r = new B.Retriever(RECALL_CAPS);
+    const hits = r.search('量子计算机的采购预算', 3);
+    assert(hits.length > 0, '共享「预算」应召回（检索层不做话题同一性判断）');
+    assert(/999/.test(hits[0].text), '且应收敛到那条预算发言，实际 ' + hits[0].text.slice(0, 30));
+  });
+
+  await T('★ 高频口头禅不足以构成命中（"今天/天气"人人都在说）', () => {
+    /* 单字兜底后，任何查询都能和某句话共用一个字；若再允许"高频 bigram"充数，
+     *   "今天股市涨了多少"就会靠"今天"命中"今天天气不错"——非常荒谬的假阳性。 */
+    const r = new B.Retriever(RECALL_CAPS);
+    assert(r.search('明天天气如何', 3).length === 0, '不该靠"天气"这种高频词命中');
+    assert(r.search('今天的股市行情怎么样', 3).length === 0, '不该靠"今天"这种高频词命中');
+  });
+
+  await T('★ 小语料（N≤3）不做信息量筛选——三五条字幕里"频率"没有意义', () => {
+    /* 踩过的坑：资格判据第一版写成"IDF ≥ 1.0"，而 IDF 的取值域随 N 压缩
+     * （df=1 时 N=2→0.69、N=3→0.98、N=62→3.7），于是**短会里完美匹配也判不够格**，
+     * AI 明明有依据却答"没提到"。 → 判据必须尺度无关（占比），且小语料直接豁免。 */
+    const tiny = new B.Retriever([
+      { name: '张三', text: '交付时间定在 11 月 20 日', ts: 1 },
+      { name: '李四', text: '压测报告我负责', ts: 2 },
+    ]);
+    assert(tiny.search('交付时间', 3).length > 0, '两条语料时也应能召回（不能被频率判据误杀）');
+    assert(tiny.search('交付时间', 3)[0].text.includes('11 月 20 日'), '且应命中正确那条');
+  });
+
+  await T('单字只影响排序，不单独构成命中', () => {
+    /* 「交」是"交付/交货"共用的字。若单字能独立构成命中，
+     * 那么任何含"交"的问句都会召回"交付时间"，假阳性会失控。
+     * 判据：**只擦到单字、不共享 bigram 的查询必须落空**。 */
+    const one = new B.Retriever([{ name: '王五', text: '联网设备的账号要单独申请', ts: 1 }]);
+    assert(one.search('联网', 3).length > 0, '共享 bigram 应命中');
+    assert(one.search('联系方式', 3).length === 0,
+      '「联系方式」与语料只共用一个字、不共享 bigram，不该命中');
+  });
+
+  await T('词级重叠才有资格：命中条目必须与查询共享一个 bigram', () => {
+    const r = new B.Retriever(RECALL_CAPS);
+    for (const q of ['交付时间是什么时候？', '谁负责压测？', '预算多少？']) {
+      const hits = r.search(q, 3);
+      assert(hits.length > 0, `「${q}」应有命中`);
+      const qb = new Set(B.tokenize(q).filter((t) => !t.startsWith('\u0001')));
+      const ok = hits.every((h) => {
+        const db = new Set(B.tokenize(h.text));
+        return [...qb].some((t) => db.has(t));
+      });
+      assert(ok, `「${q}」的命中必须与查询共享 bigram（否则就是靠单字蹭到的）`);
+    }
+  });
+
   await T('不存在的内容 → 空结果（而不是硬凑无关句）', () => {
     const hits = new B.Retriever(LONG_MEETING).search('量子计算机的采购预算', 5);
     assert(hits.length === 0, '无关查询应返回空，实际 ' + hits.length + ' 条');
