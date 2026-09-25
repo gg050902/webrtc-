@@ -375,33 +375,77 @@
       </div>
     </main>
 
-    <!-- 侧栏：成员列表（★ D4）+ 会议聊天 -->
+    <!-- 侧栏：★ 09-25 起改为**分段式**（成员 / 看板 / 聊天）
+         原先成员与聊天上下堆叠，加了 AI 看板就没有第三块的地方了。
+         改成 tab 后每块都有完整高度（看板条目多时尤其需要），也是 Teams/Zoom 的既有范式。
+         ⚠️ 所有元素 **id 与契约类名零改动**（memberList/chatList/memberNum…），
+            只新增 .side-tab / .side-view 这层壳，client.js 与冒烟测试无需改契约。 -->
     <aside class="sidebar">
-      <div class="member-panel">
-        <div class="member-title">
-          <span>👥 成员 <span id="memberNum">1</span></span>
-          <span id="ownerTag" class="role-tag hidden"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 17.5h15L18 9l-3.8 3.2L12 6l-2.2 6.2L6 9l-1.5 8.5z"/></svg>你是房主</span>
-        </div>
-        <div id="memberList" class="member-list"></div>
-        <!-- ★ 09-24 真远程桌面：把"怎么让这台电脑变成可被控的"直接写在页面上。
-             因为被控端代理必须是**本地程序**（浏览器的安全沙箱不允许网页驱动真实鼠标键盘），
-             用户得在自己电脑的终端跑一行命令 —— 那就把这行命令准备好，一键复制。 -->
-        <div id="agentHint" class="agent-hint hidden">
-          <div class="ah-title">🖥️ 想让别人操作这台电脑？</div>
-          <div class="ah-body">在本机终端运行下面这行命令，房间里就会出现一台「可被控的电脑」：</div>
-          <code id="agentCmd" class="ah-cmd">node agent/index.js --room ------</code>
-          <div class="ah-actions">
-            <button id="agentCopy" class="btn ah-copy">复制命令</button>
-            <button id="agentHow" class="btn ah-how">为什么不能在网页里做？</button>
+      <div class="side-tabs" role="tablist">
+        <button class="side-tab active" data-side="members" role="tab" aria-selected="true">👥 成员</button>
+        <button class="side-tab" data-side="board" role="tab" aria-selected="false">
+          🧠 看板<span id="boardNum" class="side-num hidden">0</span>
+        </button>
+        <button class="side-tab" data-side="chat" role="tab" aria-selected="false">
+          💬 聊天<span id="chatUnread" class="side-num unread hidden">0</span>
+        </button>
+      </div>
+
+      <div class="side-body">
+        <!-- ── ① 成员 ── -->
+        <div class="side-view active" data-side="members">
+          <div class="member-panel">
+            <div class="member-title">
+              <span>👥 成员 <span id="memberNum">1</span></span>
+              <span id="ownerTag" class="role-tag hidden"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 17.5h15L18 9l-3.8 3.2L12 6l-2.2 6.2L6 9l-1.5 8.5z"/></svg>你是房主</span>
+            </div>
+            <div id="memberList" class="member-list"></div>
+            <!-- ★ 09-24 真远程桌面：把"怎么让这台电脑变成可被控的"直接写在页面上。
+                 因为被控端代理必须是**本地程序**（浏览器的安全沙箱不允许网页驱动真实鼠标键盘），
+                 用户得在自己电脑的终端跑一行命令 —— 那就把这行命令准备好，一键复制。 -->
+            <div id="agentHint" class="agent-hint hidden">
+              <div class="ah-title">🖥️ 想让别人操作这台电脑？</div>
+              <div class="ah-body">在本机终端运行下面这行命令，房间里就会出现一台「可被控的电脑」：</div>
+              <code id="agentCmd" class="ah-cmd">node agent/index.js --room ------</code>
+              <div class="ah-actions">
+                <button id="agentCopy" class="btn ah-copy">复制命令</button>
+                <button id="agentHow" class="btn ah-how">为什么不能在网页里做？</button>
+              </div>
+            </div>
           </div>
         </div>
-      </div>
-      <div class="chat-panel">
-        <div class="chat-title">💬 会议聊天 <span class="chat-via">经服务器转发</span></div>
-        <div class="chat-messages" id="chatList"></div>
-        <div class="chat-input-bar">
-          <textarea id="chatInput" rows="1" placeholder="说点什么…（Enter 发送）"></textarea>
-          <button id="chatSendBtn" class="btn send">发送</button>
+
+        <!-- ── ② ★ 09-25 AI 会议看板（边听边整理：决定/风险/行动项/议题） ──
+             这不是"AI 回答的另一种展示"，而是**AI 主动参与会议**的证据：
+             它整场都在消化字幕，把会后最容易扯皮的四类信息实时摊在这里。
+             与聊天区分开是刻意的——看板是"随时瞥一眼"的仪表，聊天是"逐条读"的流水。 -->
+        <div class="side-view" data-side="board">
+          <div class="board-panel">
+            <div class="board-title">
+              <span>🧠 会议看板</span>
+              <span class="board-sub" id="boardSub">AI 边听边整理</span>
+            </div>
+            <div class="board-body" id="boardBody">
+              <div class="board-empty" id="boardEmpty">
+                看板会随会议内容自动生长<br>
+                <span class="be-row">🎯 决定 · ⚠️ 风险 · ✅ 行动项 · 💬 议题</span>
+                邀请 🤖 AI 助理入会并开启字幕，它就把会上说的这些话挑出来
+              </div>
+              <div class="board-list" id="boardList"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── ③ 聊天 ── -->
+        <div class="side-view" data-side="chat">
+          <div class="chat-panel">
+            <div class="chat-title">💬 会议聊天 <span class="chat-via">经服务器转发</span></div>
+            <div class="chat-messages" id="chatList"></div>
+            <div class="chat-input-bar">
+              <textarea id="chatInput" rows="1" placeholder="说点什么…（Enter 发送）"></textarea>
+              <button id="chatSendBtn" class="btn send">发送</button>
+            </div>
+          </div>
         </div>
       </div>
     </aside>

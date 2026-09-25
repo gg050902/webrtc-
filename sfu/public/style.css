@@ -1941,3 +1941,126 @@ body.rd-mode { overflow: hidden; }
   .insecure-banner .ib-title { font-size: 14px; }
   .insecure-banner .ib-body { font-size: 12px; }
 }
+
+/* ══════════════════════════════════════════════════════════════
+ * ★ 09-25 侧栏分段 + AI 会议看板
+ * ▎为什么把侧栏改成 tab：原本"成员 + 聊天"上下堆叠，各占约一半高度；
+ *   再加一块看板就会变成三块挤在一起、每块都矮到没法用。
+ *   改成 tab 后每块都拿到完整高度——看板条目多时尤其需要。
+ * ▎契约：只新增 .side-tab/.side-view 这层壳，**原有类名与 id 一个没动**，
+ *   所以 client.js 与冒烟测试不受影响（这是改造前先确认过的）。
+ * ══════════════════════════════════════════════════════════════ */
+
+/* 分段条：三枚等宽按钮，选中态用"上浮 + 强调线"而不是换底色——
+   底色一换整条就显得很重，而这个控件应该安静地待在面板顶部。 */
+.side-tabs {
+  display: flex; flex-shrink: 0; gap: 3px;
+  padding: 3px; margin-bottom: -2px;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+}
+.side-tab {
+  flex: 1; position: relative;
+  padding: 7px 6px; font: inherit; font-size: 12px;
+  color: var(--fg-muted); background: transparent;
+  border: 0; border-radius: 7px; cursor: pointer;
+  transition: color .14s, background .14s;
+}
+.side-tab:hover { color: var(--fg); background: rgba(255, 255, 255, .04); }
+.side-tab.active { color: var(--accent); background: var(--accent-muted); }
+.side-tab.active::after {
+  content: ''; position: absolute; left: 22%; right: 22%; bottom: 1px; height: 2px;
+  background: var(--accent); border-radius: 2px;
+}
+/* 角标：看板条数 / 未读聊天数 */
+.side-num {
+  margin-left: 5px; padding: 0 5px; border-radius: 999px;
+  font-size: 9px; line-height: 14px; vertical-align: 1px;
+  color: var(--accent); background: var(--accent-muted); border: 1px solid var(--accent-border);
+  font-variant-numeric: tabular-nums;
+}
+.side-num.unread { color: var(--bg0); background: var(--accent); border-color: var(--accent); }
+
+/* 面板容器：只有 active 的那个显示 */
+.side-body { flex: 1; min-height: 0; display: flex; }
+.side-view { display: none; flex: 1; min-height: 0; }
+.side-view.active { display: flex; flex-direction: column; }
+/* 成员面板在 tab 模式下占满整格（原来的 42% 上限是给"上下堆叠"用的） */
+.side-view .member-panel { max-height: none; height: 100%; }
+
+/* ── AI 看板 ── */
+.board-panel {
+  display: flex; flex-direction: column; flex: 1; min-height: 0;
+  background: var(--glass); border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden;
+}
+.board-title {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 10px 12px; font-size: 12px; color: var(--fg-muted);
+  border-bottom: 1px solid var(--border);
+}
+.board-sub { font-size: 10px; color: var(--fg-faint); }
+.board-body { flex: 1; min-height: 0; overflow-y: auto; padding: 10px; }
+.board-empty {
+  padding: 22px 14px; text-align: center;
+  font-size: 11px; line-height: 1.9; color: var(--fg-faint);
+}
+.board-empty .be-row { display: block; margin: 6px 0; font-size: 12px; letter-spacing: .04em; }
+
+/* 四个栏目（按固定顺序：决定 → 风险 → 行动项 → 议题）
+   顺序本身就是优先级：决定最该被存档，风险最该被立刻看见。 */
+.board-sec { margin-bottom: 12px; }
+.board-sec-h {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 5px;
+  font-size: 11px; font-weight: 600; color: var(--fg-muted);
+  letter-spacing: .03em;
+}
+.board-sec-h .bsh-n {
+  margin-left: auto; font-size: 10px; font-weight: 400; color: var(--fg-faint);
+  font-variant-numeric: tabular-nums;
+}
+.board-item {
+  position: relative;
+  padding: 7px 9px 7px 11px; margin-bottom: 5px;
+  font-size: 12px; line-height: 1.55; color: var(--fg);
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 8px; border-left: 2px solid var(--border-strong);
+  word-break: break-word;
+}
+/* 各类左侧色条：一眼分辨性质（决定=强调色 / 风险=胭脂 / 行动项=竹青 / 议题=苍） */
+.board-item.k-decision { border-left-color: var(--accent); }
+.board-item.k-risk { border-left-color: #e0636f; }
+.board-item.k-todo { border-left-color: #86a876; }
+.board-item.k-topic { border-left-color: #97a3b3; }
+.board-item .bi-meta {
+  display: flex; align-items: baseline; gap: 6px;
+  margin-bottom: 2px; font-size: 10px; color: var(--fg-faint);
+}
+.board-item .bi-who { color: var(--fg-muted); font-weight: 600; }
+.board-item .bi-text { color: var(--fg); }
+/* 行动项结构化呈现：谁 / 做什么 / 何时——三字段分开写，比一大句话好扫读 */
+.board-item .bi-due {
+  margin-left: auto; padding: 0 5px; border-radius: 999px;
+  font-size: 9px; color: var(--accent); background: var(--accent-muted);
+  border: 1px solid var(--accent-border);
+}
+/* 无主行动项 = 需要有人认领 → 醒目但不刺眼 */
+.board-item .bi-ownerless {
+  display: inline-block; margin-top: 3px; padding: 1px 6px; border-radius: 999px;
+  font-size: 9px; color: #e0636f; background: rgba(224, 99, 111, .12);
+  border: 1px solid rgba(224, 99, 111, .34);
+}
+/* 新到的条目闪一下（增量高亮）——看板常驻侧栏，不闪用户根本注意不到它更新了 */
+.board-item.is-new { animation: boardPop 2.2s ease-out; }
+@keyframes boardPop {
+  0% { background: var(--accent-muted); border-color: var(--accent-border); transform: translateX(-3px); }
+  60% { background: var(--bg2); transform: translateX(0); }
+  100% { background: var(--bg2); }
+}
+
+/* 看板有新条目、但用户当前不在看板分段时，给 tab 一个短暂闪烁提示
+   （不自动切过去——那太粗暴、会打断用户正在看的东西）。 */
+.side-tab.flash { animation: tabFlash 1.6s ease-out; }
+@keyframes tabFlash {
+  0%, 100% { color: var(--fg-muted); }
+  25%, 75% { color: var(--accent); background: var(--accent-muted); }
+}

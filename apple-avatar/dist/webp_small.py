@@ -12,8 +12,8 @@ ROOT = r"C:\Users\27418\Desktop\webrtc\apple-avatar"
 TMP = os.path.join(ROOT, "dist", "_tmp")
 ANIM_OUT = os.path.join(ROOT, "dist", "anim")
 
-SIZES = [256, 128, 64]
-FPS = 15
+SIZES = [64]
+FPS = 10
 
 
 def build(tag):

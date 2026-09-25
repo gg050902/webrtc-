@@ -32,11 +32,12 @@ CORNER = 0.12
 WM_MARGIN = 0.16
 LUMA_MARGIN = 8          # alpha 黑场 = 背景亮度 + 此值
 ALPHA_HI = 140.0
-GAMMA = 0.85
+GAMMA = 0.85            # 静态图 alpha 曲线(柔和)
+GAMMA_ANIM = 1.6        # 动画 alpha 曲线(更硬, 显著压低 WebP 体积)
 ALPHA_T = 40             # 判定"主体"的 alpha 阈值
 PNG_SIZES = [1024, 512, 256, 128, 64, 40]
 WEBP_SIZES = [256, 128]      # 64 由 webp_small.py 用 Pillow 生成(见该文件说明)
-VID_FPS = 15
+VID_FPS = 10      # 慢速呼吸/脉动, 10fps 足够;再高只是徒增体积
 VID_SIZE = 512
 
 
@@ -90,10 +91,15 @@ def strip_watermark(im):
     return out
 
 
-def alpha_key(im, black):
+def alpha_key(im, black, gamma=GAMMA):
+    """亮度键控出 alpha。gamma 越大边缘越"硬"。
+
+    动画用比静态图更大的 gamma: 运动状态下细节不易察觉,
+    而更硬的 alpha 边缘能让 WebP 体积显著下降(渐变 alpha 压缩开销大)。
+    """
     lo = black + LUMA_MARGIN
     span = max(1.0, ALPHA_HI - lo)
-    lut = [0 if v <= lo else int(min(1.0, ((v - lo) / span) ** GAMMA) * 255)
+    lut = [0 if v <= lo else int(min(1.0, ((v - lo) / span) ** gamma) * 255)
            for v in range(256)]
     rgba = im.convert("RGBA")
     rgba.putalpha(im.convert("L").point(lut))
@@ -179,7 +185,7 @@ def build_anim(tag, src):
     first = Image.open(os.path.join(raw_dir, frames[0])).convert("RGB")
     black = bg_luma(first)                       # 全程锁定首帧测得的参数
 
-    keyed0 = alpha_key(strip_watermark(first), black)
+    keyed0 = alpha_key(strip_watermark(first), black, GAMMA_ANIM)
     factor = 0.66
     for _ in range(5):
         box = calc_box(keyed0, factor)
@@ -190,7 +196,7 @@ def build_anim(tag, src):
 
     for i, f in enumerate(frames):
         im = Image.open(os.path.join(raw_dir, f)).convert("RGB")
-        keyed = alpha_key(strip_watermark(im), black)
+        keyed = alpha_key(strip_watermark(im), black, GAMMA_ANIM)
         frame = crop_with(keyed, box).resize((VID_SIZE, VID_SIZE), Image.LANCZOS)
         apply_vignette(frame).save(os.path.join(clean_dir, f"{i:04d}.png"))
 

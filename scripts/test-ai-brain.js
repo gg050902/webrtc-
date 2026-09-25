@@ -15,6 +15,7 @@
  */
 'use strict';
 const B = require('../sfu/ai/brain');
+const Digest = require('../sfu/ai/digest');
 
 let pass = 0; let fail = 0; let skipped = 0;
 const T = (name, fn) => Promise.resolve().then(fn).then(
@@ -246,6 +247,130 @@ const USE_LLM = require('../sfu/ai/provider').aiEnabled();
      * 正确的判据是"**没有泄露具体数值**"：999 这个数不该出现。 */
     assert(!/999/.test(r.text), '答案不该泄露上一场会的具体数值，实际：' + r.text);
     assert(/没提到|没有提到|未提及|没有相关/.test(r.text), '应明确承认没提到，而不是含糊带过，实际：' + r.text);
+  });
+
+  /* ══════════ 六之三、实时会议看板（digest.js）★ 09-25 ══════════
+   * ▎为什么这组断言重要：看板是**实时呈现给用户**的，误报的代价与纪要完全不同——
+   *   纪要里多抽一条行动项，人复核时删掉即可；看板里冒出一条"今天天气不错 → 行动项"，
+   *   用户立刻判定"这 AI 在瞎猜"，之后就再也不看这块板了。
+   *   所以这里的核心断言是**精度**（不能误报闲聊），而不是召回。
+   *   另外两条同样关键：去重（同一句反复说只记一次）与有界（长会不涨内存）。 */
+  console.log('\n── 六之三、实时会议看板（digest）──');
+  const MEETING_LINES = [
+    { name: '张三', text: '那交付时间就这么定了，11 月 20 日', ts: 1 },
+    { name: '李四', text: '我担心时间来不及，联调还没开始', ts: 2 },
+    { name: '王五', text: 'TURN 账号密码记得轮换，下周一之前完成', ts: 3 },
+    { name: '李四', text: '压测报告我负责，周五之前提交', ts: 4 },
+    { name: '张三', text: '下一个议题是跨网连接怎么做', ts: 5 },
+    { name: '张三', text: '今天天气不错', ts: 6 },
+    { name: '李四', text: '午饭吃什么', ts: 7 },
+    { name: '王五', text: '好', ts: 8 },
+    { name: '王五', text: '嗯', ts: 9 },
+  ];
+  await T('★ 四类信息都能抽到（决定 / 风险 / 行动项 / 议题）', () => {
+    const d = new Digest.Digest();
+    const r = d.ingest(MEETING_LINES);
+    assert(r.added.decision.length === 1, '应抽到 1 条决定，实际 ' + r.added.decision.length);
+    assert(r.added.risk.length === 1, '应抽到 1 条风险，实际 ' + r.added.risk.length);
+    assert(r.added.todo.length === 2, '应抽到 2 条行动项，实际 ' + r.added.todo.length);
+    assert(r.added.topic.length === 1, '应抽到 1 条议题，实际 ' + r.added.topic.length);
+  });
+  await T('★ 闲聊/语气词绝不进看板（看板的生命线是精度）', () => {
+    const d = new Digest.Digest();
+    const r = d.ingest([
+      { name: '张三', text: '今天天气不错', ts: 1 },
+      { name: '李四', text: '午饭吃什么', ts: 2 },
+      { name: '王五', text: '好', ts: 3 },
+      { name: '王五', text: '嗯嗯', ts: 4 },
+      { name: '张三', text: '哈哈哈哈', ts: 5 },
+    ]);
+    assert(r.addedCount === 0,
+      '闲聊不该产出任何看板条目，实际产出：' + JSON.stringify(r.added).slice(0, 200));
+  });
+  await T('★ 行动项带负责人（"我负责"型必须认到说话人）', () => {
+    /* 实测踩坑：初版 classify 为了省参数没传说话人，"压测报告我负责" 的负责人
+     *   永远是空 → 所有自认领型行动项都变成"待认领"，看板会误报一堆无主任务。 */
+    const d = new Digest.Digest();
+    const r = d.ingest([{ name: '李四', text: '压测报告我负责，周五之前提交', ts: 1 }]);
+    const todo = r.added.todo[0];
+    assert(todo, '应识别为行动项');
+    assert(todo.owner === '李四', '自认领型应归到说话人李四，实际 "' + todo.owner + '"');
+    assert(todo.due === '周五', '应识别期限，实际 "' + todo.due + '"');
+  });
+  await T('无人认领的行动项能被单独挑出（AI 主动提醒的原料）', () => {
+    const d = new Digest.Digest();
+    d.ingest(MEETING_LINES);
+    const un = d.unclaimedTodos();
+    assert(un.length === 1, '应恰好 1 条无主行动项（TURN 轮换），实际 ' + un.length);
+    assert(/TURN/.test(un[0].text), '无主的那条应是 TURN 轮换，实际 ' + un[0].text);
+  });
+  await T('同一句反复说只记一次（去重）', () => {
+    const d = new Digest.Digest();
+    d.ingest([{ name: '张三', text: '那交付时间就这么定了，11 月 20 日', ts: 1 }]);
+    const again = d.ingest([
+      { name: '李四', text: '那交付时间就这么定了，11 月 20 日', ts: 2 },
+      { name: '王五', text: '那交付时间就这么定了, 11 月 20 日', ts: 3 },   // 标点/空格不同
+    ]);
+    assert(again.addedCount === 0, '重复表述不该重复入板，实际新增 ' + again.addedCount);
+  });
+  await T('同一句不会在两个栏目各出现一次（跨类去重）', () => {
+    const d = new Digest.Digest();
+    const r = d.ingest([
+      { name: '张三', text: '这个方案就这么定了，但是我有风险担心来不及', ts: 1 },
+    ]);
+    // 同时命中"决定"和"风险"两个正则，但只能入一类（决定优先）
+    const total = Digest.KINDS.reduce((n, k) => n + r.added[k].length, 0);
+    assert(total === 1, '同一句应只入一类，实际入了 ' + total + ' 类：' + JSON.stringify(r.added).slice(0, 200));
+  });
+  await T('★ 有界：超出上限丢最老的（长会不涨内存）', () => {
+    const d = new Digest.Digest({ maxPerKind: 3 });
+    for (let i = 0; i < 10; i++) {
+      d.ingest([{ name: '张三', text: `第 ${i} 个议题：这是第 ${i} 项要讨论的内容`, ts: i }]);
+    }
+    const snap = d.snapshot();
+    assert(snap.counts.topic === 3, '每类应被压到 3 条，实际 ' + snap.counts.topic);
+    assert(/第 9 个议题/.test(snap.items.topic[0].text), '最新一条应在最前，实际 ' + snap.items.topic[0].text);
+  });
+  await T('快照是最新在前（看板关心"现在"）', () => {
+    const d = new Digest.Digest();
+    d.ingest([
+      { name: '张三', text: '第一个议题是部署', ts: 1 },
+      { name: '李四', text: '第二个议题是测试', ts: 2 },
+    ]);
+    const snap = d.snapshot();
+    assert(snap.items.topic[0].ts === 2, '最新议题应排最前，实际 ts=' + snap.items.topic[0].ts);
+  });
+  await T('原文照录，不做任何改写（看板不编造）', () => {
+    const src = 'TURN 账号密码记得轮换，下周一之前完成';
+    const d = new Digest.Digest();
+    const r = d.ingest([{ name: '王五', text: src, ts: 1 }]);
+    assert(r.added.todo[0].text === src, '看板条目必须是原话，实际：' + r.added.todo[0].text);
+  });
+  await T('★ "把某个日期/方案定下来"是**决定**，不是行动项（真截图暴露的错分）', () => {
+    /* 这条来自真浏览器截图：看板把「先说结论：交付时间定在 11 月 20 日」归进了
+     *   **行动项**并打了"待认领"——因为句中有"交付"（命中行动项的动词闸门），
+     *   而决定词表当时不认"定在"。
+     *   后果很实际：用户会去找人认领一句**根本不需要人做**的事实陈述。
+     *   所以这条断言的判据是"栏目归属"，不是"有没有抽到"。 */
+    const d = new Digest.Digest();
+    const r = d.ingest([{ name: '张三', text: '先说结论：交付时间定在 11 月 20 日，这个日期不能再动了', ts: 1 }]);
+    assert(r.added.decision.length === 1, '应归入「决定」，实际归到了：' +
+      JSON.stringify(Digest.KINDS.filter((k) => r.added[k].length)));
+    assert(r.added.todo.length === 0, '不该同时出现在行动项里');
+  });
+  await T('"不一定/固定在线"这类含"定"字的词不会被误判成决定', () => {
+    const d = new Digest.Digest();
+    const r = d.ingest([
+      { name: '张三', text: '这个方案我还不一定同意', ts: 1 },
+      { name: '李四', text: '服务器固定在线，随时可以连', ts: 2 },
+    ]);
+    assert(r.added.decision.length === 0, '不该误判成决定，实际：' +
+      JSON.stringify(r.added.decision.map((x) => x.text)));
+  });
+  await T('空输入 / 非法输入不抛错', () => {
+    const d = new Digest.Digest();
+    assert(d.ingest(null).addedCount === 0, 'null 应安全');
+    assert(d.ingest([{ text: '' }, null, { text: '   ' }]).addedCount === 0, '空文本应被跳过');
   });
 
   /* ══════════ 七、LLM 轨 ══════════ */

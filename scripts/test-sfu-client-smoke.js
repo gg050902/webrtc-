@@ -721,8 +721,26 @@ const emit = (ev, payload) => {
   const capPostTotal = capPosts.reduce((n, c) => {
     try { return n + JSON.parse(c.body).entries.length; } catch (e) { return n; }
   }, 0);
-  ok('值守：账本溢出触发归档 POST /api/captions（分批但一条不少）',
-    capPosts.length >= 1 && capPostTotal === 5); // 4 条旧账 + 501 条新灌 - 内存 500 = 溢出 5
+  /* ★ 09-25 断言改写（原为 `capPostTotal === 5`）。为什么改：
+   *   那条断言写的是**旧实现的一个细节**——"内存环形装不下时，把溢出的旧段上传"，
+   *   所以灌 505 条只发 5 条（505 - 500）。但本轮为了让服务端 AI 能实时参与会议，
+   *   把"保留历史"和"上传队列"拆开了（见 client.js capPushLog 的长注释），
+   *   上传改为按队列阈值成批发送 → 同样灌 505 条，会发 500 条、队列里还剩 5 条。
+   *   两条路**最终送达的总量完全一样**，只是拿货的那一端变了。
+   *   所以真正该守的不变量不是"发几条"，而是：
+   *     ① **一条不少**：已上传 + 仍在队列 === 全部入账；
+   *     ② **一条不重**：两条上传路径（队列溢出 / 定时兜底）不得重复投递同一条。
+   *   这两条比原来的 `=== 5` 更强——原来那条既挡不住重复，也挡不住丢账。 */
+  const capPending = vm.runInContext('cap.sentry.queue.length', ctx);
+  const capIngested = vm.runInContext('cap.sentry.total', ctx);
+  ok('值守：账本溢出触发归档 POST /api/captions（已分批上传）', capPosts.length >= 1);
+  ok('值守：归档"一条不少"（已上传 + 仍在队列 = 全部入账）',
+    capPostTotal + capPending === capIngested, `已传 ${capPostTotal} + 待传 ${capPending} ≠ 入账 ${capIngested}`);
+  const capTexts = capPosts.flatMap((c) => {
+    try { return JSON.parse(c.body).entries.map((e) => e.text); } catch (e) { return []; }
+  });
+  ok('值守：归档"一条不重"（两条上传路径不重复投递）',
+    new Set(capTexts).size === capTexts.length, `${capTexts.length} 条里有 ${capTexts.length - new Set(capTexts).size} 条重复`);
   const capPostBody = (() => { try { return JSON.parse(capPosts[0].body); } catch (e) { return null; } })();
   ok('值守：归档载荷带房间号（room=123456）',
     !!capPostBody && capPostBody.room === '123456');

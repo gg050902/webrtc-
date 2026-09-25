@@ -121,12 +121,14 @@ td code{color:var(--accent)}
   el.src = speaking ? 'anim/apple-speaking-128.webp' : 'anim/apple-idle-128.webp';
 &lt;/script&gt;
 
-&lt;!-- 3. 需要更高画质时用视频格式（含 VP9 透明 alpha） --&gt;
-&lt;video autoplay muted loop playsinline
-       src="anim/apple-idle-512.webm"
-       style="width:180px;height:180px"&gt;&lt;/video&gt;
+&lt;!-- 3. 圆形容裁：主体占 66%，方形/圆形裁切都不会切到轮廓 --&gt;
+&lt;style&gt;
+  .avatar { width:64px; height:64px; border-radius:50%; }
+  @media (prefers-reduced-motion: reduce) { .avatar { content-visibility:auto } }
+&lt;/style&gt;
 
-&lt;!-- 4. 若UI是深色底，静态PNG可直接1:1使用；浅色底同样可用（已抠透明） --&gt;</code></pre>
+&lt;!-- 4. 静态 PNG 用于低性能场景或不希望动画的时刻（如下载中、页面失焦） --&gt;
+&lt;img class="avatar" src="png/apple-idle-128.png"&gt;</code></pre>
   </div>
 </section>
 
@@ -139,16 +141,17 @@ td code{color:var(--accent)}
         <tr><td>静态 PNG</td><td><code>png/apple-{state}-{size}.png</code></td>
             <td>state = idle / listening / speaking / thinking / happy；size = 1024·512·256·128·64·40</td></tr>
         <tr><td>动画 WebP</td><td><code>anim/apple-{idle|speaking}-{256|128|64}.webp</code></td>
-            <td>推荐用于头像：体积小、原生透明、自动循环</td></tr>
-        <tr><td>动画 WebM</td><td><code>anim/apple-{idle|speaking}-512.webm</code></td>
-            <td>VP9 + alpha，用于大尺寸展示或视频式集成</td></tr>
+            <td>推荐用于头像：原生透明、自动循环。<strong>默认用 128px</strong>（64=84KB / 128=266KB / 256=775KB）</td></tr>
       </tbody>
     </table>
     <p class="note" style="margin:16px 0 0">
       <span class="pill">透明背景</span><span class="pill">无缝循环</span><span class="pill">主体占比统一 66%</span>
-      <span class="pill">已去水印</span><span class="pill">15fps / 5s</span>
+      <span class="pill">已去水印</span><span class="pill">10fps / 5s 循环</span>
     </p>
-    <p class="note">建议：≤64px 场景用 128px 资源由浏览器缩放，比直接用 64px 更清晰且省一个文件。</p>
+    <p class="note">
+      建议：绝大多数场景用 <strong>128px 资源 + CSS 缩放</strong>，不必为每档尺寸各准备一份。
+      另注：本机 ffmpeg 的 VP9 编码不支持 alpha，因此<strong>不提供 WebM</strong>（避免给你一个黑底格式）。
+    </p>
   </div>
 </section>
 

@@ -510,6 +510,7 @@ let deviceReady = false;
 let sfuIceServers = [];       // ★ 09-13：服务器下发的 ICE 服务器（STUN/TURN），initSFU 时拉取
 let sfuVideoSvc = false;      // ★ D+3：VP9 SVC 开关（config.json 的 videoSvc 下发）
 let sfuAiEnabled = false;     // ★ 09-24：AI 是否接了真模型（服务器只下发布尔值，绝不回显 key）
+let sfuHasBot = false;        // ★ 09-25：AI 助理当前是否在会（决定字幕上行快慢，见 capUploadWindow）
 let lanUrl = null;            // ★ 09-16：局域网 HTTPS 入口（邀请链接跨电脑用）
 const myProducers = new Map(); // producerId -> Producer（我上传的，如屏幕共享要用）
 
@@ -844,6 +845,9 @@ socket.on('room-members', ({ roomNumber, members, roomToken }) => {
   // ★ 09-24 C4：进房成功时服务器**单播给我自己**的房间内令牌（游客也有；重连后会换新，直接覆盖）
   if (roomToken) myRoomToken = roomToken;
   enterRoom(roomNumber);
+  /* ★ 09-25：进房后拉一次看板全量——ai-board 是推模式，晚进房/刷新页面的人
+   *   会错过之前所有广播，不拉就是一块空板。（推保实时，拉保完整。） */
+  requestBoard();
 
   (async () => {
     if (initializing) return;      // 防并发：重连与首次进房若撞在一起，只跑一次
@@ -1330,6 +1334,8 @@ function appendChat(text, sender, isMe, via, name, ai) {
       `<div class="msg-time">${new Date().toLocaleTimeString()}</div>`;
   }
   chatList.appendChild(item);
+  // ★ 09-25：侧栏分段后聊天可能被切走 → 非当前分段时累计未读角标（否则会漏消息）
+  noteChatActivity();
   // ★ 09-19d 架构优化：聊天 DOM 环形上限（300 条）——SCTP 广播语义下长会消息不少，
   //   DOM 节点数是前端内存与重排开销的大头；超限剪最老的（字幕账本另有 jsonl 存档）。
   while (chatList.children.length > 300) chatList.firstChild.remove();
@@ -2470,10 +2476,169 @@ socket.on('room-state', ({ members, expiresAt }) => {
   const hasBot = lastMembers.some((m) => m.isBot);
   aiBtn.classList.toggle('active', hasBot);
   hasBot ? setIconBtn(aiBtn, ICONS.bot, '送走 AI') : setIconBtn(aiBtn, ICONS.bot, 'AI 助理');
+  /* ★ 09-25：AI 在场 → 字幕上行调快（看板要跟着会议实时走）+ 回拉一次看板全量。
+   *   为什么在这里判定"AI 在不在"：room-state 是所有客户端都能收到的权威快照，
+   *   任何客户端开关助理，全房的上行节奏会一致地跟着切，不需要额外信令。 */
+  const botJustArrived = hasBot && !sfuHasBot;
+  sfuHasBot = hasBot;
+  if (botJustArrived) requestBoard();
   // 被控/控制关系也可以通过快照同步（和 remote-state 广播互为兜底）
   if (expiresAt) { remoteExpiresAt = expiresAt; startCountdown(); }
   applyLayout(); // ★ F1：共享状态变了（比如有人开始共享屏幕），演讲者视图的大画面要跟着换人
 });
+
+/* ══════════════════════════════════════════════════════════════
+ * ★ 09-25 侧栏分段 + AI 会议看板（前端）
+ *
+ * ▎看板是什么：服务端（sfu/ai/digest.js）边听边把字幕抽成四类结构化信息，
+ *   这里只负责**照单渲染**——不做任何判断、不改写一个字。
+ *   这个分工很重要：判断逻辑全在服务器（可单测、全房一致），
+ *   前端纯展示（不会出现"不同人看到不同看板"）。
+ *
+ * ▎为什么要有"新条目闪一下"：看板是常驻侧栏的，不闪的话用户根本注意不到它更新了
+ *   （侧栏内容变化很容易被忽略）。闪一下就把"AI 又听出来一条"这件事变成可见的。
+ * ══════════════════════════════════════════════════════════════ */
+const BOARD_KINDS = [
+  // 顺序 = 优先级，与服务端 digest 的判定优先级一致（决定 > 风险 > 行动项 > 议题）
+  { key: 'decision', icon: '🎯', label: '决定' },
+  { key: 'risk', icon: '⚠️', label: '风险' },
+  { key: 'todo', icon: '✅', label: '行动项' },
+  { key: 'topic', icon: '💬', label: '议题' },
+];
+let boardState = { counts: {}, items: {}, total: 0 };
+let boardNewKeys = new Set();     // 本次增量到达的条目（渲染时加 .is-new 闪一下）
+
+/** 切侧栏分段（成员 / 看板 / 聊天）。切到聊天时清未读角标。 */
+function switchSide(name, opts) {
+  document.querySelectorAll('.side-tab').forEach((t) => {
+    const on = t.dataset.side === name;
+    t.classList.toggle('active', on);
+    t.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  document.querySelectorAll('.side-view').forEach((v) => {
+    v.classList.toggle('active', v.dataset.side === name);
+  });
+  if (name === 'chat') {
+    chatUnread = 0;
+    renderChatUnread();
+    const inp = $('chatInput');
+    if (inp && opts && opts.focus) inp.focus();
+  }
+}
+function initSideTabs() {
+  document.querySelectorAll('.side-tab').forEach((t) => {
+    t.addEventListener('click', () => switchSide(t.dataset.side));
+  });
+}
+
+/* 未读计数：不在聊天分段时来消息就 +1。
+ * ▎为什么值得做：侧栏分段之后，聊天可能被切走——不看角标会真的漏消息。
+ *   这是"改布局引入的新需求"，必须一起补，否则改 tab 就是体验倒退。 */
+let chatUnread = 0;
+function renderChatUnread() {
+  const el = $('chatUnread');
+  if (!el) return;
+  el.textContent = String(chatUnread > 99 ? '99+' : chatUnread);
+  el.classList.toggle('hidden', !chatUnread);
+}
+function noteChatActivity() {
+  const chatView = document.querySelector('.side-view[data-side="chat"]');
+  if (chatView && chatView.classList.contains('active')) return;  // 正在看聊天，不用提醒
+  chatUnread++;
+  renderChatUnread();
+}
+
+/** 渲染看板（全量重建——条目数最多 4×20，重建最简单也最不容易漏状态） */
+function renderBoard() {
+  const listEl = $('boardList');
+  const emptyEl = $('boardEmpty');
+  const numEl = $('boardNum');
+  const subEl = $('boardSub');
+  if (!listEl || !emptyEl) return;   // 假 DOM / 未渲染时安全返回
+
+  const items = boardState.items || {};
+  const counts = boardState.counts || {};
+  const total = BOARD_KINDS.reduce((n, k) => n + ((items[k.key] || []).length), 0);
+
+  if (numEl) {
+    numEl.textContent = String(total);
+    numEl.classList.toggle('hidden', !total);
+  }
+  if (subEl) {
+    subEl.textContent = boardState.total
+      ? `已消化 ${boardState.total} 条字幕`
+      : 'AI 边听边整理';
+  }
+  emptyEl.classList.toggle('hidden', total > 0);
+
+  listEl.textContent = '';
+  for (const k of BOARD_KINDS) {
+    const arr = items[k.key] || [];
+    if (!arr.length) continue;             // 空栏目不显示（避免四个空标题占位）
+    const sec = document.createElement('div');
+    sec.className = 'board-sec';
+    const h = document.createElement('div');
+    h.className = 'board-sec-h';
+    h.innerHTML = `<span>${k.icon} ${k.label}</span><span class="bsh-n">${arr.length}</span>`;
+    sec.appendChild(h);
+
+    for (const it of arr) {
+      const row = document.createElement('div');
+      row.className = `board-item k-${k.key}`;
+      /* 新条目高亮：键与服务端一致（kind|时间戳|文本前 20 字），
+       * 用 ts+text 组合而不是纯 ts——同一毫秒可能来两条。 */
+      if (boardNewKeys.has(`${k.key}|${it.ts}|${String(it.text).slice(0, 20)}`)) row.classList.add('is-new');
+      // ★ 全部走 escapeHtml：看板内容是**用户说的原话**，不转义就是 XSS 直通车
+      const meta = `<div class="bi-meta"><span class="bi-who">${escapeHtml(it.name || '成员')}</span>`
+        + `${it.due ? `<span class="bi-due">${escapeHtml(it.due)}</span>` : ''}</div>`;
+      // 行动项显示"任务"字段（结构化后的 clean 版），其余类目显示原话
+      const bodyText = k.key === 'todo' && it.task ? it.task : it.text;
+      let body = `<div class="bi-text">${escapeHtml(bodyText)}</div>`;
+      // 无主行动项 = 需要有人认领（会板上最该被看见的一类）
+      if (k.key === 'todo' && !it.owner) body += '<span class="bi-ownerless">待认领</span>';
+      row.innerHTML = meta + body;
+      sec.appendChild(row);
+    }
+    listEl.appendChild(sec);
+  }
+  // 高亮只生效一次（下一帧渲染就不该再闪了）
+  if (boardNewKeys.size) setTimeout(() => { boardNewKeys.clear(); }, 2400);
+}
+
+/* 服务端推来的增量看板更新 */
+socket.on('ai-board', (payload) => {
+  if (!payload) return;
+  boardState = { counts: payload.counts || {}, items: payload.items || {}, total: payload.total || 0 };
+  const added = payload.added || {};
+  boardNewKeys = new Set();
+  for (const k of BOARD_KINDS) {
+    for (const it of (added[k.key] || [])) boardNewKeys.add(`${k.key}|${it.ts}|${String(it.text).slice(0, 20)}`);
+  }
+  renderBoard();
+  /* 有新条目时若用户不在看板分段，给个小提示——不然"AI 又听出来一条"完全不可见。
+   * 只在真的有新增时才提，且不抢焦点（不自动切过去，那太粗暴）。 */
+  const addedCount = BOARD_KINDS.reduce((n, k) => n + ((added[k.key] || []).length), 0);
+  if (addedCount) {
+    const boardView = document.querySelector('.side-view[data-side="board"]');
+    if (boardView && !boardView.classList.contains('active')) {
+      const tab = document.querySelector('.side-tab[data-side="board"]');
+      if (tab) { tab.classList.add('flash'); setTimeout(() => tab.classList.remove('flash'), 1600); }
+    }
+  }
+});
+
+/* 主动拉一次全量：ai-board 是"推"，晚进房/刷新的人会错过之前的广播。
+ * 推保证实时、拉保证完整——两者缺一不可。 */
+function requestBoard() {
+  try {
+    socket.emit('ai-board-get', {}, (r) => {
+      const data = r && r.data;
+      if (!data) return;
+      boardState = { counts: data.counts || {}, items: data.items || {}, total: data.total || 0 };
+      renderBoard();
+    });
+  } catch (e) { /* 未连接等异常：看板空着不影响会议 */ }
+}
 
 function renderMembers(members) {
   memberNumEl.textContent = members.length;
@@ -4954,13 +5119,51 @@ function handleCaptionMessage(from, msg) {
 
 function capPushLog(entry) {
   cap.log.push(entry);
+  /* ★ 09-25 重构：把"保留历史"与"上传队列"**拆成两个独立的东西**。
+   * ▎为什么必须拆（原本是一体的，且拆之前做不到"实时上行"）：
+   *   原实现是 `cap.log` 既当热窗口又当上传队列——只有它涨到 500 条才把旧的剪去上传。
+   *   于是**服务器要等 500 条字幕才知道会上发生了什么**，服务端的 AI 看板/问答
+   *   全部滞后一整段会议（这是"AI 无法实时参与会议"的根本原因）。
+   *   但直接把阈值调小也不行：`cap.log` 同时供字幕历史面板（slice(-100)）和
+   *   导出/日报使用，窗口一小，用户能回看的字幕就少了一截——那是功能倒退。
+   * ▎拆完各司其职：
+   *   · cap.log   = 保留历史（上限 500，仅剪切，不再参与上传）→ 面板/导出照旧；
+   *   · sentry.queue = 上传队列（按阈值或定时器排空）→ 可以按需调快调慢。
+   *   两者各自收到**同一条** entry 一次，所以既不会重复入库，也不会有条目丢失。 */
+  cap.sentry.queue.push(entry);
   cap.sentry.total++; // ★ 第 30 步：值守累计计数（含已归档/待归档的——内存里被剪掉的也算）
-  if (cap.log.length > 500) {
-    // 环形上限，防长会涨内存；★ 第 30 步值守：剪掉的旧段不再丢弃，交给归档上传服务器
-    // （"内存 = 热窗口，服务器 = 权威副本"——权威副本正是将来 G2 给 LLM 吃的那份输入）
-    capSentryOnSpill(cap.log.splice(0, cap.log.length - 500));
+  if (cap.log.length > 500) cap.log.splice(0, cap.log.length - 500); // 只剪不再传（上传走 queue）
+  if (cap.sentry.queue.length >= capUploadWindow()) {
+    capSentryOnSpill(cap.sentry.queue.splice(0));
   }
 }
+
+/* ★ 09-25 自适应上行窗口：AI 助理在场时把上传调快（看板要跟着会议实时走），
+ *   不在场时保持原样（没有消费者，没必要多打网络）。
+ *   ▎为什么"AI 在场才调快"而不是一直快：归档请求的是**可靠性**（宁可攒批少打网络），
+ *     而看板请求的是**时效性**。两个消费者的诉求不同，就按"有没有消费者"切换策略——
+ *     这比"一律变快"（白耗流量）和"一律慢"（看板废掉）都更贴切。 */
+const CAP_WINDOW_IDLE = 500;    // 无 AI：沿用原阈值
+const CAP_WINDOW_LIVE = 12;     // AI 在场：攒 12 条就上送（约等于"说几句就同步一次"）
+function capUploadWindow() {
+  return sfuHasBot ? CAP_WINDOW_LIVE : CAP_WINDOW_IDLE;
+}
+
+/* ★ 09-25 定时兜底上行：字幕可能是**稀疏**的（几分钟才一句），
+ *   只靠条数阈值的话，看板会在冷场期一直不更新。
+ *   每 6s 把队列里攒着的推一次——保证"即使没人连续说话，看板也不会哑"。 */
+const CAP_LIVE_TICK_MS = 6000;
+setInterval(() => {
+  if (!sfuHasBot || !myRoom) return;
+  /* ⚠️ 必须先 spill 再 flush：字幕进的是 queue（新队列），而 capSentryFlush 只发 batch。
+   *   直接调 flush 会"看着像在工作、实际什么都没发"（初版就是这么写的）——
+   *   capSentryOnSpill 内部会把 queue 的内容推进 batch 并接着 flush，所以走它。
+   *   队列为空时仍尝试一次 flush：那是为了**重试上一次失败的批次**（batch 里滞留的）。 */
+  try {
+    if (cap.sentry.queue.length) capSentryOnSpill(cap.sentry.queue.splice(0));
+    else if (cap.sentry.batch.length) capSentryFlush();
+  } catch (e) { /* 上行失败静默（已有 lastPostErr 限流提示），下一轮再试 */ }
+}, CAP_LIVE_TICK_MS);
 
 // 字幕条显示：文本更新 + 显示 + 8 秒无新字幕自动隐藏（真产品同款节奏）
 function showCaptionBar(name, text, interim) {
@@ -5177,6 +5380,7 @@ cap.sentry = {
   startedAt: 0,    // 首次开字幕的时间戳（值守计时起点；关字幕不清零——一夜的账要留着看）
   total: 0,        // 累计入账条数（含已归档的——内存里已经没有的也算，见 capPushLog）
   restarts: 0,     // 看门狗拉起识别器的次数（onend 的 300ms 常规续命不算在内）
+  queue: [],       // ★ 09-25：待上行队列（与 cap.log 解耦；见 capPushLog 的注释）
   batch: [],       // 待落盘的溢出字幕（POST 失败滞留这里，兜底重试会再发）
   archived: 0,     // 已成功落盘到服务器的条数
   drops: 0,        // 滞留批超上限被丢弃的最老条数（正常不该发生，发生了要在统计里看见）
@@ -5972,3 +6176,7 @@ startLocalMedia();
 // ★ 第 33 步：非安全上下文时弹出安全提示横幅。放在 startLocalMedia 之后调用，
 //   这样"正在连接信令服务器/本地媒体就绪"这类首行日志仍在最上面，横幅日志不会抢戏。
 initInsecureNotice();
+// ★ 09-25：侧栏分段（成员/看板/聊天）——脚本在 body 末尾，DOM 已就绪，可直接挂事件
+initSideTabs();
+renderBoard();      // 先渲染一次空看板（把"投喂提示"空状态显示出来）
+renderChatUnread();

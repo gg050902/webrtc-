@@ -30,6 +30,7 @@
     "test:ai": "node scripts/test-ai.js",
     "test:ai-brain": "node scripts/test-ai-brain.js",
     "verify:ai": "node scripts/verify-ai-live.js",
+    "verify:board": "node scripts/verify-board-live.js",
     "ai:chat": "node scripts/chat.js",
     "ai:summarize": "node scripts/summarize.js",
     "ai:agent": "node scripts/agent.js",

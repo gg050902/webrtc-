@@ -45,6 +45,11 @@ const AI = require('./ai/provider');
  * ▎为什么单独一个模块：让 Assistant 从"只喂最近 8 条字幕的关键词模板"升级为
  *   "全档检索 + 多轮记忆 + 真意图理解"。改造前的具体缺陷与修法见 brain.js 文件头。 */
 const Brain = require('./ai/brain');
+/* ★ 09-25 AI 实时会议看板（Live Digest）：让助理从"被问才答"变为"边听边消化"。
+ *   字幕持续流入 → 实时抽成「决定 / 风险 / 行动项 / 议题」四类 → 汇成一块看板广播给全房。
+ *   与 brain.js 的分工：brain = 按需检索+归纳（深但不实时）；digest = 持续抽取+原样呈现
+ *   （实时但不归纳）。两者互补，详见 digest.js 文件头。 */
+const Digest = require('./ai/digest');
 /* ★ 09-24 账号存储层：node:sqlite（零新依赖的真数据库）
  * ▎从"整文件 JSON 读写"换成 SQLite 的原因见 sfu/store.js 文件头。
  * ▎require 即完成：建库建表 + PRAGMA WAL + 旧 users.json 自动迁移（都在 store.js 里）。 */
@@ -727,15 +732,25 @@ async function handleApiCaptions(req, res) {
     }
     const day = new Date().toISOString().slice(0, 10).replace(/-/g, ''); // UTC 日期做分档
     const file = path.join(CAPTIONS_DIR, `cap-${room}-${day}.jsonl`);
-    const lines = entries.map((e) => JSON.stringify({
+    const clean = entries.map((e) => ({
       ts: Number(e && e.ts) || Date.now(),
       from: String((e && e.from) || '').slice(0, 64),
       name: String((e && e.name) || '').slice(0, 64),
       text: String((e && e.text) || '').slice(0, 500),
     }));
-    fs.appendFileSync(file, `${lines.join('\n')}\n`);
+    fs.appendFileSync(file, `${clean.map((e) => JSON.stringify(e)).join('\n')}\n`);
+    /* ★ 09-25：字幕入库 = AI 的"听觉信号"到达服务器 → 顺手喂给实时看板。
+     * ▎为什么挂在这里而不是新开一条信令：字幕本来就要经过这个端点落盘（复用既有通路，
+     *   不新增协议），而"落盘"与"消化"用的是同一批数据、同一时刻——天然该在一起。
+     * ▎为什么用 try 包住：看板是**增值功能**，它坏了绝不能影响字幕归档这条主干
+     *   （归档丢了就是真的丢数据，看板丢了只是少一块辅助信息，两者严重性不对等）。 */
+    try {
+      feedBoard(room, clean);
+    } catch (e) {
+      logEvent('warn', 'ai-board-feed-failed', { roomNumber: room, reason: String(e && e.message).slice(0, 120) });
+    }
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-    res.end(JSON.stringify({ saved: lines.length }));
+    res.end(JSON.stringify({ saved: clean.length }));
   } catch (err) {
     res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end(`归档失败：${err.message}`);
@@ -1532,6 +1547,91 @@ function getRoomBrain(roomNumber) {
 // 房间销毁/助理送走时释放智能体（记忆清空是有意的：新一轮会 = 新对话，不该继承旧记忆）
 function disposeRoomBrain(roomNumber) {
   roomBrains.delete(roomNumber);
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * ★ 09-25 AI 实时会议看板（Live Digest）—— 让助理"边听边干活"
+ *
+ * ▎要解决什么：在此之前 AI 是**纯被动**的（你不问它不说）。它虽自称"参会者"，
+ *   但对会议内容零贡献——像个坐在角落、戳一下才答一句的记录员。
+ *   现在它持续消化字幕，实时维护一块看板（决定/风险/行动项/议题），
+ *   并在**值得开口时主动说话**（待认领的任务、新发现的风险）。
+ *
+ * ▎为什么"一直消化"而不是"AI 在场才消化"：
+ *   看板是**会议级**产物，不是 AI 的私有状态——没有 AI 时它也照样有用。
+ *   而且这样 AI 入会时看板已经攒好了内容，不存在"冷启动空白期"。
+ *   （与「会话范围」不冲突：那是**问答检索**的范围，管的是"我听过什么"；
+ *     看板管的是"这场会里有什么"。一个约束证据来源，一个呈现会议事实。）
+ *
+ * ▎为什么广播要"有变化才发"：同 net-levels/talk-stats 的取舍——省信令、不闪屏。
+ *   一条字幕没抽出新东西就不发，房间安静时看板也不会抖。
+ * ══════════════════════════════════════════════════════════════ */
+const roomBoards = new Map();          // roomNumber -> Digest.Digest
+const AI_SPEAK_COOLDOWN_MS = 45000;    // AI 主动发言的最小间隔（同一条问题不追问）
+
+function getRoomBoard(roomNumber) {
+  let b = roomBoards.get(roomNumber);
+  if (!b) {
+    b = new Digest.Digest({ maxPerKind: Number(CONFIG.aiBoardMaxPerKind) || 20 });
+    roomBoards.set(roomNumber, b);
+  }
+  return b;
+}
+function disposeRoomBoard(roomNumber) {
+  roomBoards.delete(roomNumber);
+}
+
+/* AI 主动发言：**只在"有人需要知道"时才开口**，且严格节流。
+ *
+ * ▎产品判断（这一段是设计意图，不是技术细节）：一个会不停插话的 AI 比不说话更糟。
+ *   所以开口的门槛设得很高——只报两类「不提醒就会有损失」的事：
+ *     ① 出现**没人认领的行动项**（会上承诺了，但没人接 → 会后必然烂尾）
+ *     ② 出现**新的风险点**（来不及/阻塞 → 越早知道越好）
+ *   决定与议题**只进看板不发言**：它们是存档性质的，不需要打断会议。
+ *
+ * ▎为什么要节流：规则抽取难免偶有误报，若不限速，三五条误报连成一串就成了刷屏机器人。
+ *   45s 冷却 + 每次只说**一条**（挑最新最要紧的那条），把噪声压到可接受。
+ */
+function maybeAiSpeakUp(roomNumber, added) {
+  const room = rooms.get(roomNumber);
+  if (!room || !room.aiBot) return;                     // 助理不在场就不说话（它得有"嘴"）
+  const now = Date.now();
+  if (room.aiLastSpeakAt && now - room.aiLastSpeakAt < AI_SPEAK_COOLDOWN_MS) return;
+
+  // 挑一条最值得说的：**无主行动项**优先于风险（前者需要有人立刻行动）
+  const unowned = (added.todo || []).filter((t) => !t.owner);
+  const risk = (added.risk || [])[0];
+  let text = null;
+  if (unowned.length) {
+    const t = unowned[unowned.length - 1];
+    text = `📌 我记到一条行动项还没有负责人：**${t.task}**${t.due ? `（${t.due}）` : ''}——谁来认领？`;
+  } else if (risk) {
+    text = `⚠️ 我记到一个风险点：**${risk.text}**`;
+  }
+  if (!text) return;
+
+  room.aiLastSpeakAt = now;
+  emitBotSay(roomNumber, text);
+  logEvent('info', 'ai-proactive-say', { roomNumber, kind: unowned.length ? 'unowned-todo' : 'risk' });
+}
+
+/* 消化一批新到的字幕（由 /api/captions 入库后调用）。
+ * 纯 CPU、毫秒级、无 IO——所以可以每批都跑，不做额外节流。
+ * @returns {{addedCount:number}|null} null = 该房间还没建看板（不强制创建，省内存） */
+function feedBoard(roomNumber, entries) {
+  const room = rooms.get(roomNumber);
+  if (!room) return null;                 // 房间已销毁/号码回收：不消化（否则会凭空造一个孤儿看板）
+  const board = roomBoards.get(roomNumber) || getRoomBoard(roomNumber);
+  const r = board.ingest(entries);
+  if (!r.addedCount) return r;            // 没抽出新东西 → 不广播（"有变化才发"）
+  io.to(roomNumber).emit('ai-board', {
+    ...board.snapshot(),
+    added: r.added,                        // ★ 增量（前端据此做"新条目高亮"，全量在 items 里）
+    ts: Date.now(),
+  });
+  logEvent('info', 'ai-board-update', { roomNumber, added: r.addedCount, total: r.total });
+  maybeAiSpeakUp(roomNumber, r.added);
+  return r;
 }
 
 // 单路音频管线：PlainTransport 把这路音频 RTP 推给本机 ffmpeg，astats 每 ~2s 吐一次 RMS
@@ -2425,6 +2525,7 @@ function destroyRoom(roomNumber, reason) {
   remoteCtl.delete(roomNumber);
   stopAiAudioPipeline(roomNumber); // ★ 09-19：房间销毁 → AI 管线全拆（防 ffmpeg/Transport 泄漏）
   disposeRoomBrain(roomNumber);    // ★ 09-24e：智能体（检索索引 + 会话记忆）同步释放，防内存慢性泄漏
+  disposeRoomBoard(roomNumber);    // ★ 09-25：看板同步释放（它是会议级状态，房间没了就该没了）
   console.log(`🗑️ 房间 ${roomNumber} 已销毁（${reason}），号码回收`);
   logEvent('info', 'room-destroyed', { roomNumber, reason });
 }
@@ -3391,6 +3492,18 @@ io.on('connection', (socket) => {
       tokens: (r.usage && r.usage.totalTokens) || 0, intent: r.intent || null,
       hits: (r.hits || []).length, docs: r.totalDocs || 0, turns: r.turns || 0,
     });
+  });
+
+  /* ★ 09-25：取当前会议看板快照。
+   * ▎为什么需要这个"拉"的接口（而不只靠 ai-board 广播）：
+   *   ai-board 是**推**模式——只在有新增时广播。晚进房的人（或刷新页面的人）
+   *   会错过之前所有的广播，界面就是一块空板。所以必须有"拉一次全量"的路径。
+   *   推+拉并存是这类实时看板的标准做法：推保证实时，拉保证完整。 */
+  socket.on('ai-board-get', (payload = {}, callback) => {
+    const roomNumber = socket.roomNumber;
+    if (!roomNumber || !rooms.get(roomNumber)) return fail(callback, '先进入房间');
+    const b = roomBoards.get(roomNumber);
+    ok(callback, b ? b.snapshot() : { counts: { decision: 0, risk: 0, todo: 0, topic: 0 }, items: { decision: [], risk: [], todo: [], topic: [] }, total: 0 });
   });
 
   // ★ 09-19c N2：手动生成纪要（不需要 bot 在场——纪要吃的是字幕账本，人人可取）
