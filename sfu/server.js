@@ -41,6 +41,10 @@ const { Server } = require('socket.io');
 const mediasoup = require('mediasoup');
 // ★ 09-24 AI Provider：所有 LLM 调用的唯一入口（密钥托管 + 双轨降级 + 用量记账）
 const AI = require('./ai/provider');
+/* ★ 09-24e AI 智能内核：检索（RAG）+ 会话记忆 + 意图分类 + 行动项结构化
+ * ▎为什么单独一个模块：让 Assistant 从"只喂最近 8 条字幕的关键词模板"升级为
+ *   "全档检索 + 多轮记忆 + 真意图理解"。改造前的具体缺陷与修法见 brain.js 文件头。 */
+const Brain = require('./ai/brain');
 /* ★ 09-24 账号存储层：node:sqlite（零新依赖的真数据库）
  * ▎从"整文件 JSON 读写"换成 SQLite 的原因见 sfu/store.js 文件头。
  * ▎require 即完成：建库建表 + PRAGMA WAL + 旧 users.json 自动迁移（都在 store.js 里）。 */
@@ -1498,6 +1502,30 @@ const aiShortId = (id) => String(id).slice(-4); // AI 块内的短 id（server �
 const aiHearing = new Map();          // roomNumber -> Map(memberId -> {rms, ts})（bot 的听觉账本）
 const aiAudioPipes = new Map();       // roomNumber -> Set<管线对象>
 
+/* ★ 09-24e 每房间一个"智能体"（检索索引 + 会话记忆）的生命周期管理
+ * ▎为什么放在房间级而不是全局：会话记忆必须**按房间隔离**——两个人同时在两个房间
+ *   问不同的问题，记忆串了就是灾难（AI 会把 A 房间的事答进 B 房间）。
+ * ▎为什么必须清理：记忆和索引都占内存，房间销毁后不删就是慢性泄漏。
+ *   清理点与 aiHearing/aiAudioPipes 完全一致（房间销毁 / bot 送走），**不能漏**。
+ * ▎上限的意义：一场会开 3 小时能产生几千条字幕，索引是 O(词数) 的；
+ *   教学规模下这完全没问题，但"知道它会涨、知道涨到哪"是工程素养。 */
+const roomBrains = new Map();         // roomNumber -> Brain.RoomBrain
+
+function getRoomBrain(roomNumber) {
+  let b = roomBrains.get(roomNumber);
+  if (!b) {
+    const turns = Number(CONFIG.aiMemoryTurns) || 8;   // config 可调（长会想要更长的记忆就调大）
+    b = new Brain.RoomBrain(turns);
+    roomBrains.set(roomNumber, b);
+  }
+  return b;
+}
+
+// 房间销毁/助理送走时释放智能体（记忆清空是有意的：新一轮会 = 新对话，不该继承旧记忆）
+function disposeRoomBrain(roomNumber) {
+  roomBrains.delete(roomNumber);
+}
+
 // 单路音频管线：PlainTransport 把这路音频 RTP 推给本机 ffmpeg，astats 每 ~2s 吐一次 RMS
 async function startAiAudioPipe(roomNumber, producer, memberId) {
   const room = rooms.get(roomNumber);
@@ -1594,82 +1622,71 @@ function setAiBot(roomNumber, on) {
     // ★ N2：送走 bot = 值守段落结束 → 清定时器 + 出终稿（异步落盘，不阻塞信令）
     if (room.minutesTimer) { clearInterval(room.minutesTimer); room.minutesTimer = null; }
     buildMinutes(roomNumber, { type: 'final' }).catch(() => {});
+    // ★ 09-24e：送走助理 = 本轮对话结束 → 清会话记忆（下一轮重新开始，不继承旧上下文）
+    disposeRoomBrain(roomNumber);
   }
   broadcastRoomState(roomNumber);
   logEvent('info', on ? 'ai-join' : 'ai-leave', { roomNumber });
   return room.aiBot;
 }
 
-/* AI 大脑：统一走 AI.askLLM（sfu/ai/provider.js）——有 key 走 DeepSeek 真答，
- *   无 key/超时/限流走本地模板并返回 mock:true（输出带 [Mock] 前缀，AI 双轨约定）。
- * ★ 09-24 返回值从 string 改成 { text, mock, usage }——调用方要拿得到"这一答是 LLM 还是 Mock"
- *   （前端据此给气泡打 mode 徽标），用量也要能进 /metrics。 */
+/* AI 大脑 ★ 09-24e 重构：从「关键词模板 + 最近 8 条字幕」升级为
+ *   **检索增强（RAG）+ 多轮记忆 + LLM 意图分类**。三者都走 brain.js（可单测的纯逻辑层）。
+ *
+ * ▎改造前的两个真实缺陷（都在本节被修掉）：
+ *   ① **上下文失明**：老代码 `capTail.slice(-8)` 只把最后 8 条字幕喂给模型 →
+ *      会议第 3 分钟说的"交付时间 11 月 20 日"，到第 38 分钟问就答不出来。
+ *      现在：`Brain.RoomBrain` 对**全档字幕**建 BM25 索引，按问题检索出最相关的 6 条。
+ *   ② **动作型意图靠正则**：老代码 `/纪要|会议总结|总结一下|摘要|行动项|待办清单/.test(q)`，
+ *      用户说"帮我整理下今天聊了啥"就匹配不上 → 走闲聊分支 → **纪要根本没生成**，
+ *      AI 却回了一段"好的我来整理"的漂亮话。这是最恶劣的缺陷：用户以为做成了。
+ *      现在：`Brain.classifyIntent`（有 key 交给 LLM 分类，无 key 走扩展规则 + 同义词典）。
+ *
+ * ▎返回值向后兼容：仍是 { text, mock, usage, ms, ... }，另**新增** hits/turns/intent，
+ *   供 UI 摊开"这条答案是检索自哪几条字幕"（把智能做成可验证的，而不是让它变成玄学）。
+ */
 async function aiBrain(roomNumber, question, onDelta) {
   const room = rooms.get(roomNumber);
   const members = room ? [...room.members] : [];
   const talkRows = room ? [...room.talk.entries()].sort((a, b) => b[1] - a[1]) : [];
   const talkTxt = talkRows.slice(0, 3).map(([id, v], i) =>
     `${i + 1}. ${aiShortId(id)} 发言约 ${Math.round(v)}s`).join('；') || '（还没有发言统计）';
-  const capFiles = fs.existsSync(CAPTIONS_DIR)
-    ? fs.readdirSync(CAPTIONS_DIR).filter((f) => f.startsWith(`cap-${roomNumber}-`) && f.endsWith('.jsonl')).sort() : [];
-  let capTail = [];
-  for (const f of capFiles) {
-    for (const line of fs.readFileSync(path.join(CAPTIONS_DIR, f), 'utf8').split('\n')) {
-      if (!line.trim()) continue;
-      try { capTail.push(JSON.parse(line)); } catch (e) { /* 坏行跳过 */ }
-    }
-  }
-  capTail = capTail.slice(-40);
-  const capTxt = capTail.slice(-8).map((e) => `${e.name}: ${e.text}`).join('\n') || '（还没有字幕记录）';
-  const hearingTxt = (() => {
-    const h = aiHearing.get(roomNumber);
-    if (!h || !h.size) return '（音频管线暂无响度数据）';
-    return [...h.entries()].map(([id, v]) => `${aiShortId(id)}:${v.rms}dB`).join('，');
-  })();
   const dur = room ? Math.round((Date.now() - room.createdAt) / 60000) : 0;
-  const context = `会议时长约 ${dur} 分钟，${members.length} 人在线（含 AI 助理）。\n发言统计：${talkTxt}\n近期字幕：\n${capTxt}\n音频响度：${hearingTxt}`;
 
   const q = String(question || '');
-  /* ★ 09-24 实修「配了 key 反而生成不了纪要」：
-   *   「生成纪要」这类**动作型**请求原先写在 Mock 分支里——一旦配上 DeepSeek key，
-   *   LLM 分支抢先返回一段"好的，我来总结一下…"的漂亮话，**纪要文件根本没落盘**，
-   *   用户在聊天里看到的却是"AI 已答应"。能力与动作的错位，是最难自查的一类缺陷。
-   *   修法：动作意图在进 LLM 之前就被路由走（tools-first），聊天模型只负责聊天。 */
-  if (/纪要|会议总结|总结一下|摘要|行动项|待办清单/.test(q)) {
-    const r = await buildMinutes(roomNumber, { type: /终稿|最终/.test(q) ? 'final' : 'segment' });
-    const picks = (r.markdown.split('## 关键句节选')[1] || '')
+
+  /* ── ① 意图分类（tools-first 的推广：先判断"这句话想让我做什么"）──
+   * 为什么放在最前面：动作型意图必须走**不同的代码路径**（落盘 / 授权），
+   * 一旦误判成闲聊，能力与动作就错位了（AGENTS 坑 38 的同类问题）。 */
+  const cls = await Brain.classifyIntent(q);
+  const intent = cls.intent;
+
+  if (intent === 'minutes') {
+    const isFinal = /终稿|最终|结束|归档/.test(q);
+    const r = await buildMinutes(roomNumber, { type: isFinal ? 'final' : 'segment' });
+    const picks = (r.markdown.split('## 行动项')[1] || r.markdown.split('## 关键句节选')[1] || '')
       .split('\n').filter((l) => l.startsWith('- ')).slice(0, 3).join('；');
     return {
       text: `纪要已生成：${r.path}${r.mock ? '（[Mock] 本地模板）' : '（LLM 撰写）'}${picks ? ' —— 要点节选：' + picks : ''}`,
-      mock: r.mock, file: r.file, path: r.path, usage: { totalTokens: 0 },
+      mock: r.mock, file: r.file, path: r.path, usage: { totalTokens: 0 }, intent,
     };
   }
 
-  const messages = [
-    { role: 'system', content: '你是简易腾讯会议的 AI 会议助理，以参会者身份入会。用简短中文回答（不超过120字），基于给的会议上下文，不要编造上下文里没有的内容。' },
-    { role: 'user', content: `会议上下文：\n${context}\n\n成员提问：${question}` },
-  ];
-  // ── 降级路径（AI 双轨约定）：无 key / 超时 / 限流都走这里，输出带 [Mock] 前缀 ──
-  const mockAnswer = () => {
-    const s = String(question || '');
-    if (/你是谁|介绍.*自己|hello|hi|你好/i.test(s)) {
-      return `我是本房间的 AI 助理（🤖），${dur} 分钟前入会，一直在听：当前 ${members.length} 人在场。问"谁发言最多/会议多久/最近说了什么"都能答；配置 DEEPSEEK_API_KEY 后我会更聪明。`;
-    }
-    if (/谁|发言|说话/.test(s)) return `按服务器发言统计：${talkTxt}。`;
-    if (/多久|时长|开.*久/.test(s)) return `这场会已开约 ${dur} 分钟（${members.length} 人在场）。`;
-    if (/多少人|几个人|在线/.test(s)) return `当前 ${members.length} 人在场${room && room.aiBot ? '（含我）' : ''}。`;
-    if (/字幕|说了|提到|刚才/.test(s)) {
-      return capTail.slice(-3).map((e) => `${e.name}："${e.text}"`).join('；') || '字幕账本还是空的——请大家打开「💬 字幕」。';
-    }
-    return `我在听（${members.length} 人在场，字幕 ${capTail.length} 条）。目前是 [Mock] 模式：可以问我"谁发言最多/会议多久/刚才说了什么"；配 DEEPSEEK_API_KEY 后可自由问答。`;
-  };
+  /* ── ② 取全档字幕 + 走检索型问答 ──
+   * `entries` 来自 loadCaptions（服务器权威 jsonl 副本），是全量、按时间排序的。
+   * RoomBrain 内部会按需建索引，并把检索结果拼成"证据块"喂模型。 */
+  const entries = loadCaptions(roomNumber);
+  const brain = getRoomBrain(roomNumber);
+  const extraContext = `会议时长约 ${dur} 分钟，${members.length} 人在线。发言统计：${talkTxt}`
+    + (intent === 'recap' ? '\n（用户想回顾刚才讨论的内容，请按时间线归纳，不要生成正式纪要文档。）' : '');
 
-  /* ★ 09-24 流式：onDelta 存在就走 SSE 增量（打字机），否则一次性返回。
-   *   两条路径共用同一份 messages 和同一个 mockAnswer——"会降级"这件事不因换链路而失效。 */
-  const res = onDelta
-    ? await AI.streamLLM(messages, { label: 'ai-ask', temperature: 0.4, timeoutMs: 20000, maxTokens: 300, mock: mockAnswer }, onDelta)
-    : await AI.askLLM(messages, { label: 'ai-ask', temperature: 0.4, timeoutMs: 15000, maxTokens: 300, mock: mockAnswer });
-  return { text: (res.mock ? '[Mock] ' : '') + res.text, mock: res.mock, usage: res.usage, ms: res.ms };
+  const r = await brain.answer(q, entries, { extraContext, onDelta, topK: 6 });
+
+  return {
+    text: (r.mock && AI.aiEnabled() === false ? '[Mock] ' : '') + r.text,
+    mock: r.mock, usage: r.usage, ms: r.ms, reason: r.reason,
+    hits: r.hits, usedHits: r.usedHits, totalDocs: r.totalDocs, turns: r.turns, intent,
+  };
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -1775,9 +1792,98 @@ async function llmPlan(goal) {
 }
 
 // 主流程：连入 → join-room → remote-request（真实授权）→ 执行 → release
+/* ══════════════════════════════════════════════════════════════
+ * ★ 09-24e AI 操作员 ReAct 闭环（Observation 回环——把"开环脚本"变成"闭环智能体"）
+ *
+ * ▎改造前的真实状态（原注释自己都写着"教学版留作升级点"）：
+ *     先让 LLM 一次性吐一个 12 步计划，然后**闷头执行完**，中间不看结果。
+ *   这不是 agent，这是"录制好的宏"。后果很具体：
+ *     · LLM 把计算器图标坐标猜成 {0.05, 0.10}（略偏 5 像素）→ 双击点到空白桌面 → 后面 5 步
+ *       全在对着空气点 → 任务失败，但 AI 最后会报"🏁 任务完成"。**报成功而实际失败**，
+ *       比报错还糟：用户不知道要重试。
+ *
+ * ▎ReAct 的本质 = Reason(想) → Act(做) → **Observe(看)** → 再 Reason。
+ *   缺了 Observe，就退化成"一次性规划 + 盲执行"。所以闭环的关键是：**每步之后必须拿到反馈**。
+ *
+ * ▎Observation 从哪来（诚实版：我们没有给 AI 装眼睛，也**不假装有**）：
+ *   先说我**试过并否掉**的方案，以及为什么——这段比结论更有价值：
+ *     ❌ 加 `remote-input-ack`（被控端收到就回执）→ 我一度这么写了，然后 grep 全仓库发现
+ *        **这个事件根本不存在**（客户端收了 remote-input 从不回 ack）。基于不存在的事件写闭环，
+ *        ack 永远为 0 → 永远误判"帧未送达" → AI 会疯狂重试。**未经验证的假设必须被证伪**，
+ *        这是本项目反复踩到的同一类坑（AGENTS 坑 40）。
+ *     ❌ 让服务端截图 → 截图能力在**控制端浏览器**里（client.js 的 peerScreens 抓 video 帧），
+ *        服务端拿不到；新增"服务端要截图"协议会破坏零协议改动前提。
+ *   最终采用**服务端确实能 100% 确定的三类观测**（够用，且不含一丝编造）：
+ *     ① **转发门禁结果**：服务器转发 remote-input 时会判定"目标是否还在房间"——
+ *        转发成功 / 目标不在（帧被丢弃）是**服务器自己算出来的事实**，比页面回执更可靠；
+ *     ② **控制权状态**：remoteCtl 是否还持有、剩余授权时长——授权被收回时立刻停手；
+ *     ③ **执行轨迹**：已发操作的坐标与文本（服务器自己记的，必然准确）。
+ *   把这三样拼成观察文本喂回 LLM，让它判断：目标达成了吗？坐标要不要修正？
+ *   这是"在能力边界内做到真反馈"，而不是宣称"AI 能看见屏幕"——**能说清边界**才是工程。
+ *
+ * ▎降级纪律（三档，全部要能用）：
+ *   真 LLM + 转发观测 → 真闭环 ReAct（每步后问模型"要不要调整"）
+ *   无 key           → 开环 mock 计划 + 本地转发结果校验（送不到就明确报"未送达"）
+ *   观测拿不到       → 退回开环，但**结论如实标注**（见下方 doneReport 的三种措辞）
+ * ══════════════════════════════════════════════════════════════ */
+
+/** LLM 基于"已有观察"决定下一步：这是 ReAct 的 Reason 位（与初始规划分开：规划是无观察的推理） */
+async function llmReact(goal, done, observation) {
+  const res = await AI.askLLM([
+    {
+      role: 'system',
+      content: '你是远程桌面 AI 操作员，正在用鼠标键盘完成目标。'
+        + '我会给你【已执行的操作】和【最新观察结果】。判断：目标达成了吗？需要修正吗？'
+        + '只输出一个 JSON 对象，不要任何其他文字：'
+        + '{"done":true|false,"next":[操作数组],"reason":"一句话说明"}。'
+        + 'next 里的操作格式与规划相同：{op:"move|click|dblclick|type|key|wait",x?,y?,text?,key?,ms?}。'
+        + '坐标是 0~1 归一化。如果观察显示上一步没送达或被丢弃，next 里就给**修正后**的操作。'
+        + 'done 为 true 时 next 留空数组。',
+    },
+    { role: 'user', content: `目标：${goal}\n\n已执行的操作：\n${done}\n\n最新观察结果：\n${observation}` },
+  ], {
+    label: 'ai-op-react', temperature: 0.2, timeoutMs: 20000, maxTokens: 400, json: true,
+    mock: () => { throw new Error('LLM 不可用'); },   // 契约与 llmPlan 一致：拿不到就抛，降级交调用方
+  });
+  if (res.mock) throw new Error(res.reason || 'LLM 不可用');
+  const j = JSON.parse(res.text);
+  return {
+    done: j.done === true,
+    next: Array.isArray(j.next) ? j.next.slice(0, 4) : [],   // 修正步数也要有上限，防"越修越多"
+    reason: String(j.reason || '').slice(0, 160),
+  };
+}
+
+/** 收集当前可用的 Observation（拿不到的一律如实写"不可得"，绝不编造状态） */
+function collectObservation(roomNumber, step, delivery, executed) {
+  const ctl = remoteCtl.get(roomNumber) || {};
+  const parts = [];
+  // ① 转发结果：服务器自己算出来的事实（不是猜的）
+  parts.push(delivery.forwarded
+    ? '输入投递：上一步已由服务器**成功转发给被控端**（目标在线）'
+    : '输入投递：**转发失败——被控端不在房间，这一步的输入被丢弃，等于没点**');
+  // ② 控制权
+  parts.push(`控制权：${ctl.controllerId ? `仍持有（约剩 ${Math.max(0, Math.round(((ctl.expiresAt || 0) - Date.now()) / 1000))}s）` : '**已被收回**'}`);
+  // ③ 执行轨迹（服务器自己记的，必然准确）
+  parts.push(executed.length
+    ? `已执行轨迹：${executed.slice(-6).join(' → ')}`
+    : '已执行轨迹：（尚无）');
+  parts.push(`刚执行的操作：${step.op}${step.x !== undefined ? ` @ (${step.x}, ${step.y})` : ''}${step.text ? ` 文本"${step.text}"` : ''}`);
+  // ④ 坐标精度提示：mock 坐标是"按 1280×800 标定的估算值"，明确告知模型这不是实测
+  parts.push('坐标来源说明：坐标来自计划中的**估算值**（非实测屏幕反馈），若未命中请按目标元素的相对位置微调');
+  return parts.join('\n');
+}
+
 async function runAiOperator(roomNumber, hostId, goal) {
   const room = rooms.get(roomNumber);
   const sock = ensureAiOpSocket();
+  /* ★ 09-24e 观测通道：监听服务器自己的转发结果（remote-input-fwd-result）。
+   *   为什么不让被控端记 ack：见文件头「试过并否掉的方案」——客户端根本没这个回执，
+   *   而**服务器在转发那一刻就知道目标在不在**，这是零协议改动的既成事实。 */
+  const fwd = { last: null };
+  const onFwd = (r) => { fwd.last = r; };
+  sock.on('remote-input-fwd-result', onFwd);
+
   await new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error('AI 控制端连接超时')), 5000);
     if (sock.connected) { clearTimeout(t); resolve(); }
@@ -1816,28 +1922,94 @@ async function runAiOperator(roomNumber, hostId, goal) {
 
   // 计划：LLM 优先，Mock 兜底（双轨）
   let plan = null;
-  if (AI.aiEnabled()) {                       // ★ 09-24：统一判断（三处来源之一有 key 就行）
+  if (AI.aiEnabled()) {
     try { plan = await llmPlan(goal); } catch (e) { plan = null; }
   }
   const isMock = !plan;
   if (!plan) plan = mockPlan(goal);
   const deadline = Date.now() + AI_OP_MAX_MS;
 
-  // 执行（ReAct 的 Act；Observation 回环=每步拿屏幕反馈修正，教学版留作升级点）
+  const executed = [];          // 已执行操作的文字轨迹（喂回 LLM 用）
+  let reactRounds = 0;
+  const maxReact = Number(process.env.AI_OP_REACT_ROUNDS) || 4;   // 闭环最多修正几轮（防无限自纠）
+  let anyForwardFail = false;   // 是否出现过"输入被丢弃"（"报成功但实际失败"的探测器）
+
+  /* 执行一步：发输入 → 等一小段 → 读取服务器转发结果，返回本步投递情况 */
+  async function execStep(step) {
+    if (step.op === 'wait') { await aiSleep(Math.min(Number(step.ms) || 500, 3000)); return { forwarded: true, sent: 0 }; }
+    step._to = hostId;
+    fwd.last = null;
+    // 本步期望的帧数（click = move+down+up 三条）——用于日志统计，不影响放行判定
+    const sent = step.op === 'click' ? 3 : step.op === 'dblclick' ? 2 : 1;
+    try { aiInput(sock, step); } catch (e) { /* 单步失败不中断（比如坐标越界） */ }
+    await aiSleep(AI_OP_STEP_MS);
+    /* fwd.last 由服务器在转发那一刻同步回填：{ ok:boolean, reason:string }。
+     * ★ 保守原则：**没收到结果时不判失败**（forwarded 默认 true）——
+     *   宁可漏报也不误报，否则会把"一切正常"的任务报成"输入丢失"，反而制造混乱。 */
+    const forwarded = fwd.last ? fwd.last.ok === true : true;
+    if (!forwarded) anyForwardFail = true;
+    return { forwarded, sent };
+  }
+
+  // ── 主循环：开环执行 plan，每步读取观测；LLM 可用时进入闭环修正 ──
   for (const step of plan) {
     if (Date.now() > deadline) throw new Error('执行超时保护触发');
     const ctl = remoteCtl.get(roomNumber);
     if (!ctl || !ctl.controllerId) throw new Error('授权已被收回，任务中止');
-    if (step.op === 'wait') { await aiSleep(Math.min(Number(step.ms) || 500, 3000)); continue; }
-    step._to = hostId;
-    try { aiInput(sock, step); } catch (e) { /* 单步失败不中断（比如坐标越界） */ }
-    await aiSleep(AI_OP_STEP_MS);
+
+    const delivery = await execStep(step);
+    executed.push(`${step.op}${step.x !== undefined ? `(${step.x},${step.y})` : ''}${step.text ? `"${step.text}"` : ''}`);
+
+    /* ── ReAct 的 Observe → Reason：转发失败、或 LLM 可用时，问模型"要不要修正" ── */
+    const needReact = (!delivery.forwarded || AI.aiEnabled()) && reactRounds < maxReact && Date.now() < deadline;
+    if (!needReact) continue;
+    reactRounds++;
+    try {
+      const obs = collectObservation(roomNumber, step, delivery, executed);
+      const decision = await llmReact(goal, executed.join('\n') || '（无）', obs);
+      if (decision.done) {
+        io.to(roomNumber).emit('chat-message', {
+          from: 'ai-bot', name: '🤖 AI 操作员',
+          text: `🧠 闭环判断：目标已达成（第 ${reactRounds} 轮核对）——${decision.reason}`, ts: Date.now(),
+        });
+        logEvent('info', 'ai-op-react-done', { roomNumber, round: reactRounds, reason: decision.reason });
+        break;
+      }
+      if (decision.next.length) {
+        io.to(roomNumber).emit('chat-message', {
+          from: 'ai-bot', name: '🤖 AI 操作员',
+          text: `🔧 闭环修正（第 ${reactRounds} 轮）：${decision.reason} → 补 ${decision.next.length} 步`, ts: Date.now(),
+        });
+        logEvent('info', 'ai-op-react-fix', { roomNumber, round: reactRounds, steps: decision.next.length, reason: decision.reason });
+        for (const s of decision.next) {
+          if (Date.now() > deadline) break;
+          const c2 = remoteCtl.get(roomNumber);
+          if (!c2 || !c2.controllerId) break;
+          await execStep(s);
+          executed.push(`${s.op}(修正)${s.x !== undefined ? `(${s.x},${s.y})` : ''}`);
+        }
+      }
+    } catch (e) {
+      // 闭环本身失败（LLM 超时/JSON 坏）→ **不中断任务**，退回开环继续跑完（降级纪律）
+      logEvent('warn', 'ai-op-react-skip', { roomNumber, round: reactRounds, why: String(e.message).slice(0, 120) });
+    }
   }
+
   sock.emit('remote-release', {});
+  sock.off('remote-input-fwd-result', onFwd);
+
+  /* ── 结论必须诚实：三种措辞对应三种确定程度（绝不无条件报"任务完成"）──
+   * ▎这是本文件最该被记住的一处：改造前无论实际有没有点到，一律报"🏁 任务完成"。
+   *   AI 产品**报成功而实际失败**是最伤信任的缺陷——用户不会重试，只会觉得"这东西是假的"。 */
+  const doneReport = anyForwardFail
+    ? `⚠️ 计划已执行完（${plan.length} 步${isMock ? '，[Mock] 本地脚本' : '，LLM 计划'}），但**有输入帧因被控端不在房间被丢弃**——可能未完全生效，建议查看被控端画面确认`
+    : `🏁 计划已执行完（${plan.length} 步${isMock ? '，[Mock] 本地脚本' : '，LLM 计划'}），输入已全部转发${reactRounds ? `，并经 ${reactRounds} 轮闭环核对` : ''}；控制权已交还`;
   io.to(roomNumber).emit('chat-message', {
-    from: 'ai-bot', name: '🤖 AI 操作员', text: `🏁 任务完成（${plan.length} 步${isMock ? '，[Mock] 本地脚本' : '，LLM 计划'}）；控制权已交还`, ts: Date.now(),
+    from: 'ai-bot', name: '🤖 AI 操作员', text: doneReport, ts: Date.now(),
   });
-  logEvent('info', 'ai-op-done', { roomNumber, steps: plan.length, mock: isMock });
+  logEvent('info', 'ai-op-done', {
+    roomNumber, steps: plan.length, mock: isMock, reactRounds, fwdFail: anyForwardFail, executed: executed.length,
+  });
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -1874,7 +2046,7 @@ function loadCaptions(roomNumber) {
 async function llmMinutes(seg) {
   const transcript = seg.slice(-200).map((e) => `${e.name}: ${e.text}`).join('\n');
   const res = await AI.askLLM([
-    { role: 'system', content: '你是会议纪要助手。基于会议字幕输出 markdown，只含三个小节：## 要点（不超过6条）## 待办（可执行的动作项，没有就写"（无）"）## 结论（一句话）。不要编造字幕里没有的内容。' },
+    { role: 'system', content: '你是会议纪要助手。基于会议字幕输出 markdown，只含三个小节：## 要点（不超过6条）## 结论（一句话）## 风险与未决（可留"（无）"）。不要编造字幕里没有的内容。行动项由另一个环节单独抽取，你不要写行动项。' },
     { role: 'user', content: `会议字幕：\n${transcript}` },
   ], { label: 'ai-minutes', temperature: 0.3, timeoutMs: 30000, maxTokens: 900, mock: () => { throw new Error('LLM 不可用'); } });
   if (res.mock) throw new Error(res.reason || 'LLM 不可用');
@@ -1892,9 +2064,16 @@ async function buildMinutes(roomNumber, opts = {}) {
   const bySpeaker = {};
   for (const e of seg) bySpeaker[e.name || '未知'] = (bySpeaker[e.name || '未知'] || 0) + 1;
   const speakers = Object.entries(bySpeaker).sort((a, b) => b[1] - a[1]);
-  // 待办关键词抽取（零 LLM 的规则层——分门别类永远有用的兜底）
-  const todoRe = /(需要|待办|记得|下周|明天|得去|别忘了|安排|跟进|然后要)/;
-  const todos = seg.filter((e) => todoRe.test(e.text || '')).slice(-8);
+
+  /* ★ 09-24e 行动项从"正则捞整句"升级为"结构化三元组 {owner, task, due}"
+   * ▎为什么值得单独做：改造前的输出是 `- [ ] 张三："记得把 TURN 轮换一下"`
+   *   —— 有用，但**不可执行**：没有负责人字段（得人去读句子猜）、没有期限字段。
+   *   纪要里最有价值、最需要被"下一步"消费的就是行动项，它值得结构化的待遇。
+   * ▎双轨：有 key 让 LLM 抽（能理解"文档我负责"里"我"=张三 这类指代与去重）；
+   *   无 key 走规则（尽力抽，抽不到就留空——**宁可留空，不可编造**）。
+   * ▎抽不到由 renderActions 明确写"（未识别到明确的行动项）"，不假装有。 */
+  const actRes = await Brain.extractActions(seg);
+  const actions = actRes.actions;
 
   let body = null;
   let isMock = false;
@@ -1913,18 +2092,34 @@ async function buildMinutes(roomNumber, opts = {}) {
     if (seg.length) for (const e of seg.slice(-12)) lines.push(`- ${e.name}："${e.text}"`);
     else lines.push('- （无）');
     lines.push('');
-    lines.push('## 待办线索（关键词规则抽取）');
-    if (todos.length) for (const e of todos) lines.push(`- [ ] ${e.name}："${e.text}"`);
-    else lines.push('- （未检测到含待办关键词的句子）');
+    lines.push('## 风险与未决');
+    const riskRe = /(风险|担心|不确定|待定|存疑|可能有问题|卡住|阻塞|来不及)/;
+    const risks = seg.filter((e) => riskRe.test(e.text || '')).slice(-6);
+    if (risks.length) for (const e of risks) lines.push(`- ${e.name}："${e.text}"`);
+    else lines.push('- （无）');
     body = lines.join('\n');
   }
+
+  /* ── 行动项小节统一由代码渲染（而非交给 LLM 自由发挥）──
+   * ▎这是个刻意的架构决定：LLM 擅长"理解内容"，不擅长"严格遵守格式"。
+   *   让它同时负责内容 + 格式，结果通常是格式走样（少字段、多寒暄）。
+   *   所以分工是：**LLM 只产出结构化的 {owner,task,due}，渲染交给确定性代码**。
+   *   这样无论走 LLM 轨还是 Mock 轨，行动项小节的**格式完全一致**——前端解析不用分叉。 */
+  const actBlock = [
+    '', '## 行动项', renderActionTable(actions),
+    actRes.mock
+      ? `> 由规则抽取（${actRes.reason === 'rules' ? '字幕条数少或未配 key' : 'LLM 未参与'}）；配置 DEEPSEEK_API_KEY 后由模型识别，可理解指代与去重。`
+      : '> 由 DeepSeek 从字幕中识别（含指代消解与去重）。',
+    '',
+  ].join('\n');
+
   const stamp = new Date(now).toISOString().slice(0, 16).replace(/[-:T]/g, '');
   const md = [
     `# 会议纪要（${opts.type === 'final' ? '终稿' : '分段'}）· 房间 ${roomNumber}`, '',
     `- 生成时间：${new Date(now).toLocaleString()}`,
     `- 会议时长：约 ${durMin} 分钟；本${opts.type === 'final' ? '场' : '时段'}字幕 ${seg.length} 条（全档 ${entries.length} 条）`,
     `- 发言统计：${talkRows.slice(0, 3).map(([id, v]) => `${aiShortId(id)} 约 ${Math.round(v)}s`).join('、') || '无'}`,
-    '', body, '',
+    actBlock, body, '',
     opts.type === 'final' ? '> 终稿：AI 助理送走 / 房间销毁时自动生成。' : '> 分段纪要：值守期间定时生成。',
     isMock ? '> [Mock] 本地模板生成（无 DEEPSEEK_API_KEY 或 LLM 失败）；配置 key 后本节由 LLM 撰写。' : '> 由 DeepSeek 撰写。',
     '',
@@ -1933,8 +2128,24 @@ async function buildMinutes(roomNumber, opts = {}) {
   fs.mkdirSync(dir, { recursive: true });
   const file = `${stamp}-${opts.type || 'segment'}.md`;
   fs.writeFileSync(path.join(dir, file), md, 'utf8');
-  logEvent('info', 'minutes-generated', { roomNumber, type: opts.type || 'segment', entries: seg.length, mock: isMock });
-  return { file, path: `/minutes/${roomNumber}/${file}`, markdown: md, mock: isMock };
+  logEvent('info', 'minutes-generated', {
+    roomNumber, type: opts.type || 'segment', entries: seg.length,
+    actions: actions.length, actionsMock: actRes.mock, mock: isMock,
+  });
+  return { file, path: `/minutes/${roomNumber}/${file}`, markdown: md, mock: isMock, actions, actionsMock: actRes.mock };
+}
+
+/** 行动项渲染成 markdown 表格（比清单更紧凑，且 owner/due 缺失一眼可见） */
+function renderActionTable(actions) {
+  const list = Array.isArray(actions) ? actions : [];
+  if (!list.length) return '（未识别到明确的行动项——可能是本时段没有任务性表述）';
+  const rows = list.map((a) => {
+    const owner = a.owner ? a.owner : '**待认领**';
+    const due = a.due ? a.due : '—';
+    const task = String(a.task || '').replace(/\|/g, '\\|');   // 防表格串列
+    return `| ${owner} | ${task} | ${due} |`;
+  });
+  return ['| 负责人 | 事项 | 期限 |', '| --- | --- | --- |', ...rows].join('\n');
 }
 
 function broadcastRoomState(roomNumber) {
@@ -2112,6 +2323,7 @@ function destroyRoom(roomNumber, reason) {
   rooms.delete(roomNumber);
   remoteCtl.delete(roomNumber);
   stopAiAudioPipeline(roomNumber); // ★ 09-19：房间销毁 → AI 管线全拆（防 ffmpeg/Transport 泄漏）
+  disposeRoomBrain(roomNumber);    // ★ 09-24e：智能体（检索索引 + 会话记忆）同步释放，防内存慢性泄漏
   console.log(`🗑️ 房间 ${roomNumber} 已销毁（${reason}），号码回收`);
   logEvent('info', 'room-destroyed', { roomNumber, reason });
 }
@@ -2711,6 +2923,19 @@ io.on('connection', (socket) => {
     if (!ctl || ctl.controllerId !== socket.id || ctl.hostId !== to) return; // 门禁
 
     io.to(to).emit('remote-input', { event }); // 定向转发给被控端
+
+    /* ★ 09-24e AI 操作员闭环的观测源：把"这一次转发的结果"同步回给发送方。
+     * ▎为什么服务端能给出比页面回执更可靠的信号：**在这一行，服务器自己就知道**
+     *   目标 socket 还在不在房间（上面门禁已判定 hostId 匹配，这里再查一次在线状态）。
+     *   如果被控端已经掉线，`io.to(to).emit` 是**静默失败**的——帧进了虚空，
+     *   而调用方一无所知，于是出现最坏的情况：AI 报"任务完成"，实际一个点击都没落地。
+     * ▎这条回执是给"AI 操作员自己"用的（它也是本服务器的一个 socket 客户端），
+     *   对普通人类控制端无害（多收一条事件而已，前端不监听就无影响）。 */
+    const targetPresent = !!rooms.get(socket.roomNumber)
+      && [...rooms.get(socket.roomNumber).members].some((m) => m.id === to);
+    socket.emit('remote-input-fwd-result', {
+      ok: targetPresent, to, reason: targetPresent ? 'forwarded' : 'target-left', ts: Date.now(),
+    });
   });
 
   /* ---- 事件 5.6b：★ 09-24 真远程桌面 —— 画面帧回传（方向刚好和 remote-input 相反）
@@ -3026,12 +3251,35 @@ io.on('connection', (socket) => {
     const r = await aiBrain(roomNumber, question, (delta) => {
       io.to(roomNumber).emit('ai-stream', { id: streamId, delta, done: false });
     });
-    io.to(roomNumber).emit('ai-stream', { id: streamId, delta: '', done: true, mock: !!r.mock });
+    /* ★ 09-24e：done 帧把"检索过程"一起送给前端（流式路径的增量期还不知道检索结果，
+     *   等 aiBrain 返回才有）。前端在 done 时把它插进气泡——这样流式与一次性两条路径
+     *   的信息披露完全一致（否则只有非流式能看到证据链，等于两条路径两种可信度）。 */
+    const traceParts = [];
+    if (r.totalDocs) traceParts.push(`📚 检索 ${r.totalDocs} 条字幕取 ${(r.hits || []).length} 条`);
+    if (r.turns > 1) traceParts.push(`💬 第 ${r.turns} 轮`);
+    if (r.intent && r.intent !== 'question') {
+      traceParts.push(`🎯 ${({ minutes: '生成纪要', recap: '回顾', operator: '远程操作' })[r.intent] || r.intent}`);
+    }
+    io.to(roomNumber).emit('ai-stream', {
+      id: streamId, delta: '', done: true, mock: !!r.mock, trace: traceParts.join(' · '),
+    });
     io.to(roomNumber).emit('chat-message', {
       from: 'ai-bot', name: '🤖 AI 助理', text: r.text, ts: Date.now(), streamId,
-      ai: { mock: !!r.mock, tokens: (r.usage && r.usage.totalTokens) || 0, file: r.file || null, path: r.path || null },
+      /* ★ 09-24e：把"这条答案是怎么来的"一起广播出去——检索自几千条字幕里的哪几条、
+       *   这是第几轮追问、意图是什么。**智能不该是玄学**：用户能看到 AI 真的去查了会议记录，
+       *   而不是凭空编了一段话。这也是最有力的"AI 不是空壳"的现场证据。 */
+      ai: {
+        mock: !!r.mock, tokens: (r.usage && r.usage.totalTokens) || 0,
+        file: r.file || null, path: r.path || null,
+        intent: r.intent || null, turns: r.turns || 0,
+        hits: (r.hits || []).length, usedHits: r.usedHits || 0, totalDocs: r.totalDocs || 0,
+      },
     });
-    logEvent('info', 'ai-ask', { roomNumber, by: socket.id, qLen: question.length, mock: !!r.mock, tokens: (r.usage && r.usage.totalTokens) || 0 });
+    logEvent('info', 'ai-ask', {
+      roomNumber, by: socket.id, qLen: question.length, mock: !!r.mock,
+      tokens: (r.usage && r.usage.totalTokens) || 0, intent: r.intent || null,
+      hits: (r.hits || []).length, docs: r.totalDocs || 0, turns: r.turns || 0,
+    });
   });
 
   // ★ 09-19c N2：手动生成纪要（不需要 bot 在场——纪要吃的是字幕账本，人人可取）

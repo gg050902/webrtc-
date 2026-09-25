@@ -81,13 +81,23 @@ function pingServer() {
 
 async function ensureServer() {
   if (await pingServer()) {
-    console.log('⚠️  3001 端口已有服务器在跑 —— 本脚本直接用它。');
-    console.log('   若那个服务器没带 AI_OP_STEP_MS=20 / AI_FORCE_MOCK=1，AI 那组断言可能假失败。');
-    console.log('   ★ 09-24 G8 起还有一条：HTTP 门禁断言依赖"本脚本注册的测试账号是管理员"。');
-    console.log('     若那个服务器用的是**已有管理员的正式库**，测试账号就只是普通用户，');
-    console.log('     /api/rooms、/metrics 等断言会因 401 而失败——那不是代码坏了，是环境不对。');
-    console.log('   想跑确定性回归：先把它关掉，让本脚本自己起一个（临时库 → 首个账号即管理员）。\n');
-    return;
+    /* ★ 09-24e 实修：这里原先"打印一段警告然后 return（让测试继续跑）"。
+     *   听起来很体贴——"环境不对不是代码坏了，所以我照跑"——但它制造了一个**会说话不算数的测试**：
+     *   环境不对时，断言会以"代码坏了"的样子失败（本次实测：`/api/rooms?token=` 那条 FAIL，
+     *   让人一度以为门禁改坏了，真实原因只是端口上跑着另一个用正式库的服务器）。
+     *   更糟的另一种情况：环境"恰好"能让断言过，于是测试通过但**验的不是本脚本起的那个服务器**。
+     *   两种都坏。**环境前提不成立时，唯一诚实的做法是明确失败并说清怎么修**。
+     *   这就是"测试要确定性"的具体落地：宁可红得清楚，也不要绿得可疑。 */
+    console.log('\n❌ 3001 端口已有别的服务器在跑 —— 本脚本无法保证测试的确定性，拒绝继续。\n');
+    console.log('   为什么必须拒绝：本脚本需要"它自己起的、用临时库的"那个服务器——');
+    console.log('     · 临时库是全新的 → 首个注册账号自动是管理员 → HTTP 门禁断言才成立；');
+    console.log('     · 若端口上是用**正式库**的服务器（正式库已有管理员 Guoge），');
+    console.log('       本脚本注册的测试账号只是普通用户 → /api/rooms、/metrics 会因 401 而"假失败"；');
+    console.log('     · 更隐蔽的是：那种情况下测试其实**验的不是本脚本的服务器**，通过也不作数。');
+    console.log('   修法（任选）：先关掉占用 3001 的进程再重跑 ——');
+    console.log('     ① Windows:  taskkill /F /IM node.exe      （会关掉所有 node，注意别误杀你的编辑器进程）');
+    console.log('     ② 或找到占用者：netstat -ano | findstr :3001   然后 taskkill /F /PID <PID>\n');
+    process.exit(1);
   }
   console.log('🚀 自起测试服务器（AI_OP_STEP_MS=20 加速 + AI_FORCE_MOCK=1 确定性轨道）…');
   serverProc = spawn(process.execPath, [nodePath.join(__dirname, '..', 'sfu', 'server.js')], {

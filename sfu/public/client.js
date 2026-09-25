@@ -1206,15 +1206,17 @@ function updateAiModeUi() {
   btn.dataset.aiMode = sfuAiEnabled ? 'LLM' : 'Mock';
   btn.classList.toggle('ai-mock', !sfuAiEnabled);
   btn.title = sfuAiEnabled
-    ? '邀请 AI 助理入会（已接 DeepSeek 真模型；聊天里 @ai 提问、@ai 生成纪要）'
-    : '邀请 AI 助理入会（未配置 DEEPSEEK_API_KEY → 走本地 [Mock] 规则，功能照样可用）';
+    ? '邀请 AI 助理入会（已接 DeepSeek 真模型：全档字幕检索 + 多轮记忆 + 意图理解；聊天里 @ai 提问、@ai 生成纪要）'
+    : '邀请 AI 助理入会（未配置 DEEPSEEK_API_KEY → 走本地 [Mock] 规则，检索与记忆照常可用）';
 }
 
 const aiStreamNodes = new Map();   // streamId -> 正在打字中的气泡 DOM
 const aiStreamDone = new Set();    // 已靠增量渲染完成的 streamId（终态消息据此去重）
+const streamTraces = new Map();    // ★ 09-24e streamId -> 待补的"检索过程"文字（done 帧到达时插入气泡）
 
-socket.on('ai-stream', ({ id, delta, done, mock }) => {
+socket.on('ai-stream', ({ id, delta, done, mock, trace }) => {
   let box = aiStreamNodes.get(id);
+  if (trace) streamTraces.set(id, String(trace).slice(0, 200));   // 元信息先存着，done 时插入
   if (!box) {
     const node = document.createElement('div');
     node.className = 'msg';
@@ -1248,6 +1250,18 @@ socket.on('ai-stream', ({ id, delta, done, mock }) => {
     box.node.classList.remove('streaming');
     const mode = mock ? 'Mock' : 'LLM';
     box.nameEl.innerHTML += `<span class="msg-ai-mode${mock ? ' mock' : ''}" title="这条答案由${mock ? '本地规则（未接 LLM）' : 'DeepSeek 模型'}生成">${mode}</span>`;
+    /* ★ 09-24e：流式终态也把"检索过程"补上（增量渲染时还不知道这些元信息，
+     *   服务器在 done 帧里一起送来）。注意 trace 挂在 bubble 上、**不在 textEl 里**——
+     *   因为 textEl 是逐字累加的正文，往里塞 HTML 会破坏打字机与文本一致性。 */
+    const t = streamTraces.get(id);
+    if (t) {
+      const traceEl = document.createElement('div');
+      traceEl.className = 'msg-ai-trace';
+      traceEl.title = 'AI 得出这条答案的中间过程（可验证，非黑箱）';
+      traceEl.textContent = t;
+      box.node.insertBefore(traceEl, box.textEl);
+      streamTraces.delete(id);
+    }
     aiStreamNodes.delete(id);
     aiStreamDone.add(id);
     if (aiStreamDone.size > 60) aiStreamDone.delete(aiStreamDone.values().next().value); // 环形，防长会内存涨
@@ -1266,6 +1280,22 @@ function appendChat(text, sender, isMe, via, name, ai) {
     // （classList.add 而非纯 className 字符串——冒烟桩的 classList 与 className 不同步，坑 27 同源）
     const mode = ai ? (ai.mock ? 'Mock' : 'LLM') : (sfuAiEnabled ? 'LLM' : 'Mock');
     const meta = ai && ai.tokens ? `<span class="msg-ai-tok" title="本次调用的 token 用量">${ai.tokens}t</span>` : '';
+    /* ★ 09-24e 把"AI 是怎么得出这条答案的"摊开给用户看：
+     *   · 检索自 N 条字幕中的 M 条 → 证明它**真的查了会议记录**，不是凭空编
+     *   · 第 N 轮追问 → 让用户知道它有上下文记忆
+     *   · 意图标签 → 让"它把我的话理解成了什么"可被纠正（理解错了用户能立刻发现）
+     *   为什么值得做：AI 最大的信任问题是"不可验证"。把中间过程暴露出来，
+     *   用户才能判断该不该信这条答案——这是产品诚实的核心，也是本项目的 AI 叙事里
+     *   最有说服力的一处（别人演示 AI 只给你看答案，我们给你看证据链）。 */
+    const trace = [];
+    if (ai && ai.totalDocs) trace.push(`📚 检索 ${ai.totalDocs} 条字幕取 ${ai.hits || 0} 条`);
+    if (ai && ai.turns > 1) trace.push(`💬 第 ${ai.turns} 轮`);
+    if (ai && ai.intent && ai.intent !== 'question') {
+      trace.push(`🎯 ${({ minutes: '生成纪要', recap: '回顾', operator: '远程操作' })[ai.intent] || ai.intent}`);
+    }
+    const traceHtml = trace.length
+      ? `<div class="msg-ai-trace" title="AI 得出这条答案的中间过程（可验证，非黑箱）">${escapeHtml(trace.join(' · '))}</div>`
+      : '';
     /* ★ 09-24 C4：纪要链接是 <a href> 导航，浏览器发不出自定义请求头——只能把 roomToken
      *   挂到查询串（服务端 extractRoomToken 已支持 ?roomToken= 这条兜底）。
      *   ai.path 可能已经带查询串，所以判断用 '?' 还是 '&'。文案与 DOM 结构一个字没动。 */
@@ -1279,6 +1309,7 @@ function appendChat(text, sender, isMe, via, name, ai) {
     item.innerHTML =
       `<div class="msg-name">🤖 ${escapeHtml(name || 'AI 助理')}<span class="msg-via" title="AI 会议助理">AI</span>` +
       `<span class="msg-ai-mode${mode === 'Mock' ? ' mock' : ''}" title="这条答案由${mode === 'Mock' ? '本地规则（未接 LLM）' : 'DeepSeek 模型'}生成">${mode}</span>${meta}</div>` +
+      traceHtml +
       `<div class="msg-text">${escapeHtml(text)}${link ? '<br>' + link : ''}</div>` +
       `<div class="msg-time">${new Date().toLocaleTimeString()}</div>`;
   } else {

@@ -267,6 +267,8 @@ AI 助理（`@ai` 问答 / 📝 纪要 / 🛰️ 远程操作员）**没有密�
 echo "DEEPSEEK_API_KEY=sk-你的密钥" > .env
 npm run start:sfu      # 启动日志会写明：AI 模式 = LLM 还是 [Mock]
 npm run test:ai        # 双轨自检（有 key 跑满 10 项，无 key 跑 5 项并提示）
+npm run test:ai-brain  # AI 智能内核单测：检索/记忆/意图/行动项（★ 有 key 时 30/30）
+npm run verify:ai      # 真服务器端到端：起真服务器 + 询真模型（★ 6/6）
 ```
 
 - 取值优先级：`DEEPSEEK_API_KEY` 环境变量 > 项目根 `.env` > `sfu/config.json` 的 `ai.key`；
@@ -468,6 +470,8 @@ npm run test:shutdown # 优雅退出：关 Worker / 关库 checkpoint / 幂等 /
 npm test           # Mesh 对照版信令：需先 npm start（连 localhost:3000）★ 2026-09-24 实测 36/36
 npm run test:smoke # SFU 前端无头冒烟（零依赖，不用起服务器）★ 2026-09-24 实测 136/136
 npm run test:ai    # AI 双轨自检：无 key 只跑 Mock 轨并提示怎么配；有 key 两条都跑 ★ 10/10
+npm run test:ai-brain # AI 智能内核单测（BM25 检索/会话记忆/意图分类/行动项抽取）★ 30/30
+npm run verify:ai  # AI 真服务器端到端（起真服务器+真信令+真模型，验检索/记忆/意图/抗幻觉）★ 6/6
 npm run test:record # D+2 服务器侧录制端到端自测（ffmpeg 当媒体源→mediasoup→落盘，需已装 ffmpeg）
 npm run test:turn  # ICE 可达性实测（对 config 里每个 STUN/TURN 手搓 STUN Binding，3s 超时）
 npm run bench      # E4 压力基准（4/8/16 路，约 1 分钟，独立 Worker，不用起 3001）
@@ -520,6 +524,18 @@ npm run admin:list   # 管理员 CLI：看库里有哪些账号 / 谁是 admin�
   答案不含 `[Mock]`、纪要事实取自输入、问答命中原文、操作员产出合法 JSON 计划、流式有增量。
   结束后打印调用次数与**估算花费**（本次自检 5 次调用 ≈ ¥0.0028）。
   服务器侧同样可核对：`curl http://localhost:3001/metrics | grep sfu_ai_llm`。
+- **★ AI 智能内核单测 `npm run test:ai-brain`（2026-09-24e 实测：30 通过 / 0 失败）**：
+  验的是"AI 的**结构性保证**"——答得够不够好无法自动断言，但下面这些能：
+  **检索**（关键信息被 25 条闲聊隔开仍能命中 Top1、无关句不进上下文、证据块有字符预算）；
+  **记忆**（有界、指代时拼上一轮、长答案截断）；**意图**（"纪要"换三种说法都要认出来）；
+  **行动项**（能抽出 owner/task/due、**提不到负责人必须留空而不是编造**）。
+  LLM 轨另加 4 项真模型断言：意图分类认出口语说法、行动项三元组、**抗幻觉**（证据里没有的要承认"没提到"）、**隔 30 条的信息能答对**。
+- **★ AI 真服务器端到端 `npm run verify:ai`（2026-09-24e 实测：6 通过 / 0 失败）**：
+  它补上单测补不了的一层——**接线**。会真的起一个服务器、建一个房间、写一份"长会字幕账本"，
+  然后走真信令真模型跑完：检索型问答（答案含被隔开的"11 月 20 日"）、流式打字机 + 证据链、
+  追问结合上文（"那他什么时候交"→"周五之前提交"）、**换个说法触发纪要并真的落盘**、
+  结构化行动项表格、抗幻觉。**为什么必须单独做这一层**：本项目吃过"模块单测全过、
+  但调用方忘了接线"的亏（见 AGENTS 坑 41）——集成点只有跑起来才能验。
 - **桌面代理端到端 `npm run test:agent`（2026-09-24 实测：16 通过 / 0 失败）**：
   真起 Chromium + 真跑服务器 + 真授权 + 真收 JPEG 帧 + 真注入 16 字节控制帧再回页面读坐标。
   最严的一条是坐标：发归一化 (0.5, 0.5)，页面 `clientX` 必须**正好**等于视口宽一半（±3px）——
@@ -580,6 +596,8 @@ npm run admin:list   # 管理员 CLI：看库里有哪些账号 / 谁是 admin�
 | 38 | **AI 主攻收官（09-24）** | **真 DeepSeek key 接入**：`sfu/ai/provider.js` 收口三处 LLM 调用（askLLM/streamLLM，Node 内置 fetch 零 SDK），密钥三来源（env > `.env` > config 的 ai.key）且**永不下发浏览器**，用量账本并入 `/metrics`；教学三件套 `scripts/{chat,summarize,agent}.js` + `npm run test:ai` 双轨自检 10/10；产品化四项：**流式打字机**（ai-stream + 终态去重）、**助理缺位自动入会**、**📝 纪要入口**、LLM/Mock 徽标与 token 用量；**实修三 bug**：announcedIp 漂移自动纠偏（跨机黑屏元凶）、ffmpeg 探测超时误判 + test:record 的 spawnSync EBUSY、配了 key 反而生成不了纪要（动作被聊天抢答）；回归：冒烟 **118/118**、信令 **106/106**（Mock 轨/LLM 轨双绿）、Mesh 33/33、test:record 连跑 3 次 PASS |
 | 39 | **真 OS 级远程桌面 + 跨网一键发布 + SW 缓存纪律（09-24b）** | **B 档落地**：本地代理 `agent/`（零新依赖手写 **CDP** 客户端，`Page.startScreencast` 抓真屏 + `Input.*` 注入真输入）驱动真实 Chromium 窗口，控制端在网页里操作被控电脑真实浏览器；新信令 `agent-hello`/`remote-frame`/`remote-meta` + 复用 `remote-input`，三道闸门（身份/授权/体量，"信任≠免检查"）；**📱 手机控电脑**——控制台 canvas 全用 **Pointer Events**（单指=鼠标、双指=滚轮、中文整段 insertText）；**跨网 ICE 下发**（Mesh 版 `mesh.config.json` + `/config.json`）；**一键发布** `npm run publish:mesh`（生成 publish-mesh/ → 真起一次体检 → 可选 cloudflared/ngrok 隧道；`--check` 过期闸）；**坑 40**：Service Worker 缓存旧代码（cache-first 绕过 HTTP `no-store`，改业务代码 sw.js 不动就一直吃旧缓存 → 按资源性质分 cache-first/network-first + `?nosw=1` 逃生舱 + e2e 每次清 profile）；回归 `test:agent` 16/16、`test:e2e` 15 项全过、`test:publish` 29/29 |
 | 40 | **账号上真数据库 + 门禁边界修正 + 房间令牌 + 优雅退出（09-24）** | **存储层**：新增 `sfu/store.js`，用 Node 内置 `node:sqlite`（零新依赖）替换 JSON 文件——WAL 模式、users/audit 两表、旧 `users.json` **自动迁移（原样保留 salt/hash、绝不重新哈希）** + 旧文件改名备份；**口令单一实现** `sfu/password.js`（scrypt + 随机盐 + timingSafeEqual，服务器与 CLI 共用，消除"照抄漂移"）；**管理员 CLI** `scripts/admin.js`（list/grant/revoke/adduser/passwd/purge，purge 默认干跑、deleteUser 拒绝删唯一 admin）；**门禁边界修正**：观测类（`/api/rooms`/`/metrics`/`/api/recordings`）加 admin 门禁；**内容类加房间内令牌**——进房成功时给**本人**签发**无状态 HMAC 房间令牌**（`/api/captions`、`/api/minutes`、`/minutes/<房号>/<文件>.md` 校验，`X-Room-Token` 头首选 / `?roomToken=` 兜底），`/recordings/<文件名>` 改用 **admin 或短时效签名 URL**（默认 1 小时），关闭"6 位房号可枚举"的弱能力缺口（令牌确保**游客也有**，否则游客字幕归档会静默失效）；**优雅退出**（SIGINT/SIGTERM→关 Worker→关库 checkpoint→退出，幂等 + 5s 保险丝，`TEST_SHUTDOWN_AFTER_MS` 自测钩子）；**证书 SAN 自愈**（缺失/无 SAN/未覆盖当前 IP 都重生成，修手机连不上）；**测试隔离**（账号测试一律 `DB_FILE` 指临时目录，硬断言不碰真实库）+ 修 `test:sfu` 默认带 token 掩盖游客视角的回归；回归：SFU 信令 **149/149**（含房间令牌 15 项）、存储 **49/49**、优雅退出 **9/9**、冒烟 **136/136**、Mesh **36/36**、代理 **16/16**、发布 **30/30**、e2e **15/15** = **合计 440 全绿** |
+
+| 41 | **★ AI 智能内核：从「关键词模板」到「真智能」（09-24e，本轮重点）** | 新文件 `sfu/ai/brain.js`（零依赖、可单测）：**① BM25 检索（RAG）**——中文 **bigram 分词** + IDF/TF饱和/长度归一 + 时间衰减 + 说话人加成 + 证据块字符预算，修掉"只喂 `slice(-8)` 最近 8 条字幕 → **长会早期信息问不出来**"的硬伤（实测 29 条含 25 条闲聊，仍答出被隔开的关键信息）；**② 多轮会话记忆**（环形上限 + 截断 + **指代时把上一轮问题一起检索**做廉价指代消解，"那他什么时候交"→ 答出"周五之前提交"）；**③ LLM 意图分类**替代正则（修掉"帮我整理下今天聊了啥"→ **纪要根本没生成**却回"好的我来整理"的能力错位；动作型高置信短路省钱、未知标签 fail-safe 落回规则）；**④ 行动项结构化** `{owner,task,due}`（LLM 理解指代与去重；规则轨**宁可留空不可编造**→ 标"待认领"；**内容交 LLM、格式交代码**，两轨格式一致）；**⑤ 操作员 ReAct 闭环**（每步收集服务端可确定的三类观测：转发门禁结果/控制权/执行轨迹 → 喂回 LLM 判断达成与修正，≤4 轮；**结论三档措辞**，出现过输入丢弃就报"⚠️ 可能未完全生效"，不再无条件报成功）；**⑥ 证据链 UI**（气泡摊开 `📚 检索 N 条取 M 条 · 💬 第 K 轮 · 🎯 意图`，流式与非流式都带）。**本轮实修 4 个真缺陷**（AGENTS 坑 41~44）：`RoomBrain` 漏 `memory.push`（记忆整体失效）、行动项正则贪婪（`压测报告我负责`→`压测报告我`）、**基于不存在的 `remote-input-ack` 写闭环**（grep 证伪后改用转发在线状态）、验证脚本消息竞态。回归：`test:ai-brain` **30/30**、`verify:ai` 真端到端 **6/6**、`test:ai` **10/10**、`test:sfu` **149/149**、`test:smoke` **136/136**、`test:store` 49/49、`test:shutdown` 9/9、`test:agent` 16/16、`test:e2e` 15/15 |
 
 **下一步方向**（`后续升级方向.md` 是唯一权威）：
 - ✅ **A 档（A1~A7）与 D 档（D1~D6）已全部完成**（2026-09-11，SFU 主版本）；

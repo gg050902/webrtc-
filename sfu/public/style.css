@@ -1567,6 +1567,17 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
 .msg-ai-mode.mock { color: var(--fg-faint); background: transparent; border-color: var(--border); }
 .msg-ai-tok { margin-left: 5px; font-family: var(--mono); font-size: 9px; color: var(--fg-faint); }
 
+/* ★ 09-24e AI 证据链：气泡顶部一行小字，显示"检索了多少条字幕 / 第几轮追问 / 意图"
+ * ▎设计意图：AI 最大的信任问题是**不可验证**。这行字让用户能判断该不该信这条答案，
+ *   也是"我们的 AI 不是黑箱"最直观的证据。所以它要**看得见但绝不喧宾夺主**——
+ *   弱化字号与颜色，靠一条左侧细线（呼应"来自证据"）建立视觉归属，不抢正文的注意力。 */
+.msg-ai-trace {
+  margin: 3px 0 4px; padding: 2px 0 2px 8px;
+  font-size: 10px; line-height: 1.5; color: var(--fg-faint);
+  border-left: 2px solid var(--accent-border);
+  font-variant-numeric: tabular-nums;
+}
+
 /* 纪要下载链接：与 bot 气泡同源的金调，虚线下划线呼应"文档"意象 */
 .msg-link {
   display: inline-block; margin-top: 6px;

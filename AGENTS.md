@@ -646,7 +646,8 @@
 | 28 | **G4 移动端 / PWA（09-23，主版本独有，纯前端零依赖）** | PWA：manifest（.webmanifest 扩展名避开 /config.json 特殊路由）+ sw.js Service Worker（预热缓存/cache-first/socket.io 绝不碰/导航 network-first 断网兜底/版本号自清）+ 图标 icons/icon-1024.png + 服务器 MIME 表补四条；移动端：≤980px 侧栏抽屉（sideBtn 开关+sideScrim 遮罩+body.side-open 状态位——补真缺口：原侧栏移出画布后无开关）、≤760px 紧凑档（:has(.i) 图标化/网格 150px/字幕条上移/预览竖屏堆叠）；低带宽模式：「省流」开关所有远端画面锁 simulcast 最低层（复用 set-preferred-layers 服务器零改动；layer-changed 钩子纠回 ABR 升层） | — | client.js **第 32 步**、style.css 第 25 节、sfu/public/{manifest.webmanifest,sw.js,icons/}、sfu/server.js MIME 表（LEARN.md 5.27） |
 
 | 29 | **AI Bot 参会者 + N2 纪要 + C1 AI 远程操作员（09-19b/09-19c/09-19g，主版本独有）** | 以参会者身份入会（room-state `isBot`，服务端 ffmpeg astats 音频管线"听"响度）；N2 纪要 `buildMinutes`（字幕账本 + 待办关键词规则层 + LLM 双轨，落 `sfu/minutes/<房间>/`，值守定时分段 + 离开出终稿，`/minutes` 双白名单防穿越）；C1 操作员：服务器开真实 socket.io 控制端连自己，**授权链路与人类完全同一套、绝不豁免**，计划-执行型 agent 把目标翻成 remote-input 序列（服务器端 16 字节帧编码） | 27 | sfu/server.js AI 基建块 + `buildMinutes` + `runAiOperator`、sfu/public/client.js AI 按钮/`@ai`/AI 操作按钮 |
-| 30 | **AI Provider 双轨 + 流式助理（09-24，主版本独有，本次重点）** | 新文件 `sfu/ai/provider.js` 收口三处 LLM 调用（`askLLM`/`streamLLM`，DeepSeek 走 Node 内置 fetch、零新依赖）；密钥三来源（env > 项目根 `.env` > `sfu/config.json` 的 `ai.key`）且**永不下发浏览器**；**AI 双轨**：无 key/超时/限流 → 本地规则兜底并带 `[Mock]` 标记；用量账本（调用/错误/tokens/估算花费）并入 `/metrics`（`sfu_ai_llm_*`）；前端三项：**流式打字机**（`ai-stream` 增量 + 终态 chat-message 去重）、**助理缺位自动入会**、**📝 纪要入口** + LLM/Mock 徽标与 token 用量；教学脚本 `scripts/{chat,summarize,agent}.js` + `npm run test:ai` 双轨自检 | 27 | sfu/ai/provider.js、sfu/server.js（`aiBrain`/`llmPlan`/`llmMinutes`/`ai-ask`/`ai-stream`）、sfu/public/client.js AI 段、style.css 第 23 节、scripts/test-ai.js（LEARN.md **5.28**） |
+| 31 | **★ AI 智能内核：RAG 检索 + 会话记忆 + 意图分类 + 结构化行动项 + 操作员 ReAct 闭环（09-24e，主版本独有，本轮重点）** | 新文件 `sfu/ai/brain.js`（零依赖，可单测）：**① BM25 检索器**（中文 **bigram 分词** + IDF/TF饱和/长度归一 + 时间衰减 + 说话人加成 + 证据块字符预算）——修掉"只喂最近 8 条字幕"导致**长会早期信息问不出来**的硬伤；**② ConversationMemory** 多轮记忆（环形上限 + 截断 + **指代时把上一轮问题一起检索**做廉价指代消解）；**③ classifyIntent** LLM 意图分类（替代正则，修掉"帮我整理下今天聊了啥"匹配不上→**纪要根本没生成**的能力错位；动作型高置信时短路省钱，未知标签 fail-safe 落回规则）；**④ extractActions** 行动项**结构化三元组** `{owner,task,due}`（LLM 理解指代/去重，规则轨**宁可留空不可编造**→ 标"待认领"；**内容交 LLM、格式交代码**，两轨格式一致）；**⑤ 操作员 ReAct 闭环**：每步收集**服务端可确定的三类观测**（转发门禁结果/控制权/执行轨迹）喂回 LLM 判断达成与修正（≤4 轮），**结论三档措辞**——出现过输入丢弃就明确报"⚠️ 可能未完全生效"，不再无条件报成功；**⑥ 证据链 UI**：气泡摊开 `📚 检索 N 条取 M 条 · 💬 第 K 轮 · 🎯 意图`（流式与非流式都带）。**本轮实修 4 个真缺陷**：`RoomBrain` 漏 `memory.push`（记忆整体失效）、行动项正则贪婪（`压测报告我负责`→owner=`压测报告我`；用 lookbehind + 集体词表修）、**基于不存在的 `remote-input-ack` 写闭环**（grep 证伪后改用转发在线状态）、验证脚本消息竞态（先清空再 emit，按 ts 过滤） | — | `sfu/ai/brain.js`、`sfu/server.js`（`aiBrain` 重构 / `getRoomBrain` / `disposeRoomBrain` / `buildMinutes` 行动项表 / `runAiOperator` 闭环 / `remote-input-fwd-result`）、`sfu/public/client.js` 证据链段、`style.css` `.msg-ai-trace`、`scripts/{test-ai-brain,verify-ai-live}.js`（AGENTS 坑 **41~44**） |
+
 
 **双版本架构形态（主次已调换）**：**SFU 版（sfu/ 目录/3001，mediasoup 服务器转发，腾讯会议同款）为
 主版本/简历主打**；Mesh 版（根目录/3000，浏览器 P2P 直连）是教学对照版——先把 P2P 讲明白，
@@ -752,6 +753,8 @@ npm run test:shutdown  # ★ 09-24 优雅退出回归（关 Worker / 关库 WAL 
 npm run test:smoke     # SFU 版**前端**无头冒烟（假 DOM/假 mediasoup，零依赖不用起服务器）★ 2026-09-24 实测 136/136
 npm run admin:list     # ★ 09-24 管理员 CLI（另有 grant/revoke/adduser/passwd/purge；purge 默认干跑、`--yes` 才删）
 npm run test:ai        # AI 双轨自检（无 key 只跑 Mock 轨并提示，有 key 两条都跑）★ 10/10
+npm run test:ai-brain  # ★ AI 智能内核单测（检索/记忆/意图/行动项）★ 30/30（Mock 26 + 真模型 4）
+npm run verify:ai      # ★ AI 真服务器端到端（起真服务器+真信令+真模型）★ 6/6
 npm run ai:chat        # AI 脚本：终端一问一答（教学阶段 0）／--q "问题" 单发
 npm run ai:summarize   # AI 脚本：文本/文件/房间字幕 → markdown 纪要（--text/--file/--room）
 npm run ai:agent       # AI 脚本：手写 ReAct 工具循环（--goal "…" --maxsteps 6 --verbose）
@@ -1041,6 +1044,38 @@ node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU �
     修法：**每次运行前清空 profile 目录**。
     排查方法论：最后靠"让页面自己 fetch client.js 自证版本指纹"才定死是缓存问题——
     **当"改了没生效"时，先让页面证明它加载的是哪一版，再谈改代码**。
+
+41. **★ "模块写对了"不等于"接线对了"——集成点必须被断言覆盖**（09-24e 实修，AI 智能内核轮）：
+    `brain.js` 的 `ConversationMemory` 类写得很对（有界、指代拼串、截断全对），单测也全过；
+    但 `RoomBrain.answer()` **漏了一行 `this.memory.push(q, res.text)`** ——
+    于是"追问不失忆"这个卖点**整体是死的**：每轮 messages 里历史永远为空，
+    模块却"测试全绿"。**这类缺陷的隐蔽性在于：单测模块过、单测返回值也过，
+    只有把"模块 + 调用方"放一起断言（"问答之后记忆里应该有一轮"）才会暴露。**
+    纪律：**凡是有状态被写入的功能，都要有一条"写进去没有"的断言**，而不是只测纯函数的输出。
+
+42. **★ 正则做中文抽取一定会被"贪婪"咬到**（09-24e 实修）：行动项抽取里
+    `([\u4e00-\u9fff]{2,6})(?:负责|跟进)` 把 `压测报告我负责` 抓成 owner=`压测报告我`；
+    `我们需要跟进` 更离谱，抓成 owner=`们需要`（因为中文没有词边界，`{2,3}` 从"们"开始切了）。
+    修法两层：① **lookbehind 近似词边界** `(?<![\u4e00-\u9fff])`——只能从词首开始匹配，
+    于是抓到的是完整的"我们"，再被 ② **集体词表**（我们/咱们/大家/团队/各位）拦掉。
+    通用教训：**用正则处理中文时，默认它会在错误的位置切开**，必须显式约束左右边界，
+    并对"抓到的东西"再做一次语义白/黑名单校验——**不要相信 extract 出来的字符串是干净的**。
+
+43. **★ 别给不存在的能力写代码——先 grep 证伪，再动手**（09-24e 实修）：
+    给 AI 操作员做 ReAct 闭环时，我"理所当然"地写了监听 `remote-input-ack`
+    （假定被控端收到输入会回执）。写完例行 grep 全仓库 —— **这个事件根本不存在**，
+    客户端收了 `remote-input` 从不回 ack。若照此上线：ack 恒为 0 → 恒判定"帧未送达"
+    → AI 会疯狂重试并最终误报失败。**一个不存在的假设，足以让整个闭环反向工作。**
+    纪律：涉及"某个事件/字段/接口存在吗"时，**先 grep 证伪再写**；
+    能用"本方此刻就能确定的事实"（如服务器转发时的目标在线状态）就别依赖对方的回执。
+
+44. **★ 等待异步结果的测试，要先清空再做动作**（09-24e 实修）：
+    `verify-ai-live.js` 里写成 `emitAck(提问)` → 清空消息数组 → 等回复。
+    但 `emitAck` 的**回执先到、AI 的答案后到**，于是"抓到的第一条 ai-bot 消息"
+    很可能是**上一轮**的尾巴。**症状极具迷惑性：表现是"AI 记忆失效/答错"，
+    实际是测试抓错了消息**——差点让我去改一个本来正确的记忆模块。
+    修法：**先清空数组、再 emit、只认 `ts >= t0` 的消息**（按时间戳过滤比按顺序可靠）。
+    通用教训：**异步测试里"清空"与"触发"的顺序是语义的一部分**，写反了它不会报错，只会说谎。
 
 
 ---
