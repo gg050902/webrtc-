@@ -406,16 +406,32 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
           ss.cancel = () => {};
           ss.__patched = true;
         }
-        const b = document.getElementById('aiVoiceBtn');
-        if (b) b.click();          // 真点击开启
         return true;
       })()`);
+      /* ⚠️ 语音偏好存在 localStorage 里（这是**功能正确**——用户的开关该被记住），
+       *   但它让"盲目点一下"变成了**跨运行有状态**的操作：
+       *   上一次跑完留下 `sfuAiVoice=1`，这一次再点一下就是**关掉**它，
+       *   于是断言"应点亮"失败。**症状看起来像语音坏了，其实是测试没做状态归一。**
+       *   → 先读当前状态，只在未开时点一次；断言只验"最终必须为开"。
+       *   （通用教训：凡是"持久化偏好"型功能，测试都必须先归一再操作，
+       *     否则第一次跑绿、第二次跑红，最难查。） */
+      const pre = await browser.evaluate(`(() => {
+        const b = document.getElementById('aiVoiceBtn');
+        return { active: b ? b.classList.contains('active') : null };
+      })()`);
+      if (pre.active !== true) {
+        await browser.evaluate(`(() => {
+          const b = document.getElementById('aiVoiceBtn');
+          if (b) b.click();
+          return true;
+        })()`);
+      }
       const on = await browser.evaluate(`(() => {
         const b = document.getElementById('aiVoiceBtn');
         return { active: b ? b.classList.contains('active') : null,
                  speakPatched: !!window.speechSynthesis.__patched };
       })()`);
-      assert(on.active === true, '开启后按钮应点亮（.active）');
+      assert(on.active === true, '开启后按钮应点亮（.active），实际 ' + JSON.stringify({ pre, on }));
       assert(on.speakPatched === true, '探针应已装上（否则本用例测不到东西）');
 
       /* ⚠️ 触发源选择：初版用"主动提醒"来触发，结果念不出任何东西——

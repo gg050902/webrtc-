@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>古风小人头 · 手绘矢量版</title>
+<style>
+:root{
+  --bg:#f7f3ea; --card:#fffdf8; --fg:#241f19; --fg2:#6d6255;
+  --line:#e3dbc9; --accent:#a83c30; --radius:12px;
+  --serif:"Noto Serif SC","Songti SC",serif;
+  --sans:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+}
+body.dark{--bg:#14110d;--card:#1e1a15;--fg:#ece4d6;--fg2:#9a8e7e;--line:#332b23;--accent:#cc6a52}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);transition:background .35s}
+.wrap{max-width:1060px;margin:0 auto;padding:40px 24px 70px}
+h1{font-family:var(--serif);font-size:30px;margin:0 0 8px;letter-spacing:3px;font-weight:600}
+.sub{color:var(--fg2);font-size:14px;line-height:1.85;max-width:660px}
+.toggle{border:1px solid var(--line);background:var(--card);color:var(--fg);padding:8px 18px;
+  border-radius:999px;cursor:pointer;font-size:13px}
+header{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;flex-wrap:wrap}
+section{margin-top:40px}
+h2{font-family:var(--serif);font-size:16px;margin:0 0 16px;color:var(--fg2);letter-spacing:3px;
+  display:flex;align-items:center;gap:12px}
+h2::after{content:"";flex:1;height:1px;background:var(--line)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:26px}
+.row{display:flex;gap:28px;align-items:flex-end;flex-wrap:wrap}
+.cell{display:flex;flex-direction:column;align-items:center;gap:8px}
+.cap{font-size:12px;color:var(--fg2);font-variant-numeric:tabular-nums}
+
+/* ---- 呼吸浮动：数学级流畅，比逐帧视频更丝滑 ---- */
+@keyframes breathe{0%,100%{transform:translateY(0) scale(1)}50%{transform:translateY(-3.2%) scale(1.012)}}
+@keyframes sway{0%,100%{transform:rotate(-1.1deg)}50%{transform:rotate(1.1deg)}}
+@keyframes blink{0%,90%,100%{transform:scaleY(1)}94%{transform:scaleY(.08)}}
+@keyframes ribbon{0%,100%{transform:rotate(-5deg)}50%{transform:rotate(7deg)}}
+@keyframes glow{0%,100%{opacity:.28}50%{opacity:.55}}
+
+.avatar{width:200px;height:200px;animation:breathe 4.2s ease-in-out infinite;transform-origin:50% 70%}
+.avatar.speaking{animation-duration:1.9s}
+.avatar.happy{animation-duration:2.6s}
+.avatar .head-grp{animation:sway 6s ease-in-out infinite;transform-origin:50% 90%}
+.avatar .eye{animation:blink 4.6s ease-in-out infinite;transform-origin:50% 50%}
+.avatar .ribbon{animation:ribbon 3.4s ease-in-out infinite;transform-origin:80% 20%}
+.avatar .halo{animation:glow 4.2s ease-in-out infinite}
+
+/* 状态切换：靠元素的显隐与形变，不改结构 */
+.st-idle   .mouth-smile{display:block} .st-idle   .mouth-open{display:none}  .st-idle   .mouth-flat{display:none}
+.st-idle   .eye-open{display:block}   .st-idle   .eye-curve{display:none}
+.st-listen .mouth-smile{display:none}  .st-listen .mouth-open{display:none}   .st-listen .mouth-flat{display:block}
+.st-listen .eye-open{display:none}     .st-listen .eye-curve{display:block}
+.st-speak  .mouth-smile{display:none}  .st-speak  .mouth-open{display:block}  .st-speak  .mouth-flat{display:none}
+.st-speak  .eye-open{display:block}    .st-speak  .eye-curve{display:none}
+.st-think  .mouth-smile{display:none}  .st-think  .mouth-open{display:none}   .st-think  .mouth-flat{display:block}
+.st-think  .eye-open{display:none}     .st-think  .eye-curve{display:block}
+.st-happy  .mouth-smile{display:none}  .st-happy  .mouth-open{display:block} .st-happy  .mouth-flat{display:none}
+.st-happy  .eye-open{display:none}     .st-happy  .eye-curve{display:block}
+.st-think .head-grp{animation-duration:9s}
+.st-speak .halo{animation-duration:1.9s}
+
+.states{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px}
+.chip{border:1px solid var(--line);background:transparent;color:var(--fg);padding:9px 18px;
+  border-radius:999px;cursor:pointer;font-size:13px;font-family:var(--serif);letter-spacing:1px;transition:.2s}
+.chip:hover{border-color:var(--accent)}
+.chip.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.note{font-size:13px;color:var(--fg2);line-height:1.9}
+.pill{display:inline-block;padding:3px 11px;border:1px solid var(--line);border-radius:2px;
+  font-size:12px;color:var(--fg2);margin:2px 5px 2px 0;font-family:var(--serif)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left}
+th{font-size:12px;color:var(--fg2);letter-spacing:1px}
+td code{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div>
+    <h1>古风小人头</h1>
+    <p class="sub">手绘矢量版。逐笔控制造型，不存在 AI 生成人物常见的五官崩坏；
+    动画由 CSS 矢量插值驱动，数学级流畅，且体积只有几 KB。</p>
+  </div>
+  <button class="toggle" id="theme">切换宣纸 / 墨底</button>
+</header>
+
+<section>
+  <h2>形象</h2>
+  <div class="card">
+    <div class="row" style="justify-content:center">
+      <div id="stage" class="avatar st-idle">
+        <!-- 手绘 SVG：丫髻童子 -->
+        <svg viewBox="0 0 200 200" width="100%" height="100%" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <radialGradient id="halo" cx="50%" cy="46%" r="52%">
+              <stop offset="0%" stop-color="#cfe6df" stop-opacity=".85"/>
+              <stop offset="100%" stop-color="#cfe6df" stop-opacity="0"/>
+            </radialGradient>
+            <linearGradient id="skin" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#fbeedd"/>
+              <stop offset="100%" stop-color="#f2ddc4"/>
+            </linearGradient>
+            <linearGradient id="hair" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#3b2f24"/>
+              <stop offset="100%" stop-color="#241c14"/>
+            </linearGradient>
+          </defs>
+
+          <circle class="halo" cx="100" cy="96" r="86" fill="url(#halo)"/>
+
+          <g class="head-grp">
+            <!-- 丫髻（左右两个发髻） -->
+            <circle cx="52" cy="56" r="23" fill="url(#hair)"/>
+            <circle cx="148" cy="56" r="23" fill="url(#hair)"/>
+            <!-- 发带 -->
+            <g class="ribbon">
+              <path d="M62 44 q14 -10 26 -2" stroke="#a83c30" stroke-width="5" fill="none" stroke-linecap="round"/>
+              <path d="M138 44 q-14 -10 -26 -2" stroke="#a83c30" stroke-width="5" fill="none" stroke-linecap="round"/>
+            </g>
+            <!-- 头 -->
+            <ellipse cx="100" cy="104" rx="54" ry="58" fill="url(#skin)"/>
+            <!-- 头发（覆盖上半） -->
+            <path d="M46 104 q4 -46 54 -46 q50 0 54 46 q-12 -26 -54 -26 q-42 0 -54 26 Z" fill="url(#hair)"/>
+            <path d="M46 100 q-6 22 2 34 q-14 -12 -12 -34 Z" fill="url(#hair)"/>
+            <path d="M154 100 q6 22 -2 34 q14 -12 12 -34 Z" fill="url(#hair)"/>
+            <!-- 腮红 -->
+            <ellipse cx="70" cy="118" rx="10" ry="6.5" fill="#eda79c" opacity=".5"/>
+            <ellipse cx="130" cy="118" rx="10" ry="6.5" fill="#eda79c" opacity=".5"/>
+            <!-- 眼睛：睁眼 -->
+            <g class="eye-open">
+              <g class="eye"><ellipse cx="80" cy="107" rx="7.5" ry="9.5" fill="#241c14"/>
+                <circle cx="82.5" cy="103.5" r="2.6" fill="#fff"/></g>
+              <g class="eye"><ellipse cx="120" cy="107" rx="7.5" ry="9.5" fill="#241c14"/>
+                <circle cx="122.5" cy="103.5" r="2.6" fill="#fff"/></g>
+            </g>
+            <!-- 眼睛：弯眼（倾听/思考/愉悦） -->
+            <g class="eye-curve">
+              <path d="M71 108 q9 -9 18 0" stroke="#241c14" stroke-width="4.5" fill="none" stroke-linecap="round"/>
+              <path d="M111 108 q9 -9 18 0" stroke="#241c14" stroke-width="4.5" fill="none" stroke-linecap="round"/>
+            </g>
+            <!-- 嘴：三种 -->
+            <path class="mouth-smile" d="M90 128 q10 9 20 0" stroke="#b4594c" stroke-width="3.4" fill="none" stroke-linecap="round"/>
+            <ellipse class="mouth-open" cx="100" cy="130" rx="8" ry="7" fill="#b4594c"/>
+            <path class="mouth-flat" d="M91 130 h18" stroke="#b4594c" stroke-width="3.4" fill="none" stroke-linecap="round"/>
+            <!-- 衣领 -->
+            <path d="M64 162 q36 22 72 0 l6 40 h-84 Z" fill="#5b8f86"/>
+            <path d="M100 176 v26" stroke="#e8dcc6" stroke-width="4" stroke-linecap="round"/>
+          </g>
+        </svg>
+      </div>
+    </div>
+    <div class="states" id="chips"></div>
+    <p class="note" style="margin:18px 0 0">
+      五个状态靠<strong>眼形与嘴形的切换</strong>实现（睁眼/弯眼 × 微笑/张开/平直），结构不变，
+      因此切换是瞬时的、不会有跳变；呼吸浮动与眨眼由 CSS 关键帧驱动，任何帧率下都平滑。
+    </p>
+  </div>
+</section>
+
+<section>
+  <h2>尺寸</h2>
+  <div class="card">
+    <div class="row" id="sizes"></div>
+    <p class="note" style="margin:18px 0 0">矢量放大不失真，40px 与 200px 共用同一份代码。</p>
+  </div>
+</section>
+
+<section>
+  <h2>集成</h2>
+  <div class="card">
+    <pre><code>&lt;!-- 直接内联 SVG，或存成 .svg 用 &lt;img&gt; 引用 --&gt;
+&lt;div class="avatar st-idle"&gt; …SVG… &lt;/div&gt;
+
+&lt;!-- 切状态：只换 class --&gt;
+el.className = 'avatar ' + (speaking ? 'st-speak' : 'st-idle');
+
+/* 关键动画 */
+.avatar   { animation: breathe 4.2s ease-in-out infinite; }
+.avatar .eye { animation: blink 4.6s ease-in-out infinite; }</code></pre>
+  </div>
+</section>
+
+<section>
+  <h2>为什么这一版能看</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>对比项</th><th>AI 生成人物</th><th>手绘矢量</th></tr></thead>
+      <tbody>
+        <tr><td>五官稳定性</td><td>古风人物崩坏率高，越写实越明显</td><td>逐笔控制，绝不变形</td></tr>
+        <tr><td>动画</td><td>逐帧视频，受限于生成帧数与随机性</td><td>CSS 矢量插值，任意帧率都平滑</td></tr>
+        <tr><td>体积</td><td>动图数百 KB</td><td>几 KB</td></tr>
+        <tr><td>改一个细节</td><td>需重新生成，结果不可控</td><td>改一个数值即可</td></tr>
+      </tbody>
+    </table>
+    <p class="note" style="margin:16px 0 0">
+      <span class="pill">矢量无损缩放</span><span class="pill">CSS 丝滑动画</span>
+      <span class="pill">体积 KB 级</span><span class="pill">细节可微调</span>
+    </p>
+  </div>
+</section>
+</div>
+
+<script>
+const STATES=[['st-idle','待机'],['st-listen','倾听'],['st-speak','说话'],['st-think','思考'],['st-happy','愉悦']];
+const chips=document.getElementById('chips');
+const stage=document.getElementById('stage');
+STATES.forEach(([cls,label],i)=>{
+  const b=document.createElement('button');
+  b.className='chip'+(i===0?' on':'');
+  b.textContent=label;
+  b.onclick=()=>{
+    document.querySelectorAll('.chip').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on');
+    stage.className='avatar '+cls;
+  };
+  chips.appendChild(b);
+});
+const SVG_HTML=stage.innerHTML;
+const sizes=document.getElementById('sizes');
+[40,64,96,120,180].forEach(s=>{
+  const d=document.createElement('div');
+  d.className='cell';
+  d.innerHTML=`<div style="width:${s}px;height:${s}px">${SVG_HTML}</div><span class="cap">${s}px</span>`;
+  sizes.appendChild(d);
+});
+document.getElementById('theme').onclick=()=>document.body.classList.toggle('dark');
+</script>
+</body>
+</html>
