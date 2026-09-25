@@ -195,6 +195,59 @@ const USE_LLM = require('../sfu/ai/provider').aiEnabled();
     assert(typeof r.text === 'string' && r.totalDocs === 0, '应安全降级，实际 ' + JSON.stringify(r).slice(0, 120));
   });
 
+  /* ══════════ 六之二、参会语义：会话范围（★ 09-25）══════════
+   * ▎为什么这组必须存在：09-24e 把 aiBrain 升级成"全档检索"后，助理能翻到
+   *   **它入会之前**的字幕，甚至**上一场会**的（房间号销毁后回收复用）——
+   *   这是"能力升级引入的新语义漏洞"，且症状极隐蔽：答案收尾得体、内容却来自别的会。
+   *   能自动断言的正是它的结构保证：**入会前的证据必须检索不到**。 */
+  console.log('\n── 六之二、参会语义（会话范围 · 入会前后的边界）──');
+  const TWO_SESSIONS = [
+    { name: '张三', text: '上一场会的旧账：预算 999 万，全部交给李四处理', ts: 1000 },
+    { name: '王五', text: '本场会新结论：交付时间定在 11 月 20 日', ts: 5000 },
+    { name: '赵六', text: '本场会新结论：压测报告由孙七负责', ts: 9000 },
+  ];
+  await T('不给 joinedAt → 全档（历史档案模式，行为不变）', () => {
+    const b = new B.RoomBrain(8);
+    assert(b.retriever(TWO_SESSIONS).size === 3, '不限范围时应索引全部');
+  });
+  await T('★ 给了 joinedAt → 入会前的字幕**检索不到**（参会，不是翻档案）', () => {
+    const b = new B.RoomBrain(8, { joinedAt: 4000 });
+    const r = b.retriever(TWO_SESSIONS);
+    assert(r.size === 2, '应只索引入会后 2 条，实际 ' + r.size);
+    assert(r.search('预算 999 万', 3).length === 0, '入会前的旧内容不该被检索到（这是跨会话串味的根源）');
+    assert(r.search('交付时间', 3).length > 0, '入会后的内容必须能检索到');
+  });
+  await T('★ 入会后确无字幕 → 范围就是空的，**不退回全档**（诚实：我没听到就是没听到）', () => {
+    /* ⚠️ 这条断言是**修过的**：初版断言"应退回全档（宁可多看不可失明）"，
+     *   而且当时是绿的 —— 它把一个**真缺陷**当成了期望行为给保护起来了。
+     *   缺陷长什么样：入会那一刻通常还没有新字幕，兜底逻辑于此无条件生效，
+     *   整个会话范围机制形同虚设（助理照样答出入会前/上一场会的内容）。
+     *   教训：**一条绿色的断言也可能是错的**——断言写的是"我以为的对",
+     *   当"我以为"本身就是缺陷来源时，测试会替缺陷站岗（这是最危险的一类测试）。 */
+    const b = new B.RoomBrain(8, { joinedAt: 99999 });
+    const r = b.retriever(TWO_SESSIONS);
+    assert(r.size === 0, '会话内没有字幕时应为空集，实际 ' + r.size + '（退回全档=范围失效）');
+    assert(r.search('预算', 3).length === 0, '不该检索到入会前的内容');
+  });
+  await T('范围内为空时，端到端如实回答"没提到"（而不是拿全档兜底）', async () => {
+    const b = new B.RoomBrain(8, { joinedAt: 99999 });
+    const r = await b.answer('预算多少？', TWO_SESSIONS);
+    assert(r.totalDocs === 0, '范围内应无文档，实际 ' + r.totalDocs);
+    assert(/没提到|没有提到|未提及|没有相关|没有找到/.test(r.text), '应如实说没提到，实际：' + r.text);
+  });
+  await T('端到端：受限会话的答案**不含上一场会的内容**，且 scoped 标志为真', async () => {
+    const b = new B.RoomBrain(8, { joinedAt: 4000 });
+    const r = await b.answer('预算多少？', TWO_SESSIONS);
+    assert(r.scoped === true, '应标记为受限会话');
+    assert(r.totalDocs === 2 && r.allDocs === 3, '应报出"入会后 2 条 / 全档 3 条"，实际 ' + r.totalDocs + '/' + r.allDocs);
+    /* ⚠️ 断言写法自省：**不能**简单断言"文本里不含'预算'二字"——
+     * 正确行为恰恰是"会议里没提到预算相关信息"（拒绝作答时要复述问题里的词）。
+     * 那样写会把**正确的拒答**判成失败（本次初版就踩了这个坑：1 失败但其实是对的）。
+     * 正确的判据是"**没有泄露具体数值**"：999 这个数不该出现。 */
+    assert(!/999/.test(r.text), '答案不该泄露上一场会的具体数值，实际：' + r.text);
+    assert(/没提到|没有提到|未提及|没有相关/.test(r.text), '应明确承认没提到，而不是含糊带过，实际：' + r.text);
+  });
+
   /* ══════════ 七、LLM 轨 ══════════ */
   console.log('\n── 七、LLM 轨（真模型）──');
   if (!USE_LLM) {

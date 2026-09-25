@@ -1412,6 +1412,15 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
   animation: botPulse 2.4s ease-in-out infinite;
 }
 @keyframes botPulse { 50% { opacity: .45; } }
+/* ★ 09-25 参会升级：bot 行尾的「提问」入口（把 @ai 这条隐藏用法变成可点按钮）。
+   刻意做得**比常规 .mini 更矮更淡**——它是"随手一问"的入口，不是主操作，
+   和旁边的录制/踢人小按钮抢视觉重量会破坏成员列表的秩序感。 */
+.member-row .m-ai-ask-btn {
+  padding: 1px 8px; font-size: 10px; line-height: 1.6; border-radius: 999px;
+  background: transparent; border: 1px solid var(--accent-border); color: var(--accent);
+  opacity: .78; transition: opacity .15s ease, background .15s ease;
+}
+.member-row .m-ai-ask-btn:hover { opacity: 1; background: var(--accent-muted); }
 
 /* ────────── 23. ★ 09-19d 舒适性打磨层（"去人机"：让界面有呼吸和分寸）──────────
    人机感的三个来源与对策：

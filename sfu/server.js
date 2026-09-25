@@ -1515,8 +1515,16 @@ function getRoomBrain(roomNumber) {
   let b = roomBrains.get(roomNumber);
   if (!b) {
     const turns = Number(CONFIG.aiMemoryTurns) || 8;   // config 可调（长会想要更长的记忆就调大）
-    b = new Brain.RoomBrain(turns);
+    const room = rooms.get(roomNumber);
+    /* ★ 09-25 参会语义修复：智能体诞生时**记下入会时刻**，检索只覆盖入会之后的字幕。
+     *   为什么必须在这一刻记：原来 RoomBrain 不带时间范围 → 它会把**入会之前**、
+     *   甚至**上一场会**（房间号回收复用）的字幕当成"我听到的"答出来。
+     *   详见 brain.js scopeEntries 的注释。这里把 room.aiJoinedAt 传进去。 */
+    b = new Brain.RoomBrain(turns, { joinedAt: (room && room.aiJoinedAt) || 0 });
     roomBrains.set(roomNumber, b);
+    if (process.env.AI_DEBUG_SCOPE) {
+      console.log(`[scope-debug] 新建 brain joinedAt=${b.joinedAt} (${b.joinedAt ? new Date(b.joinedAt).toISOString() : '不限'})`);
+    }
   }
   return b;
 }
@@ -1590,12 +1598,64 @@ function stopAiAudioPipeline(roomNumber) {
   aiHearing.delete(roomNumber);
 }
 
+/* ★ 09-25 「AI 助手参加会议」补完：入会/离会要**有声音**。
+ *
+ * ▎改造前是什么样：点「🤖 AI 助理」只改了 room.aiBot + 广播一份快照 + 记一条 logEvent。
+ *   成员列表里**悄悄多了一行**"聆听中…"，聊天区一个字都没有。
+ *   用户的真实困惑是："我点了按钮，它到底来没来？它能听见吗？我能问它什么？"
+ *   现在的做法：以**参会者身份说第一句话**——报出"我是谁、我听得到什么、怎么用我"。
+ *
+ * ▎为什么这不是"装饰"：这是把 AI 的**能力边界**在入会那一刻交代清楚。
+ *   AI 产品最大的信任问题是"用户以为它什么都会"（然后失望）；
+ *   入会时明说"我只听得见音频、我看不到你屏幕"，反而让后续的诚实体感成立。
+ *
+ * ▎听觉状态为什么由服务器**实测**而不是写死一句话：
+ *   听觉有两条真实降级路径（ffmpeg 缺失 / 管线建失败），盲写"我能听见"就是在撒谎。
+ *   所以这里数一遍**真实建成的管线数**，如实报出来——这是"诚实 UI"落到最外层的一处。
+ */
+function aiHearingStatus(roomNumber) {
+  const room = rooms.get(roomNumber);
+  const pipes = aiAudioPipes.get(roomNumber);
+  const live = pipes ? pipes.size : 0;
+  // 在场有麦克风的人（静音的不算——他不推音频流，bot 客观上听不见）
+  const talkers = room
+    ? [...room.members].filter((m) => m.producers && [...m.producers.values()].some((p) => p.kind === 'audio')).length
+    : 0;
+  return { live, talkers, degraded: live === 0 && talkers > 0 };
+}
+
+/* ★ 09-25 入会/离会事件以"参会者发言"的形式广播。
+ * ▎为什么用 chat-message 而不是新事件：聊天台账已有的去重/导出/离线补帧
+ *   都能直接复用（AGENTS 坑里反复出现的教训：能复用既有通路就别开新协议）。
+ * ▎from 用 'ai-bot' 保持一致 → 前端气泡走既有的"机器同事"样式，无需新增分支。 */
+function emitBotSay(roomNumber, text, extra) {
+  io.to(roomNumber).emit('chat-message', {
+    from: 'ai-bot', name: '🤖 AI 助理', text, ts: Date.now(),
+    ...(extra || {}),
+  });
+}
+
 // bot 开/关（幂等）：改房间状态 + 拆/建管线 + 广播快照
-function setAiBot(roomNumber, on) {
+/* @param {Object} [opts] { quiet:true } = 不说入会致辞（用于 ai-ask 的自动入会）
+ *
+ * ▎quiet 为什么必需（这是本轮自己的端到端测试抓出来的真实缺陷）：
+ *   ai-ask 在 bot 缺位时会**自动入会**，而自动入会会广播一条"大家好，我入会了"。
+ *   用户的第一句话如果是 "@ai 交付时间是什么时候"，真实序列就是：
+ *       入会致辞（先） → 检索（后，要等模型 2~5 秒） → 答案
+ *   于是用户先看到一段与自己问题无关的寒暄。更糟的是**任何按"最后一条 ai-bot 消息"
+ *   取答案的调用方（含本次的验证脚本）都会抓到那段寒暄**——症状是"AI 答非所问"，
+ *   看起来像检索坏了，实际是两件事在同一个信道上抢跑。
+ *   这属于典型的"两个都正确的功能叠加出错误行为"，所以要在源头分开：
+ *   **被邀请就致辞（人主动请它），被顺带拉起就不致辞（人着急要答案）。** */
+function setAiBot(roomNumber, on, opts = {}) {
   const room = rooms.get(roomNumber);
   if (!room) return null;
+  const was = !!room.aiBot;
   room.aiBot = !!on;
   if (on) {
+    /* ★ 09-25：记录**首次**入会时刻（重复点开不覆盖——否则会话范围会被推后，
+     *   入会早期聊的内容会凭空"消失"）。这个值 = 检索证据范围的时间下界。 */
+    if (!room.aiJoinedAt) room.aiJoinedAt = Date.now();
     // 把当前所有音频路喂给管线（bot 入会晚了也能"听见"在场的每个说话人）
     for (const [pid, owner] of room.producerOwner) {
       const sock = [...room.members].find((m) => m.id === owner);
@@ -1617,13 +1677,44 @@ function setAiBot(roomNumber, on) {
         } catch (e) { /* 定时纪要失败不打断值守，下一轮再试 */ }
       }, MINUTES_INTERVAL_MS);
     }
+    /* ★ 09-25 入会致辞（仅在**首次**入会、且**不是**被 ai-ask 顺带拉起时说）。
+     *   内容分三层：① 报到（我来了，以什么能力）；② 听觉实况（我能听见谁，或为什么听不见）；
+     *   ③ 用法（@ai 提问 / @ai 纪要）——最后一层最重要：不说用户根本不知道该干什么。
+     *   quiet=true 时跳过：见 setAiBot 的 @param 注释（避免寒暄与答案抢道）。 */
+    if (!was && !opts.quiet) {
+      const h = aiHearingStatus(roomNumber);
+      const hear = h.degraded
+        ? '⚠️ 但本机 ffmpeg 不可用，我暂时**听不见**音频——字幕转写若不开启，我只能靠已有字幕作答。'
+        : h.talkers === 0
+          ? '房间里现在还没人开麦，等有人说话我就能听见。'
+          : `已接入 ${h.live || h.talkers} 路音频，能听见正在说话的各位。`;
+      emitBotSay(roomNumber,
+        `👋 大家好，我是会议 AI 助理，已作为参会者入会。\n`
+        + `${hear}\n`
+        + `我能做：在聊天里说 **@ai 你的问题**（我基于**本次入会后**的会议内容作答，并会标出检索到哪几条）；`
+        + `说 **@ai 生成纪要** 我整理成 markdown；字幕开启时我的"听力"最完整。`);
+      logEvent('info', 'ai-join-ceremony', {
+        roomNumber, pipes: h.live, talkers: h.talkers, degraded: h.degraded,
+      });
+    }
   } else {
+    // ★ 09-25 离会告别（送出终稿是一件"耗时的事"，先说话再干活，用户不用干等）
+    if (was) {
+      emitBotSay(roomNumber, '👋 好的，我先退会了。正在把本次会议沉淀成终稿纪要……');
+    }
     stopAiAudioPipeline(roomNumber);
     // ★ N2：送走 bot = 值守段落结束 → 清定时器 + 出终稿（异步落盘，不阻塞信令）
     if (room.minutesTimer) { clearInterval(room.minutesTimer); room.minutesTimer = null; }
-    buildMinutes(roomNumber, { type: 'final' }).catch(() => {});
+    buildMinutes(roomNumber, { type: 'final' }).then((r) => {
+      if (!was || !r) return;
+      emitBotSay(roomNumber,
+        `📋 终稿纪要已生成：${r.path}${r.mock ? '（[Mock] 本地模板）' : '（DeepSeek 撰写）'}`
+        + `${r.actions && r.actions.length ? `，含 ${r.actions.length} 条行动项` : ''}。`
+        + '需要我再参会随时点 🤖。');
+    }).catch(() => {});
     // ★ 09-24e：送走助理 = 本轮对话结束 → 清会话记忆（下一轮重新开始，不继承旧上下文）
     disposeRoomBrain(roomNumber);
+    room.aiJoinedAt = 0;   // ★ 09-25：送走 = 会话结束，下次请回来是一段新会话（范围重新起算）
   }
   broadcastRoomState(roomNumber);
   logEvent('info', on ? 'ai-join' : 'ai-leave', { roomNumber });
@@ -1674,18 +1765,23 @@ async function aiBrain(roomNumber, question, onDelta) {
 
   /* ── ② 取全档字幕 + 走检索型问答 ──
    * `entries` 来自 loadCaptions（服务器权威 jsonl 副本），是全量、按时间排序的。
-   * RoomBrain 内部会按需建索引，并把检索结果拼成"证据块"喂模型。 */
+   * RoomBrain 按**会话范围**（入会之后，见 scopeEntries）过滤后建索引，
+   * 并把检索结果拼成"证据块"喂模型。 */
   const entries = loadCaptions(roomNumber);
   const brain = getRoomBrain(roomNumber);
   const extraContext = `会议时长约 ${dur} 分钟，${members.length} 人在线。发言统计：${talkTxt}`
     + (intent === 'recap' ? '\n（用户想回顾刚才讨论的内容，请按时间线归纳，不要生成正式纪要文档。）' : '');
 
   const r = await brain.answer(q, entries, { extraContext, onDelta, topK: 6 });
+  if (process.env.AI_DEBUG_SCOPE) {
+    console.log(`[scope-debug] answer joinedAt=${brain.joinedAt} 全档=${entries.length} 范围内=${r.totalDocs} scoped=${r.scoped}`);
+  }
 
   return {
     text: (r.mock && AI.aiEnabled() === false ? '[Mock] ' : '') + r.text,
     mock: r.mock, usage: r.usage, ms: r.ms, reason: r.reason,
     hits: r.hits, usedHits: r.usedHits, totalDocs: r.totalDocs, turns: r.turns, intent,
+    scoped: r.scoped, allDocs: r.allDocs,
   };
 }
 
@@ -2113,7 +2209,12 @@ async function buildMinutes(roomNumber, opts = {}) {
     '',
   ].join('\n');
 
-  const stamp = new Date(now).toISOString().slice(0, 16).replace(/[-:T]/g, '');
+  /* ★ 09-25：时间戳精确到**秒**（原来是分钟级 slice(0,16)）。
+   *   分钟级会导致同一分钟内生成的同名纪要**互相覆盖**——实测路径：
+   *   送走助理出终稿 → 立刻又被请回来 → 再送走 → 第二份终稿把第一份盖掉。
+   *   纪要是有留存价值的产物，静默覆盖属于数据丢失。加两位秒即可根治。
+   *   （文件名格式无人解析——只被列表/下载，见 /minutes/ 路由，故改动安全。） */
+  const stamp = new Date(now).toISOString().slice(0, 19).replace(/[-:T]/g, '');
   const md = [
     `# 会议纪要（${opts.type === 'final' ? '终稿' : '分段'}）· 房间 ${roomNumber}`, '',
     `- 生成时间：${new Date(now).toLocaleString()}`,
@@ -3235,7 +3336,9 @@ io.on('connection', (socket) => {
     const room = roomNumber && rooms.get(roomNumber);
     if (!room) return fail(callback, '先进入房间再向 AI 助理提问');
     if (!room.aiBot) {
-      setAiBot(roomNumber, true); // 见上注：助理缺位时自动入会（与点「🤖 AI 助理」完全同一条链路）
+      /* quiet:true —— 人在等答案，不需要一段寒暄；
+       * 否则寒暄会与答案抢同一条信道（详见 setAiBot 的 @param 注释，真缺陷）。 */
+      setAiBot(roomNumber, true, { quiet: true });
       logEvent('info', 'ai-auto-join', { roomNumber, by: socket.id, why: 'ai-ask' });
     }
     const question = String(payload.question || '').trim().slice(0, 300);
@@ -3255,7 +3358,13 @@ io.on('connection', (socket) => {
      *   等 aiBrain 返回才有）。前端在 done 时把它插进气泡——这样流式与一次性两条路径
      *   的信息披露完全一致（否则只有非流式能看到证据链，等于两条路径两种可信度）。 */
     const traceParts = [];
-    if (r.totalDocs) traceParts.push(`📚 检索 ${r.totalDocs} 条字幕取 ${(r.hits || []).length} 条`);
+    if (r.totalDocs) {
+      /* ★ 09-25：检索范围要说清楚是"入会后"还是"全档"——这两个数的可信度不同。
+       *   入会前的内容它是"翻档案"（可能有上下文缺失），入会后的才是"亲耳听到"。 */
+      traceParts.push(r.scoped && r.allDocs > r.totalDocs
+        ? `📚 检索入会后 ${r.totalDocs} 条字幕取 ${(r.hits || []).length} 条（全档 ${r.allDocs} 条）`
+        : `📚 检索 ${r.totalDocs} 条字幕取 ${(r.hits || []).length} 条`);
+    }
     if (r.turns > 1) traceParts.push(`💬 第 ${r.turns} 轮`);
     if (r.intent && r.intent !== 'question') {
       traceParts.push(`🎯 ${({ minutes: '生成纪要', recap: '回顾', operator: '远程操作' })[r.intent] || r.intent}`);
@@ -3267,12 +3376,14 @@ io.on('connection', (socket) => {
       from: 'ai-bot', name: '🤖 AI 助理', text: r.text, ts: Date.now(), streamId,
       /* ★ 09-24e：把"这条答案是怎么来的"一起广播出去——检索自几千条字幕里的哪几条、
        *   这是第几轮追问、意图是什么。**智能不该是玄学**：用户能看到 AI 真的去查了会议记录，
-       *   而不是凭空编了一段话。这也是最有力的"AI 不是空壳"的现场证据。 */
+       *   而不是凭空编了一段话。这也是最有力的"AI 不是空壳"的现场证据。
+       * ★ 09-25 增 scoped/allDocs：证据的**时间范围**同样属于可信度信息。 */
       ai: {
         mock: !!r.mock, tokens: (r.usage && r.usage.totalTokens) || 0,
         file: r.file || null, path: r.path || null,
         intent: r.intent || null, turns: r.turns || 0,
         hits: (r.hits || []).length, usedHits: r.usedHits || 0, totalDocs: r.totalDocs || 0,
+        scoped: !!r.scoped, allDocs: r.allDocs || 0,
       },
     });
     logEvent('info', 'ai-ask', {

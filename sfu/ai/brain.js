@@ -494,15 +494,61 @@ function buildEvidenceBlock(hits, opts = {}) {
  *   所以"每次有新增就重建"的朴素策略完全够用（**不做增量索引的过度设计**）。
  */
 class RoomBrain {
-  constructor(maxTurns) {
+  /**
+   * @param {number} maxTurns 会话记忆轮数上限
+   * @param {Object} [opts]
+   * @param {number} [opts.joinedAt] 助理**入会时刻**（ms）。给了它，检索就只覆盖
+   *   入会之后的字幕——这是「参会」与「翻档案」的分界线，见下方 scopeEntries。
+   */
+  constructor(maxTurns, opts = {}) {
     this.memory = new ConversationMemory(maxTurns);
+    this.joinedAt = Number(opts.joinedAt) || 0;   // 0 = 不限（处理历史档案）
     this._retriever = null;
     this._indexedCount = -1;
   }
 
+  /**
+   * 会话范围过滤：助理是**参会者**，不是档案检索机。
+   *
+   * ▎为什么需要这一步（一个真实的语义 bug）：
+   *   09-24e 把 aiBrain 从"最近 8 条字幕"升级成"全档 BM25 检索"后，
+   *   助理能翻到**它还没入会时**的旧字幕。翻旧账本身在"楼里刚进来的人问
+   *   刚才说了啥"时是优点，但会让"我入会后听到的"和"它答的"不一致——
+   *   更糟的是**同一房间号被复用**时（房间销毁后号码回收），
+   *   新一场会的助理会把**上一场会**的记录当成本场证据答出来。
+   *   这是"检索能力太强"引入的新缺陷：能力升级要配套补语义边界。
+   *
+   * ▎为什么用 joinedAt 而不是"清空存档"：老字幕仍然要能导出/生成纪要
+   *   （ai-minutes 走的是全档，不受影响），只是**问答的证据范围**收窄到会话内。
+   *   两个用途本来就该用不同的范围，硬合成一个必然有一个不对。
+   *
+   * ▎边界（诚实说明）：joinedAt 是**第一次入会**的时刻，送走再请回来不会重置
+   *   （单次会议的连续对话体验更好）。要真正重开局：房间销毁 or 手动清记忆。
+   */
+  /* ▎边界规则（这一版是修过的——初版写错了，记在这里）：
+   *   初版是 `return inScope.length ? inScope : list`，意思是"会话内没字幕就退回全档"。
+   *   看着很稳妥（"宁可多看不可失明"），实际**把整个范围机制废掉了**：
+   *   只要入会那一刻还没产生新字幕（这是最常见的情况！），过滤就无条件失效，
+   *   助理照样能翻到入会前 / 上一场会的内容——正是要修的那个缺陷。
+   *
+   *   正确规则要区分两种"范围内为空"：
+   *     (a) **档案整体都在入会之前** → 没有任何"我参会期间"的内容。
+   *         此时**就该是空的**（诚实：我没听到过这些），让 AI 老实说"没提到"。
+   *         ← 初版在这里错误地退回了全档。
+   *     (b) 档案里有入会后的内容，只是过滤后为空 → 不可能发生（>= 保证非空）。
+   *
+   *   所以：**不做兜底**。范围就是范围——"我入会后听到的"这件事不能用
+   *   "怕它答不上来"当理由去偷偷扩大。答不上来就诚实说答不上来，
+   *   这也是本项目一以贯之的"宁可留空不可编造"在检索层的同一条原则。 */
+  scopeEntries(entries) {
+    const list = Array.isArray(entries) ? entries : [];
+    if (!this.joinedAt) return list;              // 未设范围 = 历史档案模式（ai-minutes 等用途）
+    return list.filter((e) => (e.ts || 0) >= this.joinedAt);
+  }
+
   /** 拿到与当前字幕同步的检索器（数量没变就复用，避免重复建索引） */
   retriever(entries) {
-    const list = Array.isArray(entries) ? entries : [];
+    const list = this.scopeEntries(entries);
     if (!this._retriever || list.length !== this._indexedCount) {
       this._retriever = new Retriever(list);
       this._indexedCount = list.length;
@@ -567,6 +613,12 @@ class RoomBrain {
       hits: hits.map((h) => ({ name: h.name, text: h.text.slice(0, 80), score: h.score })),
       usedHits: ev.usedHits,
       totalDocs: r.size,
+      /* ★ 09-25：把"检索范围"一并交出去——前端据此在证据链里写「仅检索入会后 N 条」。
+       *   为什么不只在服务端日志里记：这个范围直接影响答案该怎么被信任
+       *   （"我只查了入会后的"和"我翻了你整场会"是两种不同强度的结论），
+       *   用户有权知道。跟 hits/turns 一样，属于"可验证性"的一部分。 */
+      scoped: !!this.joinedAt,
+      allDocs: Array.isArray(entries) ? entries.length : r.size,
       turns: this.memory.length,
     };
   }

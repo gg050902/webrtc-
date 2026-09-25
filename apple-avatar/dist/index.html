@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Apple · AI 助理动态头像 · 资产与集成</title>
+<style>
+:root{
+  --bg:#f7f8fa; --card:#ffffff; --fg:#14161a; --fg2:#5b6472;
+  --line:#e4e7ec; --accent:#2f6fed; --code-bg:#f2f4f7; --radius:14px;
+}
+body.dark{
+  --bg:#0d0f14; --card:#161922; --fg:#eef1f6; --fg2:#9aa4b2;
+  --line:#262b36; --accent:#6b96ff; --code-bg:#11141b;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  transition:background .3s,color .3s;}
+.wrap{max-width:1080px;margin:0 auto;padding:40px 24px 72px}
+header{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;flex-wrap:wrap}
+h1{font-size:26px;margin:0 0 6px;letter-spacing:.3px}
+.sub{color:var(--fg2);font-size:14px;line-height:1.7;max-width:620px}
+.toggle{border:1px solid var(--line);background:var(--card);color:var(--fg);
+  padding:8px 16px;border-radius:999px;cursor:pointer;font-size:13px;white-space:nowrap}
+.toggle:hover{border-color:var(--accent);color:var(--accent)}
+section{margin-top:40px}
+h2{font-size:15px;margin:0 0 16px;color:var(--fg2);font-weight:600;
+  text-transform:uppercase;letter-spacing:1.2px;display:flex;align-items:center;gap:10px}
+h2::after{content:"";flex:1;height:1px;background:var(--line)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:24px}
+.row{display:flex;gap:28px;align-items:flex-end;flex-wrap:wrap}
+.cell{display:flex;flex-direction:column;align-items:center;gap:8px}
+.av{border-radius:50%;overflow:hidden;background:rgba(127,127,127,.06);
+  display:grid;place-items:center;flex:none}
+.av img{width:100%;height:100%;object-fit:contain;display:block}
+.cap{font-size:12px;color:var(--fg2);font-variant-numeric:tabular-nums}
+.states{display:flex;gap:16px;flex-wrap:wrap}
+.st{display:flex;flex-direction:column;align-items:center;gap:8px;
+  padding:14px;border:1px solid var(--line);border-radius:12px;cursor:pointer;
+  background:transparent;transition:.2s;min-width:104px}
+.st:hover{border-color:var(--accent)}
+.st.on{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent)}
+.st img{width:72px;height:72px;object-fit:contain}
+.st .n{font-size:13px;color:var(--fg)}
+.st .d{font-size:11px;color:var(--fg2)}
+pre{background:var(--code-bg);border:1px solid var(--line);border-radius:10px;
+  padding:16px;overflow:auto;font-size:12.5px;line-height:1.75;margin:0}
+code{font-family:"SF Mono",Consolas,Monaco,monospace}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}
+th{color:var(--fg2);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.6px}
+td code{color:var(--accent)}
+.note{font-size:13px;color:var(--fg2);line-height:1.8}
+.pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;
+  border:1px solid var(--line);color:var(--fg2);margin:2px 4px 2px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div>
+    <h1>Apple · AI 助理动态头像</h1>
+    <p class="sub">发光能量核心形态。全部资产为<strong>透明背景</strong>，可直接叠加在任意 UI 底色上；
+    动态版本为<strong>无缝循环</strong>（首尾接缝差异小于动画自身的帧间变化）。</p>
+  </div>
+  <button class="toggle" id="theme">切换深/浅背景</button>
+</header>
+
+<section>
+  <h2>小头像场景 · 实际尺寸</h2>
+  <div class="card">
+    <div class="row">
+      <div class="cell"><div class="av" style="width:40px;height:40px"><img src="anim/apple-idle-64.webp" alt="40px"></div><span class="cap">40px</span></div>
+      <div class="cell"><div class="av" style="width:64px;height:64px"><img src="anim/apple-idle-128.webp" alt="64px"></div><span class="cap">64px</span></div>
+      <div class="cell"><div class="av" style="width:96px;height:96px"><img src="anim/apple-idle-128.webp" alt="96px"></div><span class="cap">96px</span></div>
+      <div class="cell"><div class="av" style="width:120px;height:120px"><img src="anim/apple-idle-256.webp" alt="120px"></div><span class="cap">120px</span></div>
+      <div class="cell"><div class="av" style="width:180px;height:180px"><img src="anim/apple-idle-256.webp" alt="180px"></div><span class="cap">180px</span></div>
+    </div>
+    <p class="note" style="margin:20px 0 0">
+      主体经归一化处理，占画布约 <strong>66%</strong>，因此无论方形还是圆形裁切都不会切到轮廓边缘。
+      五个状态的视觉大小完全一致，切换时不会出现“忽大忽小”。
+    </p>
+  </div>
+</section>
+
+<section>
+  <h2>状态集</h2>
+  <div class="card">
+    <div class="states" id="states"></div>
+    <p class="note" style="margin:18px 0 0">
+      静态图用于低性能场景或不希望动画的时刻（如下载中、页面失焦）。动画则可挂在语音事件上：
+      助手说话时切到 <code>speaking</code>，其余时间回落到 <code>idle</code>。
+    </p>
+  </div>
+</section>
+
+<section>
+  <h2>说话态 · 大画面</h2>
+  <div class="card">
+    <div class="row">
+      <div class="cell"><div class="av" style="width:160px;height:160px"><img src="anim/apple-speaking-256.webp" alt="speaking"></div><span class="cap">256 webp</span></div>
+      <div class="cell"><div class="av" style="width:56px;height:56px"><img src="anim/apple-speaking-128.webp" alt="speaking small"></div><span class="cap">128 webp</span></div>
+      <div class="cell"><div class="av" style="width:40px;height:40px"><img src="anim/apple-speaking-64.webp" alt="speaking tiny"></div><span class="cap">64 webp</span></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>集成代码</h2>
+  <div class="card">
+    <pre><code>&lt;!-- 1. 动态头像：加 autoplay 无关的 img 即可，WebP 原生循环 --&gt;
+&lt;img src="anim/apple-idle-128.webp" style="width:64px;height:64px;border-radius:50%"&gt;
+
+&lt;!-- 2. 按状态切换 --&gt;
+&lt;img id="avatar" src="png/apple-idle-128.png" style="width:64px;height:64px"&gt;
+&lt;script&gt;
+  const el = document.getElementById('avatar');
+  // 助手说话 -> speaking；回答结束 -> idle
+  el.src = speaking ? 'anim/apple-speaking-128.webp' : 'anim/apple-idle-128.webp';
+&lt;/script&gt;
+
+&lt;!-- 3. 需要更高画质时用视频格式（含 VP9 透明 alpha） --&gt;
+&lt;video autoplay muted loop playsinline
+       src="anim/apple-idle-512.webm"
+       style="width:180px;height:180px"&gt;&lt;/video&gt;
+
+&lt;!-- 4. 若UI是深色底，静态PNG可直接1:1使用；浅色底同样可用（已抠透明） --&gt;</code></pre>
+  </div>
+</section>
+
+<section>
+  <h2>资产清单</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>类别</th><th>文件</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>静态 PNG</td><td><code>png/apple-{state}-{size}.png</code></td>
+            <td>state = idle / listening / speaking / thinking / happy；size = 1024·512·256·128·64·40</td></tr>
+        <tr><td>动画 WebP</td><td><code>anim/apple-{idle|speaking}-{256|128|64}.webp</code></td>
+            <td>推荐用于头像：体积小、原生透明、自动循环</td></tr>
+        <tr><td>动画 WebM</td><td><code>anim/apple-{idle|speaking}-512.webm</code></td>
+            <td>VP9 + alpha，用于大尺寸展示或视频式集成</td></tr>
+      </tbody>
+    </table>
+    <p class="note" style="margin:16px 0 0">
+      <span class="pill">透明背景</span><span class="pill">无缝循环</span><span class="pill">主体占比统一 66%</span>
+      <span class="pill">已去水印</span><span class="pill">15fps / 5s</span>
+    </p>
+    <p class="note">建议：≤64px 场景用 128px 资源由浏览器缩放，比直接用 64px 更清晰且省一个文件。</p>
+  </div>
+</section>
+
+</div>
+
+<script>
+const STATES = [
+  ['idle','待机','静息时的默认呼吸态'],
+  ['listening','倾听','收拢为声呐波纹，专注接收'],
+  ['speaking','说话','波环向外发射，配合语音输出'],
+  ['thinking','思考','螺旋深潜，色相偏冷'],
+  ['happy','愉悦','暖光绽放，正反馈时刻'],
+];
+const box = document.getElementById('states');
+STATES.forEach(([k,n,d],i)=>{
+  const b = document.createElement('div');
+  b.className = 'st' + (i===0?' on':'');
+  b.innerHTML = `<img src="png/apple-${k}-128.png" alt="${n}"><span class="n">${n}</span><span class="d">${d}</span>`;
+  b.onclick = ()=>{ document.querySelectorAll('.st').forEach(x=>x.classList.remove('on')); b.classList.add('on'); };
+  box.appendChild(b);
+});
+document.getElementById('theme').onclick = ()=> document.body.classList.toggle('dark');
+</script>
+</body>
+</html>

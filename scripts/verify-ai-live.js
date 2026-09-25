@@ -36,7 +36,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // ── 起真服务器 ──
   const logFile = path.join(os.tmpdir(), `ai-verify-${Date.now()}.log`);
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'sfu', 'server.js')], {
-    env: { ...process.env, PORT: String(PORT), MEDIASOUP_WORKER_NUM: '1' },
+    env: {
+      ...process.env, PORT: String(PORT), MEDIASOUP_WORKER_NUM: '1',
+      // AI_DEBUG_SCOPE=1 → 打印 joinedAt 与检索范围（排查会话范围问题时开）
+      ...(process.env.AI_DEBUG_SCOPE ? { AI_DEBUG_SCOPE: '1' } : {}),
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const logBuf = [];
@@ -96,12 +100,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
    *   正确做法：**先清空、再发请求、只认请求之后到达的消息**（按 ts 过滤）。 */
   const botMsgs = [];
   sock.on('chat-message', (m) => { if (m.from === 'ai-bot') botMsgs.push(m); });
+  /* ⚠️ 入会致辞/离会告别会以 ai-bot 身份广播，它**不是**任何问题的答案。
+   *   本脚本第一版就因此翻了车：setup 阶段的 ai-ask 触发自动入会 → 致辞先到 →
+   *   被当成"对交付时间的回答"，症状看起来像"检索坏了"。
+   *   → 取答案时必须把这类"事件型"消息排除掉。
+   *
+   * ⚠️ 但这个正则**必须收得足够窄**（第二次踩坑）：初版把 `纪要已生成：` 也included在内，
+   *   结果第 ④ 步"帮我整理一下今天聊了啥"的**正确答案**（"📋 纪要已生成：…"）
+   *   被当成事件过滤掉了 → askAndWait 空等 90 秒 → 断言"应有回复"失败。
+   *   判据：只排除**用户没主动要、却被推送到聊天里的**播报（入会/离会/值守定时），
+   *   凡是"回答了某人某句提问"的消息一律**不能**排除，否则就是测试在自欺。 */
+  const EVENT_BROADCAST_RE = /已作为参会者入会|大家好，我是会议 AI 助理|先退会了|值守分段纪要已生成/;
   async function askAndWait(question, timeoutMs = 60000) {
     const t0 = Date.now();
     botMsgs.length = 0;                    // 清空必须先于 emit
     const ack = await emitAck('ai-ask', { question });
     while (Date.now() - t0 < timeoutMs) {
-      const m = botMsgs.find((x) => (x.ts || 0) >= t0);
+      const m = botMsgs.find((x) => (x.ts || 0) >= t0 && !EVENT_BROADCAST_RE.test(x.text || ''));
       if (m) return { ack, msg: m };
       await sleep(150);
     }
@@ -124,18 +139,49 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   if (!roomNumber) { console.log('❌ 建房失败：' + JSON.stringify(created)); cleanup(); process.exit(1); }
   console.log('房间：' + roomNumber + '\n');
 
-  // ── 准备：把"长会"字幕账本写进真 captions 目录（文件名必须用真实房间号）──
+  /* ── 准备：把"长会"字幕账本写进真 captions 目录（文件名必须用真实房间号）──
+   *
+   * ★ 09-25 时间戳重构（本轮踩过的坑，写清楚）：
+   *   问答的证据范围 = **入会之后**。而"入会"发生在第 ① 步 ai-ask 的自动入会那一刻。
+   *   于是这批 fixture 的时间戳决定了整份脚本能不能测出东西：
+   *     · 若写成"入会前"（更早），第 ①~⑥ 步**全部**会因超出范围而答不出 → 假失败；
+   *     · 若写成"入会后"（更晚），第 ⑦ 步就测不出"入会前内容检索不到" → 缺一条真断言。
+   *   两者不可兼得，所以改成**显式两段**：
+   *     · ARCHIVE（这份 fixture）＝ 入会**之前**的会议档案 → 只用来验证第 ⑦ 步的范围边界；
+   *     · SESSION（下面 join 之后追加）＝ 入会**之后**的内容 → 承接第 ①~⑥ 步的检索/记忆/纪要断言。
+   *   这样每条断言都落在正确的范围内，而且范围本身也被正反两面测到了。 */
   capFile = path.join(CAP_DIR, `cap-${roomNumber}-20260924.jsonl`);
   hadCap = fs.existsSync(capFile);
   backup = hadCap ? fs.readFileSync(capFile, 'utf8') : null;
-  const lines = [
-    { ts: Date.now() - 60000, name: '张三', text: '先说结论：交付时间定在 11 月 20 日，这个日期不能再动了' },
-    { ts: Date.now() - 50000, name: '李四', text: '好的我记下了' },
-    ...Array.from({ length: 25 }, (_, i) => ({ ts: Date.now() - 40000 + i * 100, name: '王五', text: `闲聊第 ${i} 条：今天天气不错` })),
-    { ts: Date.now() - 5000, name: '李四', text: '压测报告我负责，周五之前提交' },
-    { ts: Date.now() - 4000, name: '王五', text: 'TURN 账号密码记得轮换，下周一之前完成' },
+  const T_ARCHIVE = Date.now() - 600000;   // 10 分钟前 = 远早于入会时刻
+  const archiveLines = [
+    { ts: T_ARCHIVE, name: '张三', text: '上一场会的旧账：预算总盘子是 999 万，走 A 方案' },
+    { ts: T_ARCHIVE + 1000, name: '李四', text: '好的我记下了' },
+    ...Array.from({ length: 8 }, (_, i) => ({ ts: T_ARCHIVE + 2000 + i * 100, name: '王五', text: `档案里的闲聊第 ${i} 条` })),
   ];
-  fs.writeFileSync(capFile, lines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+  fs.writeFileSync(capFile, archiveLines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+
+  /* 追加"会话内"内容：先触发一次自动入会（建立 joinedAt），再写这批。
+   * ⚠️ 必须用 askAndWait **把这次探测的答案收干净**，不能只 emitAck 就往下走：
+   *   ai-ask 的回执是"已受理"，LLM 的答案还要 2~5 秒后才到，
+   *   而下面第 ① 步也在等 ai-bot 消息 → 会把**"你好"的答案**当成第 ① 步的答案
+   *   （初版就是这样：第 ① 步收到"会议还没有任何发言记录"，看起来像检索坏了，
+   *   实际是前一个问题的答案串进了后一个问题的等待窗口）。
+   *   这也正是 run-to-run 结果飘忽（有时过有时不过）的根源——纯竞态。 */
+  {
+    const probe = await askAndWait('你好', 60000);
+    assert(probe.ack && probe.ack.data && probe.ack.data.started, '首次提问应被受理（触发自动入会）：' + JSON.stringify(probe.ack));
+    await sleep(200);   // 再稳一手：确保 joinedAt 已落定，下面这批的时间戳严格晚于它
+    const T_SESSION = Date.now() + 10;
+    const sessionLines = [
+      { ts: T_SESSION, name: '张三', text: '先说结论：交付时间定在 11 月 20 日，这个日期不能再动了' },
+      { ts: T_SESSION + 100, name: '李四', text: '好的我记下了' },
+      ...Array.from({ length: 25 }, (_, i) => ({ ts: T_SESSION + 200 + i * 10, name: '王五', text: `闲聊第 ${i} 条：今天天气不错` })),
+      { ts: T_SESSION + 500, name: '李四', text: '压测报告我负责，周五之前提交' },
+      { ts: T_SESSION + 600, name: '王五', text: 'TURN 账号密码记得轮换，下周一之前完成' },
+    ];
+    fs.appendFileSync(capFile, sessionLines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+  }
 
   console.log('── ① 检索型问答：关键信息被 25 条闲聊隔开，还能答对吗？──');
   await T('问"交付时间" → 答案包含 11 月 20 日（证明检索真的捞回了第 1 条）', async () => {
@@ -214,6 +260,133 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const invented = /\d+\s*(万|元|亿)/.test(m.text) && !/没提到|没有提到|未提及|没有相关|没有找到/.test(m.text);
     assert(!invented, '不该编造预算数字，实际：' + m.text);
     console.log('     AI 回答：' + m.text.slice(0, 100));
+  });
+
+  /* ══════════ 七、★ 09-25 AI 助手"参加会议"的端到端 ══════════
+   * ▎为什么这几条必须在真服务器上跑：
+   *   入会致辞、离会告别、会话范围都不是纯逻辑——它们依赖
+   *   **setAiBot 的真实调用链**（管线建立 → 快照广播 → chat-message 广播 → 时间戳记账）。
+   *   单测能证明 scopeEntries 过滤对，证明不了"joinedAt 真的被写进了 room 并传给了 brain"。
+   *   这正是 brain.js 吃过的那次亏（模块对、接线断）在服务端的同构风险。 */
+  console.log('\n── ⑦ AI 助手参会：会话范围 / 入会致辞 / 离会告别 ──');
+  /* ⚠️ 顺序有讲究（本轮实测踩过）：会话范围是**入会时刻**决定的，
+   *   而"邀请入会"那条用例必须先 ai-leave 再 ai-join（才能触发致辞），
+   *   一 leave 就把 aiJoinedAt 清零、一 join 又重置成当下 —— 会话范围随之改变，
+   *   后面的"会话内检索"就会因为 fixture 全部落到范围之外而失败。
+   *   所以把**范围类断言放在前面**（用自动入会建立的会话），
+   *   把**致辞/告别类断言放在后面**（它们会重置会话，不再影响前面）。 */
+
+  await T('★ 会话范围生效：入会**之后**的字幕能答出，入会**之前**的档案答不出', async () => {
+    /* 本条是本轮最有价值的一条断言——它直接证明"参会"与"翻档案"的区别。
+     * 两面都要测，缺一面就是假通过：
+     *   ① 档案内容（入会前写入的"预算 999 万"）→ 必须**答不出**（否则范围失效）；
+     *   ② 会话内容（入会后写入的"灰度 12 月 3 日"）→ 必须**答得出**（否则范围过严误伤）。 */
+    const q1 = await askAndWait('上一场会的预算总盘子是多少？');
+    assert(q1.msg, '应有回复');
+    assert(!/999/.test(q1.msg.text),
+      '入会前的档案内容不该被检索到（这正是"参会"语义），实际：' + q1.msg.text);
+    assert(q1.msg.ai && q1.msg.ai.scoped === true, '应标记为受限会话，实际：' + JSON.stringify(q1.msg.ai));
+    assert(q1.msg.ai.allDocs > q1.msg.ai.totalDocs,
+      '应报出"范围内 < 全档"（证明确实过滤了），实际 ' + q1.msg.ai.totalDocs + '/' + q1.msg.ai.allDocs);
+    console.log(`     ① 入会前档案（范围内 ${q1.msg.ai.totalDocs} / 全档 ${q1.msg.ai.allDocs}）：${q1.msg.text.slice(0, 70)}`);
+
+    // ② 入会后补一条新字幕（写进真 jsonl → 服务器下次问答会读到）
+    const fresh = { ts: Date.now() + 10, name: '孙七', text: '入会后新增：灰度发布窗口定在 12 月 3 日晚上八点' };
+    fs.appendFileSync(capFile, JSON.stringify(fresh) + '\n', 'utf8');
+    const q2 = await askAndWait('灰度发布窗口是什么时候？');
+    assert(q2.msg, '应有回复');
+    assert(/12\s*月\s*3\s*日/.test(q2.msg.text),
+      '入会后新增的字幕必须能答出来（否则范围过滤误伤新内容），实际：' + q2.msg.text);
+    console.log('     ② 入会后内容：' + q2.msg.text.slice(0, 80));
+  });
+
+  await T('会话内检索仍有效：关键信息被 25 条闲聊隔开也能捞回', async () => {
+    // 「交付时间 11 月 20 日」在会话内 fixture 的第 1 条，后面垫了 25 条闲聊
+    const { msg: m } = await askAndWait('交付时间是什么时候？');
+    assert(m, '应有回复');
+    assert(/11\s*月\s*20\s*日/.test(m.text), '会话内检索应能隔 25 条捞回首条，实际：' + m.text);
+  });
+
+  await T('room-state 快照里出现 isBot 虚拟成员（前端成员列表据此渲染）', async () => {
+    /* ⚠️ 不能"先 join 再挂监听"——room-state 是**同步广播**的，
+     *   等 ai-join 的 ack 回来时快照早就发完了（本脚本第一版就因此空等 8 秒）。
+     *   正确做法：主动触发一次快照重广播（用一个幂等的 member-state 上报）。 */
+    const st = await new Promise((res) => {
+      const h = (s) => { sock.off('room-state', h); res(s); };
+      sock.on('room-state', h);
+      sock.emit('member-state', { patch: { muted: true } });   // 触发一次快照广播
+      setTimeout(() => { sock.off('room-state', h); res(null); }, 8000);
+    });
+    assert(st && Array.isArray(st.members), '应收到 room-state 快照');
+    const bot = st.members.find((m) => m.isBot);
+    assert(bot, '快照里应有 isBot 成员，实际：' + JSON.stringify(st.members.map((m) => m.id)));
+    assert(bot.id === 'ai-bot', 'bot 的固定 id 应为 ai-bot，实际 ' + bot.id);
+  });
+
+  await T('★ 邀请 AI 入会 → 它作为参会者**开口报到**（含能力与听觉说明）', async () => {
+    /* 前置：前面的 ai-ask 已经**自动**把助理拉进房了，那时它是"静默入会"（不说寒暄）。
+     *   所以这里要先把它送走，才能测"被主动邀请时致辞"这条路径——
+     *   否则 setAiBot 幂等（was===true）会直接跳过致辞，断言必然失败。
+     *   顺带也覆盖了 ai-leave 的连通性。 */
+    await emitAck('ai-leave', {});
+    await sleep(500);
+
+    botMsgs.length = 0;
+    streams.length = 0;
+    const ack = await emitAck('ai-join', {});
+    assert(ack && ack.data && ack.data.aiBot === true, 'ai-join 应成功：' + JSON.stringify(ack));
+    // 致辞是异步广播，给它一点时间到达
+    let hello = null;
+    for (let i = 0; i < 40 && !hello; i++) {
+      hello = botMsgs.find((m) => /已作为参会者入会|大家好/.test(m.text || ''));
+      if (!hello) await sleep(150);
+    }
+    assert(hello, '入会后机器人应发一条报到消息，实收：' + JSON.stringify(botMsgs.map((m) => (m.text || '').slice(0, 40))));
+    assert(/@ai/.test(hello.text), '报到消息应说明用法（@ai），实际：' + hello.text);
+    console.log('     🤖 入会致辞：' + hello.text.split('\n').filter(Boolean).slice(0, 3).join(' / ').slice(0, 160));
+  });
+
+  await T('★ 主动邀请才致辞、自动入会不致辞（否则寒暄会与答案抢道）', async () => {
+    /* 这条守的是本轮修掉的真缺陷：ai-ask 自动入会时若也致辞，
+     *   用户问的第一个问题会被一段寒暄"挡住"（任何取末条 ai-bot 的调用方都会抓错）。 */
+    const logDir = path.join(__dirname, '..', 'sfu', 'logs');
+    const today = new Date().toISOString().slice(0, 10);
+    const jl = path.join(logDir, `app-${today}.jsonl`);
+    assert(fs.existsSync(jl), '应有当天事件日志');
+    const evs = fs.readFileSync(jl, 'utf8').split('\n').filter(Boolean)
+      .map((l) => { try { return JSON.parse(l); } catch (e) { return null; } })
+      .filter((x) => x && x.roomNumber === roomNumber);
+    const ceremonies = evs.filter((e) => e.event === 'ai-join-ceremony');
+    const autoJoins = evs.filter((e) => e.event === 'ai-auto-join');
+    assert(autoJoins.length >= 1, '本流程里应发生过自动入会（setup 阶段的探测提问）');
+    assert(ceremonies.length === 1, '致辞次数应恰好为 1（自动入会那次静默，主动邀请那次致辞），实际 ' + ceremonies.length);
+    console.log(`     自动入会 ${autoJoins.length} 次 / 致辞 ${ceremonies.length} 次（=1，证明自动入会确实静默）`);
+  });
+
+  await T('★ 送走 AI → 告别 + 终稿纪要落盘（值钱的产物在离场那刻交付）', async () => {
+    const dir = path.join(__dirname, '..', 'sfu', 'minutes', String(roomNumber));
+    const before = fs.existsSync(dir) ? fs.readdirSync(dir).length : 0;
+    botMsgs.length = 0;
+    const ack = await emitAck('ai-leave', {});
+    /* ⚠️ ai-leave 的回执是**操作后的新状态**（aiBot:false），不是"成功与否"。
+     *   本脚本第一版断言 aiBot===true → 失败，但服务器行为完全正确——
+     *   是断言写错了语义。这里按真实语义断言（false = 已送走）。 */
+    assert(ack && ack.data && ack.data.aiBot === false, 'ai-leave 后应回 aiBot:false（已送走）：' + JSON.stringify(ack));
+    let bye = null;
+    for (let i = 0; i < 40 && !bye; i++) {
+      bye = botMsgs.find((m) => /退会|告辞|先走|离会/.test(m.text || ''));
+      if (!bye) await sleep(150);
+    }
+    assert(bye, '离会应有一句告别，实收：' + JSON.stringify(botMsgs.map((m) => (m.text || '').slice(0, 40))));
+    // 终稿是异步落盘的（buildMinutes 内含 LLM 调用），给它足够时间
+    let after = before;
+    for (let i = 0; i < 60 && after <= before; i++) {
+      await sleep(500);
+      after = fs.existsSync(dir) ? fs.readdirSync(dir).length : 0;
+    }
+    assert(after > before, `送走时应落一份终稿纪要（${before} → ${after}）`);
+    console.log('     🤖 告别：' + bye.text.slice(0, 90));
+    console.log(`     终稿纪要：${before} → ${after} 份`);
   });
 
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);

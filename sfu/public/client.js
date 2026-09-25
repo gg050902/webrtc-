@@ -1288,7 +1288,13 @@ function appendChat(text, sender, isMe, via, name, ai) {
      *   用户才能判断该不该信这条答案——这是产品诚实的核心，也是本项目的 AI 叙事里
      *   最有说服力的一处（别人演示 AI 只给你看答案，我们给你看证据链）。 */
     const trace = [];
-    if (ai && ai.totalDocs) trace.push(`📚 检索 ${ai.totalDocs} 条字幕取 ${ai.hits || 0} 条`);
+    if (ai && ai.totalDocs) {
+      /* ★ 09-25：把检索**范围**也写出来——"入会后 N 条"与"全档 N 条"是不同的可信度声明，
+       *   用户看到"它只查了入会后的记录"才能正确理解为什么早期内容它答不上来。 */
+      trace.push(ai.scoped && ai.allDocs > ai.totalDocs
+        ? `📚 检索入会后 ${ai.totalDocs} 条取 ${ai.hits || 0} 条（全档 ${ai.allDocs}）`
+        : `📚 检索 ${ai.totalDocs} 条字幕取 ${ai.hits || 0} 条`);
+    }
     if (ai && ai.turns > 1) trace.push(`💬 第 ${ai.turns} 轮`);
     if (ai && ai.intent && ai.intent !== 'question') {
       trace.push(`🎯 ${({ minutes: '生成纪要', recap: '回顾', operator: '远程操作' })[ai.intent] || ai.intent}`);
@@ -2435,6 +2441,28 @@ function reportMyState(patch) {
 let lastMembers = [];   // 最近一次快照（成员列表重建时要用）
 let lastLevels = [];    // 最近一次音量数据（列表重建后要立刻把"说话高亮"补回去）
 
+/* ★ 09-25 AI 助理"活状态"：让"它到底在不在听"可被用户看见。
+ * ▎为什么值得单独维护一个小状态：改造前 bot 行永远写着"聆听中…"——
+ *   这是**无条件的断言**，哪怕 ffmpeg 没装、哪怕房间里没人开麦，它都说"在听"。
+ *   无条件的断言就是谎言（和 AI 结论"报告成功却失败"是同一类缺陷）。
+ *   现在：字幕在进来 → "已聆听 N 条"；一段时间没有新字幕 → "待机中"。
+ * ▎为什么用"字幕条数"当作听觉证据：它恰好是**用户自己也能看到的东西**
+ *   （字幕就在屏幕上），所以这个状态是双方可核对的，不是服务器自说自话。 */
+let botHeard = { count: 0, lastTs: 0 };
+function botHearingNote() {
+  const idleMs = Date.now() - botHeard.lastTs;
+  if (!botHeard.count) return '待机中（暂无字幕）';
+  if (botHeard.lastTs && idleMs < 20000) return `聆听中（已听到 ${botHeard.count} 条）`;
+  return `已听到 ${botHeard.count} 条 · 待机`;
+}
+// 字幕进来时更新该状态并**就地**刷新 bot 行的文案（不整表重建，避免闪）
+function bumpBotHeard() {
+  botHeard.count++;
+  botHeard.lastTs = Date.now();
+  const noteEl = memberListEl.querySelector('.ai-bot-row .m-bot-note');
+  if (noteEl) noteEl.textContent = botHearingNote();
+}
+
 socket.on('room-state', ({ members, expiresAt }) => {
   lastMembers = members || [];
   renderMembers(lastMembers);
@@ -2460,9 +2488,25 @@ function renderMembers(members) {
     row.className = `member-row${isMe ? ' me' : ''}`;
     row.dataset.id = m.id; // ★ D2：说话高亮要按 id 找行，所以把 id 存在 dataset 上
     if (m.isBot) {
-      // ★ 09-19 AI Bot 行：无媒体无网络概念，一张安静的"机器同事"名牌
+      /* ★ 09-19 AI Bot 行：无媒体无网络概念，一张安静的"机器同事"名牌。
+       * ★ 09-25 参会升级：不再是死的"聆听中…"，而是**活的状态**——
+       *   ① 显示它当前真正能听见什么（字幕条数 / 待机），让"它到底在不在听"可验证；
+       *   ② 行尾给一个「提问」按钮，把"@ai 提问"这条隐藏用法变成可点的入口
+       *      （隐藏功能等于没有功能；这是 AI 参会里最容易漏掉的一环）。 */
       row.classList.add('ai-bot-row');
-      row.innerHTML = `<span class="m-id">${ICONS.bot} ${escapeHtml(m.name || 'AI 助理')}<span class="m-bot-note">聆听中…</span></span>`;
+      const note = botHearingNote();   // 由最近一次快照/字幕事件维护的活状态
+      row.innerHTML = `<span class="m-id">${ICONS.bot} ${escapeHtml(m.name || 'AI 助理')}`
+        + `<span class="m-bot-note" title="AI 助理的实时状态">${escapeHtml(note)}</span></span>`;
+      const askBtn = document.createElement('button');
+      askBtn.className = 'btn m-ai-ask-btn';
+      askBtn.textContent = '提问';
+      askBtn.title = '向 AI 助理提问（等价于在聊天里发「@ai 你的问题」）';
+      askBtn.addEventListener('click', () => {
+        const inp = $('chatInput');
+        if (inp) { inp.value = '@ai '; inp.focus(); }
+        log('🤖 在聊天框里输入你的问题（已自动带上 @ai 前缀）');
+      });
+      row.appendChild(askBtn);
       memberListEl.appendChild(row);
       continue;
     }
@@ -4905,6 +4949,7 @@ function handleCaptionMessage(from, msg) {
   capPushLog(entry);
   showCaptionBar(entry.name, msg.text, false);
   if (capHistoryPanel && !capHistoryPanel.classList.contains('hidden')) appendCapHistoryRow(entry);
+  bumpBotHeard();   // ★ 09-25：字幕 = AI 助理"的确在听"的可见证据（见 botHearingNote 注释）
 }
 
 function capPushLog(entry) {
