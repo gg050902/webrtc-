@@ -2064,3 +2064,32 @@ body.rd-mode { overflow: hidden; }
   0%, 100% { color: var(--fg-muted); }
   25%, 75% { color: var(--accent); background: var(--accent-muted); }
 }
+
+/* ── ★ 09-25 快捷问法（AI 能力的"可点击发现"）──
+   隐藏能力等于没有能力：用户不会读文档，但会点按钮。
+   四个问题刻意覆盖两条不同链路（看板 / RAG+意图），一次点击就能演示整条 AI 链路。 */
+.ai-chips {
+  display: flex; flex-wrap: wrap; gap: 5px; align-items: center;
+  padding: 7px 10px 4px;
+  border-top: 1px solid var(--border);
+}
+.ai-chips-h { font-size: 10px; color: var(--fg-faint); margin-right: 2px; }
+.ai-chip {
+  padding: 3px 9px; font: inherit; font-size: 11px; line-height: 1.6;
+  color: var(--accent); background: var(--accent-muted);
+  border: 1px solid var(--accent-border); border-radius: 999px;
+  cursor: pointer; transition: transform .12s, background .12s;
+  white-space: nowrap;
+}
+.ai-chip:hover { background: var(--accent-emphasis, rgba(216, 179, 106, .2)); transform: translateY(-1px); }
+.ai-chip:active { transform: translateY(0) scale(.97); }
+
+/* 看板头的操作按钮：小而安静（它是"顺手出一份"的快捷动作，不是主操作） */
+.board-act {
+  margin-left: auto; padding: 2px 9px; font: inherit; font-size: 10px;
+  color: var(--accent); background: transparent;
+  border: 1px solid var(--accent-border); border-radius: 999px;
+  cursor: pointer; transition: background .14s, opacity .14s; opacity: .8;
+}
+.board-act:hover { background: var(--accent-muted); opacity: 1; }
+.board-act:disabled { opacity: .45; cursor: default; }

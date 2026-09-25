@@ -290,6 +290,91 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     console.log('     🤖 主动发言：' + spoke.text.slice(0, 100));
   });
 
+  // ── ⑨ 快捷问法：真点击 → 真信令 → 真回答 ──
+  console.log('\n── 快捷问法（AI 能力的可点击发现）──');
+  await T('★ AI 入会后，聊天分段的快捷问法按钮出现', async () => {
+    const r = await browser.evaluate(`(() => {
+      const t = document.querySelector('.side-tab[data-side="chat"]');
+      if (t) t.click();
+      const c = document.getElementById('aiChips');
+      return { hidden: c ? c.classList.contains('hidden') : null, n: document.querySelectorAll('.ai-chip').length };
+    })()`);
+    assert(r.hidden === false, 'AI 在场时快捷问法应可见（hidden=' + r.hidden + '）');
+    assert(r.n === 4, '应有 4 个快捷问法，实际 ' + r.n);
+  });
+
+  await T('★ 点一个快捷问法 → 真的发出提问并收到 AI 回答（真点击链路）', async () => {
+    botMsgs.length = 0;
+    // 真点按钮（不是直接调用函数）——这才验证了"事件绑定也没问题"
+    await browser.evaluate(`(() => {
+      const c = document.querySelector('.ai-chip[data-q="这场会都定了什么？"]');
+      if (c) c.click();
+      return true;
+    })()`);
+    let ans = null;
+    for (let i = 0; i < 60 && !ans; i++) {
+      ans = botMsgs.find((m) => m.streamId || (m.ai && m.ai.turns));
+      if (!ans) await sleep(500);
+    }
+    assert(ans, '点快捷问法后应收到 AI 回答，实收：' + JSON.stringify(botMsgs.map((m) => m.text).slice(0, 3)));
+    /* ⚠️ 必须断言"这是一条**回答**，不是一个文件"——初版只断言了"提到决定/日期"，
+     *   而当时意图分类把「这场会都定了什么？」错判成了 minutes（去生成纪要文件了），
+     *   纪要的正文里当然也提到决定与日期 → **断言照样通过**，缺陷被绿的测试放过去了。
+     *   这类"断言太宽 ⇒ 替缺陷站岗"是本项目反复踩的同一个坑（AGENTS 坑 41/44 同源），
+     *   所以这里加一条**负向**断言：产出物形态必须是回答，不是落盘动作。 */
+    assert(!/纪要已生成|\.md/.test(ans.text),
+      '问事实应得到"回答"，不该被当成"要文件"去生成纪要，实际：' + ans.text);
+    /* ★ 清单型问题必须**答全**——这是"看板回喂"这个功能存在的全部理由。
+     *   改造前 BM25 只捞到一条决定（A 方案），交付时间那条被漏掉。 */
+    const one = /11\s*月\s*20/.test(ans.text);
+    const two = /A\s*方案/.test(ans.text);
+    assert(one && two,
+      `「这场会都定了什么」应完整列出两条决定（交付时间 + A 方案），实际：${ans.text}（11月20日=${one} A方案=${two}）`);
+    console.log('     🤖 快捷问法回答：' + ans.text.replace(/\s+/g, ' ').slice(0, 130));
+  });
+
+  await T('★ 看板的「📝 出纪要」按钮真的落盘一份纪要', async () => {
+    const dir = path.join(__dirname, '..', 'sfu', 'minutes', String(roomNumber));
+    const before = fs.existsSync(dir) ? fs.readdirSync(dir).length : 0;
+    await browser.evaluate(`(() => {
+      const t = document.querySelector('.side-tab[data-side="board"]');
+      if (t) t.click();
+      const b = document.getElementById('boardMinutesBtn');
+      if (b) b.click();
+      return true;
+    })()`);
+    let after = before;
+    for (let i = 0; i < 60 && after <= before; i++) {
+      await sleep(500);
+      after = fs.existsSync(dir) ? fs.readdirSync(dir).length : 0;
+    }
+    assert(after > before, `点「出纪要」应真的落盘（${before} → ${after}）`);
+    // 落盘的纪要里应有与看板同源的「决定」小节
+    const files = fs.readdirSync(dir).sort();
+    const md = fs.readFileSync(path.join(dir, files[files.length - 1]), 'utf8');
+    assert(md.includes('## 决定'), '纪要应含与看板同源的「决定」小节');
+    console.log(`     纪要落盘：${before} → ${after} 份，含「决定」小节 ✅`);
+  });
+
+  await T('★ 未读角标：不在聊天分段时来消息会累计', async () => {
+    // 先切到看板分段，再从 Node 侧广播一条聊天
+    await browser.evaluate(`(() => {
+      const t = document.querySelector('.side-tab[data-side="board"]');
+      if (t) t.click();
+      return true;
+    })()`);
+    await sleep(300);
+    sock.emit('chat-message', { text: '角标测试消息' });
+    await sleep(900);
+    const r = await browser.evaluate(`(() => {
+      const el = document.getElementById('chatUnread');
+      return { hidden: el ? el.classList.contains('hidden') : null, text: el ? el.textContent : null };
+    })()`);
+    assert(r.hidden === false, '聊天未读角标应出现，实际 hidden=' + r.hidden);
+    assert(Number(r.text) >= 1, '角标应 ≥1，实际 ' + r.text);
+    console.log('     未读角标：' + r.text);
+  });
+
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
   console.log(`服务器日志：${logFile}`);
   cleanup();

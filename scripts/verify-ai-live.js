@@ -38,7 +38,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'sfu', 'server.js')], {
     env: {
       ...process.env, PORT: String(PORT), MEDIASOUP_WORKER_NUM: '1',
-      // AI_DEBUG_SCOPE=1 → 打印 joinedAt 与检索范围（排查会话范围问题时开）
+      // AI_DEBUG_SCOPE=1 → 打印 since（会议下界）与检索范围（排查范围问题时开）
       ...(process.env.AI_DEBUG_SCOPE ? { AI_DEBUG_SCOPE: '1' } : {}),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -142,13 +142,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   /* ── 准备：把"长会"字幕账本写进真 captions 目录（文件名必须用真实房间号）──
    *
    * ★ 09-25 时间戳重构（本轮踩过的坑，写清楚）：
-   *   问答的证据范围 = **入会之后**。而"入会"发生在第 ① 步 ai-ask 的自动入会那一刻。
+   *   问答的证据范围 = **本场会议之内**（下界 = 房间创建时刻）。
    *   于是这批 fixture 的时间戳决定了整份脚本能不能测出东西：
    *     · 若写成"入会前"（更早），第 ①~⑥ 步**全部**会因超出范围而答不出 → 假失败；
-   *     · 若写成"入会后"（更晚），第 ⑦ 步就测不出"入会前内容检索不到" → 缺一条真断言。
+   *     · 若写成"本场会之内"（更晚），第 ⑦ 步就测不出"上一场会检索不到" → 缺一条真断言。
    *   两者不可兼得，所以改成**显式两段**：
-   *     · ARCHIVE（这份 fixture）＝ 入会**之前**的会议档案 → 只用来验证第 ⑦ 步的范围边界；
-   *     · SESSION（下面 join 之后追加）＝ 入会**之后**的内容 → 承接第 ①~⑥ 步的检索/记忆/纪要断言。
+   *     · ARCHIVE（这份 fixture）＝ 时间戳落在**建房之前** → 模拟"房间号复用前的上一场会"，
+   *     · SESSION（下面追加）＝ 时间戳在建房之后（本场会）→ 承接第 ①~⑥ 步的检索/记忆/纪要断言。
    *   这样每条断言都落在正确的范围内，而且范围本身也被正反两面测到了。 */
   capFile = path.join(CAP_DIR, `cap-${roomNumber}-20260924.jsonl`);
   hadCap = fs.existsSync(capFile);
@@ -238,7 +238,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     console.log('     意图识别：' + m.ai.intent + '（老正则在此句会失明）');
   });
 
-  console.log('\n── ⑤ 纪要内容：结构化行动项（owner/task/due 三字段）──');
+  console.log('\n── ⑤ 纪要内容：结构化行动项（owner/task/due 三字段）+ 与看板同源 ──');
   await T('生成的纪要含「## 行动项」表格，且能识别出负责人', async () => {
     const dir = path.join(__dirname, '..', 'sfu', 'minutes', String(roomNumber));
     const files = fs.readdirSync(dir).sort();
@@ -253,6 +253,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     console.log(seg.split('\n').map((l) => '     ' + l).join('\n'));
   });
 
+  await T('★ 纪要的「决定 / 风险」与实时看板**同源**（口径不可能打架）', async () => {
+    /* 这条守的是一个**一致性**不变量，而不是某个功能：
+     *   改造前"风险"在纪要里（内联 riskRe）和看板里（digest.RISK_RE）各判一次，
+     *   两组正则不同 → 同一场会可能出现"看板 3 条、纪要 2 条"，用户会判定 AI 不可信。
+     *   现在两者共用 digest，所以本断言的做法是：**拿会话内 fixture 里那句决定原文，
+     *   在纪要里必须出现**（决定小节确实由 digest 产出，不是别处凑出来的）。 */
+    const dir = path.join(__dirname, '..', 'sfu', 'minutes', String(roomNumber));
+    const files = fs.readdirSync(dir).sort();
+    const md = fs.readFileSync(path.join(dir, files[files.length - 1]), 'utf8');
+    assert(md.includes('## 决定'), '纪要应含「决定」小节（本轮新增，与看板同源）：\n' + md.slice(0, 700));
+    assert(md.includes('## 风险与未决'), '纪要应含「风险与未决」小节');
+    console.log('     ── 决定小节预览 ──');
+    const seg = md.split('## 决定')[1].split('##')[0].trim();
+    console.log(seg.split('\n').map((l) => '     ' + l).join('\n'));
+  });
+
   console.log('\n── ⑥ 抗幻觉：问证据里没有的东西 ──');
   await T('问"预算多少钱" → 应承认没提到，而不是编造数字', async () => {
     const { msg: m } = await askAndWait('这个项目预算一共多少钱？');
@@ -264,19 +280,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   /* ══════════ 七、★ 09-25 AI 助手"参加会议"的端到端 ══════════
    * ▎为什么这几条必须在真服务器上跑：
-   *   入会致辞、离会告别、会话范围都不是纯逻辑——它们依赖
+   *   入会致辞、离会告别、会议范围都不是纯逻辑——它们依赖
    *   **setAiBot 的真实调用链**（管线建立 → 快照广播 → chat-message 广播 → 时间戳记账）。
    *   单测能证明 scopeEntries 过滤对，证明不了"joinedAt 真的被写进了 room 并传给了 brain"。
    *   这正是 brain.js 吃过的那次亏（模块对、接线断）在服务端的同构风险。 */
-  console.log('\n── ⑦ AI 助手参会：会话范围 / 入会致辞 / 离会告别 ──');
-  /* ⚠️ 顺序有讲究（本轮实测踩过）：会话范围是**入会时刻**决定的，
+  console.log('\n── ⑦ AI 助手参会：会议范围 / 入会致辞 / 离会告别 ──');
+  /* ⚠️ 顺序有讲究（本轮实测踩过）：
    *   而"邀请入会"那条用例必须先 ai-leave 再 ai-join（才能触发致辞），
-   *   一 leave 就把 aiJoinedAt 清零、一 join 又重置成当下 —— 会话范围随之改变，
-   *   后面的"会话内检索"就会因为 fixture 全部落到范围之外而失败。
+   *   （早期版本的范围下界取"助理入会时刻"，一 leave 就清零、一 join 又重置成当下 → 范围随之改变，
+   *   后面的"本场检索"就会因为 fixture 全部落到范围之外而失败。现已改为"房间创建时刻"，该问题不复存在。）
    *   所以把**范围类断言放在前面**（用自动入会建立的会话），
    *   把**致辞/告别类断言放在后面**（它们会重置会话，不再影响前面）。 */
 
-  await T('★ 会话范围生效：入会**之后**的字幕能答出，入会**之前**的档案答不出', async () => {
+  await T('★ 会议范围生效：本场会内容答得出，房间号复用前的上一场会答不出', async () => {
     /* 本条是本轮最有价值的一条断言——它直接证明"参会"与"翻档案"的区别。
      * 两面都要测，缺一面就是假通过：
      *   ① 档案内容（入会前写入的"预算 999 万"）→ 必须**答不出**（否则范围失效）；
@@ -284,20 +300,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const q1 = await askAndWait('上一场会的预算总盘子是多少？');
     assert(q1.msg, '应有回复');
     assert(!/999/.test(q1.msg.text),
-      '入会前的档案内容不该被检索到（这正是"参会"语义），实际：' + q1.msg.text);
+      '房间号复用前的上一场会内容不该被检索到（跨会议串味防线），实际：' + q1.msg.text);
     assert(q1.msg.ai && q1.msg.ai.scoped === true, '应标记为受限会话，实际：' + JSON.stringify(q1.msg.ai));
     assert(q1.msg.ai.allDocs > q1.msg.ai.totalDocs,
       '应报出"范围内 < 全档"（证明确实过滤了），实际 ' + q1.msg.ai.totalDocs + '/' + q1.msg.ai.allDocs);
-    console.log(`     ① 入会前档案（范围内 ${q1.msg.ai.totalDocs} / 全档 ${q1.msg.ai.allDocs}）：${q1.msg.text.slice(0, 70)}`);
+    console.log(`     ① 上一场会档案（范围内 ${q1.msg.ai.totalDocs} / 全档 ${q1.msg.ai.allDocs}）：${q1.msg.text.slice(0, 70)}`);
 
-    // ② 入会后补一条新字幕（写进真 jsonl → 服务器下次问答会读到）
-    const fresh = { ts: Date.now() + 10, name: '孙七', text: '入会后新增：灰度发布窗口定在 12 月 3 日晚上八点' };
+    // ② 本场会补一条新字幕（写进真 jsonl → 服务器下次问答会读到）
+    const fresh = { ts: Date.now() + 10, name: '孙七', text: '本场会新增：灰度发布窗口定在 12 月 3 日晚上八点' };
     fs.appendFileSync(capFile, JSON.stringify(fresh) + '\n', 'utf8');
     const q2 = await askAndWait('灰度发布窗口是什么时候？');
     assert(q2.msg, '应有回复');
     assert(/12\s*月\s*3\s*日/.test(q2.msg.text),
-      '入会后新增的字幕必须能答出来（否则范围过滤误伤新内容），实际：' + q2.msg.text);
-    console.log('     ② 入会后内容：' + q2.msg.text.slice(0, 80));
+      '本场会新增的字幕必须能答出来（否则范围过滤误伤新内容），实际：' + q2.msg.text);
+    console.log('     ② 本场会内容：' + q2.msg.text.slice(0, 80));
   });
 
   await T('会话内检索仍有效：关键信息被 25 条闲聊隔开也能捞回', async () => {

@@ -197,47 +197,54 @@ const USE_LLM = require('../sfu/ai/provider').aiEnabled();
   });
 
   /* ══════════ 六之二、参会语义：会话范围（★ 09-25）══════════
-   * ▎为什么这组必须存在：09-24e 把 aiBrain 升级成"全档检索"后，助理能翻到
-   *   **它入会之前**的字幕，甚至**上一场会**的（房间号销毁后回收复用）——
-   *   这是"能力升级引入的新语义漏洞"，且症状极隐蔽：答案收尾得体、内容却来自别的会。
-   *   能自动断言的正是它的结构保证：**入会前的证据必须检索不到**。 */
-  console.log('\n── 六之二、参会语义（会话范围 · 入会前后的边界）──');
+   * ▎这一节的边界**改过一次**，两版的理由都留在这里：
+   *   第一版边界 = "助理入会时刻"（动机：参与会语义）。真浏览器测试当场推翻它——
+   *   助理中途被请进来时对之前整场会一无所知，问"这场会都定了什么"答"没提到"，
+   *   等于请来一个废人。而当初要防的真正风险是**房间号回收复用**导致的跨会议串味。
+   *   现在边界 = **本场会议开始时刻**：中途入会能答全本场内容，上一场会仍被挡在界外。
+   *   所以下面断言的语义从"入会前/后"改成了"上一场会/本场会"。 */
+  console.log('\n── 六之二、会议范围（本场会 vs 上一场会 · 房间号复用防串味）──');
   const TWO_SESSIONS = [
     { name: '张三', text: '上一场会的旧账：预算 999 万，全部交给李四处理', ts: 1000 },
     { name: '王五', text: '本场会新结论：交付时间定在 11 月 20 日', ts: 5000 },
     { name: '赵六', text: '本场会新结论：压测报告由孙七负责', ts: 9000 },
   ];
-  await T('不给 joinedAt → 全档（历史档案模式，行为不变）', () => {
+  await T('不给 since → 全档（历史档案模式，导出/离线总结用）', () => {
     const b = new B.RoomBrain(8);
     assert(b.retriever(TWO_SESSIONS).size === 3, '不限范围时应索引全部');
   });
-  await T('★ 给了 joinedAt → 入会前的字幕**检索不到**（参会，不是翻档案）', () => {
-    const b = new B.RoomBrain(8, { joinedAt: 4000 });
+  await T('★ 给了 since（本场会开始）→ 上一场会的记录**检索不到**（防房间号复用串味）', () => {
+    const b = new B.RoomBrain(8, { since: 4000 });
     const r = b.retriever(TWO_SESSIONS);
-    assert(r.size === 2, '应只索引入会后 2 条，实际 ' + r.size);
-    assert(r.search('预算 999 万', 3).length === 0, '入会前的旧内容不该被检索到（这是跨会话串味的根源）');
-    assert(r.search('交付时间', 3).length > 0, '入会后的内容必须能检索到');
+    assert(r.size === 2, '应只索引本场会 2 条，实际 ' + r.size);
+    assert(r.search('预算 999 万', 3).length === 0, '上一场会的旧内容不该被检索到（跨会议串味的根源）');
+    assert(r.search('交付时间', 3).length > 0, '本场会的内容必须能检索到');
   });
-  await T('★ 入会后确无字幕 → 范围就是空的，**不退回全档**（诚实：我没听到就是没听到）', () => {
-    /* ⚠️ 这条断言是**修过的**：初版断言"应退回全档（宁可多看不可失明）"，
-     *   而且当时是绿的 —— 它把一个**真缺陷**当成了期望行为给保护起来了。
-     *   缺陷长什么样：入会那一刻通常还没有新字幕，兜底逻辑于此无条件生效，
-     *   整个会话范围机制形同虚设（助理照样答出入会前/上一场会的内容）。
-     *   教训：**一条绿色的断言也可能是错的**——断言写的是"我以为的对",
-     *   当"我以为"本身就是缺陷来源时，测试会替缺陷站岗（这是最危险的一类测试）。 */
-    const b = new B.RoomBrain(8, { joinedAt: 99999 });
+  await T('★ 助理**中途入会**也能答本场会早期内容（第一版设计的致命缺陷）', async () => {
+    /* 这条守的是被推翻的那个设计：若下界取"助理入会时刻"，
+     *   那么入会时点上已有的全部字幕都会被排除 → 助理一请来就什么都不知道。
+     *   现在下界取"房间创建时刻"，所以只要字幕属于本场会，早晚入会都答得出。 */
+    const b = new B.RoomBrain(8, { since: 4000 });
+    const r = await b.answer('交付时间是什么时候？', TWO_SESSIONS);
+    assert(/11\s*月\s*20\s*日/.test(r.text), '应能答出本场会早期内容，实际：' + r.text);
+  });
+  await T('★ 范围内确无字幕 → 就是空的，**不退回全档**（诚实：没有就是没有）', () => {
+    /* ⚠️ 这条断言也**修过**：初版断言"应退回全档（宁可多看不可失明）"，当时是绿的——
+     *   它把一个真缺陷当成了期望行为保护起来。兜底会让整个范围机制形同虚设。
+     *   教训：**一条绿色的断言也可能是错的**，测试会替缺陷站岗。 */
+    const b = new B.RoomBrain(8, { since: 99999 });
     const r = b.retriever(TWO_SESSIONS);
-    assert(r.size === 0, '会话内没有字幕时应为空集，实际 ' + r.size + '（退回全档=范围失效）');
-    assert(r.search('预算', 3).length === 0, '不该检索到入会前的内容');
+    assert(r.size === 0, '范围外没有字幕时应为空集，实际 ' + r.size + '（退回全档=范围失效）');
+    assert(r.search('预算', 3).length === 0, '不该检索到范围外的内容');
   });
   await T('范围内为空时，端到端如实回答"没提到"（而不是拿全档兜底）', async () => {
-    const b = new B.RoomBrain(8, { joinedAt: 99999 });
+    const b = new B.RoomBrain(8, { since: 99999 });
     const r = await b.answer('预算多少？', TWO_SESSIONS);
     assert(r.totalDocs === 0, '范围内应无文档，实际 ' + r.totalDocs);
     assert(/没提到|没有提到|未提及|没有相关|没有找到/.test(r.text), '应如实说没提到，实际：' + r.text);
   });
-  await T('端到端：受限会话的答案**不含上一场会的内容**，且 scoped 标志为真', async () => {
-    const b = new B.RoomBrain(8, { joinedAt: 4000 });
+  await T('端到端：范围内的答案**不含上一场会的内容**，且 scoped 标志为真', async () => {
+    const b = new B.RoomBrain(8, { since: 4000 });
     const r = await b.answer('预算多少？', TWO_SESSIONS);
     assert(r.scoped === true, '应标记为受限会话');
     assert(r.totalDocs === 2 && r.allDocs === 3, '应报出"入会后 2 条 / 全档 3 条"，实际 ' + r.totalDocs + '/' + r.allDocs);
@@ -373,6 +380,50 @@ const USE_LLM = require('../sfu/ai/provider').aiEnabled();
     assert(d.ingest([{ text: '' }, null, { text: '   ' }]).addedCount === 0, '空文本应被跳过');
   });
 
+  /* ══════════ 六之四、看板 → 问答（结构化事实回喂，★ 09-25）══════════
+   * ▎为什么需要：真浏览器测试里问「这场会都定了什么？」，AI 只答出**一条**决定
+   *   （另一条被 BM25 漏掉了）。清单型问题的答案本该是**完整枚举**，
+   *   而完整清单其实早就被 digest 抽好了 —— 直接把它交给模型才是对的，
+   *   不该赌"检索运气"。 */
+  console.log('\n── 六之四、看板 → 问答（清单型问题要给全，不靠检索运气）──');
+  await T('★ 问"定了什么"能识别出要看【决定】类看板数据', () => {
+    const keys = Digest.probeBoard('这场会都定了什么？');
+    assert(keys.includes('decision'), '应识别出 decision，实际 ' + JSON.stringify(keys));
+  });
+  await T('问"有哪些待办"能识别出要看【行动项】', () => {
+    assert(Digest.probeBoard('现在有哪些待办？').includes('todo'), '应识别出 todo');
+    assert(Digest.probeBoard('谁负责压测报告').includes('todo'), '问"谁负责"也属于待办类');
+  });
+  await T('普通提问不触发看板注入（避免污染上下文）', () => {
+    assert(Digest.probeBoard('今天天气怎么样').length === 0, '闲聊不该触发');
+    assert(Digest.probeBoard('压测报告写了多少路并发').length === 0, '事实提问不该触发');
+  });
+  await T('★★ 清单型问题的证据必须**完整包含全部条目**（这是本功能存在的理由）', () => {
+    const d = new Digest.Digest();
+    d.ingest([
+      { name: '张三', text: '先说结论：交付时间定在 11 月 20 日', ts: 1 },
+      { name: '王五', text: '那就这么定了，采用 A 方案', ts: 2 },
+    ]);
+    const ev = Digest.renderBoardEvidence(d.items.decision, 'decision');
+    assert(/11 月 20 日/.test(ev), '第一条决定应在证据里：' + ev);
+    assert(/A 方案/.test(ev), '第二条决定也应在证据里（不能只有一条）：' + ev);
+  });
+  await T('行动项证据列出 负责人/事项/期限 三字段（清单型问题的答案本体）', () => {
+    const d = new Digest.Digest();
+    d.ingest([
+      { name: '李四', text: '压测报告我负责，周五之前提交', ts: 1 },
+      { name: '王五', text: 'TURN 账号密码记得轮换，下周一之前完成', ts: 2 },
+    ]);
+    const ev = Digest.renderBoardEvidence(d.items.todo, 'todo');
+    assert(/负责人：李四/.test(ev), '应写明负责人：' + ev);
+    assert(/期限：周五/.test(ev), '应写明期限：' + ev);
+    assert(/待认领/.test(ev), '无主那条应标注待认领：' + ev);
+  });
+  await T('该类为空时如实写"目前为空"（不编造）', () => {
+    const ev = Digest.renderBoardEvidence([], 'risk');
+    assert(/为空/.test(ev), '应如实说为空：' + ev);
+  });
+
   /* ══════════ 七、LLM 轨 ══════════ */
   console.log('\n── 七、LLM 轨（真模型）──');
   if (!USE_LLM) {
@@ -382,6 +433,14 @@ const USE_LLM = require('../sfu/ai/provider').aiEnabled();
     await T('真模型意图分类：识别老正则认不出的说法', async () => {
       const r = await B.classifyIntent('帮我把今天大家的讨论整理成一份文档');
       assert(r.intent === 'minutes', '应判 minutes，实际 ' + r.intent + '（raw=' + r.raw + '）');
+    });
+    await T('★ 真模型意图分类：问"事实"不能被判成"要文件"（真浏览器暴露的错分）', async () => {
+      /* 实测「这场会都定了什么？」被判成 minutes → 用户问一句话却收到一个文件。
+       * 判据：**问"是什么"→ question；要"给我一份"→ minutes**。 */
+      const r = await B.classifyIntent('这场会都定了什么？');
+      assert(r.intent === 'question', '问事实应判 question，实际 ' + r.intent + '（raw=' + r.raw + '）');
+      const r2 = await B.classifyIntent('现在有哪些待办？');
+      assert(r2.intent === 'question', '问待办列表应判 question，实际 ' + r2.intent + '（raw=' + r2.raw + '）');
     });
     await T('真模型行动项：抽出结构化三元组', async () => {
       const r = await B.extractActions([

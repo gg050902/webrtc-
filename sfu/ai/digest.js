@@ -89,6 +89,52 @@ function normText(t) {
     .slice(0, 120);
 }
 
+/* ══════════════════════════════════════════════════════════════
+ * 七、看板 → 问答：让 AI 消费自己整理出来的结构化事实
+ *
+ * ▎为什么需要这一步（真浏览器测试暴露的"答不全"）：
+ *   用户点「这场会都定了什么？」，AI 答"只提到采用 A 方案"——但看板上明明有两条决定
+ *   （A 方案 + 交付时间 11 月 20 日）。原因是那句话太宽泛，BM25 只在字幕里捞到了
+ *   匹配度最高的那条，**另一条决定就漏了**。
+ *   这类问题的正确答案本来就不该靠"检索运气"——**决定/待办/风险本来就是被结构化抽出来的**，
+ *   直接把它们作为证据交给模型，答案才是**完整**的。
+ *
+ * ▎这也是一个漂亮的闭环：digest 抽出来的结构 → 既渲染成人看的看板 →
+ *   又回喂给 AI 做证据。一份抽取，两种消费，且**用户看到的和 AI 用的是同一份数据**
+ *   （所以他不会遇到"看板上有、问 AI 却说没有"这种最伤信任的不一致）。
+ * ══════════════════════════════════════════════════════════════ */
+
+/** 问题 → 想看哪一类看板信息（可多类；都不像就返回空数组 = 走常规检索） */
+const BOARD_PROBES = [
+  { key: 'decision', re: /(定了什么|都定了|定下|决定|结论|拍板|敲定|通过了什么|达成)/ },
+  { key: 'todo', re: /(待办|行动项|要做|要做的|谁负责|谁来做|任务|安排|认领|todo)/i },
+  { key: 'risk', re: /(风险|隐患|问题点|担心|阻塞|卡在哪)/ },
+];
+function probeBoard(question) {
+  const q = String(question || '');
+  return BOARD_PROBES.filter((p) => p.re.test(q)).map((p) => p.key);
+}
+
+/**
+ * 把看板某一类的条目渲染成给模型的**结构化证据**。
+ * ▎行动项列出 owner/due：因为"谁负责、什么时候交"正是这类问题的答案本体，
+ *   而看板里这三项已经抽好了（不必让模型再从原话里猜）。
+ */
+function renderBoardEvidence(items, kind) {
+  const list = Array.isArray(items) ? items : [];
+  const label = (KIND_META[kind] || {}).label || kind;
+  if (!list.length) return `【本场会议已抽取的${label}】目前为空。`;
+  const lines = [`【本场会议已抽取的${label}】（按时间顺序，来自会议看板的结构化抽取）`];
+  for (const it of list) {
+    if (kind === 'todo') {
+      lines.push(`- 负责人：${it.owner || '（未指定，待认领）'} ｜ 事项：${it.task || it.text} ｜ 期限：${it.due || '（未提及）'}`);
+    } else {
+      lines.push(`- ${it.name}：${it.text}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 class Digest {
   /**
    * @param {Object} [opts]
@@ -213,4 +259,4 @@ class Digest {
   }
 }
 
-module.exports = { Digest, KINDS, KIND_META, normText };
+module.exports = { Digest, KINDS, KIND_META, normText, probeBoard, renderBoardEvidence };

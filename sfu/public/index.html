@@ -424,6 +424,7 @@
             <div class="board-title">
               <span>🧠 会议看板</span>
               <span class="board-sub" id="boardSub">AI 边听边整理</span>
+              <button id="boardMinutesBtn" class="board-act" title="把当前看板与会议内容整理成一份 markdown 纪要（落盘服务器 /minutes/）">📝 出纪要</button>
             </div>
             <div class="board-body" id="boardBody">
               <div class="board-empty" id="boardEmpty">
@@ -441,8 +442,18 @@
           <div class="chat-panel">
             <div class="chat-title">💬 会议聊天 <span class="chat-via">经服务器转发</span></div>
             <div class="chat-messages" id="chatList"></div>
+            <!-- ★ 09-25 快捷问法：把"AI 能干什么"从说明文字变成**可点的按钮**。
+                 隐藏能力等于没有能力——用户不会去读文档，但会点按钮。
+                 只在 AI 助理入会时出现（不在会时点了也是白点）。 -->
+            <div class="ai-chips hidden" id="aiChips">
+              <span class="ai-chips-h">试试问 AI：</span>
+              <button class="ai-chip" data-q="这场会都定了什么？">这场会定了什么</button>
+              <button class="ai-chip" data-q="现在有哪些待办？">有哪些待办</button>
+              <button class="ai-chip" data-q="总结一下刚才聊的内容">总结一下</button>
+              <button class="ai-chip" data-q="帮我生成会议纪要">生成纪要</button>
+            </div>
             <div class="chat-input-bar">
-              <textarea id="chatInput" rows="1" placeholder="说点什么…（Enter 发送）"></textarea>
+              <textarea id="chatInput" rows="1" placeholder="说点什么…（Enter 发送，@ai 问 AI 助理）"></textarea>
               <button id="chatSendBtn" class="btn send">发送</button>
             </div>
           </div>

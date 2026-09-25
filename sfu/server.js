@@ -1531,14 +1531,15 @@ function getRoomBrain(roomNumber) {
   if (!b) {
     const turns = Number(CONFIG.aiMemoryTurns) || 8;   // config 可调（长会想要更长的记忆就调大）
     const room = rooms.get(roomNumber);
-    /* ★ 09-25 参会语义修复：智能体诞生时**记下入会时刻**，检索只覆盖入会之后的字幕。
-     *   为什么必须在这一刻记：原来 RoomBrain 不带时间范围 → 它会把**入会之前**、
-     *   甚至**上一场会**（房间号回收复用）的字幕当成"我听到的"答出来。
-     *   详见 brain.js scopeEntries 的注释。这里把 room.aiJoinedAt 传进去。 */
-    b = new Brain.RoomBrain(turns, { joinedAt: (room && room.aiJoinedAt) || 0 });
+    /* ★ 09-25 会议范围：下界 = **房间创建时刻**（本场会议开始）。
+     *   ⚠️ 这里一开始写的是"助理入会时刻"，被真浏览器测试否掉了——
+     *   助理中途被请进来时会对之前整场会一无所知（"这场会都定了什么"答"没提到"），
+     *   等于请来一个废人。而当初要防的真正风险是**房间号回收复用**导致的跨会议串味，
+     *   那用"房间创建时刻"就能根治。完整推演见 brain.js 的 scopeEntries 注释。 */
+    b = new Brain.RoomBrain(turns, { since: (room && room.createdAt) || 0 });
     roomBrains.set(roomNumber, b);
     if (process.env.AI_DEBUG_SCOPE) {
-      console.log(`[scope-debug] 新建 brain joinedAt=${b.joinedAt} (${b.joinedAt ? new Date(b.joinedAt).toISOString() : '不限'})`);
+      console.log(`[scope-debug] 新建 brain since=${b.since} (${b.since ? new Date(b.since).toISOString() : '不限'})`);
     }
   }
   return b;
@@ -1753,9 +1754,10 @@ function setAiBot(roomNumber, on, opts = {}) {
   const was = !!room.aiBot;
   room.aiBot = !!on;
   if (on) {
-    /* ★ 09-25：记录**首次**入会时刻（重复点开不覆盖——否则会话范围会被推后，
-     *   入会早期聊的内容会凭空"消失"）。这个值 = 检索证据范围的时间下界。 */
-    if (!room.aiJoinedAt) room.aiJoinedAt = Date.now();
+    /* ★ 09-25：这里原先会记 room.aiJoinedAt（检索范围的时间下界）。
+     *   现在下界改为"房间创建时刻"，不再需要按入会时刻记账——
+     *   助理中途入会也能答本场会的全部内容（见 getRoomBrain 的注释与 brain.js 的推演）。 */
+
     // 把当前所有音频路喂给管线（bot 入会晚了也能"听见"在场的每个说话人）
     for (const [pid, owner] of room.producerOwner) {
       const sock = [...room.members].find((m) => m.id === owner);
@@ -1791,7 +1793,7 @@ function setAiBot(roomNumber, on, opts = {}) {
       emitBotSay(roomNumber,
         `👋 大家好，我是会议 AI 助理，已作为参会者入会。\n`
         + `${hear}\n`
-        + `我能做：在聊天里说 **@ai 你的问题**（我基于**本次入会后**的会议内容作答，并会标出检索到哪几条）；`
+        + `我能做：在聊天里说 **@ai 你的问题**（我基于**本场会议**的内容作答，并会标出检索到哪几条）；`
         + `说 **@ai 生成纪要** 我整理成 markdown；字幕开启时我的"听力"最完整。`);
       logEvent('info', 'ai-join-ceremony', {
         roomNumber, pipes: h.live, talkers: h.talkers, degraded: h.degraded,
@@ -1814,7 +1816,6 @@ function setAiBot(roomNumber, on, opts = {}) {
     }).catch(() => {});
     // ★ 09-24e：送走助理 = 本轮对话结束 → 清会话记忆（下一轮重新开始，不继承旧上下文）
     disposeRoomBrain(roomNumber);
-    room.aiJoinedAt = 0;   // ★ 09-25：送走 = 会话结束，下次请回来是一段新会话（范围重新起算）
   }
   broadcastRoomState(roomNumber);
   logEvent('info', on ? 'ai-join' : 'ai-leave', { roomNumber });
@@ -1869,8 +1870,26 @@ async function aiBrain(roomNumber, question, onDelta) {
    * 并把检索结果拼成"证据块"喂模型。 */
   const entries = loadCaptions(roomNumber);
   const brain = getRoomBrain(roomNumber);
-  const extraContext = `会议时长约 ${dur} 分钟，${members.length} 人在线。发言统计：${talkTxt}`
+  let extraContext = `会议时长约 ${dur} 分钟，${members.length} 人在线。发言统计：${talkTxt}`
     + (intent === 'recap' ? '\n（用户想回顾刚才讨论的内容，请按时间线归纳，不要生成正式纪要文档。）' : '');
+
+  /* ★ 09-25：问"决定/待办/风险"这类**结构化问题**时，把看板已抽好的条目作为证据一起给模型。
+   * ▎为什么必须这么做（真浏览器测试暴露）：问「这场会都定了什么？」时，
+   *   光标字幕 BM25 只捞到"采用 A 方案"，**另一条决定（交付时间）就漏了** ——
+   *   答案"答不全"，而这类问题的答案本该是**完整枚举**。
+   *   而完整清单**本来就已经抽好了**（就是用户在看板上看到的那几条），
+   *   直接交给模型即可，不该再赌检索。
+   * ▎副作用是好的：用户看到的看板 = AI 回答的依据，两者**不可能不一致**。 */
+  const probes = Digest.probeBoard(q);
+  if (probes.length) {
+    const board = roomBoards.get(roomNumber);
+    if (board) {
+      const parts = probes.map((k) => Digest.renderBoardEvidence(board.items[k], k));
+      extraContext += '\n\n' + parts.join('\n\n')
+        + '\n（以上是系统已从本场会议中结构化抽取的内容，请**完整**据此回答，不要遗漏其中的条目。）';
+      if (process.env.AI_DEBUG_SCOPE) console.log(`[board-evidence] probes=${probes.join(',')} 注入 ${parts.join('').length} 字`);
+    }
+  }
 
   const r = await brain.answer(q, entries, { extraContext, onDelta, topK: 6 });
   if (process.env.AI_DEBUG_SCOPE) {
@@ -2242,7 +2261,13 @@ function loadCaptions(roomNumber) {
 async function llmMinutes(seg) {
   const transcript = seg.slice(-200).map((e) => `${e.name}: ${e.text}`).join('\n');
   const res = await AI.askLLM([
-    { role: 'system', content: '你是会议纪要助手。基于会议字幕输出 markdown，只含三个小节：## 要点（不超过6条）## 结论（一句话）## 风险与未决（可留"（无）"）。不要编造字幕里没有的内容。行动项由另一个环节单独抽取，你不要写行动项。' },
+    /* ★ 09-25：prompt 从"三个小节"收成"两个小节"——去掉了「风险与未决」。
+     *   为什么：风险现在由**看板那套判据**统一产出（见 buildMinutes 里的 Digest）。
+     *   若这里再让 LLM 写一遍"风险"，同一份纪要里就会出现两份风险清单，
+     *   且两者口径不同（LLM 归纳 vs 规则抽取），互相打架——
+     *   用户看到"看板说这是风险、纪要正文没提"就会怀疑整个 AI 不可信。
+     *   **一个概念只能有一个来源**，这是纪要可信度的地基。 */
+    { role: 'system', content: '你是会议纪要助手。基于会议字幕输出 markdown，只含两个小节：## 要点（不超过6条）## 结论（一句话）。不要编造字幕里没有的内容。行动项与风险点由其他环节单独抽取，你不要写。' },
     { role: 'user', content: `会议字幕：\n${transcript}` },
   ], { label: 'ai-minutes', temperature: 0.3, timeoutMs: 30000, maxTokens: 900, mock: () => { throw new Error('LLM 不可用'); } });
   if (res.mock) throw new Error(res.reason || 'LLM 不可用');
@@ -2271,6 +2296,19 @@ async function buildMinutes(roomNumber, opts = {}) {
   const actRes = await Brain.extractActions(seg);
   const actions = actRes.actions;
 
+  /* ★ 09-25 看板与纪要**同源**（一处判据、两处消费）。
+   * ▎之前在纪要里"风险"是被抽了两遍的：mock 轨用本文件内联的 riskRe，
+   *   实时看板用 digest 的 RISK_RE —— 两组正则不一样，于是同一场会里
+   *   "看板显示了 3 条风险、纪要只写了 2 条"这种矛盾就会真实出现，
+   *   用户看到只会得出一个结论：这套 AI 不可信。
+   * ▎现在改成：纪要里的「决定 / 风险」直接取自 digest（与实时看板**同一份判据、
+   *   同一份实现**），所以两边**天然一致**——不是"努力对齐"，而是结构上不可能不一致。
+   *   这也是为什么值得为看板单独抽一个模块：抽出来之后它才能被两个消费者共用。 */
+  const dig = new Digest.Digest({ maxPerKind: 50 });
+  dig.ingest(seg);
+  const decisions = dig.items.decision;
+  const risks = dig.items.risk;
+
   let body = null;
   let isMock = false;
   if (AI.aiEnabled() && seg.length) {
@@ -2287,12 +2325,7 @@ async function buildMinutes(roomNumber, opts = {}) {
     lines.push('## 关键句节选（最近 12 条）');
     if (seg.length) for (const e of seg.slice(-12)) lines.push(`- ${e.name}："${e.text}"`);
     else lines.push('- （无）');
-    lines.push('');
-    lines.push('## 风险与未决');
-    const riskRe = /(风险|担心|不确定|待定|存疑|可能有问题|卡住|阻塞|来不及)/;
-    const risks = seg.filter((e) => riskRe.test(e.text || '')).slice(-6);
-    if (risks.length) for (const e of risks) lines.push(`- ${e.name}："${e.text}"`);
-    else lines.push('- （无）');
+    // ★ 09-25：「风险与未决」从这里**移除**——改由下方统一的 boardBlock 产出（同源，见上方注释）
     body = lines.join('\n');
   }
 
@@ -2314,13 +2347,30 @@ async function buildMinutes(roomNumber, opts = {}) {
    *   送走助理出终稿 → 立刻又被请回来 → 再送走 → 第二份终稿把第一份盖掉。
    *   纪要是有留存价值的产物，静默覆盖属于数据丢失。加两位秒即可根治。
    *   （文件名格式无人解析——只被列表/下载，见 /minutes/ 路由，故改动安全。） */
+  /* ── ★ 09-25「决定 / 风险」小节：与实时看板同一份判据（见上方 dig 的注释）──
+   * ▎决定是**新增**的小节。在此之前纪要里没有任何地方专门记"会上定下来了什么"——
+   *   而那恰恰是会后再复盘时最容易被扯皮的一件事（"当时到底定没说""我怎么记得不是这样"）。
+   *   现在它会作为独立小节留档，且与会议中大家在看板上看到的**完全一致**。
+   * ▎为什么只列最近 12 条：纪要是给人读的，不是数据库导出；更长会由"关键句节选"兜底，
+   *   完整的看板数据另有留存。宁短勿滥，是文档类产物的基本体面。 */
+  const renderInsight = (title, items) => {
+    const head = ['', `## ${title}`];
+    if (!items.length) return head.concat(['- （无）', '']).join('\n');
+    return head.concat(items.slice(-12).map((it) =>
+      `- **${it.name}**：${it.text}`)).concat(['']).join('\n');
+  };
+  const boardBlock = dig.total
+    ? renderInsight('决定', decisions) + renderInsight('风险与未决', risks)
+      + '\n> 以上两节与会议进行中的「🧠 会议看板」**同源**（同一套判据、同一份实现），口径必然一致。\n'
+    : '';
+
   const stamp = new Date(now).toISOString().slice(0, 19).replace(/[-:T]/g, '');
   const md = [
     `# 会议纪要（${opts.type === 'final' ? '终稿' : '分段'}）· 房间 ${roomNumber}`, '',
     `- 生成时间：${new Date(now).toLocaleString()}`,
     `- 会议时长：约 ${durMin} 分钟；本${opts.type === 'final' ? '场' : '时段'}字幕 ${seg.length} 条（全档 ${entries.length} 条）`,
     `- 发言统计：${talkRows.slice(0, 3).map(([id, v]) => `${aiShortId(id)} 约 ${Math.round(v)}s`).join('、') || '无'}`,
-    actBlock, body, '',
+    actBlock, boardBlock, body, '',
     opts.type === 'final' ? '> 终稿：AI 助理送走 / 房间销毁时自动生成。' : '> 分段纪要：值守期间定时生成。',
     isMock ? '> [Mock] 本地模板生成（无 DEEPSEEK_API_KEY 或 LLM 失败）；配置 key 后本节由 LLM 撰写。' : '> 由 DeepSeek 撰写。',
     '',
@@ -3460,10 +3510,10 @@ io.on('connection', (socket) => {
      *   的信息披露完全一致（否则只有非流式能看到证据链，等于两条路径两种可信度）。 */
     const traceParts = [];
     if (r.totalDocs) {
-      /* ★ 09-25：检索范围要说清楚是"入会后"还是"全档"——这两个数的可信度不同。
-       *   入会前的内容它是"翻档案"（可能有上下文缺失），入会后的才是"亲耳听到"。 */
+      /* ★ 09-25：把检索范围写清楚——"本场会议 N 条"与"全档 M 条"（M>N 说明存档里还有
+       *   房间号复用前 / 更早的会议记录）是两种不同强度的证据，用户有权知道。 */
       traceParts.push(r.scoped && r.allDocs > r.totalDocs
-        ? `📚 检索入会后 ${r.totalDocs} 条字幕取 ${(r.hits || []).length} 条（全档 ${r.allDocs} 条）`
+        ? `📚 本场检索 ${r.totalDocs} 条字幕取 ${(r.hits || []).length} 条（全档 ${r.allDocs} 条）`
         : `📚 检索 ${r.totalDocs} 条字幕取 ${(r.hits || []).length} 条`);
     }
     if (r.turns > 1) traceParts.push(`💬 第 ${r.turns} 轮`);

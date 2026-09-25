@@ -1293,10 +1293,10 @@ function appendChat(text, sender, isMe, via, name, ai) {
      *   最有说服力的一处（别人演示 AI 只给你看答案，我们给你看证据链）。 */
     const trace = [];
     if (ai && ai.totalDocs) {
-      /* ★ 09-25：把检索**范围**也写出来——"入会后 N 条"与"全档 N 条"是不同的可信度声明，
-       *   用户看到"它只查了入会后的记录"才能正确理解为什么早期内容它答不上来。 */
+      /* ★ 09-25：把检索**范围**也写出来——"本场会议 N 条"与"全档 N 条"是不同的可信度声明
+       *   （全档更大说明存档里还有房间号复用前的旧会议记录，本次没有采用）。 */
       trace.push(ai.scoped && ai.allDocs > ai.totalDocs
-        ? `📚 检索入会后 ${ai.totalDocs} 条取 ${ai.hits || 0} 条（全档 ${ai.allDocs}）`
+        ? `📚 本场检索 ${ai.totalDocs} 条取 ${ai.hits || 0} 条（全档 ${ai.allDocs}）`
         : `📚 检索 ${ai.totalDocs} 条字幕取 ${ai.hits || 0} 条`);
     }
     if (ai && ai.turns > 1) trace.push(`💬 第 ${ai.turns} 轮`);
@@ -1342,24 +1342,42 @@ function appendChat(text, sender, isMe, via, name, ai) {
   chatList.scrollTop = chatList.scrollHeight;
 }
 
+/* 把一个问题发给 AI 助理（就是「@ai ...」走的那条路）。
+ * ▎为什么抽成函数：让「快捷问法按钮」与「手打 @ai」走**完全相同**的链路。
+ *   不给快捷方式开特例分支，否则两条路的行为迟早漂移——
+ *   以后若给提问加上限流/去重/权限，只改一处就会漏掉另一处。
+ * @returns {boolean} true = 已作为 AI 提问发出 */
+function sendAiQuestion(question) {
+  const q = String(question || '').trim();
+  if (!q) return false;
+  if (!myRoom) {
+    appendChat('（还没进房间，消息发不出去）', 'system', false);
+    return false;
+  }
+  // ★ 09-19g：@ai 后接「操作/打开/点击…」走 C1 AI 远程操作员（授权卡照弹，与人类同链路）
+  if (/^(操作|打开|点击|帮我操作|远程)/.test(q)) {
+    socket.emit('ai-op', { goal: q });
+    return true;
+  }
+  /* ★ 09-19 AI Bot：提问以信令发出，回答由服务器以 chat-message(from='ai-bot') 广播回来。
+   *   这里**不本地回显**问题——避免"我说的话"与"AI 的回答"分裂成两个来源，
+   *   也保证房间内所有人看到的问答记录完全一致（问答是公开的，不是私聊）。 */
+  socket.emit('ai-ask', { question: q });
+  return true;
+}
+
 function sendChat() {
   const text = chatInput.value.trim();
   if (!text) return;
-  if (!myRoom) {
-    appendChat('（还没进房间，消息发不出去）', 'system', false);
-    return;
-  }
   // ★ 09-19 AI Bot：以「@ai」开头的消息走 ai-ask 问答（服务器应答会以 ai-bot 气泡广播回来）
-  //   ★ 09-19g：@ai 后接「操作/打开/点击…」走 C1 AI 远程操作员（授权卡照弹，与人类同链路）
   if (/^@ai\b|^@ai$/i.test(text) || text.toLowerCase().startsWith('@ai ')) {
     const question = text.replace(/^@ai\b\s*/i, '').trim() || '你好，介绍一下你自己';
-    if (/^(操作|打开|点击|帮我操作|远程)/.test(question)) {
-      socket.emit('ai-op', { goal: question });
-      chatInput.value = '';
-      return;
-    }
-    socket.emit('ai-ask', { question });
+    sendAiQuestion(question);
     chatInput.value = '';
+    return;
+  }
+  if (!myRoom) {
+    appendChat('（还没进房间，消息发不出去）', 'system', false);
     return;
   }
   // ★ D+1 双路径发送：主路 SCTP（mediasoup 自动广播给所有订阅者），兜底信令广播。
@@ -2481,6 +2499,7 @@ socket.on('room-state', ({ members, expiresAt }) => {
    *   任何客户端开关助理，全房的上行节奏会一致地跟着切，不需要额外信令。 */
   const botJustArrived = hasBot && !sfuHasBot;
   sfuHasBot = hasBot;
+  renderAiChips();                     // ★ 09-25：快捷问法只在 AI 在场时显示
   if (botJustArrived) requestBoard();
   // 被控/控制关系也可以通过快照同步（和 remote-state 广播互为兜底）
   if (expiresAt) { remoteExpiresAt = expiresAt; startCountdown(); }
@@ -2638,6 +2657,56 @@ function requestBoard() {
       renderBoard();
     });
   } catch (e) { /* 未连接等异常：看板空着不影响会议 */ }
+}
+
+/* 快捷问法：点一下就把问题填进输入框并发送（等价于手打 "@ai xxx"）。
+ * ▎为什么值得做：AI 的能力是"隐藏"的——用户不知道可以问什么，就不会问。
+ *   把最常用/最能体现智能的四个问题做成按钮，比写一段说明文字有效得多。
+ *   四个问题也是刻意挑的：前两个吃**看板**（考实时消化），
+ *   后两个吃**检索+意图分类**（考 RAG 与动作识别）——一次点击就演示了整条 AI 链路。 */
+function initAiChips() {
+  const chips = $('aiChips');
+  if (!chips) return;
+  chips.addEventListener('click', (e) => {
+    const btn = e.target && e.target.closest ? e.target.closest('.ai-chip') : null;
+    if (!btn) return;
+    const q = btn.dataset.q || '';
+    const inp = $('chatInput');
+    if (inp) inp.value = '';
+    // 直接走 sendChat 那条路（与手打 "@ai …" 完全同一条链路，不做特例分支）
+    sendAiQuestion(q);
+  });
+}
+
+function renderAiChips() {
+  const chips = $('aiChips');
+  if (!chips) return;
+  // 只在 AI 助理入会时显示（它不在会里，点了也只会触发自动入会+回答，反而不如不显示引导）
+  chips.classList.toggle('hidden', !sfuHasBot);
+}
+
+/* 看板头的「📝 出纪要」：看板看够了直接要一份文档，不用回聊天分段再找入口。
+ * ▎这是"看板 → 产物"的最短路径：看板上你刚看到 3 条决定 2 条待办，
+ *   这时候最自然的动作就是"给我一份文件"，而不是切走去找按钮。 */
+function initBoardActions() {
+  const btn = $('boardMinutesBtn');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    if (!myRoom) { showToast('先进房间再生成纪要', 'error'); return; }
+    btn.disabled = true;
+    const old = btn.textContent;
+    btn.textContent = '生成中…';
+    try {
+      const res = await request('ai-minutes', { type: 'segment' });
+      showToast(res.data.mock ? '纪要已生成（[Mock] 本地模板）' : '纪要已生成（LLM 撰写）', 'ok');
+      log(`📝 纪要已生成：${res.data.path}`);
+    } catch (err) {
+      showToast('纪要生成失败：' + (err.message || err), 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = old;
+    }
+  });
 }
 
 function renderMembers(members) {
@@ -6178,5 +6247,8 @@ startLocalMedia();
 initInsecureNotice();
 // ★ 09-25：侧栏分段（成员/看板/聊天）——脚本在 body 末尾，DOM 已就绪，可直接挂事件
 initSideTabs();
-renderBoard();      // 先渲染一次空看板（把"投喂提示"空状态显示出来）
+initAiChips();          // 快捷问法按钮（点一下 = 手打 "@ai …"）
+initBoardActions();     // 看板头的「📝 出纪要」
+renderBoard();          // 先渲染一次空看板（把"投喂提示"空状态显示出来）
 renderChatUnread();
+renderAiChips();        // 初始隐藏（AI 还没入会）
