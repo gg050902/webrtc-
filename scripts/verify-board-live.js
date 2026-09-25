@@ -375,6 +375,70 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     console.log('     未读角标：' + r.text);
   });
 
+  // ── ⑩ AI 语音播报（真浏览器：在 speechSynthesis 上装探针，验证整条链）──
+  console.log('\n── AI 语音播报 ──');
+  const voice = await browser.evaluate(`(() => {
+    const supported = typeof window !== 'undefined' && 'speechSynthesis' in window;
+    const btn = document.getElementById('aiVoiceBtn');
+    return { supported, disabled: btn ? btn.disabled : null, struck: btn ? btn.classList.contains('ai-voice-na') : null };
+  })()`);
+  if (!voice.supported) {
+    /* 环境不支持（无头 Chromium 常见）→ 这时**必须**看到"明确降级"：
+     * 按钮置灰+划线，而不是可点却毫无反应。
+     * ▎这条断言本身有价值：把"没这个能力"如实告诉用户，比静默失效好得多。 */
+    await T('★ 浏览器不支持语音 → 按钮明确置灰划掉（不做"点了没反应"）', () => {
+      assert(voice.disabled === true, '不支持时按钮应禁用，实际 disabled=' + voice.disabled);
+      assert(voice.struck === true, '不支持时按钮应有 ai-voice-na 标记（划线）');
+    });
+    console.log('     （该无头浏览器无 speechSynthesis，已按降级路径验证）');
+  } else {
+    await T('★ 开语音 → AI 说的话被交给语音引擎，且 markdown 已洗掉', async () => {
+      // 装探针：拦下 speak()，记录将要念出的文本（无头环境真播也没声音，验证链即可）
+      await browser.evaluate(`(() => {
+        window.__spoken = [];
+        const ss = window.speechSynthesis;
+        if (!ss.__patched) {
+          ss.speak = (u) => { window.__spoken.push(u.text); };
+          ss.cancel = () => {};
+          ss.__patched = true;
+        }
+        const b = document.getElementById('aiVoiceBtn');
+        if (b) b.click();          // 真点击开启
+        return true;
+      })()`);
+      const on = await browser.evaluate(`(() => {
+        const b = document.getElementById('aiVoiceBtn');
+        return { active: b ? b.classList.contains('active') : null,
+                 speakPatched: !!window.speechSynthesis.__patched };
+      })()`);
+      assert(on.active === true, '开启后按钮应点亮（.active）');
+      assert(on.speakPatched === true, '探针应已装上（否则本用例测不到东西）');
+
+      /* ⚠️ 触发源选择：初版用"主动提醒"来触发，结果念不出任何东西——
+       *   因为主动发言有 45s 冷却（防刷屏），而这轮里它刚说过话 → 被节流掉了。
+       *   教训：测 A 功能时不要用一个**自带节流**的旁路去触发它，
+       *   否则失败原因会指向错误的地方（看起来像"语音坏了"，其实是"没到说话的时候"）。
+       *   改用**确定性触发**：直接问一句 → 回答必然以 ai-bot 消息广播 → 必被播报。 */
+      botMsgs.length = 0;
+      await emitAck('ai-ask', { question: '这场会都定了什么？' });
+      let answer = null;
+      for (let i = 0; i < 70 && !answer; i++) {
+        answer = botMsgs.find((m) => m.text && !/已作为参会者入会/.test(m.text));
+        if (!answer) await sleep(500);
+      }
+      assert(answer, '应收到 AI 回答（否则不是语音的问题）');
+      await sleep(1200);   // 等播报发生
+      const spoken = await browser.evaluate('window.__spoken || []');
+      assert(spoken.length >= 1,
+        'AI 回答应被交给语音引擎，实际 []。回答文本：' + answer.text.slice(0, 80));
+      const joined2 = spoken.join(' | ');
+      assert(/11\s*月|A 方案|定了/.test(joined2), '念出的应是那条回答，实际：' + joined2);
+      // ★ 关键：绝不能念出 markdown 记号
+      assert(!/\*\*|\|/.test(joined2), '语音里不该出现 markdown 记号（** 或 |），实际：' + joined2);
+      console.log('     🔊 实际念出：' + spoken[0].slice(0, 90));
+    });
+  }
+
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
   console.log(`服务器日志：${logFile}`);
   cleanup();

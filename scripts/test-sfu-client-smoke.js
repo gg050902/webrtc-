@@ -1071,6 +1071,74 @@ const emit = (ev, payload) => {
   const capMinutesBtnEl = documentStub.getElementById('capMinutesBtn');
   ok('09-24 纪要按钮已挂接到客户端 JS', !!capMinutesBtnEl);
 
+  /* ---- ★ 09-25 AI 会议看板 + 侧栏分段 + 快捷问法 + 语音（前端契约）----
+   *   ▎这里的断言刻意选"**结构与契约**"而非"渲染细节"（渲染由 verify-board 的真浏览器测）：
+   *     假 DOM 断言渲染细节等于自欺（桩不是浏览器），但它足够验证"线通没通"：
+   *     元素在不在、事件挂没挂、点击有没有发出正确信令。 */
+  const idxHtml = fs.readFileSync(path.join(PUB, 'index.html'), 'utf8');
+  ok('09-25 index.html 含侧栏三分段（成员/看板/聊天）',
+    /data-side="members"/.test(idxHtml) && /data-side="board"/.test(idxHtml) && /data-side="chat"/.test(idxHtml));
+  ok('09-25 index.html 含看板容器与空状态', /id="boardList"/.test(idxHtml) && /id="boardEmpty"/.test(idxHtml));
+  ok('09-25 index.html 含快捷问法区与语音开关',
+    /id="aiChips"/.test(idxHtml) && /id="aiVoiceBtn"/.test(idxHtml));
+  ok('09-25 侧栏改造没丢原有契约 id（memberList/chatList/memberNum）',
+    /id="memberList"/.test(idxHtml) && /id="chatList"/.test(idxHtml) && /id="memberNum"/.test(idxHtml));
+
+  const boardListEl = documentStub.getElementById('boardList');
+  ok('09-25 看板列表元素已挂到客户端 JS（可被渲染）', !!boardListEl);
+  ok('09-25 看板为空时不渲染任何条目（空状态由 boardEmpty 承担）',
+    (boardListEl.children || []).length === 0);
+
+  // 主动拉全量：进房时 client 必须发 ai-board-get（否则晚进房者看到空板）
+  ok('09-25 进房后主动拉取看板全量（ai-board-get，推+拉并存）',
+    rec.emits.includes('ai-board-get'));
+
+  // 服务端推来的看板增量 → 渲染出条目（走真实事件处理链路）
+  const beforeBoard = (boardListEl.children || []).length;
+  emit('ai-board', {
+    counts: { decision: 1, risk: 0, todo: 1, topic: 0 },
+    items: {
+      decision: [{ ts: 1, name: '张三', text: '交付时间定在 11 月 20 日', kind: 'decision' }],
+      risk: [], topic: [],
+      todo: [{ ts: 2, name: '李四', text: '压测报告我负责', kind: 'todo', owner: '李四', task: '提交压测报告', due: '周五' }],
+    },
+    added: { decision: [{ ts: 1, text: '交付时间定在 11 月 20 日' }], risk: [], todo: [], topic: [] },
+    total: 9,
+  });
+  /* ⚠️ 假 DOM 里 appendChild 只往 children 推，**不会把子节点的 innerHTML 汇总到父节点**，
+   *   所以"读 boardList.innerHTML 找内容"永远是空串（初版断言就是这么失败的）。
+   *   必须**递归遍历子树**把每层的 innerHTML/textContent 都收上来——
+   *   这是假 DOM 与真 DOM 的行为差异，写断言时得记住（不是代码的问题）。 */
+  const collectText = (el) => {
+    if (!el) return '';
+    let s = String(el.innerHTML || '') + ' ' + String(el.textContent || '');
+    for (const c of (el.children || [])) s += ' ' + collectText(c);
+    return s;
+  };
+  const boardHtml = collectText(boardListEl);
+  ok('09-25 收到 ai-board 后渲染出看板条目', (boardListEl.children || []).length > beforeBoard);
+  ok('09-25 看板渲染含决定与行动项内容（走真实事件链路）',
+    boardHtml.includes('11 月 20 日') && boardHtml.includes('提交压测报告'), boardHtml.slice(0, 200));
+  ok('09-25 看板行动项显示期限与负责人（三字段结构化呈现）',
+    boardHtml.includes('周五') && boardHtml.includes('李四'), boardHtml.slice(0, 200));
+  ok('09-25 看板内容经过 HTML 转义（原话是用户输入，不转义就是 XSS 直通车）',
+    !/<script/i.test(boardHtml));
+
+  /* 快捷问法：必须与手打 @ai 走**完全相同**的信令（不给快捷方式开特例分支）。
+   * 断言方式：源码里发 ai-ask 的分支只能有一处（在 sendAiQuestion 里），
+   * 若某天有人给 chips 复制了一份发送逻辑，这条会红。 */
+  const clientSrc = fs.readFileSync(path.join(PUB, 'client.js'), 'utf8');
+  const askEmits = (clientSrc.match(/emit\('ai-ask'/g) || []).length;
+  ok('09-25 快捷问法与手打 @ai 共用同一条 ai-ask 链路（只有一处发送点）',
+    askEmits === 1 && /function sendAiQuestion/.test(clientSrc));
+
+  // 语音播报：默认关（绝不默认出声），且不支持时安全降级
+  ok('09-25 AI 语音默认关闭（默认出声会惊吓用户）', /let aiVoiceOn = false/.test(clientSrc));
+  ok('09-25 AI 语音有不支持检测（speechSynthesis 缺失时按钮置灰，不做"点了没反应"）',
+    /SPEECH_OK/.test(clientSrc) && /ai-voice-na/.test(clientSrc));
+  ok('09-25 AI 语音会先洗掉 markdown 再念（不念出星号与表格竖线）',
+    /function speakableText/.test(clientSrc) && /\\\*\\\*\(\[\^\*\]\*\)\\\*\\\*/.test(clientSrc));
+
   /* ════════════════════════════════════════════════════════════════
    * ★ 09-24 真远程桌面（控制端控制台）—— 前端契约断言
    *   ▎这一组守的是"两条控制路径不能串"：控制代理 = 真远程桌面控制台（canvas + 真注入），

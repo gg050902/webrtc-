@@ -2093,3 +2093,20 @@ body.rd-mode { overflow: hidden; }
 }
 .board-act:hover { background: var(--accent-muted); opacity: 1; }
 .board-act:disabled { opacity: .45; cursor: default; }
+
+/* ── ★ 09-25 AI 语音播报按钮 ──
+   开启态用"点亮"，与其它 toggle 型按钮（白板/字幕）保持同一套视觉语言：
+   不用文字变化来提示状态（🔈/🔊 的差别在小字号下几乎看不见）。 */
+#aiVoiceBtn { position: relative; }   /* 给 .active::after 的小圆点定位（父级必须定位） */
+#aiVoiceBtn.active {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  background: var(--accent-muted);
+}
+#aiVoiceBtn.active::after {
+  content: ''; position: absolute; right: 4px; top: 4px;
+  width: 4px; height: 4px; border-radius: 50%; background: var(--accent);
+}
+/* 浏览器不支持 speechSynthesis：按钮置灰并划掉，明示"这台设备上没有这个能力"，
+   而不是让用户点了没反应（"点了没反应"是最让人困惑的交互）。 */
+#aiVoiceBtn.ai-voice-na { text-decoration: line-through; opacity: .45; }

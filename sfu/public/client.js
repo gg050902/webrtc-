@@ -337,6 +337,8 @@ function enterRoom(roomNumber) {
   capBtn.disabled = false;    // ★ 第 29 步：字幕开关（识别不依赖进房，但广播要）
   aiBtn.disabled = false;     // ★ 09-19 AI Bot：邀请助理不依赖媒体（信令功能）
   aiOpBtn.disabled = false;   // ★ 09-19g：AI 操作员入口（授权链路见服务器 ai-op）
+  // ★ 09-25 AI 语音：也在这里放开（updateAiVoiceUi 内部会再判浏览器是否支持 speechSynthesis）
+  updateAiVoiceUi();
   lowBwBtn.disabled = false;  // ★ 第 32 步：省流开关（订阅了别人画面才有意义，进房后放开）
   log(`🏠 已进入房间「${roomNumber}」。把房间号或右上角链接发给别人即可邀请`);
 }
@@ -1190,6 +1192,10 @@ socket.on('chat-message', ({ from, text, ts, msgId, name, ai, streamId }) => {
   // ★ D+1：同一条消息可能从 SCTP 和信令各到一次，msgId 相同的只显示第一条
   if (msgId && seenChatIds.has(msgId)) return;
   if (msgId) markSeenChatId(msgId);
+  /* ★ 09-25：语音播报放在**去重判断之前**——因为流式回答的终态会在下一行被 early-return
+   *   丢掉（增量已渲染过），若把播报放在 appendChat 里，流式答案就永远不会被念出来。
+   *   这类"顺序错了功能静默失效"的坑，只能靠把它写在注释里记住。 */
+  if (from === 'ai-bot') speakAiText(text);
   // ★ 09-24：带 streamId 的是流式回答的"终态"——增量已经在同一个气泡里渲染过了，
   //   这里再插一条就是两遍。（终态仍然必要：给中途进房/丢过流事件的人兜底）
   if (streamId && aiStreamDone.has(streamId)) return;
@@ -2707,6 +2713,101 @@ function initBoardActions() {
       btn.textContent = old;
     }
   });
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * ★ 09-25 AI 语音播报（浏览器原生 speechSynthesis，零依赖）
+ *
+ * ▎为什么给 AI 加"嘴"：它此前只有"耳朵"（服务端音频管线）和"文字嘴"（聊天）。
+ *   会中它主动提醒"这条行动项还没有负责人"时，你若正盯着共享屏幕，
+ *   侧栏那行字很可能根本没被注意到——**提醒没被听见就等于没提醒**。
+ *   语音是唯一能"不占眼球"的提醒通道。
+ *
+ * ▎默认**关**：默认出声会惊吓用户（"这网页怎么突然说话"）。
+ *   这是刻意留给用户主动开启的能力，选择权在用户手里。
+ *   顺带它也是一条无障碍通道（视障用户不必逐条读聊天）。
+ *
+ * ▎为什么不用云 TTS：又贵又要网又要把会议内容发给第三方——
+ *   而这个场景只需要"把已经确定的文本念出来"，浏览器原生能力完全够用。
+ * ══════════════════════════════════════════════════════════════ */
+let aiVoiceOn = false;
+try { aiVoiceOn = localStorage.getItem('sfuAiVoice') === '1'; } catch (e) { /* 隐私模式等：默认关 */ }
+
+const SPEECH_OK = typeof window !== 'undefined' && 'speechSynthesis' in window;
+
+/* 把 markdown 洗成"能念的句子"。
+ * ▎必须洗：AI 的文本里有 `**加粗**`、`@ai`、`/minutes/xxx.md`、表格竖线等，
+ *   直接念会变成"星号星号加粗星号星号""斜杠 minutes 斜杠…"，非常刺耳。
+ *   这也是"给机器读的文本"和"给人听的文本"必须分开处理的典型案例。 */
+function speakableText(md) {
+  return String(md || '')
+    .replace(/```[\s\S]*?```/g, '（代码块）')
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/\*\*([^*]*)\*\*/g, '$1')
+    .replace(/^[#>\-\s|]+/gm, '')
+    .replace(/\|/g, '，')
+    .replace(/https?:\/\/\S+/g, '（链接）')
+    .replace(/\/minutes\/\S+/g, '（纪要文件）')
+    .replace(/@ai/gi, 'A I')
+    .replace(/[📚💬🎯📌⚠️✅👋📋🌙🏁🛰️🔈🤖]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 300);   // 太长的答案念不完会妨碍开会，截断
+}
+
+function speakAiText(text) {
+  if (!aiVoiceOn || !SPEECH_OK) return;
+  const say = speakableText(text);
+  if (!say) return;
+  try {
+    /* ★ 先 cancel 再 speak：会议里 AI 可能连续说几句，
+     *   排队会让语音越来越滞后于会议（说到第三句时会议早走远了）。
+     *   宁可"只说最新那句"，也不要"逐句补念过时信息"。 */
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(say);
+    u.lang = 'zh-CN';
+    u.rate = 1.05;     // 略快于默认：会议场景下默认语速显得拖沓
+    u.pitch = 1.0;
+    // 优先挑一个中文音色（不同系统默认音色不同，不指定可能用英文腔念中文）
+    try {
+      const vs = window.speechSynthesis.getVoices() || [];
+      const zh = vs.find((v) => /zh[-_]?CN|Chinese|中文|普通话/i.test(v.lang + ' ' + v.name));
+      if (zh) u.voice = zh;
+    } catch (e) { /* 音色列表拿不到就用默认 */ }
+    window.speechSynthesis.speak(u);
+  } catch (e) { /* 播报失败绝不影响会议功能（它是增值项，不是主链路） */ }
+}
+
+function updateAiVoiceUi() {
+  const btn = $('aiVoiceBtn');
+  if (!btn) return;
+  btn.classList.toggle('active', aiVoiceOn);
+  btn.textContent = aiVoiceOn ? '🔊 AI 语音' : '🔈 AI 语音';
+  btn.title = !SPEECH_OK
+    ? '当前浏览器不支持语音合成（speechSynthesis），该功能不可用'
+    : (aiVoiceOn
+      ? 'AI 语音播报：已开启（点一下关闭）。AI 说的话会用浏览器语音念出来'
+      : 'AI 语音播报（默认关）：开启后 AI 说的话会用浏览器语音念出来');
+  btn.disabled = !SPEECH_OK || !myRoom;   // 不支持语音 / 还没进房 → 不可点
+  if (!SPEECH_OK) btn.classList.add('ai-voice-na');
+}
+
+function initAiVoice() {
+  const btn = $('aiVoiceBtn');
+  updateAiVoiceUi();
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    aiVoiceOn = !aiVoiceOn;
+    try { localStorage.setItem('sfuAiVoice', aiVoiceOn ? '1' : '0'); } catch (e) { /* 存不了就只在本次生效 */ }
+    if (!aiVoiceOn) { try { window.speechSynthesis.cancel(); } catch (e) { /* */ } }  // 关掉时立刻闭嘴
+    updateAiVoiceUi();
+    log(aiVoiceOn ? '🔊 AI 语音播报已开启（AI 说的话会被念出来）' : '🔈 AI 语音播报已关闭');
+  });
+  /* 某些浏览器 voices 是异步加载的（首次 getVoices 可能返回空数组）。
+   * 挂一次 voiceschanged，让首次播报就能用上中文音色。 */
+  if (SPEECH_OK) {
+    try { window.speechSynthesis.onvoiceschanged = () => { /* 触发一次加载即可，取用时再挑 */ }; } catch (e) { /* */ }
+  }
 }
 
 function renderMembers(members) {
@@ -6249,6 +6350,7 @@ initInsecureNotice();
 initSideTabs();
 initAiChips();          // 快捷问法按钮（点一下 = 手打 "@ai …"）
 initBoardActions();     // 看板头的「📝 出纪要」
+initAiVoice();          // ★ 09-25 AI 语音播报开关（默认关，用户可开）
 renderBoard();          // 先渲染一次空看板（把"投喂提示"空状态显示出来）
 renderChatUnread();
 renderAiChips();        // 初始隐藏（AI 还没入会）

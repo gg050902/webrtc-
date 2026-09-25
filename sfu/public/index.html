@@ -269,6 +269,12 @@
         <button id="aiBtn" class="btn" disabled title="邀请 AI 助理入会（能听全场，聊天里 @ai 提问）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="8.5" width="14" height="9.5" rx="3"/><circle cx="9.5" cy="13.2" r="1" fill="currentColor" stroke="none"/><circle cx="14.5" cy="13.2" r="1" fill="currentColor" stroke="none"/><path d="M12 8.5V5.5M9 5.5h6"/></svg><span>AI 助理</span></button>
         <!-- ★ 09-19g C1 AI 远程操作员：AI 走与人类完全相同的授权卡与输入门禁 -->
         <button id="aiOpBtn" class="btn" disabled title="AI 远程操作员：在被控端授权后自动执行演示操作（计算器 7×8）">🛰️ AI 操作</button>
+        <!-- ★ 09-25 AI 语音播报（浏览器原生 speechSynthesis，零依赖）：
+             让 AI 说的话"能被听见"——它不再只是一个聊天框里的机器人，
+             而是真的会开口提醒（"这条行动项还没有负责人"）。
+             默认**关**：默认出声会惊吓用户；这是刻意留给用户主动开启的能力。
+             同时也是一条无障碍通道（视觉不便者不必读聊天）。 -->
+        <button id="aiVoiceBtn" class="btn" disabled title="AI 语音播报（默认关）：开启后 AI 说的话会用浏览器语音念出来">🔈 AI 语音</button>
         <!-- ★ 09-14 F6：滤镜与虚拟背景（canvas 逐帧处理 + replaceTrack，纯前端零依赖） -->
         <button id="fxBtn" class="btn" disabled title="滤镜/磨皮/虚拟背景（绿幕抠像，经 replaceTrack 上行）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l1.8 4.7 4.7 1.8-4.7 1.8L12 17l-1.8-4.7-4.7-1.8 4.7-1.8L12 4z"/><path d="M18.5 4v3M20 5.5h-3"/></svg><span>滤镜</span></button>
         <!-- ★ 09-17 实时字幕（第 29 步，AI 线 L1）：Web Speech API 识别自己的麦克风，成稿经 SCTP 广播全房 -->
