@@ -295,7 +295,86 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     console.log(seg.split('\n').map((l) => '     ' + l).join('\n'));
   });
 
-  console.log('\n── ⑥ 抗幻觉：问证据里没有的东西 ──');
+  /* ══════════ ⑤b ★ 跨段归并（把按小时切开的纪要合成一份总纪要）══════════
+   * ▎为什么这条必须有：值守挂一夜会产出 7~8 份分段纪要，而没有人会逐份读——
+   *   早上要的是**一份**。这个"map-reduce 的 reduce 半步"此前只存在于离线实验脚本里，
+   *   服务器与界面都没有入口（等于对用户不存在）。本轮补上，所以要守住两件事：
+   *     ① 归并**真的合并了**（不是把几份文件摞在一起——那不算"一份纪要"）；
+   *     ② 没有可归并的源时给**人能看懂的业务提示**，而不是"生成失败：xxx"。 */
+  console.log('\n── ⑤b 跨段归并（分段 → 一份总纪要）──');
+  await T('★ 只有一份源时不硬凑，给出人能看懂的提示（不是"生成失败"）', async () => {
+    /* ⚠️ 这个边界必须用**另一个 socket** 在自己的新房间里测（踩了两回才写对）：
+     *   ① 初版用主 socket 直接 `create-room` → 报"已在房间里"
+     *      （主 socket 早在 E2E 主房间里了，create-room 要求不在任何房间）；
+     *   ② 改成"主 socket 建房 + 第二 socket 加入"也不对——建的是主 socket 的房，
+     *      而 `mergeMinutes` 作用于**当前 socket 所在房间**，主 socket 的房间有纪要。
+     *   正解：**让第二个 socket 自己建房**（create-room 会把建房者自动放进新房间），
+     *        再用它调 merge —— 那才是"一个没有纪要的房间"。
+     *   ▎教训：测"空/边界"状态时，先确认**你操作的确实是那个空对象**，
+     *     而不是"我以为切过去了"（同 AGENTS 坑 44：症状会指向错误的地方）。 */
+    const { io: ioClient } = require('socket.io-client');
+    const sock2 = ioClient(`http://127.0.0.1:${PORT}`, { transports: ['websocket'] });
+    try {
+      await new Promise((res, rej) => {
+        sock2.once('connect', res); sock2.once('connect_error', rej);
+        setTimeout(() => rej(new Error('第二连接超时')), 8000);
+      });
+      const emit2 = (ev, payload, waitMs = 20000) => new Promise((res) => {
+        let done = false;
+        sock2.emit(ev, payload, (r) => { done = true; res(r); });
+        setTimeout(() => { if (!done) res({ error: 'ack 超时' }); }, waitMs);
+      });
+      const fresh = await emit2('create-room', {});
+      assert(fresh && fresh.data && fresh.data.roomNumber,
+        '第二 socket 应能自建房间：' + JSON.stringify(fresh));
+
+      const r = await emit2('ai-minutes', { type: 'merge' });
+      assert(r && r.error, '无源可归并时应返回错误：' + JSON.stringify(r));
+      // 文案必须是人话，且**不能**带"生成失败"这种把业务边界说成故障的前缀
+      assert(!/失败/.test(r.error), '业务边界不该说成"失败"，实际：' + r.error);
+      assert(/纪要|归并/.test(r.error), '提示应说清原因，实际：' + r.error);
+      console.log('     边界提示：' + r.error);
+    } finally {
+      try { sock2.disconnect(); } catch (e) { /* 已断 */ }
+    }
+  });
+
+  await T('★ 两份以上源 → 归并成一份（真的合并去重，不是摞在一起）', async () => {
+    const dir = path.join(__dirname, '..', 'sfu', 'minutes', String(roomNumber));
+    // 再灌一条全新内容并出一份分段纪要，确保"多段内容确有差异"
+    fs.appendFileSync(capFile, JSON.stringify({ ts: Date.now() + 500, name: '孙七', text: '新增待办：监控告警接入要排到下周处理' }) + '\n', 'utf8');
+    const segAck = await emitAck('ai-minutes', { type: 'segment' });
+    assert(segAck && segAck.data && segAck.data.file, '应能出一份分段纪要：' + JSON.stringify(segAck));
+
+    const before = fs.readdirSync(dir).filter((f) => f.endsWith('.md')).length;
+    const merged = await emitAck('ai-minutes', { type: 'merge' });
+    assert(merged && merged.data && merged.data.file, '归并应成功：' + JSON.stringify(merged));
+    assert(merged.data.sources >= 2, '应报告归并了 ≥2 份源，实际 ' + merged.data.sources);
+    assert(/-merged\.md$/.test(merged.data.file), '产物文件名应带 -merged 后缀，实际 ' + merged.data.file);
+
+    const md = fs.readFileSync(path.join(dir, merged.data.file), 'utf8');
+    const after = fs.readdirSync(dir).filter((f) => f.endsWith('.md')).length;
+    assert(after > before, '应多出一份归并产物');
+    assert(/跨时段归并/.test(md), '标题应表明这是跨段归并产物：' + md.slice(0, 200));
+    assert(/归并来源：\*\*\d+\*\* 份/.test(md), '应写明归并了几份源：' + md.slice(0, 300));
+    assert(/监控告警接入/.test(md), '归并产物必须包含较晚那段的新内容（否则是假的归并）');
+
+    /* 结构断言：**小节标题只出现一次**。
+     * 这正是"归并"与"拼接"的分界——直接拼几份文件会得到多个"## 行动项"，
+     * 读起来像 8 份文件摞在一起，那不叫"给用户一份纪要"。 */
+    const actHead = (md.match(/^##\s*行动项/gm) || []).length;
+    assert(actHead <= 1, `「## 行动项」应只出现一次（归并而非拼接），实际 ${actHead} 次`);
+    /* 一级标题也只能有一个（就是系统写的那个）。
+     * 实测踩到：LLM 归并时会自己再写一个 `# 会议纪要 · 房间 xxx`，
+     * 于是产物里出现两个同级标题，读起来像两份文档拼在一起。 */
+    const h1 = (md.match(/^#\s+\S/gm) || []).length;
+    assert(h1 === 1, `一级标题应恰好 1 个（系统写的那个），实际 ${h1} 个（LLM 多写了一个？）`);
+    // 源文件必须保留（归并不删源：删了就查不到细节了）
+    assert(fs.existsSync(path.join(dir, merged.data.file)), '归并产物应落盘');
+    console.log(`     归并 ${merged.data.sources} 份 → ${merged.data.file}（行动项小节 ${actHead} 个）`);
+  });
+
+
   await T('问"预算多少钱" → 应承认没提到，而不是编造数字', async () => {
     const { msg: m } = await askAndWait('这个项目预算一共多少钱？');
     assert(m, '应有回复');

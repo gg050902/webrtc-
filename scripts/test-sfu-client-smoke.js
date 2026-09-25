@@ -1071,6 +1071,16 @@ const emit = (ev, payload) => {
   const capMinutesBtnEl = documentStub.getElementById('capMinutesBtn');
   ok('09-24 纪要按钮已挂接到客户端 JS', !!capMinutesBtnEl);
 
+  /* ★ 09-25「🗂 汇总」跨段归并入口：值守挂一夜会产出 7~8 份分段纪要，
+   *   但没人会逐份读——"早上只看一份"才是用户要的。
+   *   前端契约：入口在位 + 点击必须发 `ai-minutes {type:'merge'}`（不是 segment）。 */
+  ok('09-25 index.html 含「🗂 汇总」入口（跨段归并的下游）',
+    /id="capMergeBtn"/.test(fs.readFileSync(path.join(PUB, 'index.html'), 'utf8')));
+  const capMergeBtnEl = documentStub.getElementById('capMergeBtn');
+  ok('09-25 汇总按钮已挂接到客户端 JS', !!capMergeBtnEl);
+  const mergeEmitsBefore = rec.emits.filter((e) => e === 'ai-minutes').length;
+  if (capMergeBtnEl) guard('汇总按钮点击', () => capMergeBtnEl.dispatch('click'));
+
   /* ---- ★ 09-25 AI 会议看板 + 侧栏分段 + 快捷问法 + 语音（前端契约）----
    *   ▎这里的断言刻意选"**结构与契约**"而非"渲染细节"（渲染由 verify-board 的真浏览器测）：
    *     假 DOM 断言渲染细节等于自欺（桩不是浏览器），但它足够验证"线通没通"：

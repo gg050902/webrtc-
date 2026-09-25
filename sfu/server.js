@@ -2437,6 +2437,135 @@ async function buildMinutes(roomNumber, opts = {}) {
   return { file, path: `/minutes/${roomNumber}/${file}`, markdown: md, mock: isMock, actions, actionsMock: actRes.mock };
 }
 
+/* ══════════════════════════════════════════════════════════════
+ * ★ 09-25 跨段归并（全天 / 跨时段总纪要）
+ *
+ * ▎要解决什么（一个此前只在离线脚本里存在的能力）：
+ *   值守模式每 MINUTES_INTERVAL 出一份**分段纪要**（默认 1 小时一份），
+ *   挂一夜就是 7~8 个文件。可是没有人会去逐份读 8 份纪要——
+ *   用户早上想要的是一份**"昨晚到底发生了什么"**。
+ *   跨段归并（map-reduce 的 reduce 半步）此前只存在于离线实验脚本
+ *   `scripts/summarize.js` 里，**服务器侧与界面上都没有入口**，等于这个能力对用户不存在。
+ *
+ * ▎为什么是"归并已有纪要"而不是"重新吃一遍全部字幕"：
+ *   ① 分段纪要已经过 LLM 归纳，token 量远小于原始字幕（一份 8 小时的会
+ *      字幕可能 20 万字符，而 8 份分段纪要只有几千字符）——**成本差两个数量级**；
+ *   ② 分段纪要里已经包含**人工认领过的行动项**等被加工过的信息，
+ *      重吃字幕会把它们丢掉（见 buildMinutes 里"人 vs 机器"的优先级说明）；
+ *   ③ 这正是 map-reduce 的本意：map 阶段做过的事不要在 reduce 重做。
+ *
+ * ▎降级策略（无 key / LLM 失败时**必须仍然可用**）：
+ *   不编造、不假装成功——改用**确定性的拼接式合并**：按时间顺序把小节的标题与
+ *   列表项合并、按正文去重。它的质量不如 LLM 归纳（不会真的"提炼"），
+ *   但**该有的信息一条不少**，而且用户能从尾部标注看出这是降级产物。
+ *   这比"归并失败，请稍后再试"有用得多——纪要的价值在"早上能看到"，
+ *   不能因为模型不可用就什么都没有。
+ * ══════════════════════════════════════════════════════════════ */
+async function mergeMinutes(roomNumber) {
+  const dir = path.join(MINUTES_DIR, String(roomNumber));
+  const now = Date.now();
+  const stamp = new Date(now).toISOString().slice(0, 19).replace(/[-:T]/g, '');
+
+  // 收拢已有纪要：**排除已归并产物**，否则反复归并会滚雪球（把上次的合并结果再合一次）
+  const files = fs.existsSync(dir)
+    ? fs.readdirSync(dir).filter((f) => f.endsWith('.md') && !f.includes('-merged')).sort()
+    : [];
+  if (files.length < 2) {
+    const e = new Error(files.length === 0
+      ? '这个房间还没有任何纪要（先开字幕、或点「📝 纪要」生成一份）'
+      : '目前只有一份纪要，无需归并（等分段纪要累积到两份以上再汇总）');
+    e.userFacing = true;
+    throw e;
+  }
+
+  const parts = files.map((f) => ({
+    file: f,
+    md: fs.readFileSync(path.join(dir, f), 'utf8'),
+  }));
+  const joined = parts.map((p) => `===== ${p.file} =====\n${p.md}`).join('\n\n');
+
+  let body = null;
+  let isMock = true;
+  try {
+    if (AI.aiEnabled()) {
+      const res = await AI.askLLM([
+        {
+          role: 'system',
+          content: '你是会议纪要编辑。下面是同一场会议**按时间顺序排列的多份分段纪要**，'
+            + '请把它们归并成**一份完整纪要**，输出 markdown：\n'
+            + '- 保留并合并各段的关键信息，**去重**（同一件事在多段里出现只留一次，以最新表述为准）\n'
+            + '- 结构：## 决定 / ## 风险与未决 / ## 行动项（表格：负责人|事项|期限）/ ## 要点（按时间线）\n'
+            + '- **不要输出任何一级标题（#）**，直接从 ## 小节开始（文件头由系统另行写入，\n'
+            + '  否则产出里会出现两个"# 会议纪要"标题——实测就出过这个岔子）\n'
+            + '- **不要编造**分段纪要里没有的内容；信息冲突时保留两种说法并标注"（两处说法不一致）"\n'
+            + '- 不要写"本次归并"之类的话，直接给纪要正文',
+        },
+        { role: 'user', content: joined.slice(0, 24000) },
+      ], { label: 'ai-minutes-merge', temperature: 0.2, timeoutMs: 40000, maxTokens: 1600, mock: () => { throw new Error('LLM 不可用'); } });
+      if (!res.mock && res.text) { body = res.text.trim(); isMock = false; }
+    }
+  } catch (e) {
+    logEvent('warn', 'minutes-merge-llm-failed', { roomNumber, reason: String(e.message).slice(0, 120) });
+  }
+
+  if (!body) {
+    /* 降级：确定性拼接。按 `## 小节` 分组收集各段的列表项，去掉重复行。
+     * ▎为什么要按小节聚合而不是直接拼接全文：直接拼会得到一堆重复的标题
+     *   （每份分段纪要都有"## 行动项"），读起来像 8 份文件摞在一起，
+     *   那和"给用户一份纪要"的承诺不符。 */
+    const buckets = new Map();   // 小节名 -> Set(行)
+    const order = [];
+    for (const p of parts) {
+      let cur = null;
+      for (const line of p.md.split('\n')) {
+        const h = /^##\s+(.+?)\s*$/.exec(line);
+        if (h) {
+          cur = h[1].trim();
+          if (!buckets.has(cur)) { buckets.set(cur, new Set()); order.push(cur); }
+          continue;
+        }
+        if (!cur) continue;
+        const t = line.trim();
+        if (!t || t.startsWith('| ---') || t.startsWith('>')) continue;   // 表格分隔行/引言注释不算内容
+        buckets.get(cur).add(t);
+      }
+    }
+    const lines = ['## 归并要点（按小节合并，已去重）'];
+    for (const k of order) {
+      if (k === '行动项') continue;          // 行动项单独置后，避免和其它小节混在一起
+      lines.push('', `### ${k}`);
+      for (const v of buckets.get(k)) lines.push(v);
+    }
+    if (buckets.has('行动项')) {
+      lines.push('', '## 行动项（各段合并去重）');
+      for (const v of buckets.get('行动项')) lines.push(v);
+    }
+    body = lines.join('\n');
+  }
+
+  const md = [
+    `# 会议纪要（跨时段归并）· 房间 ${roomNumber}`, '',
+    `- 生成时间：${new Date(now).toLocaleString()}`,
+    `- 归并来源：**${files.length}** 份分段/终稿纪要（${files.join('、')}）`,
+    `- 说明：跨段归并 = 把按小时切开的纪要合成一份"这场会到底发生了什么"。`,
+    `  分段纪要仍然保留在本目录下（归并**不删源文件**——源件是逐时段的原始记录，删了就查不到细节了）。`,
+    '',
+    body, '',
+    isMock
+      ? '> [Mock] 确定性拼接式归并（无 DEEPSEEK_API_KEY 或 LLM 失败）：**信息一条不少，但未做语义提炼**。'
+      : '> 由 DeepSeek 归并撰写（含去重与跨段信息合并）。',
+    '',
+  ].join('\n');
+
+  fs.mkdirSync(dir, { recursive: true });
+  const file = `${stamp}-merged.md`;
+  fs.writeFileSync(path.join(dir, file), md, 'utf8');
+  logEvent('info', 'minutes-generated', {
+    roomNumber, type: 'merged', sources: files.length, mock: isMock,
+  });
+  return { file, path: `/minutes/${roomNumber}/${file}`, markdown: md, mock: isMock, sources: files.length };
+}
+
 /** 行动项渲染成 markdown 表格（比清单更紧凑，且 owner/due 缺失一眼可见） */
 function renderActionTable(actions) {
   const list = Array.isArray(actions) ? actions : [];
@@ -3618,18 +3747,32 @@ io.on('connection', (socket) => {
   // ★ 09-19c N2：手动生成纪要（不需要 bot 在场——纪要吃的是字幕账本，人人可取）
   socket.on('ai-minutes', async (payload = {}, callback) => {
     if (!socket.roomNumber || !rooms.get(socket.roomNumber)) return fail(callback, '先进入房间再生成纪要');
-    const type = payload.type === 'final' ? 'final' : 'segment';
+    /* ★ 09-25：多了一种 type = 'merge'（跨段归并）。
+     *   它和分段/终稿是**同一件事的不同粒度**：分段=1 小时，终稿=本次会议，
+     *   归并=把已有的分段合成一份"这场会到底发生了什么"。
+     *   之所以挂在同一个信令上而不是新开一个：调用方（按钮/脚本）拿到的回执结构完全一致，
+     *   前端不需要为它写第二套错误处理（"只有一份纪要无需归并"这类提示直接走同一条路）。 */
+    const type = payload.type === 'final' ? 'final'
+      : (payload.type === 'merge' ? 'merge' : 'segment');
     const since = Number(payload.since) || 0;
     try {
-      const r = await buildMinutes(socket.roomNumber, { type, since });
+      const r = type === 'merge'
+        ? await mergeMinutes(socket.roomNumber)
+        : await buildMinutes(socket.roomNumber, { type, since });
+      const label = type === 'final' ? '终稿' : (type === 'merge' ? '跨段归并' : '分段');
       io.to(socket.roomNumber).emit('chat-message', {
         from: 'ai-bot', name: '🤖 AI 助理',
-        text: `📋 ${type === 'final' ? '终稿' : '分段'}纪要已生成：${r.path}${r.mock ? '（[Mock] 本地模板）' : ''}`,
+        text: `📋 ${label}纪要已生成：${r.path}${r.mock ? '（[Mock] 本地模板）' : ''}`
+          + (type === 'merge' ? `（归并了 ${r.sources} 份分段纪要）` : ''),
         ts: Date.now(),
       });
-      ok(callback, { file: r.file, path: r.path, mock: r.mock });
+      ok(callback, { file: r.file, path: r.path, mock: r.mock, sources: r.sources || 0 });
     } catch (err) {
-      fail(callback, '纪要生成失败：' + err.message);
+      /* ★ 09-25：区分"用户可理解的业务拒绝"与"真出了故障"。
+       *   "只有一份纪要，无需归并"这类不是失败，是**正常的业务边界**，
+       *   前面挂上"纪要生成失败："会让用户以为系统坏了（实际是他点的时机不对）。
+       *   mergeMinutes 用 err.userFacing 标记这类情况。 */
+      fail(callback, err.userFacing ? err.message : ('纪要生成失败：' + err.message));
     }
   });
 

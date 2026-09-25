@@ -5468,6 +5468,34 @@ capExportBtn.addEventListener('click', async () => {
 
 capBtn.addEventListener('click', toggleCaptions);
 
+/* ---- ★ 09-25「🗂 汇总」：跨段归并（把按小时切开的纪要合成一份总纪要）----
+ * ▎为什么和「📝 纪要」并排放在同一个工具条里：它们是同一件事的**不同粒度**
+ *   （分段 = 1 小时 / 终稿 = 本次会议 / 归并 = 把已有分段合成"这场会到底发生了什么"）。
+ *   放在一起，用户才能理解成"粒度选项"，而不是两个互不相干的功能。
+ * ▎值守场景才是它的主场：挂一夜产出 7~8 份分段纪要，没有人会逐份读——
+ *   早上要的就是一份。源文件不删（细节仍可回溯）。 */
+const capMergeBtn = $('capMergeBtn');
+if (capMergeBtn) {
+  capMergeBtn.addEventListener('click', async () => {
+    if (!myRoom) { showToast('先进房间再汇总纪要', 'error'); return; }
+    capMergeBtn.disabled = true;
+    const oldTxt = capMergeBtn.textContent;
+    capMergeBtn.textContent = '汇总中…';
+    try {
+      const res = await request('ai-minutes', { type: 'merge' });
+      showToast(`已归并 ${res.data.sources || 0} 份分段纪要`, 'ok');
+      log(`🗂 跨段归并完成：${res.data.path}（来源 ${res.data.sources || 0} 份）`);
+    } catch (err) {
+      /* 服务器把"只有一份、无需归并"这类**业务边界**也走同一条错误路径，
+       * 所以这里原样展示即可——那条文案本身就是给人看的（不是"生成失败：xxx"）。 */
+      showToast(err.message || String(err), 'error');
+    } finally {
+      capMergeBtn.disabled = false;
+      capMergeBtn.textContent = oldTxt;
+    }
+  });
+}
+
 /* ---- ★ 09-24 AI 会议助理：「📝 纪要」按钮（字幕资产的下游产品）----
  * ▎一路走来：第 29 步攒字幕账本 → 第 30 步把账本归档到服务器 → 现在这一步，
  *   账本第一次被真正"消费"（喂 LLM 出要点/待办/结论）。**账本先建好，AI 自然能长出来**。
