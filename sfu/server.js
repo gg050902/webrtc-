@@ -1881,19 +1881,31 @@ async function aiBrain(roomNumber, question, onDelta) {
    *   直接交给模型即可，不该再赌检索。
    * ▎副作用是好的：用户看到的看板 = AI 回答的依据，两者**不可能不一致**。 */
   const probes = Digest.probeBoard(q);
+  /* ★ 09-25 证据链必须**如实**（真浏览器截图暴露的问题）：
+   *   改造后问「这场会都定了什么？」时，气泡里"看 AI 依据的 2 条原话"展开却是
+   *   「李四午饭吃什么」——因为那一栏此前固定显示 BM25 检索命中，
+   *   而这次答案其实**几乎完全来自看板**（BM25 那几条只是陪衬）。
+   *   于是界面在无声地撒谎：它指着一句闲聊说"这是 AI 回答的依据"。
+   *   用户的信任就是这么丢的——比"不显示证据"更糟（那是误导）。
+   *   → 规则改为：**哪个来源真的驱动了答案，就展示哪个**。
+   *     注入了看板证据 → 展示看板条目；没有 → 才展示检索命中的字幕。 */
+  let boardEvidence = [];
   if (probes.length) {
     const board = roomBoards.get(roomNumber);
     if (board) {
       const parts = probes.map((k) => Digest.renderBoardEvidence(board.items[k], k));
       extraContext += '\n\n' + parts.join('\n\n')
         + '\n（以上是系统已从本场会议中结构化抽取的内容，请**完整**据此回答，不要遗漏其中的条目。）';
+      // 用于证据链展示：与注入给模型的**同一份**条目（不是另取一次，避免两处不一致）
+      boardEvidence = probes.flatMap((k) =>
+        board.items[k].map((it) => ({ name: it.name, text: it.task || it.text, src: '看板' })));
       if (process.env.AI_DEBUG_SCOPE) console.log(`[board-evidence] probes=${probes.join(',')} 注入 ${parts.join('').length} 字`);
     }
   }
 
   const r = await brain.answer(q, entries, { extraContext, onDelta, topK: 6 });
   if (process.env.AI_DEBUG_SCOPE) {
-    console.log(`[scope-debug] answer joinedAt=${brain.joinedAt} 全档=${entries.length} 范围内=${r.totalDocs} scoped=${r.scoped}`);
+    console.log(`[scope-debug] answer since=${brain.since ? new Date(brain.since).toISOString() : 0} 全档=${entries.length} 范围内=${r.totalDocs} scoped=${r.scoped}`);
   }
 
   return {
@@ -1901,6 +1913,7 @@ async function aiBrain(roomNumber, question, onDelta) {
     mock: r.mock, usage: r.usage, ms: r.ms, reason: r.reason,
     hits: r.hits, usedHits: r.usedHits, totalDocs: r.totalDocs, turns: r.turns, intent,
     scoped: r.scoped, allDocs: r.allDocs,
+    evidence: boardEvidence.length ? boardEvidence : (r.hits || []).map((h) => ({ name: h.name, text: h.text, src: '字幕' })),
   };
 }
 
@@ -3522,6 +3535,8 @@ io.on('connection', (socket) => {
     }
     io.to(roomNumber).emit('ai-stream', {
       id: streamId, delta: '', done: true, mock: !!r.mock, trace: traceParts.join(' · '),
+      // ★ 09-25：流式路径也要带证据原话（否则两条路径的信息披露不一致 = 两种可信度）
+      hitList: r.evidence || [],
     });
     io.to(roomNumber).emit('chat-message', {
       from: 'ai-bot', name: '🤖 AI 助理', text: r.text, ts: Date.now(), streamId,
@@ -3535,6 +3550,12 @@ io.on('connection', (socket) => {
         intent: r.intent || null, turns: r.turns || 0,
         hits: (r.hits || []).length, usedHits: r.usedHits || 0, totalDocs: r.totalDocs || 0,
         scoped: !!r.scoped, allDocs: r.allDocs || 0,
+        /* ★ 09-25：把**答案真正的依据**原话一起发给前端（此前只发条数，且固定取检索命中）。
+         *   ▎`r.evidence` 已经是"哪个来源驱动了答案就展示哪个"（见 aiBrain 里的说明）——
+         *     注入了看板证据就是那些条目，否则才是检索命中的字幕。
+         *     用户能真正核对"AI 是照着我说的/看板上的哪句话回答的"：
+         *     **可验证从口号变成事实**（光有数字仍然只能选择相信）。 */
+        hitList: r.evidence || [],
       },
     });
     logEvent('info', 'ai-ask', {

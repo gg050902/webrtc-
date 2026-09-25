@@ -439,6 +439,40 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     });
   }
 
+  // ── ⑪ 证据链可展开（从"取了几条"到"哪几条原话"）──
+  await T('★ 点开证据链能看到 AI 依据的**原话**（可验证性从数字变成事实）', async () => {
+    const r = await browser.evaluate(`(() => {
+      const t = document.querySelector('.side-tab[data-side="chat"]');
+      if (t) t.click();
+      const dets = [...document.querySelectorAll('#chatList .msg-ai-ev')];
+      if (!dets.length) return { found: 0 };
+      // 真点开最后一个（最近那条回答的证据）
+      const d = dets[dets.length - 1];
+      d.open = true;
+      const items = [...d.querySelectorAll('.ev-list li')].map((li) => li.textContent.replace(/\\s+/g, ' ').trim());
+      return {
+        found: dets.length,
+        summary: String(d.querySelector('summary') ? d.querySelector('summary').textContent : ''),
+        count: items.length,
+        items,
+      };
+    })()`);
+    assert(r.found >= 1, '聊天气泡里应出现可展开的证据链，实际 ' + r.found);
+    assert(r.count >= 1, '展开后应能看到具体原话，实际 ' + r.count);
+    assert(/看 AI 依据/.test(r.summary), '折叠标题应说明这是 AI 的依据，实际：' + r.summary);
+    /* ★ 关键：证据必须**如实**。改造前这里固定显示 BM25 检索命中，
+     *   结果问"这场会都定了什么"时证据栏里是「李四午饭吃什么」——
+     *   界面在无声撒谎（指着一句闲聊说"这是 AI 回答的依据"），比不显示证据更糟。
+     *   现在展示的是**真正驱动答案的来源**（看板条目），所以断言它必须是决定内容本身。 */
+    const joined3 = r.items.join(' | ');
+    assert(/11\s*月\s*20|A 方案/.test(joined3),
+      '清单型问题的证据应是**决定本身**（不是检索噪声），实际：' + joined3);
+    assert(!/午饭|天气/.test(joined3),
+      '证据里不该出现闲聊（那说明显示的是检索命中而非真实依据），实际：' + joined3);
+    assert(/看板条目/.test(r.summary), '来自看板的证据应标明来源，实际：' + r.summary);
+    console.log(`     🔍 ${r.summary} → ${r.items[0].slice(0, 70)}`);
+  });
+
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
   console.log(`服务器日志：${logFile}`);
   cleanup();

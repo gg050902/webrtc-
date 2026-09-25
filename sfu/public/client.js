@@ -1223,10 +1223,12 @@ function updateAiModeUi() {
 const aiStreamNodes = new Map();   // streamId -> 正在打字中的气泡 DOM
 const aiStreamDone = new Set();    // 已靠增量渲染完成的 streamId（终态消息据此去重）
 const streamTraces = new Map();    // ★ 09-24e streamId -> 待补的"检索过程"文字（done 帧到达时插入气泡）
+const streamHits = new Map();      // ★ 09-25 streamId -> 待补的"证据原话"列表（同上）
 
-socket.on('ai-stream', ({ id, delta, done, mock, trace }) => {
+socket.on('ai-stream', ({ id, delta, done, mock, trace, hitList }) => {
   let box = aiStreamNodes.get(id);
   if (trace) streamTraces.set(id, String(trace).slice(0, 200));   // 元信息先存着，done 时插入
+  if (hitList) streamHits.set(id, hitList);                       // ★ 09-25：证据原话同样先存后插
   if (!box) {
     const node = document.createElement('div');
     node.className = 'msg';
@@ -1271,6 +1273,16 @@ socket.on('ai-stream', ({ id, delta, done, mock, trace }) => {
       traceEl.textContent = t;
       box.node.insertBefore(traceEl, box.textEl);
       streamTraces.delete(id);
+      /* ★ 09-25：紧跟着插入"可展开的证据原话"——trace 只说"取了几条"，
+       *   details 让用户能真的看到那几条是什么（数字 → 事实）。 */
+      const evHtml = traceEvidenceHtml(null, streamHits.get(id));
+      if (evHtml) {
+        const evEl = document.createElement('div');
+        evEl.className = 'msg-ai-ev-wrap';
+        evEl.innerHTML = evHtml;
+        box.node.insertBefore(evEl, box.textEl);
+        streamHits.delete(id);
+      }
     }
     aiStreamNodes.delete(id);
     aiStreamDone.add(id);
@@ -1326,6 +1338,7 @@ function appendChat(text, sender, isMe, via, name, ai) {
       `<div class="msg-name">🤖 ${escapeHtml(name || 'AI 助理')}<span class="msg-via" title="AI 会议助理">AI</span>` +
       `<span class="msg-ai-mode${mode === 'Mock' ? ' mock' : ''}" title="这条答案由${mode === 'Mock' ? '本地规则（未接 LLM）' : 'DeepSeek 模型'}生成">${mode}</span>${meta}</div>` +
       traceHtml +
+      traceEvidenceHtml(ai, null) +
       `<div class="msg-text">${escapeHtml(text)}${link ? '<br>' + link : ''}</div>` +
       `<div class="msg-time">${new Date().toLocaleTimeString()}</div>`;
   } else {
@@ -2808,6 +2821,29 @@ function initAiVoice() {
   if (SPEECH_OK) {
     try { window.speechSynthesis.onvoiceschanged = () => { /* 触发一次加载即可，取用时再挑 */ }; } catch (e) { /* */ }
   }
+}
+
+/* ★ 09-25 证据链（可展开）：把"AI 检索到了哪几条字幕"从数字变成**能看到原话**。
+ * ▎为什么这一步重要：此前气泡上只有"📚 检索 29 条字幕取 1 条"——那仍然只是一个**数字**，
+ *   用户只能选择相信或不相信。把原话摊开之后，用户才能自己核对
+ *   "它是不是照着我说的那句回答的"，这才是"可验证"从口号变成事实。
+ * ▎做成 <details> 折叠而不是默认展开：默认展开会把每条答案的气泡撑得很长，
+ *   把"随时能查"变成"每条都要滚"——可验证不该以牺牲可读性为代价。
+ * @returns {string} HTML（全部经 escapeHtml，原话是用户输入） */
+function traceEvidenceHtml(ai, streamHitList) {
+  const list = (streamHitList && streamHitList.length) ? streamHitList
+    : ((ai && ai.hitList) || []);
+  if (!list.length) return '';
+  /* ★ 09-25：标注每条依据的**来源**（看板条目 / 会议字幕）。
+   *   为什么要标：两者可信度不同——"看板条目"是系统结构化抽取过的（可能有抽取误差），
+   *   "会议字幕"是原话。不标来源就分不清"AI 引用的是整理结果还是原始发言"。 */
+  const isBoard = list.some((h) => h.src === '看板');
+  const rows = list.map((h) =>
+    `<li>${h.src ? `<span class="ev-src">${escapeHtml(h.src)}</span>` : ''}`
+    + `<span class="ev-who">${escapeHtml(h.name || '成员')}</span>`
+    + `<span class="ev-text">${escapeHtml(h.text || '')}</span></li>`).join('');
+  return `<details class="msg-ai-ev"><summary>🔍 看 AI 依据的 ${list.length} 条${isBoard ? '看板条目' : '原话'}</summary>`
+    + `<ol class="ev-list">${rows}</ol></details>`;
 }
 
 function renderMembers(members) {
