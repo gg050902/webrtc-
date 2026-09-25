@@ -2141,3 +2141,23 @@ body.rd-mode { overflow: hidden; }
   font-size: 9px; color: var(--fg-faint); background: rgba(255, 255, 255, .05);
   border: 1px solid var(--border);
 }
+
+/* ── ★ 09-25 看板「我来」认领按钮 ──
+   刻意做得小而克制：一条无主行动项上只有一个动作，不需要抢视觉；
+   但它必须**可发现**（就贴在"待认领"徽标旁），否则认领这个能力等于没有。 */
+.board-item .bi-claim {
+  margin: 4px 0 0 6px; padding: 1px 9px;
+  font: inherit; font-size: 10px; line-height: 1.7;
+  color: #86a876; background: rgba(134, 168, 118, .12);
+  border: 1px solid rgba(134, 168, 118, .38); border-radius: 999px;
+  cursor: pointer; transition: background .14s, transform .12s;
+}
+.board-item .bi-claim:hover { background: rgba(134, 168, 118, .22); transform: translateY(-1px); }
+.board-item .bi-claim:disabled { opacity: .5; cursor: default; transform: none; }
+
+/* 行动项的负责人徽标（认领后出现）：必须看得见"谁负责"，否则看板不算完整 */
+.board-item .bi-owner {
+  padding: 0 5px; border-radius: 999px; font-size: 9px;
+  color: #86a876; background: rgba(134, 168, 118, .12);
+  border: 1px solid rgba(134, 168, 118, .34);
+}

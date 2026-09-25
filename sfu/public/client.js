@@ -2627,14 +2627,32 @@ function renderBoard() {
        * 用 ts+text 组合而不是纯 ts——同一毫秒可能来两条。 */
       if (boardNewKeys.has(`${k.key}|${it.ts}|${String(it.text).slice(0, 20)}`)) row.classList.add('is-new');
       // ★ 全部走 escapeHtml：看板内容是**用户说的原话**，不转义就是 XSS 直通车
+      /* ★ 09-25 行动项的三字段都要看得见（真浏览器测试暴露的 UI 缺口）：
+       *   认领之后界面上只少了"待认领"三个字，**却没显示负责人是谁**——
+       *   用户会问"那到底谁负责？"。行动项的价值就是"谁 / 做什么 / 何时"三件事，
+       *   少一件这块看板就等于没做完。所以负责人要单独成一枚徽标。 */
+      const ownerChip = (k.key === 'todo' && it.owner)
+        ? `<span class="bi-owner" title="已认领的负责人">👤 ${escapeHtml(it.owner)}</span>` : '';
       const meta = `<div class="bi-meta"><span class="bi-who">${escapeHtml(it.name || '成员')}</span>`
+        + ownerChip
         + `${it.due ? `<span class="bi-due">${escapeHtml(it.due)}</span>` : ''}</div>`;
       // 行动项显示"任务"字段（结构化后的 clean 版），其余类目显示原话
       const bodyText = k.key === 'todo' && it.task ? it.task : it.text;
       let body = `<div class="bi-text">${escapeHtml(bodyText)}</div>`;
-      // 无主行动项 = 需要有人认领（会板上最该被看见的一类）
+      // 无主行动项 = 需要有人认领（看板上最该被看见、也最该能被动手的一类）
       if (k.key === 'todo' && !it.owner) body += '<span class="bi-ownerless">待认领</span>';
       row.innerHTML = meta + body;
+      /* ★ 09-25：「我来」按钮——把"待认领"从一句提示变成**一个动作**。
+       *   至此看板不只是"看"，而是能就地协作：AI 提出问题，人在同一个界面里认领。
+       *   这是"AI 参会"真正落地的地方（比再多一个 AI 能力更有价值）。 */
+      if (k.key === 'todo' && !it.owner) {
+        const claimBtn = document.createElement('button');
+        claimBtn.className = 'bi-claim';
+        claimBtn.textContent = '我来';
+        claimBtn.title = '认领这条行动项（全房可见，服务器记账）';
+        claimBtn.addEventListener('click', () => claimTodo(it.ts, claimBtn));
+        row.appendChild(claimBtn);
+      }
       sec.appendChild(row);
     }
     listEl.appendChild(sec);
@@ -2844,6 +2862,28 @@ function traceEvidenceHtml(ai, streamHitList) {
     + `<span class="ev-text">${escapeHtml(h.text || '')}</span></li>`).join('');
   return `<details class="msg-ai-ev"><summary>🔍 看 AI 依据的 ${list.length} 条${isBoard ? '看板条目' : '原话'}</summary>`
     + `<ol class="ev-list">${rows}</ol></details>`;
+}
+
+/* 认领一条无主行动项。
+ * ▎走服务器（而非本地改状态）：认领结果必须**全房一致**，否则两人同时认领会各自
+ *   看到不同的负责人，事后必然扯皮。服务器回来后会广播新的看板，这里不做本地乐观更新——
+ *   "先显示成功、再被服务器拒绝"是这类协作操作最伤信任的体验。 */
+function claimTodo(ts, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = '认领中…'; }
+  try {
+    socket.emit('ai-board-claim', { ts }, (r) => {
+      if (r && r.error) {
+        showToast(r.error, 'error');
+        if (btn) { btn.disabled = false; btn.textContent = '我来'; }
+        return;
+      }
+      // 成功：服务器会广播新看板，界面随之刷新（按钮自然消失）；这里只补一句本地反馈
+      showToast('已认领，AI 已记下', 'ok');
+    });
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = '我来'; }
+    showToast('认领失败：' + (e.message || e), 'error');
+  }
 }
 
 function renderMembers(members) {

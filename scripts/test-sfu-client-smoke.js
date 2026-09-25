@@ -1096,11 +1096,14 @@ const emit = (ev, payload) => {
   // 服务端推来的看板增量 → 渲染出条目（走真实事件处理链路）
   const beforeBoard = (boardListEl.children || []).length;
   emit('ai-board', {
-    counts: { decision: 1, risk: 0, todo: 1, topic: 0 },
+    counts: { decision: 1, risk: 0, todo: 2, topic: 0 },
     items: {
       decision: [{ ts: 1, name: '张三', text: '交付时间定在 11 月 20 日', kind: 'decision' }],
       risk: [], topic: [],
-      todo: [{ ts: 2, name: '李四', text: '压测报告我负责', kind: 'todo', owner: '李四', task: '提交压测报告', due: '周五' }],
+      todo: [
+        { ts: 2, name: '李四', text: '压测报告我负责', kind: 'todo', owner: '李四', task: '提交压测报告', due: '周五' },
+        { ts: 3, name: '王五', text: 'TURN 账号密码记得轮换', kind: 'todo', owner: '', task: '轮换 TURN 账号密码', due: '下周一' },
+      ],
     },
     added: { decision: [{ ts: 1, text: '交付时间定在 11 月 20 日' }], risk: [], todo: [], topic: [] },
     total: 9,
@@ -1123,6 +1126,29 @@ const emit = (ev, payload) => {
     boardHtml.includes('周五') && boardHtml.includes('李四'), boardHtml.slice(0, 200));
   ok('09-25 看板内容经过 HTML 转义（原话是用户输入，不转义就是 XSS 直通车）',
     !/<script/i.test(boardHtml));
+
+  /* ★ 09-25 认领按钮：无主行动项上必须有「我来」——它把"待认领"从提示变成动作。
+   *   ▎注意：已认领的那条（李四）**不该**有按钮，否则等于允许抢别人的任务。 */
+  const findRows = (el, out = []) => {
+    for (const c of (el.children || [])) { out.push(c); findRows(c, out); }
+    return out;
+  };
+  const allRows = findRows(boardListEl);
+  const claimBtns = allRows.filter((c) => c.classList.contains('bi-claim'));
+  ok('09-25 无主行动项渲染出「我来」认领按钮', claimBtns.length === 1,
+    '期望恰好 1 个（只有无主那条需要认领），实际 ' + claimBtns.length);
+  const todoRows = allRows.filter((c) => String(c.className).includes('k-todo'));
+  ok('09-25 已认领的行动项**没有**认领按钮（不能抢别人的任务）',
+    todoRows.length === 2 && claimBtns.length === 1);
+  ok('09-25 无主那条同时带「待认领」徽标（状态与动作成对出现）',
+    /待认领/.test(boardHtml));
+
+  // 真点一下「我来」→ 必须发出 ai-board-claim（走服务器记账，不做本地乐观更新）
+  const claimBefore = rec.emits.filter((e) => e === 'ai-board-claim').length;
+  if (claimBtns.length) guard('认领按钮点击', () => claimBtns[0].dispatch('click'));
+  const claimAfter = rec.emits.filter((e) => e === 'ai-board-claim').length;
+  ok('09-25 点「我来」发出 ai-board-claim（认领由服务器记账，保证全房一致）',
+    claimAfter === claimBefore + 1, `发出次数 ${claimBefore} → ${claimAfter}`);
 
   /* 快捷问法：必须与手打 @ai 走**完全相同**的信令（不给快捷方式开特例分支）。
    * 断言方式：源码里发 ai-ask 的分支只能有一处（在 sendAiQuestion 里），

@@ -124,6 +124,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
    *   再加 auto-select 权限，避免弹权限框把流程卡死。 */
   browser = new Cdp({
     headless: !process.env.VERIFY_HEADFUL,
+    /* ★ 专用 CDP 端口：`Cdp` 默认 9333，而 `test-e2e-remote-desktop.js` 用 9355。
+     *   本项目已经被"端口撞车导致测试互相污染"坑过（3001 那次，详见 AGENTS），
+     *   所以这里显式占用一个独有端口，让两个真浏览器测试可以互不干扰地跑。 */
+    port: 9444,
     windowSize: { width: 1280, height: 900 },
     extraArgs: [
       '--use-fake-device-for-media-stream',
@@ -471,6 +475,98 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       '证据里不该出现闲聊（那说明显示的是检索命中而非真实依据），实际：' + joined3);
     assert(/看板条目/.test(r.summary), '来自看板的证据应标明来源，实际：' + r.summary);
     console.log(`     🔍 ${r.summary} → ${r.items[0].slice(0, 70)}`);
+  });
+
+  // ── ⑫ 认领行动项：把「待认领」从提示变成动作 ──
+  await T('★ 点看板上的「我来」→ 服务器记账 + 看板更新 + AI 复述确认（完整闭环）', async () => {
+    await browser.evaluate(`(() => {
+      const t = document.querySelector('.side-tab[data-side="board"]');
+      if (t) t.click();
+      return true;
+    })()`);
+    await sleep(400);
+    const before = await browser.evaluate(`(() => {
+      const btns = [...document.querySelectorAll('#boardList .bi-claim')];
+      const ownerless = document.querySelectorAll('#boardList .bi-ownerless').length;
+      return { buttons: btns.length, ownerless };
+    })()`);
+    assert(before.buttons >= 1, '应有至少一条无主行动项带「我来」按钮，实际 ' + before.buttons);
+
+    botMsgs.length = 0;
+    // 真点（不是直接调函数）——验证事件绑定与信令都通
+    await browser.evaluate(`(() => {
+      const b = document.querySelector('#boardList .bi-claim');
+      if (b) b.click();
+      return true;
+    })()`);
+    await sleep(1500);
+
+    const after = await browser.evaluate(`(() => ({
+      buttons: document.querySelectorAll('#boardList .bi-claim').length,
+      ownerless: document.querySelectorAll('#boardList .bi-ownerless').length,
+      html: [...document.querySelectorAll('#boardList .board-item')].map((e) => e.textContent).join(' '),
+    }))()`);
+    // 认领后：按钮少一个、"待认领"少一个、且那份任务上出现了认领人
+    assert(after.buttons === before.buttons - 1,
+      `认领后按钮应少一个（${before.buttons} → ${after.buttons}）`);
+    assert(after.ownerless === before.ownerless - 1,
+      `认领后"待认领"应少一个（${before.ownerless} → ${after.ownerless}）`);
+    /* ★ 负责人必须**看得见**——这条是真浏览器测试暴露的 UI 缺口：
+     *   认领后界面上只少了"待认领"三个字，却没显示负责人是谁，
+     *   用户会问"那到底谁负责？"。行动项的价值就是"谁/做什么/何时"，少一件等于没做完。 */
+    assert(/👤/.test(after.html), '认领后应出现负责人徽标（👤），实际看板内容：' + after.html.slice(0, 200));
+
+    // AI 应把认领结果复述一遍（既是确认，也给全房留一条可查记录）
+    const ack = botMsgs.find((m) => /认领/.test(m.text || ''));
+    assert(ack, 'AI 应复述认领结果，实收：' + JSON.stringify(botMsgs.map((m) => m.text).slice(0, 3)));
+    console.log('     🤖 AI 复述：' + ack.text.replace(/\s+/g, ' ').slice(0, 90));
+  });
+
+  await T('★ 重复认领被明确拒绝（不静默覆盖——否则两人都以为是自己）', async () => {
+    /* 从 Node 侧走一遍协议，专门验"第二次认领"这一条：
+     * ▎为什么这条重要：协作功能最怕"静默覆盖"——两人同时认领，
+     *   系统只留最后一个，而两人都以为是自己 → 会后必然扯皮。
+     *   正确行为是**当场拒绝并告知已被谁认领**。 */
+    const snap = await emitAck('ai-board-get', {});
+    const todos = (snap && snap.data && snap.data.items && snap.data.items.todo) || [];
+    // 造一条新的无主行动项来认领（避免依赖前面已被认领那条）
+    await postCaptions([{ ts: Date.now() + 900, name: '张三', text: '发布公告的草稿需要整理一下' }]);
+    await sleep(800);
+    const snap2 = await emitAck('ai-board-get', {});
+    const list = (snap2 && snap2.data && snap2.data.items && snap2.data.items.todo) || [];
+    const target = list.find((t) => !t.owner);
+    assert(target, '应能找到一条无主行动项，实际：' + JSON.stringify(list.map((t) => t.owner)));
+    const first = await emitAck('ai-board-claim', { ts: target.ts });
+    assert(first && first.data && first.data.owner, '首次认领应成功：' + JSON.stringify(first));
+    const second = await emitAck('ai-board-claim', { ts: target.ts });
+    assert(second && second.error, '第二次认领应被拒绝（不能静默覆盖），实际：' + JSON.stringify(second));
+    assert(/已被/.test(String(second.error)), '拒绝原因应说明已被谁认领，实际：' + second.error);
+    console.log(`     首次认领 → ${first.data.owner}；重复认领 → 「${second.error}」`);
+    void todos;
+  });
+
+  await T('★ 人工认领**必须进入纪要**（机器推断不能覆盖人做过的决定）', async () => {
+    /* 这条守的是"人 vs 机器"的优先级：
+     *   看板上点过「我来」，纪要若重新从字幕抽一遍，这个认领就会消失——
+     *   纪要写"待认领"，而那个人明明已经认领了。
+     *   **机器推断绝不能覆盖人已经做过的决定**，所以纪要必须与看板合并。 */
+    const dir = path.join(__dirname, '..', 'sfu', 'minutes', String(roomNumber));
+    const before = fs.existsSync(dir) ? fs.readdirSync(dir).length : 0;
+    await emitAck('ai-minutes', { type: 'segment' });
+    let after = before;
+    for (let i = 0; i < 60 && after <= before; i++) {
+      await sleep(500);
+      after = fs.existsSync(dir) ? fs.readdirSync(dir).length : 0;
+    }
+    assert(after > before, `应落一份新纪要（${before} → ${after}）`);
+    const files = fs.readdirSync(dir).sort();
+    const md = fs.readFileSync(path.join(dir, files[files.length - 1]), 'utf8');
+    assert(md.includes('## 行动项'), '纪要应含行动项小节');
+    assert(/boardverify/.test(md),
+      '纪要的行动项里必须出现认领人（boardverify）——人工认领不能被机器推断覆盖。实际：\n'
+      + (md.split('## 行动项')[1] || '').split('##')[0].slice(0, 400));
+    assert(/以认领人为准/.test(md), '纪要应说明已与看板合并、以认领人为准');
+    console.log('     纪要已包含人工认领（以认领人为准）✅');
   });
 
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);

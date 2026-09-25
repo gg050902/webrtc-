@@ -2307,7 +2307,7 @@ async function buildMinutes(roomNumber, opts = {}) {
    *   无 key 走规则（尽力抽，抽不到就留空——**宁可留空，不可编造**）。
    * ▎抽不到由 renderActions 明确写"（未识别到明确的行动项）"，不假装有。 */
   const actRes = await Brain.extractActions(seg);
-  const actions = actRes.actions;
+  let actions = actRes.actions.slice();
 
   /* ★ 09-25 看板与纪要**同源**（一处判据、两处消费）。
    * ▎之前在纪要里"风险"是被抽了两遍的：mock 轨用本文件内联的 riskRe，
@@ -2321,6 +2321,41 @@ async function buildMinutes(roomNumber, opts = {}) {
   dig.ingest(seg);
   const decisions = dig.items.decision;
   const risks = dig.items.risk;
+
+  /* ★ 09-25 行动项与看板合并（两件事，缺一不可）：
+   *   ① **人工认领必须压过机器推断**：看板上有人点了「我来」，那是**人的决定**。
+   *      若纪要重新从字幕抽一遍，这个认领就会消失——纪要里写"待认领"，
+   *      而那个人明明已经认领了。**机器推断绝不能覆盖人已经做过的决定。**
+   *   ② **看板有的，纪要必须有**：否则又是"看板 3 条、纪要 2 条"那种口径不一致
+   *      （一个概念两个来源 → 必然漂移，AGENTS 坑 47）。
+   *
+   * ⚠️ 这里有一个**必须记住的陷阱**（本轮实测踩到）：
+   *   上面那个 `dig` 是**新建的**（为了按 `since` 只统计本段，所以要重新 ingest），
+   *   而**人工认领记在房间级的 `roomBoards` 里**——两个不同的实例！
+   *   初版直接拿 `dig.items.todo` 去合并，于是"认领"信息**凭空消失**，
+   *   纪要继续写"待认领"（正是要修的那个缺陷，只是换了个位置复发）。
+   *   所以行动项要取**房间级实时看板**（它带着人的认领），只按 `since` 过滤时间段；
+   *   房间级看板不存在时（如对历史档案离线出纪要）才退回本段的 dig。
+   *   ▎教训：**"同一份数据"必须真的是同一份**——同名/同结构但不同实例，
+   *     看起来像同源，实际上什么都不同步。 */
+  const liveBoard = roomBoards.get(roomNumber);
+  const boardTodos = liveBoard
+    ? liveBoard.items.todo.filter((t) => (t.ts || 0) >= (opts.since || 0))
+    : dig.items.todo;
+
+  const actKey = (s) => String(s || '').replace(/\s+/g, '').replace(/[，。！？、；：""''（）()]/g, '');
+  for (const t of boardTodos) {
+    const k = actKey(t.task || t.text);
+    const hit = actions.find((a) => {
+      const ak = actKey(a.task);
+      return ak && k && (ak === k || ak.includes(k) || k.includes(ak));
+    });
+    if (hit) {
+      if (t.owner) hit.owner = t.owner;        // 人工认领覆盖机器推断
+    } else {
+      actions.push({ owner: t.owner || '', task: t.task || t.text, due: t.due || '' });
+    }
+  }
 
   let body = null;
   let isMock = false;
@@ -2347,11 +2382,14 @@ async function buildMinutes(roomNumber, opts = {}) {
    *   让它同时负责内容 + 格式，结果通常是格式走样（少字段、多寒暄）。
    *   所以分工是：**LLM 只产出结构化的 {owner,task,due}，渲染交给确定性代码**。
    *   这样无论走 LLM 轨还是 Mock 轨，行动项小节的**格式完全一致**——前端解析不用分叉。 */
+  const claimedCount = actions.filter((a) => a.owner).length;
   const actBlock = [
     '', '## 行动项', renderActionTable(actions),
-    actRes.mock
+    (actRes.mock
       ? `> 由规则抽取（${actRes.reason === 'rules' ? '字幕条数少或未配 key' : 'LLM 未参与'}）；配置 DEEPSEEK_API_KEY 后由模型识别，可理解指代与去重。`
-      : '> 由 DeepSeek 从字幕中识别（含指代消解与去重）。',
+      : '> 由 DeepSeek 从字幕中识别（含指代消解与去重）。')
+    + ' 已与会议中的「🧠 会议看板」合并——**看板上有人认领过的，以认领人为准**'
+    + `（本份共 ${claimedCount} 条有负责人）。`,
     '',
   ].join('\n');
 
@@ -3593,6 +3631,39 @@ io.on('connection', (socket) => {
     } catch (err) {
       fail(callback, '纪要生成失败：' + err.message);
     }
+  });
+
+  /* ★ 09-25 认领行动项：把 AI 的抽取结果变成**可执行**的。
+   * ▎为什么需要这一步：看板此前只是"看"——它明明白白写着「TURN 轮换 待认领」，
+   *   而用户能做的只有"自己记住、会后再找人"。把"认领"做成一个点击动作，
+   *   看板就从**信息**变成了**协作界面**——这才是"AI 参会"真正落地的地方：
+   *   它提出问题，人在同一个界面里解决问题。
+   * ▎为什么由服务器记账而不是前端改本地状态：认领结果必须**全房一致**
+   *   （否则两个人同时认领会各自看到不同的负责人，事后必然扯皮）。
+   *   服务器是房间里唯一的权威，认领这种"有争议可能"的写操作必须走它。 */
+  socket.on('ai-board-claim', (payload = {}, callback) => {
+    const roomNumber = socket.roomNumber;
+    const room = roomNumber && rooms.get(roomNumber);
+    if (!room) return fail(callback, '先进入房间再认领');
+    const board = roomBoards.get(roomNumber);
+    if (!board) return fail(callback, '看板上还没有行动项');
+    const ts = Number(payload.ts);
+    const item = board.items.todo.find((t) => t.ts === ts);
+    if (!item) return fail(callback, '这条行动项已不在看板上（可能已超出保留上限）');
+    /* 已被认领 → 明确告知是谁，而不是静默覆盖。
+     * ▎"静默覆盖"是这类协作功能最容易埋下的坑：两个人都以为是自己，
+     *   而系统只留下最后一个。宁可当场拒绝并说清，也不要制造一个隐性冲突。 */
+    if (item.owner) return fail(callback, `已被 ${item.owner} 认领`);
+    const who = socket.displayName || `成员 ${String(socket.id).slice(-4)}`;
+    item.owner = who;
+    io.to(roomNumber).emit('ai-board', { ...board.snapshot(), added: {}, ts: Date.now() });
+    // AI 把认领结果**复述一遍**：既是对认领人的确认，也是给全房留一条可查的记录
+    emitBotSay(roomNumber,
+      `✅ 已记下：**${who}** 认领「${item.task || item.text}」${item.due ? `（期限 ${item.due}）` : ''}。`);
+    logEvent('info', 'ai-board-claim', {
+      roomNumber, by: socket.id, who, task: String(item.task || item.text).slice(0, 60),
+    });
+    ok(callback, { owner: who });
   });
 
   // ★ 09-19f G8-③：ping 探活（bench-signaling 的 RTT 探针；也是运维探活的轻量信令）

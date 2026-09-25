@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>水墨童子 · 古风 AI 助理头像</title>
+<style>
+:root{
+  --bg:#f5f1e8; --card:#fdfbf6; --fg:#1a1714; --fg2:#6b6157;
+  --line:#e2dbcb; --accent:#9e3d32; --code-bg:#efe9dc; --radius:10px;
+  --font-serif:"Noto Serif SC","Songti SC","SimSun",serif;
+  --font-sans:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+}
+body.dark{
+  --bg:#14110d; --card:#1e1a15; --fg:#ece5d8; --fg2:#9c9083;
+  --line:#332c24; --accent:#c8654f; --code-bg:#100e0b;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--font-sans);
+  transition:background .35s,color .35s;}
+.wrap{max-width:1080px;margin:0 auto;padding:44px 24px 72px}
+header{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;flex-wrap:wrap}
+h1{font-family:var(--font-serif);font-size:34px;margin:0 0 8px;font-weight:600;letter-spacing:2px}
+.sub{color:var(--fg2);font-size:14px;line-height:1.85;max-width:640px}
+.toggle{border:1px solid var(--line);background:var(--card);color:var(--fg);
+  padding:8px 18px;border-radius:999px;cursor:pointer;font-size:13px;white-space:nowrap}
+.toggle:hover{border-color:var(--accent);color:var(--accent)}
+section{margin-top:44px}
+h2{font-family:var(--font-serif);font-size:17px;margin:0 0 18px;color:var(--fg2);
+  font-weight:600;letter-spacing:3px;display:flex;align-items:center;gap:12px}
+h2::after{content:"";flex:1;height:1px;background:var(--line)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:26px}
+.row{display:flex;gap:30px;align-items:flex-end;flex-wrap:wrap}
+.cell{display:flex;flex-direction:column;align-items:center;gap:9px}
+.av{border-radius:50%;overflow:hidden;background:rgba(127,127,127,.05);
+  display:grid;place-items:center;flex:none;transition:background .3s}
+.av img{width:100%;height:100%;object-fit:contain;display:block}
+.cap{font-size:12px;color:var(--fg2);font-variant-numeric:tabular-nums}
+.states{display:flex;gap:16px;flex-wrap:wrap}
+.st{display:flex;flex-direction:column;align-items:center;gap:8px;padding:16px;
+  border:1px solid var(--line);border-radius:8px;cursor:pointer;background:transparent;
+  transition:.25s;min-width:108px}
+.st:hover{border-color:var(--accent)}
+.st.on{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 7%,transparent)}
+.st img{width:80px;height:80px;object-fit:contain}
+.st .n{font-family:var(--font-serif);font-size:14px;color:var(--fg);letter-spacing:1px}
+.st .d{font-size:11px;color:var(--fg2)}
+pre{background:var(--code-bg);border:1px solid var(--line);border-radius:8px;
+  padding:16px;overflow:auto;font-size:12.5px;line-height:1.8;margin:0}
+code{font-family:"SF Mono",Consolas,Monaco,monospace}
+.note{font-size:13px;color:var(--fg2);line-height:1.9}
+.pill{display:inline-block;padding:3px 11px;border-radius:2px;font-size:12px;
+  border:1px solid var(--line);color:var(--fg2);margin:2px 5px 2px 0;font-family:var(--font-serif)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}
+th{color:var(--fg2);font-weight:600;font-size:12px;letter-spacing:1px}
+td code{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div>
+    <h1>水墨童子</h1>
+    <p class="sub">古风 AI 助理头像。水墨写意笔法，宣纸留白；经反相键控处理，纸张转为透明，
+    只留墨迹，可叠加在任意底色的界面上。五个姿态，主体占画布统一约 66%。</p>
+  </div>
+  <button class="toggle" id="theme">切换宣纸 / 墨底</button>
+</header>
+
+<section>
+  <h2>五态</h2>
+  <div class="card">
+    <div class="states" id="states"></div>
+    <p class="note" style="margin:20px 0 0">
+      水墨难做细微表情，所以五个状态靠<strong>姿态与笔势</strong>区分：倾听时侧首掩耳、
+      说话时开口抬手、思考时低首拈颔、愉悦时眉眼舒展。这也更符合写意的气质。
+    </p>
+  </div>
+</section>
+
+<section>
+  <h2>尺寸</h2>
+  <div class="card">
+    <div class="row">
+      <div class="cell"><div class="av" style="width:40px;height:40px"><img src="png/apple-ink-idle-64.png" alt="40px"></div><span class="cap">40px</span></div>
+      <div class="cell"><div class="av" style="width:64px;height:64px"><img src="png/apple-ink-idle-128.png" alt="64px"></div><span class="cap">64px</span></div>
+      <div class="cell"><div class="av" style="width:96px;height:96px"><img src="png/apple-ink-idle-128.png" alt="96px"></div><span class="cap">96px</span></div>
+      <div class="cell"><div class="av" style="width:120px;height:120px"><img src="png/apple-ink-idle-256.png" alt="120px"></div><span class="cap">120px</span></div>
+      <div class="cell"><div class="av" style="width:180px;height:180px"><img src="png/apple-ink-idle-256.png" alt="180px"></div><span class="cap">180px</span></div>
+    </div>
+    <p class="note" style="margin:20px 0 0">
+      写意笔法天生怕缩小——这一点我在生成时就做了约束：压住飞白与泼墨噪点、提亮墨线对比、
+      强化丫髻与脸型轮廓，让它缩到 40px 仍然认得出是个童子。
+    </p>
+  </div>
+</section>
+
+<section>
+  <h2>集成</h2>
+  <div class="card">
+    <pre><code>&lt;!-- 透明背景, 直接叠在任意底色上 --&gt;
+&lt;img src="png/apple-ink-idle-128.png"
+     style="width:64px;height:64px;border-radius:50%"&gt;
+
+&lt;!-- 按状态切换 --&gt;
+&lt;script&gt;
+  el.src = speaking
+    ? 'png/apple-ink-speaking-128.png'
+    : 'png/apple-ink-idle-128.png';
+&lt;/script&gt;</code></pre>
+  </div>
+</section>
+
+<section>
+  <h2>资产</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>类别</th><th>文件</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>静态 PNG</td><td><code>png/apple-ink-{state}-{size}.png</code></td>
+            <td>state = idle / listening / speaking / thinking / happy；size = 1024·512·256·128·64·40</td></tr>
+      </tbody>
+    </table>
+    <p class="note" style="margin:16px 0 0">
+      <span class="pill">宣纸底已转透明</span><span class="pill">飞白保留</span>
+      <span class="pill">主体占比 65.6%–66.4%</span><span class="pill">无印章题字</span>
+    </p>
+  </div>
+</section>
+
+</div>
+
+<script>
+const STATES = [
+  ['idle','待机','安坐静息，笔势平缓'],
+  ['listening','倾听','侧首掩耳，专注'],
+  ['speaking','说话','开口抬手，有生气'],
+  ['thinking','思考','低首拈颔，墨色转淡'],
+  ['happy','愉悦','眉眼舒展，笔意轻快'],
+];
+const box = document.getElementById('states');
+STATES.forEach(([k,n,d],i)=>{
+  const b = document.createElement('div');
+  b.className = 'st' + (i===0?' on':'');
+  b.innerHTML = `<img src="png/apple-ink-${k}-128.png" alt="${n}"><span class="n">${n}</span><span class="d">${d}</span>`;
+  b.onclick = ()=>{ document.querySelectorAll('.st').forEach(x=>x.classList.remove('on')); b.classList.add('on'); };
+  box.appendChild(b);
+});
+document.getElementById('theme').onclick = ()=> document.body.classList.toggle('dark');
+</script>
+</body>
+</html>
