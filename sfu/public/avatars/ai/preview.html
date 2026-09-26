@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI 头像替换预览</title>
+  <style>
+    :root {
+      --bg0: #0e0c0a;
+      --bg1: #171209;
+      --bg2: #1f1a13;
+      --fg: #f0ebe3;
+      --accent: #d8b36a;
+      --accent-border: rgba(216, 179, 106, .45);
+      --ease: cubic-bezier(.22, .61, .36, 1);
+      --shadow-1: 0 8px 24px rgba(0, 0, 0, .35);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 40px 24px;
+      background: var(--bg0); color: var(--fg);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    h1 { font-size: 20px; margin: 0 0 8px; font-weight: 600; }
+    p { color: rgba(240, 235, 227, .65); margin: 0 0 28px; font-size: 14px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 24px;
+    }
+    .card {
+      background: var(--bg2);
+      border: 1px solid rgba(216, 179, 106, .12);
+      border-radius: 16px;
+      padding: 20px;
+    }
+    .card h2 { font-size: 15px; margin: 0 0 16px; color: var(--accent); font-weight: 600; }
+    .demo { display: flex; align-items: center; gap: 16px; }
+
+    /* 成员行小头像 */
+    .member-row {
+      display: flex; align-items: center; gap: 10px;
+      background: rgba(255,255,255,.03);
+      border-radius: 10px; padding: 8px 12px;
+    }
+    .ai-av {
+      width: 24px; height: 24px;
+      border-radius: 50%; overflow: hidden;
+      border: 1px solid var(--accent-border);
+      background: #f2ede1;
+    }
+    .ai-av img { width: 100%; height: 100%; object-fit: cover; object-position: center; display: block; }
+    .ai-av.speaking { animation: aiRingPulse 1.2s ease-in-out infinite; }
+    @keyframes aiRingPulse {
+      0%, 100% { box-shadow: 0 0 0 2px var(--accent-border); }
+      50% { box-shadow: 0 0 0 4px rgba(216, 179, 106, .5); }
+    }
+
+    /* AI 视频格子 */
+    .ai-tile {
+      position: relative;
+      width: 220px; height: 220px;
+      background: #14100a;
+      border-radius: 16px;
+      display: grid; place-items: center;
+      overflow: hidden;
+    }
+    .ai-face-wrap {
+      position: absolute;
+      left: 50%; top: 50%;
+      transform: translate(-50%, -50%);
+      width: min(76%, 220px);
+      aspect-ratio: 1;
+      background:
+        radial-gradient(circle at 50% 40%, #f7f3ea 0%, #efe9dc 58%, #e2d9c6 100%);
+      border-radius: 50%;
+      overflow: hidden;
+      box-shadow:
+        0 0 0 1px rgba(216, 179, 106, .35),
+        0 0 0 8px rgba(216, 179, 106, .06),
+        0 14px 34px rgba(6, 4, 2, .5);
+    }
+    .ai-tile .ai-face {
+      display: block;
+      width: 100%; height: 100%;
+      border-radius: 50%;
+      object-fit: cover; object-position: center;
+    }
+    .ai-tile.speaking .ai-face-wrap {
+      box-shadow:
+        0 0 0 1px rgba(216, 179, 106, .5),
+        0 0 0 10px rgba(216, 179, 106, .1),
+        0 0 34px rgba(216, 179, 106, .3);
+    }
+    .ai-tile.thinking .ai-face-wrap { filter: brightness(.94); }
+    .ai-tile.happy .ai-face { filter: saturate(1.06) brightness(1.03); }
+
+    .state-btns { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .state-btns button {
+      background: rgba(216,179,106,.12); border: 1px solid rgba(216,179,106,.25);
+      color: var(--fg); border-radius: 8px; padding: 6px 12px;
+      cursor: pointer; font-size: 13px;
+    }
+    .state-btns button.active { background: rgba(216,179,106,.35); }
+    .old-new { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+    .old-new > div { text-align: center; }
+    .old-new img { width: 120px; height: 120px; border-radius: 50%; object-fit: cover; }
+    .label { font-size: 12px; color: rgba(240,235,227,.55); margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>AI 助理头像替换预览</h1>
+  <p>左侧是成员列表里的小头像，右侧是会议网格里的大格子。点击按钮可切换 speaking / thinking / happy 状态。</p>
+
+  <div class="grid">
+    <div class="card">
+      <h2>旧版 vs 新版</h2>
+      <div class="old-new">
+        <div>
+          <img src="xiaoming-anim-old.webp" alt="旧版">
+          <div class="label">旧版国风头像</div>
+        </div>
+        <div>
+          <img src="xiaoming-anim.webp" alt="新版">
+          <div class="label">新版 Q 版 3D</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>成员列表效果</h2>
+      <div class="demo">
+        <div class="member-row">
+          <span class="ai-av" id="rowAv"><img src="xiaoming-anim-sm.webp" alt=""></span>
+          <span>AI 小明</span>
+        </div>
+      </div>
+      <div class="state-btns">
+        <button onclick="setRow('idle')" class="active" id="b-row-idle">idle</button>
+        <button onclick="setRow('speaking')" id="b-row-speaking">speaking</button>
+      </div>
+      <p style="margin-top:12px;font-size:12px">speaking = 嘴部开合说话动画，idle = 呼吸眨眼</p>
+    </div>
+
+    <div class="card">
+      <h2>会议网格效果</h2>
+      <div class="demo">
+        <div class="ai-tile" id="tile">
+          <div class="ai-face-wrap">
+            <img class="ai-face" id="tileFace" src="xiaoming-anim.webp" alt="AI 小明">
+          </div>
+        </div>
+      </div>
+      <div class="state-btns">
+        <button onclick="setTile('idle')" class="active" id="b-tile-idle">idle</button>
+        <button onclick="setTile('speaking')" id="b-tile-speaking">speaking</button>
+        <button onclick="setTile('thinking')" id="b-tile-thinking">thinking</button>
+        <button onclick="setTile('happy')" id="b-tile-happy">happy</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const rowAv = document.getElementById('rowAv');
+    const rowIm = rowAv.querySelector('img');
+    const tile = document.getElementById('tile');
+    const tileFace = document.getElementById('tileFace');
+    const IDLE = 'xiaoming-anim.webp', IDLE_SM = 'xiaoming-anim-sm.webp';
+    const TALK = 'xiaoming-talk.webp', TALK_SM = 'xiaoming-talk-sm.webp';
+    [new Image(), new Image()].forEach((im, i) => { im.src = i ? TALK_SM : TALK; }); // 预加载
+    function setRow(st) {
+      rowAv.classList.toggle('speaking', st === 'speaking');
+      rowIm.src = st === 'speaking' ? TALK_SM : IDLE_SM;
+      document.querySelectorAll('.card:nth-child(2) .state-btns button').forEach(b => b.classList.remove('active'));
+      document.getElementById('b-row-' + st).classList.add('active');
+    }
+    function setTile(st) {
+      tile.classList.remove('speaking', 'thinking', 'happy');
+      if (st !== 'idle') tile.classList.add(st);
+      tileFace.src = st === 'speaking' ? TALK : IDLE;
+      document.querySelectorAll('.card:nth-child(3) .state-btns button').forEach(b => b.classList.remove('active'));
+      document.getElementById('b-tile-' + st).classList.add('active');
+    }
+  </script>
+</body>
+</html>

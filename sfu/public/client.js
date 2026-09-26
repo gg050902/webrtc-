@@ -44,8 +44,17 @@ const PRESET_AVATARS = [
 ];
 const AI_STATES = ['idle', 'listening', 'thinking', 'speaking', 'happy'];
 const aiAvatar = { state: 'idle', el: null, rowEl: null, tile: null };
-const avatarUrl = (kind) => kind === 'ai' ? `/avatars/ai/idle-128.png` : `/avatars/presets/${kind}.png`;
+
 const aiStateUrl = (st) => `/avatars/ai/${AI_STATES.includes(st) ? st : 'idle'}-128.png`;
+/* ★ 09-27 Q版3D双动画：idle（呼吸/眨眼，palindrome 严格无缝循环）+ talk（嘴部开合说话）。
+ *  speaking 状态换 talk 图、其余状态回 idle；进页面即预加载 talk，首次切换不白闪。 */
+const AI_ANIM = {
+  idle: '/avatars/ai/xiaoming-anim.webp?v=3d',
+  idleSm: '/avatars/ai/xiaoming-anim-sm.webp?v=3d',
+  talk: '/avatars/ai/xiaoming-talk.webp?v=3d',
+  talkSm: '/avatars/ai/xiaoming-talk-sm.webp?v=3d',
+};
+try { [new Image(), new Image()].forEach((im, i) => { im.src = i ? AI_ANIM.talkSm : AI_ANIM.talk; }); } catch (e) { /* 无头环境无 Image（坑 29 家族：顶层 DOM API 防御式调用） */ }
 let myAvatar = null; // 我的预设头像 key（登录/恢复后带回）
 
 /* ★ 09-26b 唤醒词：开会时商量提到「小明」，它就接话——
@@ -1408,6 +1417,10 @@ function appendChat(text, sender, isMe, via, name, ai) {
   if (sender === 'system') {
     item.className = 'msg system';
     item.innerHTML = `<div class="msg-text">${escapeHtml(text)}</div>`;
+    // ★ 09-27：服务端 ASR 转写同步上字幕条（字幕体验统一：谁说的话都能看见）
+    if (text.indexOf('🎙 [转写]') === 0) {
+      showCaptionBar('转写', text.slice(('🎙 [转写] ').length), false);
+    }
   } else if (sender === 'ai-bot') {
     // ★ 09-19 AI Bot 的气泡（徽标一眼区分机器同事）+ ★ 09-24 mode/tokens/纪要下载三类元信息
     //   mode 由服务器逐条告知（这条答案到底谁写的），比前端猜更准——
@@ -3058,7 +3071,9 @@ function renderMembers(members) {
       row.classList.add('ai-bot-row');
       const note = botHearingNote();   // 由最近一次快照/字幕事件维护的活状态
       row.classList.add('has-av');
-      row.innerHTML = `<span class="ai-av"><img src="/avatars/ai/xiaoming-anim.webp" alt=""></span>`
+      /* 小头像初始 src 跟随当前状态（成员列表重建发生在 speaking 中时不会回跳 idle） */
+      const rowAvSrc = aiAvatar.state === 'speaking' ? AI_ANIM.talkSm : AI_ANIM.idleSm;
+      row.innerHTML = `<span class="ai-av"><img src="${rowAvSrc}" alt=""></span>`
         + `<span class="m-id">${ICONS.bot} ${escapeHtml(m.name || 'AI 小明')}`
         + `<span class="m-bot-note" title="AI 助理的实时状态">${escapeHtml(note)}</span></span>`;
       aiAvatar.rowEl = row.querySelector('.ai-av'); // ★ 09-26：状态机刷新时换五态图
@@ -4584,6 +4599,17 @@ const AI_STATE_LABEL = { idle: '聆听中…', listening: '聆听中…', thinki
 function setAiState(st, speechText) {
   if (!AI_STATES.includes(st)) return;
   aiAvatar.state = st;
+  /* ★ 09-27 说话动画切换：speaking 换"嘴部开合" talk 图，其余状态回呼吸 idle 图。
+   *  两张都是透明 WebP 循环动画，直接换 src（已预加载，无白闪）。 */
+  const talk = st === 'speaking';
+  if (aiAvatar.rowEl) {
+    const rowIm = aiAvatar.rowEl.querySelector('img');
+    if (rowIm) rowIm.src = talk ? AI_ANIM.talkSm : AI_ANIM.idleSm;
+  }
+  if (aiTileEl) {
+    const face = aiTileEl.querySelector('.ai-face');
+    if (face) face.src = talk ? AI_ANIM.talk : AI_ANIM.idle;
+  }
   /* ★ 09-26c 头像 v4（用户反馈 SVG 小人还是不够美）：
    *  底图换成 meihua4 的精美国风头像（一张好图胜过一切小动作），生动感交给
    *  **动效系统**——呼吸缩放/speaking 声波条跳动/thinking 暗化+泡泡漂浮/happy 弹跳。
@@ -4631,7 +4657,7 @@ function syncAiTile(present) {
     aiTileEl.className = 'video-box ai-tile';
     const waves = '<div class="ai-waves">' + '<i></i>'.repeat(7) + '</div>';
     aiTileEl.innerHTML =
-      '<div class="ai-face-wrap"><img class="ai-face" src="/avatars/ai/xiaoming-anim.webp" alt="AI 小明"></div>' +
+      '<div class="ai-face-wrap"><img class="ai-face" src="' + AI_ANIM.idle + '" alt="AI 小明"></div>' +
       waves +
       '<div class="ai-speech" aria-live="polite"></div>' +
       '<div class="video-label">AI 小明<span class="ai-status">聆听中…</span></div>';

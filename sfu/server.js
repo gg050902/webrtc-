@@ -1342,6 +1342,9 @@ function resolveFfmpegDeep() {
       exec(`where /r "${dirs[i]}" ffmpeg.exe`, { timeout: 5000, windowsHide: true }, (err, stdout) => {
         const first = !err && stdout && stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0];
         if (!first) return tryNext(i + 1);
+        // ★ 09-27c 安全加固（Mimosa）：只接受“白名单目录内且名为 ffmpeg.exe”的命中
+        if (path.dirname(first).toLowerCase() !== String(dirs[i]).toLowerCase()
+            || path.basename(first).toLowerCase() !== 'ffmpeg.exe') return tryNext(i + 1);
         execFile(first, ['-version'], { timeout: 1000, windowsHide: true }, (e2) => {
           if (e2) return tryNext(i + 1);
           FFMPEG_BIN = first;
@@ -1684,11 +1687,17 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
           if (size < 20000) { try { fs.unlinkSync(wav); } catch (e) {} continue; } // 静音段(≈<1s 语音)跳过
           // 转写（whisper CLI：输出同名 txt；模型 tiny 足够会议场景）
           const txtFile = wav.replace(/\.wav$/, '.txt');
+
+          // ★ 09-27c 安全加固（Mimosa）：WHISPER_BIN 只能是 probe 验证过的三种形态
+          if (WHISPER_BIN !== 'whisper' && WHISPER_BIN !== '__py__'
+              && !/whisper(\.exe)?$/i.test(WHISPER_BIN)) return; // 形态白名单
+          const wCmd = WHISPER_BIN === '__py__' ? process.execPath : WHISPER_BIN;
+          const wArgs = (WHISPER_BIN === '__py__' ? ['-m', 'whisper'] : [])
+            .concat([wav, '--model', process.env.WHISPER_MODEL || 'tiny', '--language', 'zh',
+                     '--output_format', 'txt', '--output_dir', segDir]);
           await new Promise((r) => {
-            require('child_process').execFile(WHISPER_BIN,
-              [wav, '--model', process.env.WHISPER_MODEL || 'tiny', '--language', 'zh',
-               '--output_format', 'txt', '--output_dir', segDir],
-              { timeout: 60000, windowsHide: true }, () => r());
+            require('child_process').execFile(wCmd, wArgs,
+              { timeout: 90000, windowsHide: true }, () => r());
           });
           let text = '';
           try { text = fs.readFileSync(txtFile, 'utf8').trim(); } catch (e) {}
@@ -1707,6 +1716,17 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
             ts: Date.now(),
           });
           logEvent('info', 'asr-segment', { roomNumber, member: memberId, chars: text.length });
+          /* ★ 09-27b 服务端唤醒词：转写里提到「小明」→ AI 自动回答（与客户端
+           *   emitCaption 的唤醒词对等——语音说的和字幕写的都能叫动它）。 */
+          if (/小明|小鸣/.test(text) || /ai/i.test(text)) {
+            io.to(roomNumber).emit('ai-state', { state: 'thinking' });
+            try {
+              const r = await aiBrain(roomNumber, text.slice(0, 300));
+              io.to(roomNumber).emit('ai-state', { state: 'speaking', text: r.text });
+              setTimeout(() => io.to(roomNumber).emit('ai-state', { state: 'idle' }),
+                Math.min(12000, 2000 + r.text.length * 90));
+            } catch (e) { /* 回答失败不影响转写循环 */ }
+          }
           segIdx += 1;
         }
       };
@@ -2047,7 +2067,20 @@ function probeWhisper() {
   if (whisperProbed) return Promise.resolve(WHISPER_BIN);
   whisperProbed = true;
   const { execFile } = require('child_process');
-  const cands = ['whisper', 'whisper-cli', 'whisper.exe'];
+  // ★ 09-27b：候选含 pip --user 的 whisper.exe 完整路径（Windows 上 pip --user
+  //   装的 exe 在 %APPDATA%/Python/Python312/Scripts，不在服务 PATH）+ python -m 兜底
+  // pip --user 安装位置的显式枚举（版本目录名 Python312 里的 312 是 Python 主次版本，
+  // 不是 Node 的——直接枚举常见位置 + fs 存在性过滤，比字符串拼接可靠）
+  const fsx = require('fs');
+  const userCands = [
+    process.env.APPDATA && path.join(process.env.APPDATA, 'Python', 'Python312', 'Scripts', 'whisper.exe'),
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'Python', 'Python312', 'Scripts', 'whisper.exe'),
+    'C:' + path.sep + 'Program Files' + path.sep + 'Python312' + path.sep + 'Scripts' + path.sep + 'whisper.exe',
+  ].filter(Boolean);
+  const cands = ['whisper', 'whisper-cli', 'whisper.exe',
+    ...userCands.filter((x) => { try { return fsx.existsSync(x); } catch (e) { return false; } }),
+    '__py__',
+  ];
   return new Promise((resolve) => {
     let i = 0;
     const tryNext = () => {
@@ -2056,7 +2089,11 @@ function probeWhisper() {
         return resolve(null);
       }
       const c = cands[i++];
-      execFile(c, ['--help'], { timeout: 4000, windowsHide: true }, (err) => {
+      // ★ 09-27b：候选 '__py__' = 用本机 python 以模块方式跑（pip --user 装的
+      //   whisper.exe 不在 PATH——模块方式跨机最稳）
+      const cmd = c === '__py__' ? process.execPath : c;
+      const args = c === '__py__' ? ['-m', 'whisper', '--help'] : ['--help'];
+      execFile(cmd, args, { timeout: 8000, windowsHide: true }, (err) => {
         if (err) return tryNext();
         WHISPER_BIN = c;
         console.log(`🎙 服务端转写（ASR）已开启：${c}（每路音频 15s 分段转写入字幕账本，AI 小明能听懂会议内容了）`);
@@ -2606,6 +2643,8 @@ async function buildMinutes(roomNumber, opts = {}) {
  *   不能因为模型不可用就什么都没有。
  * ══════════════════════════════════════════════════════════════ */
 async function mergeMinutes(roomNumber) {
+  // ★ 09-27c 安全加固（Mimosa）：房间号 6 位白名单（与 /minutes 路由同款钳制）
+  if (!/\d{6}$/.test(String(roomNumber))) return null;
   const dir = path.join(MINUTES_DIR, String(roomNumber));
   const now = Date.now();
   const stamp = new Date(now).toISOString().slice(0, 19).replace(/[-:T]/g, '');

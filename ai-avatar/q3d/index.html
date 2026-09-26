@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI 助理头像 · Q版3D动态</title>
+<style>
+:root{
+  --canvas:#f6f6f7; --card:#ffffff; --fg:#16161a; --fg2:#6b6f76; --line:#e5e5e8; --glow:#cfd8ea;
+  --font:"Inter","Noto Sans SC",system-ui,-apple-system,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+body.dark{--canvas:#0c0c0e;--card:#18181b;--fg:#f4f4f6;--fg2:#8b8f96;--line:#26262a;--glow:#39445c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--canvas);color:var(--fg);font-family:var(--font);
+  transition:background .35s,color .35s;-webkit-font-smoothing:antialiased}
+.wrap{max-width:980px;margin:0 auto;padding:52px 24px 76px}
+header{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;flex-wrap:wrap}
+h1{font-size:25px;font-weight:500;margin:0 0 10px;letter-spacing:-.4px}
+.sub{color:var(--fg2);font-size:14px;line-height:1.8;max-width:560px;margin:0}
+.tog{border:1px solid var(--line);background:transparent;color:var(--fg);padding:8px 16px;
+  border-radius:999px;cursor:pointer;font-size:13px;font-family:var(--font);transition:.2s}
+.tog:hover{border-color:var(--fg)}
+section{margin-top:52px}
+h2{font-size:11px;text-transform:uppercase;letter-spacing:1.6px;color:var(--fg2);font-weight:500;
+  margin:0 0 20px;display:flex;align-items:center;gap:14px}
+h2::after{content:"";flex:1;height:1px;background:var(--line)}
+.card{border:1px solid var(--line);border-radius:14px;padding:32px;background:var(--card)}
+
+.av{position:relative;width:200px;height:200px;display:grid;place-items:center}
+.av .ring{position:absolute;inset:-7%;border-radius:50%;
+  background:radial-gradient(circle,var(--glow) 0%,transparent 70%);
+  opacity:.16;animation:glow 5.2s ease-in-out infinite;pointer-events:none}
+.av img,.av .st{position:relative;width:100%;height:100%;object-fit:contain;display:block;
+  animation:breathe 5.2s ease-in-out infinite;transform-origin:50% 60%}
+.av .anim{display:block}
+.av .still{display:none;width:78%;height:78%}
+/* 手动关闭动画时退回静态帧（兼容 prefers-reduced-motion 以外的手动需求） */
+.av.still-mode .anim{display:none}
+.av.still-mode .still{display:block}
+.av.still-mode .ring{display:none}
+
+@keyframes breathe{0%,100%{transform:translateY(0) scale(1)}50%{transform:translateY(-1.8%) scale(1.012)}}
+@keyframes glow{0%,100%{opacity:.1;transform:scale(1)}50%{opacity:.22;transform:scale(1.05)}}
+@media (prefers-reduced-motion:reduce){
+  .av img,.av .st,.av .ring{animation:none!important}
+}
+
+.hero{display:flex;justify-content:center;padding:6px 0 2px}
+.chips{display:flex;gap:10px;justify-content:center;margin-top:26px;flex-wrap:wrap}
+.chip{border:1px solid var(--line);background:transparent;color:var(--fg);padding:8px 20px;
+  border-radius:999px;cursor:pointer;font-size:13px;font-family:var(--font);transition:.2s}
+.chip:hover{border-color:var(--fg)}
+.chip.on{background:var(--fg);color:var(--canvas);border-color:var(--fg)}
+
+.sizes{display:flex;gap:30px;align-items:flex-end;flex-wrap:wrap;justify-content:center}
+.cell{display:flex;flex-direction:column;align-items:center;gap:9px}
+.cell img{border-radius:18%;display:block}
+.cap{font-size:11px;color:var(--fg2);font-family:var(--mono);letter-spacing:.5px}
+
+pre{background:var(--canvas);border:1px solid var(--line);border-radius:10px;padding:18px;
+  overflow:auto;font-size:12.5px;line-height:1.85;margin:0;font-family:var(--mono)}
+code{color:#c2410c}
+.note{font-size:13px;color:var(--fg2);line-height:1.9;margin:18px 0 0}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:10px 20px;font-size:13px;color:var(--fg2)}
+.kv b{color:var(--fg);font-weight:500}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div>
+    <h1>AI 助理头像 · Q版 3D</h1>
+    <p class="sub">照你的照片生成的 Q 版 3D 手办形象，大眼睛、软胶质感。
+    在呼吸、会眨眼、头部轻微摆动——动作幅度克制，耐看。</p>
+  </div>
+  <button class="tog" id="theme">切换深 / 浅</button>
+</header>
+
+<section>
+  <h2>动态效果</h2>
+  <div class="card">
+    <div class="hero">
+      <div class="av" id="stage">
+        <span class="ring"></span>
+        <img class="anim" src="avatar-3d-256.webp" alt="AI 助理 Q版3D 动态头像">
+        <img class="still" src="avatar-3d-512.png" alt="静态帧">
+      </div>
+    </div>
+    <div class="chips">
+      <button class="chip on" data-a="">动画开</button>
+      <button class="chip" data-a="still">看静态</button>
+    </div>
+    <p class="note">
+      WebP 动画原生循环播放：眨眼、呼吸、头部轻摆。整体叠加极缓慢的呼吸浮动与淡光晕。
+      背景已抠成透明，可直接叠在任何底色上。
+    </p>
+  </div>
+</section>
+
+<section>
+  <h2>尺寸</h2>
+  <div class="card">
+    <div class="sizes">
+      <div class="cell"><img src="avatar-3d-64.webp" width="44" alt="40"><span class="cap">40px·64f</span></div>
+      <div class="cell"><img src="avatar-3d-128.webp" width="64" alt="64"><span class="cap">64px·128f</span></div>
+      <div class="cell"><img src="avatar-3d-128.webp" width="96" alt="96"><span class="cap">96px</span></div>
+      <div class="cell"><img src="avatar-3d-256.webp" width="130" alt="130"><span class="cap">130px·256f</span></div>
+      <div class="cell"><img src="avatar-3d-256.webp" width="190" alt="190"><span class="cap">190px</span></div>
+    </div>
+    <p class="note">f = 帧图边长。小尺寸用低分辨率帧图（体积小），大尺寸用高分辨率帧图（清晰）。
+    静态 PNG 另备 40 / 64 / 128 / 256 / 512 / 1024。</p>
+  </div>
+</section>
+
+<section>
+  <h2>集成</h2>
+  <div class="card">
+    <pre><code>&lt;!-- 动态：WebP 原生循环，无需 JS --&gt;
+&lt;img src="avatar-3d-128.webp" style="width:64px;height:64px"&gt;
+
+&lt;!-- 静态：任意场景兜底 --&gt;
+&lt;img src="avatar-3d-256.png" style="width:64px;height:64px"&gt;
+
+/* 包一层 .av 加呼吸与光晕 */
+.av img { animation: breathe 5.2s ease-in-out infinite; }
+.av .ring { /* 淡光晕 */ }</code></pre>
+    <div class="kv" style="margin-top:22px">
+      <b>动画</b><span>avatar-3d-{64·128·256}.webp · 76 帧 · 15fps · 透明循环</span>
+      <b>静态</b><span>avatar-3d-{40·64·128·256·512·1024}.png · 透明背景</span>
+      <b>降级</b><span>prefers-reduced-motion 时动画自动静止（保留首帧）</span>
+    </div>
+  </div>
+</section>
+
+</div>
+
+<script>
+const stage=document.getElementById('stage');
+document.querySelectorAll('.chip').forEach(c=>{
+  c.onclick=()=>{
+    document.querySelectorAll('.chip').forEach(x=>x.classList.remove('on'));
+    c.classList.add('on');
+    stage.className='av'+(c.dataset.a?' '+c.dataset.a:'');
+  };
+});
+document.getElementById('theme').onclick=()=>document.body.classList.toggle('dark');
+</script>
+</body>
+</html>

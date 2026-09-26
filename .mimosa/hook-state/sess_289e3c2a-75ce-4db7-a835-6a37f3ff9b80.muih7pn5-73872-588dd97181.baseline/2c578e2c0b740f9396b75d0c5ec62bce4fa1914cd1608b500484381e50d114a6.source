@@ -1,0 +1,12 @@
+{
+  "name": "simple-tencent-meeting-mesh",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebRTC 多人会议（Mesh/P2P 版）· 发布包（由 scripts/publish.js 生成，勿手工修改）",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "socket.io": "^4.7.5"
+  }
+}
