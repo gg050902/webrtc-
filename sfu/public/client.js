@@ -56,6 +56,7 @@ const AI_NICKNAME = '小明';
 /* ★ 09-26b 矢量动画头像 v2（素材：apple-avatar/gufeng/handdraw 丫髥童子）——
  *   静态 PNG 切换太僵硬，换成内联 SVG：呼吸浮动/眨眼/摇头由 CSS 关键帧驱动，
  *   五态靠眼形（睁/弯）与嘴形（笑/张/平）的显隐切换，瞬时无跳变。 */
+/* [09-26c 弃用保留] 矢量小人版本,如需回退 git log 可寻 */
 function aiAvatarSvg(st, cls) {
   /* ★ 09-26c 头像 v3 深度美化（用户反馈"还是不好看"）：
    *  ① 造型精修：皮肤径向渐变+柔边阴影滤镜、双眼皮+双高光眼、眉毛、发丝高光、
@@ -2903,24 +2904,58 @@ function speakAiText(text) {
   if (!aiVoiceOn || !SPEECH_OK) return;
   const say = speakableText(text);
   if (!say) return;
-  try {
-    /* ★ 先 cancel 再 speak：会议里 AI 可能连续说几句，
-     *   排队会让语音越来越滞后于会议（说到第三句时会议早走远了）。
-     *   宁可"只说最新那句"，也不要"逐句补念过时信息"。 */
-    window.speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(say);
-    u.lang = 'zh-CN';
-    u.rate = 1.05;     // 略快于默认：会议场景下默认语速显得拖沓
-    u.pitch = 1.0;
-    // 优先挑一个中文音色（不同系统默认音色不同，不指定可能用英文腔念中文）
-    try {
-      const vs = window.speechSynthesis.getVoices() || [];
-      const zh = vs.find((v) => /zh[-_]?CN|Chinese|中文|普通话/i.test(v.lang + ' ' + v.name));
-      if (zh) u.voice = zh;
-    } catch (e) { /* 音色列表拿不到就用默认 */ }
-    window.speechSynthesis.speak(u);
-  } catch (e) { /* 播报失败绝不影响会议功能（它是增值项，不是主链路） */ }
+      try {
+      /* ★ 09-26e 语音去 AI 味——三层优化：
+       *  ① 音色策略：自然神经音色优先（Online (Natural) / Premium / 常见自然音色名）——
+       *     它们与老式 SAPI 音色的差距就是“AI 味”与“真人味”的差距；
+       *  ② 分句队列：按句末标点切段排队朗读，句间自然停顿、语调重新起势，
+       *     接近真人节奏；新回答到来 cancel+清队列，“只说最新”语义不变；
+       *  ③ 参数：rate 1.02（自然音色语速快，过快吞字）、pitch 1.05 略亮。 */
+      window.speechSynthesis.cancel();
+      aiSpeakQueue.length = 0;
+      const pickVoice = () => {
+        try {
+          const vs = window.speechSynthesis.getVoices() || [];
+          const zh = vs.filter((v) => /zh[-_]?CN|Chinese|中文|普通话/i.test(v.lang + ' ' + v.name));
+          const prefs = [
+            /(Online.*Natural|Natural.*Online)/i,
+            /Xiaoxiao|Xiaoyi|云希|云野|晓晓|晓伊/i,
+            /Premium|Enhanced/i,
+            /Huihui|Yaoyao|Kangkang/i,
+          ];
+          for (const re of prefs) {
+            const hit = zh.find((v) => re.test(v.name));
+            if (hit) return hit;
+          }
+          return zh[0] || null;
+        } catch (e) { return null; }
+      };
+      const voice = pickVoice();
+      const sentences = say.split(/(?<=[。！？!?..])/).reduce((acc, seg) => {
+        if (!seg) return acc;
+        if (acc.length && (acc[acc.length - 1] + seg).length < 6) acc[acc.length - 1] += seg;
+        else acc.push(seg);
+        return acc;
+      }, []);
+      aiSpeakQueue.push(...sentences.filter((x) => x.trim()));
+      const speakNext = () => {
+        if (!aiSpeakQueue.length) return;
+        const part = aiSpeakQueue.shift();
+        if (Date.now() > aiSpeakDeadline) { aiSpeakQueue.length = 0; return; }
+        const u = new SpeechSynthesisUtterance(part);
+        u.lang = 'zh-CN';
+        u.rate = 1.02;
+        u.pitch = 1.05;
+        if (voice) u.voice = voice;
+        u.onend = () => setTimeout(speakNext, 120); // 句间自然停顿
+        window.speechSynthesis.speak(u);
+      };
+      aiSpeakDeadline = Date.now() + Math.max(20000, say.length * 400);
+      speakNext();
+    } catch (e) { /* 播报失败绝不影响会议功能 */ }
 }
+let aiSpeakQueue = [];   // 分句朗读队列
+let aiSpeakDeadline = 0; // 本轮朗读截止时刻（超时保护）
 
 function updateAiVoiceUi() {
   const btn = $('aiVoiceBtn');
@@ -3023,8 +3058,8 @@ function renderMembers(members) {
       row.classList.add('ai-bot-row');
       const note = botHearingNote();   // 由最近一次快照/字幕事件维护的活状态
       row.classList.add('has-av');
-      row.innerHTML = `<span class="ai-av">${aiAvatarSvg(aiAvatar.state, 'ai-av-mini')}</span>`
-        + `<span class="m-id">${ICONS.bot} ${escapeHtml(m.name || 'AI 助理')}`
+      row.innerHTML = `<span class="ai-av"><img src="/avatars/ai/face-256.png" alt=""></span>`
+        + `<span class="m-id">${ICONS.bot} ${escapeHtml(m.name || 'AI 小明')}`
         + `<span class="m-bot-note" title="AI 助理的实时状态">${escapeHtml(note)}</span></span>`;
       aiAvatar.rowEl = row.querySelector('.ai-av'); // ★ 09-26：状态机刷新时换五态图
       const askBtn = document.createElement('button');
@@ -4549,16 +4584,17 @@ const AI_STATE_LABEL = { idle: '聆听中…', listening: '聆听中…', thinki
 function setAiState(st, speechText) {
   if (!AI_STATES.includes(st)) return;
   aiAvatar.state = st;
-  // 成员行小头像：重渲染内联 SVG（换眼形/嘴形）
-  if (aiAvatar.rowEl) aiAvatar.rowEl.innerHTML = aiAvatarSvg(st, 'ai-av-mini');
-  // AI 格子：大头像 + 状态标签 + 发言字幕条
+  /* ★ 09-26c 头像 v4（用户反馈 SVG 小人还是不够美）：
+   *  底图换成 meihua4 的精美国风头像（一张好图胜过一切小动作），生动感交给
+   *  **动效系统**——呼吸缩放/speaking 声波条跳动/thinking 暗化+泡泡漂浮/happy 弹跳。
+   *  状态全部由格子 class 驱动 CSS，切换只动 class（丝滑过渡由 transition 承担）。 */
+  if (aiAvatar.rowEl) aiAvatar.rowEl.classList.toggle('speaking', st === 'speaking');
   if (aiTileEl) {
-    const wrap = aiTileEl.querySelector('.ai-face-wrap');
-    if (wrap) wrap.innerHTML = aiAvatarSvg(st, 'ai-face-svg');
     const label = aiTileEl.querySelector('.ai-status');
     if (label) label.textContent = AI_STATE_LABEL[st];
     aiTileEl.classList.toggle('speaking', st === 'speaking');
     aiTileEl.classList.toggle('thinking', st === 'thinking');
+    aiTileEl.classList.toggle('happy', st === 'happy');
     /* ★ 09-26b 发言字幕逐字化（用户反馈"AI 字幕太僵硬"）：
      *   speaking 时把答案在格子上方的字幕条里**逐字打出**（标点带停顿——逗号长、
      *   句号更长，模拟说话的呼吸），朗读感立刻不一样；归位时字幕淡出。
@@ -4593,8 +4629,10 @@ function syncAiTile(present) {
   if (present && !aiTileEl) {
     aiTileEl = document.createElement('div');
     aiTileEl.className = 'video-box ai-tile';
+    const waves = '<div class="ai-waves">' + '<i></i>'.repeat(7) + '</div>';
     aiTileEl.innerHTML =
-      '<div class="ai-face-wrap">' + aiAvatarSvg('idle', 'ai-face-svg') + '</div>' +
+      '<div class="ai-face-wrap"><img class="ai-face" src="/avatars/ai/face-256.png" alt="AI 小明"></div>' +
+      waves +
       '<div class="ai-speech" aria-live="polite"></div>' +
       '<div class="video-label">AI 小明<span class="ai-status">聆听中…</span></div>';
     grid.appendChild(aiTileEl);

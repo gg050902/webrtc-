@@ -2313,3 +2313,67 @@ body.rd-mode { overflow: hidden; }
 .ai-svg svg { width: 100%; height: 100%; display: block; }
 .ai-av .ai-svg svg, .ai-av-mini { display: block; }
 .ai-av .ai-svg { width: 130%; height: 130%; margin: -15% 0 0 -15%; }
+
+/* ────────── 27. ★ 09-26c 头像 v4：精美底图 + 动效系统 ──────────
+   一张好图胜过一切小动作（meihua4 国风头像），"生动"交给动效：
+   呼吸缩放常驻；speaking 声波条跳动+头像轻弹；thinking 暗化+泡泡漂浮；happy 弹跳闪光。 */
+.ai-tile .ai-face {
+  width: 74%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 2px solid var(--accent-border);
+  box-shadow: 0 0 0 6px rgba(216, 179, 106, .08), var(--shadow-1);
+  animation: aiFaceBreathe 4.2s ease-in-out infinite;
+  transition: box-shadow .4s var(--ease), filter .4s var(--ease);
+}
+@keyframes aiFaceBreathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.028); } }
+.ai-tile.speaking .ai-face {
+  animation: aiFaceTalk 0.62s ease-in-out infinite;
+  box-shadow: 0 0 0 8px rgba(216, 179, 106, .14), 0 0 26px rgba(216, 179, 106, .25);
+}
+@keyframes aiFaceTalk { 0%, 100% { transform: scale(1.02); } 50% { transform: scale(1.055); } }
+.ai-tile.thinking .ai-face { animation: aiFaceThink 2.6s ease-in-out infinite; filter: saturate(.72) brightness(.86); }
+@keyframes aiFaceThink { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
+.ai-tile.happy .ai-face { animation: aiFaceHappy 1.5s ease-in-out infinite; filter: brightness(1.08); }
+@keyframes aiFaceHappy { 0%, 100% { transform: scale(1.02); } 35% { transform: scale(1.07) rotate(-2deg); } 70% { transform: scale(1.05) rotate(2deg); } }
+/* 声波条（speaking 才跳）：7 根竖条错峰弹跳 = 正在说话的"声音可视化" */
+.ai-waves {
+  position: absolute;
+  left: 50%; bottom: 42px;
+  transform: translateX(-50%);
+  display: none;
+  align-items: flex-end;
+  gap: 4px;
+  height: 26px;
+  z-index: 4;
+  pointer-events: none;
+}
+.ai-tile.speaking .ai-waves { display: flex; }
+.ai-waves i {
+  width: 5px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, var(--accent), rgba(216, 179, 106, .35));
+  animation: aiWaveJump 0.9s ease-in-out infinite;
+}
+.ai-waves i:nth-child(1) { height: 30%; animation-delay: 0s; }
+.ai-waves i:nth-child(2) { height: 62%; animation-delay: .12s; }
+.ai-waves i:nth-child(3) { height: 92%; animation-delay: .24s; }
+.ai-waves i:nth-child(4) { height: 70%; animation-delay: .05s; }
+.ai-waves i:nth-child(5) { height: 96%; animation-delay: .18s; }
+.ai-waves i:nth-child(6) { height: 55%; animation-delay: .3s; }
+.ai-waves i:nth-child(7) { height: 34%; animation-delay: .09s; }
+@keyframes aiWaveJump { 0%, 100% { transform: scaleY(.45); } 50% { transform: scaleY(1); } }
+/* thinking 的漂浮泡泡（浮层装饰） */
+.ai-tile.thinking::after {
+  content: '💭';
+  position: absolute;
+  top: 10px; right: 14px;
+  font-size: 20px;
+  animation: aiThinkFloat 2.4s ease-in-out infinite;
+  z-index: 4;
+}
+@keyframes aiThinkFloat { 0%, 100% { transform: translateY(0); opacity: .75; } 50% { transform: translateY(-6px); opacity: 1; } }
+/* 成员行小头像 speaking 金环脉冲 */
+.ai-av.speaking { animation: aiRingPulse 1.2s ease-in-out infinite; }
+@keyframes aiRingPulse { 0%, 100% { box-shadow: 0 0 0 2px var(--accent-border); } 50% { box-shadow: 0 0 0 4px rgba(216, 179, 106, .5); } }

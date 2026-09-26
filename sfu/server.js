@@ -1770,6 +1770,46 @@ function setAiBot(roomNumber, on, opts = {}) {
       const producer = sock && sock.producers && sock.producers.get(pid);
       if (producer && producer.kind === 'audio') startAiAudioPipe(roomNumber, producer, owner);
     }
+    // ★ 09-26d 冷场暖场：AI 在场且 warmOn（默认开）时，10 分钟没人说话就主动说一句
+    if (!room.warmTimer) {
+      room.lastActivity = Date.now();
+      room.warmOn = true;
+      room.warmTimer = setInterval(async () => {
+        const r = rooms.get(roomNumber);
+        if (!r || !r.aiBot || !r.warmOn) return;
+        if (Date.now() - (r.lastActivity || 0) < AI_WARM_MS) return;
+        r.lastActivity = Date.now(); // 触发后复位，下一轮重新计时
+        try {
+          const caps = loadCaptions(roomNumber).slice(-5);
+          let line;
+          if (AI.aiEnabled() && caps.length) {
+            try {
+              const res = await fetch('https://api.deepseek.com/chat/completions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+                body: JSON.stringify({
+                  model: 'deepseek-chat', temperature: 0.8,
+                  messages: [
+                    { role: 'system', content: '你是会议 AI 助理小明。会议冷场了，根据最近的发言内容说一句自然的暖场话（不超过40字）：或邀请大家补充、或抛个小问题、或小结一下。直接输出这句话本身，不要引号。' },
+                    { role: 'user', content: '最近发言：' + (caps.map((e) => `${e.name}：${e.text}`).join('；') || '（还没人发言）') },
+                  ],
+                }),
+              });
+              if (res.ok) line = (await res.json()).choices[0].message.content.trim();
+            } catch (e) { /* 降级模板 */ }
+          }
+          if (!line) {
+            line = caps.length
+              ? `刚才聊到「${(caps[caps.length - 1].text || '').slice(0, 24)}」，大家继续呀——有结论了吗？`
+              : '大家随便聊聊，我一直都在听～（提到「小明」我就会回答）';
+          }
+          io.to(roomNumber).emit('chat-message', { from: 'ai-bot', name: '🤖 AI 小明', text: line, ts: Date.now() });
+          io.to(roomNumber).emit('ai-state', { state: 'speaking', text: line });
+          setTimeout(() => io.to(roomNumber).emit('ai-state', { state: 'idle' }), Math.min(9000, 2500 + line.length * 80));
+          logEvent('info', 'ai-warmup', { roomNumber });
+        } catch (e) { /* 暖场失败静默，下轮再试 */ }
+      }, 60000);
+    }
     // ★ N2：值守分段纪要定时器（bot 在场才挂；interval = config.minutesIntervalSec，默认 1h）
     if (!room.minutesTimer) {
       const sinceMark = { ts: Date.now() }; // 每段只统计上一段之后的新字幕
@@ -1812,6 +1852,7 @@ function setAiBot(roomNumber, on, opts = {}) {
     }
     stopAiAudioPipeline(roomNumber);
     // ★ N2：送走 bot = 值守段落结束 → 清定时器 + 出终稿（异步落盘，不阻塞信令）
+    if (room.warmTimer) { clearInterval(room.warmTimer); room.warmTimer = null; } // ★ 09-26d 暖场定时器一并清
     if (room.minutesTimer) { clearInterval(room.minutesTimer); room.minutesTimer = null; }
     buildMinutes(roomNumber, { type: 'final' }).then((r) => {
       if (!was || !r) return;
@@ -1934,6 +1975,7 @@ async function aiBrain(roomNumber, question, onDelta) {
  *   被控端视口不同会有偏差——教学演示前可在 1280×800 视口校一遍。
  * ══════════════════════════════════════════════════════════════ */
 const AI_OP_STEP_MS = Number(process.env.AI_OP_STEP_MS) || 600;
+const AI_WARM_MS = (Number(process.env.AI_WARM_SEC) || 600) * 1000; // ★ 09-26d 冷场阈值（默认 10 分钟无发言→AI 主动暖场）
 const AI_OP_MAX_MS = Number(process.env.AI_OP_MAX_MS) || 30000;
 let aiOpBusy = false;      // 全服务器同一时刻只跑一个 AI 操作任务（简单互斥）
 let aiOpSocket = null;     // AI 的"真实控制端"连接（连自己的信令端口）
@@ -2762,6 +2804,7 @@ function destroyRoom(roomNumber, reason) {
   // ★ N2：房间销毁时 bot 若在场 → 终稿纪要（异步，读的账本都在文件/闭包里，不依赖 room）
   if (room.aiBot) {
     if (room.minutesTimer) { clearInterval(room.minutesTimer); room.minutesTimer = null; }
+    if (room.warmTimer) { clearInterval(room.warmTimer); room.warmTimer = null; }
     buildMinutes(roomNumber, { type: 'final' }).catch(() => {});
   }
   rooms.delete(roomNumber);
@@ -3229,6 +3272,7 @@ io.on('connection', (socket) => {
   //   兜底 = 这条信令广播（数据通道还没建立/建立失败的人也能收到）。服务器原样带 msgId。
   socket.on('chat-message', ({ text, msgId } = {}) => {
     if (!socket.roomNumber || typeof text !== 'string' || !text.trim()) return;
+    { const _r = rooms.get(socket.roomNumber); if (_r) _r.lastActivity = Date.now(); } // ★ 09-26d 暖场计时源
     if (!rateLimit(`chat:${socket.id}`, 40, 10000)) return; // ★ G6-③：防刷屏(静默丢弃)
     // 广播给整个房间（包括自己），前端按 from 区分"我/别人"
     io.to(socket.roomNumber).emit('chat-message', {
@@ -3666,6 +3710,15 @@ io.on('connection', (socket) => {
   socket.on('ai-join', (payload = {}, callback) => {
     if (!socket.roomNumber || !rooms.get(socket.roomNumber)) return fail(callback, '先进入房间再邀请 AI 助理');
     ok(callback, { aiBot: setAiBot(socket.roomNumber, true) === true });
+  });
+
+  // ★ 09-26d：暖场开关（前端 AI 格子按钮；warmOn 存房间=全房一致）
+  socket.on('ai-warm', (payload = {}, callback) => {
+    const r = socket.roomNumber && rooms.get(socket.roomNumber);
+    if (!r) return fail(callback, '先进入房间');
+    r.warmOn = !!payload.on;
+    if (r.warmOn) r.lastActivity = Date.now();
+    ok(callback, { warmOn: r.warmOn });
   });
 
   socket.on('ai-leave', (payload = {}, callback) => {
