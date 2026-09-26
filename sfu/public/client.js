@@ -1253,7 +1253,7 @@ roomBadge.addEventListener('click', async () => {
  *   建立/订阅完成前的消息会丢——所以每条消息同时走两条路，接收端按 msgId 去重。
  *   这是工程上常见的"双发去重"做法（面试讲点：at-least-once + 幂等接收）。
  * ────────────────────────────────────────────────────────────── */
-socket.on('ai-state', ({ state }) => setAiState(state)); // ★ 09-26：AI 头像状态机
+socket.on('ai-state', ({ state, text }) => setAiState(state, text)); // ★ 09-26b：text 供逐字字幕
 
 socket.on('chat-message', ({ from, text, ts, msgId, name, ai, streamId }) => {
   // ★ D+1：同一条消息可能从 SCTP 和信令各到一次，msgId 相同的只显示第一条
