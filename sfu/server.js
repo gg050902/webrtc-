@@ -1659,6 +1659,60 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
       sdpMediaSection(c, 'audio', port)].join('\r\n');
     const sdpFile = path.join(LOGS_DIR, `ai-${roomNumber}-${producer.id}.sdp`);
     fs.writeFileSync(sdpFile, sdp);
+    // ★ 09-27：whisper 可用 → **分段录音模式**（每 15s 一段 wav，段完转写入账本）；
+    //   不可用 → 原 astats 模式（只记响度）。两条路径都吃同一路 RTP。
+    if (WHISPER_BIN) {
+      const segDir = path.join(LOGS_DIR, `asr-${roomNumber}`);
+      fs.mkdirSync(segDir, { recursive: true });
+      let segIdx = 0;
+      let alive = true;
+      pipe.alive = () => { alive = false; }; // producerclose/停用时置假
+      const recordLoop = async () => {
+        while (alive && rooms.get(roomNumber)) {
+          const wav = path.join(segDir, `seg-${Date.now()}.wav`);
+          await new Promise((r) => {
+            const rec = require('child_process').spawn(FFMPEG_BIN, [
+              '-loglevel', 'error', '-protocol_whitelist', 'file,udp,rtp',
+              '-fflags', '+genpts', '-i', sdpFile, '-t', '15',
+              '-ar', '16000', '-ac', '1', '-y', wav,
+            ], { stdio: ['ignore', 'ignore', 'ignore'] });
+            rec.on('exit', () => setTimeout(r, 300)); // 留缓冲：文件写完整
+          });
+          if (!alive || !rooms.get(roomNumber)) { try { fs.unlinkSync(wav); } catch (e) {} break; }
+          let size = 0;
+          try { size = fs.statSync(wav).size; } catch (e) { continue; }
+          if (size < 20000) { try { fs.unlinkSync(wav); } catch (e) {} continue; } // 静音段(≈<1s 语音)跳过
+          // 转写（whisper CLI：输出同名 txt；模型 tiny 足够会议场景）
+          const txtFile = wav.replace(/\.wav$/, '.txt');
+          await new Promise((r) => {
+            require('child_process').execFile(WHISPER_BIN,
+              [wav, '--model', process.env.WHISPER_MODEL || 'tiny', '--language', 'zh',
+               '--output_format', 'txt', '--output_dir', segDir],
+              { timeout: 60000, windowsHide: true }, () => r());
+          });
+          let text = '';
+          try { text = fs.readFileSync(txtFile, 'utf8').trim(); } catch (e) {}
+          try { fs.unlinkSync(wav); fs.unlinkSync(txtFile); } catch (e) {}
+          if (!text || !rooms.get(roomNumber)) continue;
+          // 入字幕账本（source:'asr' 标记来源；与客户端字幕同一条权威副本路径）
+          const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+          const capFile = path.join(CAPTIONS_DIR, `cap-${roomNumber}-${day}.jsonl`);
+          fs.appendFileSync(capFile, JSON.stringify({
+            ts: Date.now(), from: memberId, name: `成员 ${String(memberId).slice(-4)}`, text: text.slice(0, 500), asr: true,
+          }) + '\n');
+          if (!aiHearing.has(roomNumber)) aiHearing.set(roomNumber, new Map());
+          io.to(roomNumber).emit('chat-message', {
+            from: 'system', name: null,
+            text: `🎙️ [转写] ${String(memberId).slice(-4)}：${text.slice(0, 80)}`,
+            ts: Date.now(),
+          });
+          logEvent('info', 'asr-segment', { roomNumber, member: memberId, chars: text.length });
+          segIdx += 1;
+        }
+      };
+      recordLoop();
+      return;
+    }
     const proc = require('child_process').spawn(FFMPEG_BIN, [
       '-loglevel', 'error', '-protocol_whitelist', 'file,udp,rtp',
       '-fflags', '+genpts', '-i', sdpFile,
@@ -1677,7 +1731,10 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
       aiHearing.get(roomNumber).set(memberId, { rms, ts: Date.now() }); // bot 听见：某人当前 -xx dB
     });
     // 被跟的 Producer 关闭（关麦克风/断线）→ 收掉 ffmpeg（exit 回调统一清理管道）
-    c.on('producerclose', () => { try { proc.kill(); } catch (e) { /* 已退 */ } });
+    c.on('producerclose', () => {
+      if (pipe && pipe.alive) pipe.alive(); // ★ 09-27 分段转写循环停机
+      try { proc.kill(); } catch (e) { /* 已退 */ }
+    });
     const pipe = { transport: t, consumer: c, proc, memberId, producerId: producer.id, port, sdpFile };
     if (!aiAudioPipes.has(roomNumber)) aiAudioPipes.set(roomNumber, new Set());
     aiAudioPipes.get(roomNumber).add(pipe);
@@ -1975,7 +2032,40 @@ async function aiBrain(roomNumber, question, onDelta) {
  *   被控端视口不同会有偏差——教学演示前可在 1280×800 视口校一遍。
  * ══════════════════════════════════════════════════════════════ */
 const AI_OP_STEP_MS = Number(process.env.AI_OP_STEP_MS) || 600;
-const AI_WARM_MS = (Number(process.env.AI_WARM_SEC) || 600) * 1000; // ★ 09-26d 冷场阈值（默认 10 分钟无发言→AI 主动暖场）
+const AI_WARM_MS = (Number(process.env.AI_WARM_SEC) || 600) * 1000;
+
+/* ★ 09-27 服务端 ASR（字幕转写，用户点名“开启那个字幕转写”）：
+ * ▶ 原理：AI 听觉管线（startAiAudioPipe）已把每路音频推给本机 ffmpeg——在此基础上
+ *   改为 **15s 分段落盘 wav → whisper 命令行转写 → 追加进字幕账本 jsonl（source:'asr'）**。
+ *   账本一旦有真实转写，@ai 问答/RAG/纪要/唤醒词全部自动升级（不再依赖客户端 Web Speech）。
+ * ▶ 依赖：`pip install -U openai-whisper`（首次运行自动下载模型，需能访 HuggingFace）；
+ *   未检测到 whisper → 启动时明确提示安装方式，功能静默关闭（客户端 Web Speech 字幕仍可用）。
+ * ▶ 隐私边界：音频不出本机（whisper 本地推理）；模型 tiny/base 即可，中文效果已够用。 */
+let WHISPER_BIN = null;      // 检测到的 whisper 可执行文件（null = 未可用）
+let whisperProbed = false;
+function probeWhisper() {
+  if (whisperProbed) return Promise.resolve(WHISPER_BIN);
+  whisperProbed = true;
+  const { execFile } = require('child_process');
+  const cands = ['whisper', 'whisper-cli', 'whisper.exe'];
+  return new Promise((resolve) => {
+    let i = 0;
+    const tryNext = () => {
+      if (i >= cands.length) {
+        console.log('🎙 服务端转写（ASR）未开启：未检测到 whisper。安装： pip install -U openai-whisper （重启生效）；客户端 Web Speech 字幕不受影响');
+        return resolve(null);
+      }
+      const c = cands[i++];
+      execFile(c, ['--help'], { timeout: 4000, windowsHide: true }, (err) => {
+        if (err) return tryNext();
+        WHISPER_BIN = c;
+        console.log(`🎙 服务端转写（ASR）已开启：${c}（每路音频 15s 分段转写入字幕账本，AI 小明能听懂会议内容了）`);
+        resolve(WHISPER_BIN);
+      });
+    };
+    tryNext();
+  });
+} // ★ 09-26d 冷场阈值（默认 10 分钟无发言→AI 主动暖场）
 const AI_OP_MAX_MS = Number(process.env.AI_OP_MAX_MS) || 30000;
 let aiOpBusy = false;      // 全服务器同一时刻只跑一个 AI 操作任务（简单互斥）
 let aiOpSocket = null;     // AI 的"真实控制端"连接（连自己的信令端口）
@@ -4338,6 +4428,7 @@ io.on('connection', (socket) => {
    */
   console.log('⏳ 正在启动会议服务（先开 HTTP，再并行准备媒体引擎）…');
   const t0 = Date.now();
+  probeWhisper();
   const workerReady = createWorker().then(() => {
     console.log(`⚙️  媒体引擎就绪（用时 ${((Date.now() - t0) / 1000).toFixed(2)}s）：现在可以开摄像头开会了`);
     return worker;
