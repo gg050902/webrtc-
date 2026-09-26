@@ -2274,3 +2274,42 @@ body.rd-mode { overflow: hidden; }
   overflow: hidden;
 }
 .ai-speech.show { opacity: 1; transform: translateY(0); }
+
+/* ── 09-26c 头像 v3 丝滑层：交叉淡化替代硬切 + 开合嘴 + 思考泡泡 ── */
+.ai-svg .eye-open, .ai-svg .eye-curve, .ai-svg .mouth-smile, .ai-svg .mouth-open, .ai-svg .mouth-flat {
+  transition: opacity .25s ease;
+}
+.ai-svg .eye-open { opacity: 1; }
+.ai-svg .eye-curve { opacity: 0; }
+.ai-svg .mouth-smile { opacity: 1; }
+.ai-svg .mouth-open, .ai-svg .mouth-flat { opacity: 0; }
+.ai-svg.st-listen .eye-open, .ai-svg.st-think .eye-open, .ai-svg.st-happy .eye-open { opacity: 0; }
+.ai-svg.st-listen .eye-curve, .ai-svg.st-think .eye-curve, .ai-svg.st-happy .eye-curve { opacity: 1; }
+.ai-svg.st-idle .mouth-open, .ai-svg.st-idle .mouth-flat { opacity: 0; }
+.ai-svg.st-listen .mouth-smile, .ai-svg.st-listen .mouth-open { opacity: 0; }
+.ai-svg.st-listen .mouth-flat { opacity: 1; }
+.ai-svg.st-speak .mouth-smile { opacity: 0; }
+.ai-svg.st-speak .mouth-open { opacity: 1; animation: aiMouthTalk 0.42s ease-in-out infinite; transform-origin: 100px 131px; }
+.ai-svg.st-speak .mouth-flat { opacity: 0; }
+.ai-svg.st-think .mouth-smile { opacity: 0; }
+.ai-svg.st-think .mouth-flat { opacity: 1; }
+.ai-svg.st-happy .mouth-smile { opacity: 0; }
+.ai-svg.st-happy .mouth-flat { opacity: 0; }
+@keyframes aiMouthTalk { 0%, 100% { transform: scaleY(.35); } 50% { transform: scaleY(1); } }
+.ai-svg .brow { transition: transform .3s ease; transform-origin: 100px 92px; }
+.ai-svg.st-think .brow { transform: translateY(-3px); }
+.ai-svg .think-bubbles { opacity: 0; transition: opacity .4s ease; }
+.ai-svg.st-think .think-bubbles { opacity: 1; animation: aiBubbleFloat 2.4s ease-in-out infinite; }
+.ai-svg.st-think .think-bubbles circle:nth-child(2) { animation-delay: .3s; }
+.ai-svg.st-think .think-bubbles circle:nth-child(3) { animation-delay: .6s; }
+@keyframes aiBubbleFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+.ai-svg.st-listen .body-grp { transform: translateY(1.5px); transition: transform .4s ease; }
+.ai-svg.st-happy .head-grp { animation: aiHappyBounce 1.6s ease-in-out infinite; }
+@keyframes aiHappyBounce { 0%, 100% { transform: translateY(0) rotate(0); } 40% { transform: translateY(-4px) rotate(-1.6deg); } 70% { transform: translateY(-1px) rotate(1.4deg); } }
+.ai-av .ai-svg, .ai-av-mini { width: 100%; height: 100%; }
+
+/* ── 09-26c 修正:SVG 尺寸链显式化(容器 auto 高会让 100% 失控) ── */
+.ai-face-wrap .ai-svg { width: 78%; height: 88%; }
+.ai-svg svg { width: 100%; height: 100%; display: block; }
+.ai-av .ai-svg svg, .ai-av-mini { display: block; }
+.ai-av .ai-svg { width: 130%; height: 130%; margin: -15% 0 0 -15%; }
