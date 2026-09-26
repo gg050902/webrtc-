@@ -1078,6 +1078,12 @@ const rooms = new Map();
  *   现在 token 里多带一个 role（管理员门禁要用），见下面 issueToken。
  * ▎身份的用途：昵称贯通成员列表/聊天气泡/工作台状态条；不登录也能玩（游客模式）。 */
 const crypto = require('crypto');
+/* ★ 09-26 头像系统（参考 apple-avatar 素材集）：注册可选预设头像（key 白名单 av-01~09，
+ *   文件 sfu/public/avatars/presets/av-XX.png，名字映射在前端 PRESET_AVATARS）。
+ *   AI 助理五态头像（idle/listening/thinking/speaking/happy）在 avatars/ai/，
+ *   由 ai-state 广播驱动前端状态机（AI 格子 + 成员行动态头像）。 */
+const AVATAR_PRESETS = new Set(['av-01', 'av-02', 'av-03', 'av-04', 'av-05', 'av-06', 'av-07', 'av-08', 'av-09']);
+
 /* ★ 09-19h G6-③ 限流（零依赖手写固定窗口计数器，~15 行）：
  * ▎防什么：撞库（login）/暴力猜 6 位房间号（join-room）/注册机刷号（register）/刷屏（chat）。
  * ▎用固定窗口而非令牌桶：实现最短、语义直白（"一分钟最多 N 次"），教学项目够用；
@@ -2236,6 +2242,8 @@ async function runAiOperator(roomNumber, hostId, goal) {
   const doneReport = anyForwardFail
     ? `⚠️ 计划已执行完（${plan.length} 步${isMock ? '，[Mock] 本地脚本' : '，LLM 计划'}），但**有输入帧因被控端不在房间被丢弃**——可能未完全生效，建议查看被控端画面确认`
     : `🏁 计划已执行完（${plan.length} 步${isMock ? '，[Mock] 本地脚本' : '，LLM 计划'}），输入已全部转发${reactRounds ? `，并经 ${reactRounds} 轮闭环核对` : ''}；控制权已交还`;
+  io.to(roomNumber).emit('ai-state', { state: 'happy' }); // ★ 09-26：任务达成的"情绪帧"
+  setTimeout(() => io.to(roomNumber).emit('ai-state', { state: 'idle' }), 2600);
   io.to(roomNumber).emit('chat-message', {
     from: 'ai-bot', name: '🤖 AI 操作员', text: doneReport, ts: Date.now(),
   });
@@ -2592,6 +2600,7 @@ function broadcastRoomState(roomNumber) {
   const members = [...room.members].map((m) => ({
     id: m.id,
     name: m.displayName || null,           // ★ 09-16：昵称（成员列表显示用）
+    avatar: m.avatar || null,              // ★ 09-26：预设头像 key（前端拼 /avatars/presets/XX.png）
     owner: m.id === room.ownerId,          // 房主（建房的人）——踢人权限在他手里
     muted: !!(m.state && m.state.muted),   // 前端上报的"我静音了吗"
     camOff: !!(m.state && m.state.camOff), // 前端上报的"我关摄像头了吗"
@@ -2606,7 +2615,7 @@ function broadcastRoomState(roomNumber) {
   //   它没有 socket/媒体，muted/camOff 都是"是"（它不推流，只"听"：见下方音频管线）
   if (room.aiBot) {
     members.push({
-      id: 'ai-bot', name: '🤖 AI 助理', isBot: true,
+      id: 'ai-bot', name: '🤖 AI 助理', isBot: true, avatar: 'ai',
       owner: false, muted: true, camOff: true, sharing: false, hand: false, caption: true,
     });
   }
@@ -2983,11 +2992,12 @@ io.on('connection', (socket) => {
    * ▎三个动作共用"成功后把身份绑到 socket"的逻辑：之后的聊天广播/成员快照
    *   都能带上昵称（不用每条消息自带身份——身份在连接上，这是服务端会话的意义）。
    */
-  const bindIdentity = (username, displayName) => {
+  const bindIdentity = (username, displayName, avatar) => {
     socket.username = username;
     socket.displayName = displayName;
+    if (avatar) socket.avatar = avatar; // ★ 09-26：头像随身份绑定（room-state 广播用）
   };
-  socket.on('auth-register', ({ username, password, displayName } = {}, callback) => {
+  socket.on('auth-register', ({ username, password, displayName, avatar: avatarKey } = {}, callback) => {
     if (!callback) return;
     if (!validUsername(username)) return fail(callback, '用户名需 2~16 位（中英文/数字/下划线）');
     if (typeof password !== 'string' || password.length < 6) return fail(callback, '密码至少 6 位');
@@ -3003,21 +3013,21 @@ io.on('connection', (socket) => {
     let created;
     try {
       // 只存哈希：数据库泄露也拿不到原密码。role 不传 → 由 store 决定（首个账号 / 配置钦定 → admin）
-      created = store.createUser({ username, salt, hash: hashPassword(password, salt), displayName: dn });
+      created = store.createUser({ username, salt, hash: hashPassword(password, salt), displayName: dn, avatar: AVATAR_PRESETS.has(avatarKey) ? avatarKey : null });
     } catch (e) {
       // 并发下唯一约束兜底（两个请求同时通过上面的 getUser 检查）
       return fail(callback, '用户名已被注册');
     }
     const token = issueToken(username);
-    bindIdentity(username, created.displayName);
-    logEvent('info', 'auth-register', { username, role: created.role });
+    bindIdentity(username, created.displayName, created.avatar);
+    logEvent('info', 'auth-register', { username, role: created.role, avatar: created.avatar || null });
     try { store.appendAudit('auth-register', username, { role: created.role }); } catch (e) { /* 审计失败不挡注册 */ }
     if (created.role === 'admin') {
       console.log(`🛡️ 已把 ${username} 设为首个管理员`
         + (created.autoAdmin ? '（系统还没有任何管理员，第一个注册的账号自动获得）' : '（config.json 的 adminUsername 指定）'));
     }
     console.log(`👤 注册成功: ${username}（昵称 ${created.displayName}）`);
-    ok(callback, { user: { username, displayName: created.displayName }, token });
+    ok(callback, { user: { username, displayName: created.displayName, avatar: created.avatar || null }, token });
   });
   socket.on('auth-login', ({ username, password } = {}, callback) => {
     if (!callback) return;
@@ -3026,16 +3036,16 @@ io.on('connection', (socket) => {
     if (!rateLimit(`login:${clientIp(socket)}`, 20, 60000)) return fail(callback, '尝试过于频繁，请一分钟后再试');
     if (!u || hashPassword(password, u.salt) !== u.hash) return fail(callback, '用户名或密码不对');
     const token = issueToken(username);
-    bindIdentity(username, u.displayName);
+    bindIdentity(username, u.displayName, u.avatar);
     console.log(`👤 登录成功: ${username}`);
-    ok(callback, { user: { username, displayName: u.displayName }, token });
+    ok(callback, { user: { username, displayName: u.displayName, avatar: u.avatar || null }, token });
   });
   socket.on('auth-verify', ({ username, token } = {}, callback) => {
     if (!callback) return;
     const u = store.getUser(username);
     if (!u || !validToken(token, username)) return fail(callback, '登录态已失效，请重新登录');
-    bindIdentity(username, u.displayName);
-    ok(callback, { user: { username, displayName: u.displayName } });
+    bindIdentity(username, u.displayName, u.avatar);
+    ok(callback, { user: { username, displayName: u.displayName, avatar: u.avatar || null } });
   });
   // ★ 09-19h G6-①：显式滑动续期（前端每小时调一次，长期值守不掉线）
   socket.on('auth-refresh', ({ username, token } = {}, callback) => {
@@ -3686,6 +3696,7 @@ io.on('connection', (socket) => {
      *   而 chat-message 走的是既有聊天台账（导出/去重/离线补帧都靠它）。
      *   增量先行保证手感，终态兜底保证不丢——和字幕"容忍丢 / 问答不容忍丢"同一套双路哲学。 */
     io.to(roomNumber).emit('ai-stream', { id: streamId, delta: '', done: false, start: true, mock: AI.aiEnabled() === false });
+    io.to(roomNumber).emit('ai-state', { state: 'thinking' }); // ★ 09-26：动态头像状态机（LLM 推理期）
     const r = await aiBrain(roomNumber, question, (delta) => {
       io.to(roomNumber).emit('ai-stream', { id: streamId, delta, done: false });
     });
@@ -3716,6 +3727,10 @@ io.on('connection', (socket) => {
       // ★ 09-25：流式路径也要带证据原话（否则两条路径的信息披露不一致 = 两种可信度）
       hitList: r.evidence || [],
     });
+    io.to(roomNumber).emit('ai-state', { state: 'speaking' }); // ★ 09-26：答案播报期（TTS 朗读/字幕滚动）
+    // 兜底归位：各端 TTS 读完本地自然回 idle；无 TTS 端按答案长度估时归位
+    setTimeout(() => io.to(roomNumber).emit('ai-state', { state: 'idle' }),
+      Math.min(12000, 2000 + (r.text || '').length * 90));
     io.to(roomNumber).emit('chat-message', {
       from: 'ai-bot', name: '🤖 AI 助理', text: r.text, ts: Date.now(), streamId,
       /* ★ 09-24e：把"这条答案是怎么来的"一起广播出去——检索自几千条字幕里的哪几条、
@@ -3849,6 +3864,7 @@ io.on('connection', (socket) => {
     const goal = String(payload.goal || '').trim().slice(0, 200) || '演示：打开计算器按 7×8';
 
     aiOpBusy = true;
+    io.to(roomNumber).emit('ai-state', { state: 'thinking' });
     ok(callback, { started: true, goal });
     logEvent('info', 'ai-op-start', { roomNumber, by: socket.id, goal });
     io.to(roomNumber).emit('chat-message', {

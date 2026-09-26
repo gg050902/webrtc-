@@ -139,6 +139,12 @@ db.exec(`
     detail TEXT
   );
 `);
+
+/* ★ 09-26 头像系统：users 表补 avatar 列（幂等迁移——老库首次打开自动加列，老数据 avatar 为 null）*/
+{
+  const cols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+  if (!cols.includes('avatar')) db.exec('ALTER TABLE users ADD COLUMN avatar TEXT');
+}
 db.exec('CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);');
 
 /* ──────────────────────────────────────────────────────────────
@@ -153,9 +159,10 @@ const SQL = {
   insertUserIgnore: db.prepare(
     'INSERT OR IGNORE INTO users (username, salt, hash, display_name, role, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
   getUser: db.prepare(
-    'SELECT username, salt, hash, display_name, role, created_at FROM users WHERE username = ?'),
+    'SELECT username, salt, hash, display_name, role, avatar, created_at FROM users WHERE username = ?'),
   listUsers: db.prepare(
-    'SELECT username, salt, hash, display_name, role, created_at FROM users ORDER BY created_at ASC, username ASC'),
+    'SELECT username, salt, hash, display_name, role, avatar, created_at FROM users ORDER BY created_at ASC, username ASC'),
+  setAvatar: db.prepare('UPDATE users SET avatar = ? WHERE username = ?'),
   countUsers: db.prepare('SELECT COUNT(*) AS n FROM users'),
   hasAdmin: db.prepare("SELECT 1 AS x FROM users WHERE role = 'admin' LIMIT 1"),
   setRole: db.prepare('UPDATE users SET role = ? WHERE username = ?'),
@@ -172,6 +179,7 @@ const toUser = (r) => (r ? {
   hash: r.hash,
   displayName: r.display_name,
   role: r.role,
+  avatar: r.avatar || null,
   createdAt: r.created_at,
 } : null);
 
@@ -201,7 +209,7 @@ function hasAdmin() {
  *   若用"表为空"判断，迁移后就再也自动产生不了管理员，把系统锁死。用"没有 admin"更稳。
  * ▎唯一约束：同名再插会抛 UNIQUE constraint failed，调用方（注册信令）需 try/catch。
  *   库层兜底比应用层 if 检查更可靠（并发下应用层检查会漏）。 */
-function createUser({ username, salt, hash, displayName, role, createdAt } = {}) {
+function createUser({ username, salt, hash, displayName, avatar, role, createdAt } = {}) {
   let finalRole = role;
   let autoAdmin = false;
   if (!finalRole) {
@@ -220,7 +228,8 @@ function createUser({ username, salt, hash, displayName, role, createdAt } = {})
     finalRole,
     Number(createdAt) || Date.now(),
   );
-  return { username, displayName: displayName == null ? username : displayName, role: finalRole, autoAdmin };
+  if (avatar) SQL.setAvatar.run(String(avatar), username); // 注册即选头像
+  return { username, displayName: displayName == null ? username : displayName, avatar: avatar || null, role: finalRole, autoAdmin };
 }
 
 function listUsers() {
@@ -230,6 +239,11 @@ function listUsers() {
 /* setUserRole —— 提权/降权（scripts/admin.js 与未来的管理接口都用它）
  * ▎只允许 'user' / 'admin' 两档：角色是安全边界，白名单外的一律拒绝，
  *   避免"手滑写成 adminn"这种拼写错误把门禁悄悄打开。 */
+function setAvatar(username, avatar) {
+  if (typeof username !== 'string' || !username) return;
+  SQL.setAvatar.run(avatar == null ? null : String(avatar), username);
+}
+
 function setUserRole(username, role) {
   if (role !== 'user' && role !== 'admin') throw new Error(`非法角色：${role}（只允许 user/admin）`);
   return SQL.setRole.run(role, username).changes > 0;
@@ -379,6 +393,7 @@ module.exports = {
   createUser,
   listUsers,
   setUserRole,
+  setAvatar,
   setPassword,
   deleteUser,
   countUsers,

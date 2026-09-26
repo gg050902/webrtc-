@@ -2161,3 +2161,62 @@ body.rd-mode { overflow: hidden; }
   color: #86a876; background: rgba(134, 168, 118, .12);
   border: 1px solid rgba(134, 168, 118, .34);
 }
+
+/* ────────── 25. ★ 09-26 头像系统（apple-avatar 素材集）──────────
+   ① 注册选择器：9 个预设（中国传统色名），点选金框高亮；
+   ② 成员行图片头像（有 avatar 的成员盖过 ::before 圆点）；
+   ③ AI 五态动态头像（speaking 金环呼吸 / thinking 慢速旋转感）。 */
+.auth-avatars {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 6px;
+  margin-top: 2px;
+}
+.av-pick {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 5px 2px 4px;
+  background: rgba(12, 9, 5, .5);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: border-color .15s var(--ease), background .15s var(--ease), transform .15s var(--ease);
+}
+.av-pick img { width: 34px; height: 34px; border-radius: 50%; display: block; }
+.av-pick span { font-size: 9px; color: var(--fg-faint); letter-spacing: .08em; }
+.av-pick:hover { border-color: var(--border-strong); transform: translateY(-1px); }
+.av-pick.picked { border-color: var(--accent); background: var(--accent-muted); }
+.av-pick.picked span { color: var(--accent); }
+
+.member-row .avatar-img {
+  width: 24px; height: 24px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  border: 1px solid var(--accent-border);
+  background: var(--bg2);
+}
+.member-row.has-av::before { display: none; } /* 图片头像替代默认圆点 */
+.ai-tile .ai-face-wrap {
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  background:
+    radial-gradient(ellipse 60% 55% at 50% 42%, rgba(216, 179, 106, .12), transparent 68%),
+    #171209;
+}
+.ai-tile .ai-face {
+  width: min(58%, 180px);
+  aspect-ratio: 1;
+  border-radius: 50%;
+  border: 2px solid var(--accent-border);
+  transition: box-shadow .3s var(--ease), transform .3s var(--ease);
+}
+.ai-tile.speaking .ai-face { animation: speakGlow 1.6s ease-in-out infinite; transform: scale(1.04); }
+.ai-tile.thinking .ai-face { animation: aiThink 2.2s ease-in-out infinite; }
+@keyframes aiThink { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-5px); } }
+.ai-tile .ai-status {
+  margin-left: 8px; padding: 1px 7px;
+  font-size: 10px; color: var(--accent);
+  background: var(--accent-muted); border-radius: 999px;
+}

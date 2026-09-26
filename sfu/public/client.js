@@ -32,6 +32,22 @@ const videoGrid = $('videoGrid');       // 装所有人视频的网格
 const logPanel = $('log');
 const logTitle = $('logTitle');   // ★ 09-19d：日志面板折叠开关
 
+/* ★ 09-26 头像系统（素材：apple-avatar/）：
+ *  ① 注册可选预设头像 av-01~09（素材集 random-set，名=中国传统色）；
+ *  ② AI 助理五态动态头像 idle/listening/thinking/speaking/happy（素材集 gufeng），
+ *     由服务器 ai-state 广播驱动状态机——AI 格子(视频网格里的"虚拟参会者画面")
+ *     与成员行小头像共用同一状态源。 */
+const PRESET_AVATARS = [
+  { key: 'av-01', name: '青黛' }, { key: 'av-02', name: '朱砂' }, { key: 'av-03', name: '黛蓝' },
+  { key: 'av-04', name: '竹青' }, { key: 'av-05', name: '海棠' }, { key: 'av-06', name: '玄墨' },
+  { key: 'av-07', name: '黛紫' }, { key: 'av-08', name: '石青' }, { key: 'av-09', name: '墨竹' },
+];
+const AI_STATES = ['idle', 'listening', 'thinking', 'speaking', 'happy'];
+const aiAvatar = { state: 'idle', el: null, rowEl: null, tile: null };
+const avatarUrl = (kind) => kind === 'ai' ? `/avatars/ai/idle-128.png` : `/avatars/presets/${kind}.png`;
+const aiStateUrl = (st) => `/avatars/ai/${AI_STATES.includes(st) ? st : 'idle'}-128.png`;
+let myAvatar = null; // 我的预设头像 key（登录/恢复后带回）
+
 /* ★ 09-19e 去 AI 味·图标系统：彩色 emoji 换单色线性 SVG（stroke=currentColor 随按钮状态变色）——
  *   真产品的按钮都是单色图标+文字，彩色 emoji 堆在控件上是最大的「模板感」来源。
  *   所有图标 24 viewBox 手绘线性 path；静态按钮（index.html）与这里同款。 */
@@ -458,6 +474,7 @@ function hideAuth() { authOverlay.classList.add('hidden'); }
 
 function saveAuth(user, token) {
   myDisplayName = user.displayName || user.username;
+  myAvatar = user.avatar || null; // ★ 09-26：头像随登录态带回
   if (authStore) authStore.setItem('wb_auth', JSON.stringify({ username: user.username, token }));
   hideAuth();
   log(`👤 已登录：${myDisplayName}`);
@@ -477,7 +494,7 @@ async function doAuth(event) {
   const password = authPassEl.value;
   const displayName = authNameEl.value.trim();
   try {
-    const resp = await request(event, { username, password, displayName });
+    const resp = await request(event, { username, password, displayName, avatar: pickedAvatar });
     saveAuth(resp.data.user, resp.data.token);
   } catch (err) {
     showAuthMsg('❌ ' + err.message, false);
@@ -1188,6 +1205,8 @@ roomBadge.addEventListener('click', async () => {
  *   建立/订阅完成前的消息会丢——所以每条消息同时走两条路，接收端按 msgId 去重。
  *   这是工程上常见的"双发去重"做法（面试讲点：at-least-once + 幂等接收）。
  * ────────────────────────────────────────────────────────────── */
+socket.on('ai-state', ({ state }) => setAiState(state)); // ★ 09-26：AI 头像状态机
+
 socket.on('chat-message', ({ from, text, ts, msgId, name, ai, streamId }) => {
   // ★ D+1：同一条消息可能从 SCTP 和信令各到一次，msgId 相同的只显示第一条
   if (msgId && seenChatIds.has(msgId)) return;
@@ -2513,6 +2532,7 @@ socket.on('room-state', ({ members, expiresAt }) => {
   const hasBot = lastMembers.some((m) => m.isBot);
   aiBtn.classList.toggle('active', hasBot);
   hasBot ? setIconBtn(aiBtn, ICONS.bot, '送走 AI') : setIconBtn(aiBtn, ICONS.bot, 'AI 助理');
+  syncAiTile(hasBot); // ★ 09-26：AI 助理"虚拟参会画面格"随在场状态进出网格
   /* ★ 09-25：AI 在场 → 字幕上行调快（看板要跟着会议实时走）+ 回拉一次看板全量。
    *   为什么在这里判定"AI 在不在"：room-state 是所有客户端都能收到的权威快照，
    *   任何客户端开关助理，全房的上行节奏会一致地跟着切，不需要额外信令。 */
@@ -2898,6 +2918,9 @@ function renderMembers(members) {
     const row = document.createElement('div');
     row.className = `member-row${isMe ? ' me' : ''}`;
     row.dataset.id = m.id; // ★ D2：说话高亮要按 id 找行，所以把 id 存在 dataset 上
+    if (m.avatar && !m.isBot) {
+      row.classList.add('has-av'); // ★ 09-26：图片头像（CSS 盖过 ::before 圆点；img 在 innerHTML 重建后补）
+    }
     if (m.isBot) {
       /* ★ 09-19 AI Bot 行：无媒体无网络概念，一张安静的"机器同事"名牌。
        * ★ 09-25 参会升级：不再是死的"聆听中…"，而是**活的状态**——
@@ -2906,8 +2929,11 @@ function renderMembers(members) {
        *      （隐藏功能等于没有功能；这是 AI 参会里最容易漏掉的一环）。 */
       row.classList.add('ai-bot-row');
       const note = botHearingNote();   // 由最近一次快照/字幕事件维护的活状态
-      row.innerHTML = `<span class="m-id">${ICONS.bot} ${escapeHtml(m.name || 'AI 助理')}`
+      row.classList.add('has-av');
+      row.innerHTML = `<img class="avatar-img ai-av" src="${aiStateUrl(aiAvatar.state)}" alt="">`
+        + `<span class="m-id">${ICONS.bot} ${escapeHtml(m.name || 'AI 助理')}`
         + `<span class="m-bot-note" title="AI 助理的实时状态">${escapeHtml(note)}</span></span>`;
+      aiAvatar.rowEl = row.querySelector('.ai-av'); // ★ 09-26：状态机刷新时换五态图
       const askBtn = document.createElement('button');
       askBtn.className = 'btn m-ai-ask-btn';
       askBtn.textContent = '提问';
@@ -2945,6 +2971,15 @@ function renderMembers(members) {
     // ★ 09-16：登录用户的昵称贯通成员列表（未登录回退"成员 xxxx"）
     const who = isMe ? `我${myDisplayName ? ' · ' + myDisplayName : ''}` : (m.name || `成员 ${shortId(m.id)}`);
     row.innerHTML = `<span class="m-id" title="${escapeHtml(m.name || '')}">${escapeHtml(who)}</span>`;
+    if (m.avatar && !m.isBot) {
+      // ★ 09-26：头像 img 放在 innerHTML 重建**之后**再 prepend——
+      //   先 prepend 再重建会被覆盖；而"重建后查询"在冒烟桩里会自动造元素（坑 27 家族），两头的坑都绕开
+      const av = document.createElement('img');
+      av.className = 'avatar-img';
+      av.src = `/avatars/presets/${m.avatar}.png`;
+      av.alt = '';
+      row.prepend(av);
+    }
     const badges = document.createElement('span');
     badges.className = 'm-badges';
     row.appendChild(badges);
@@ -4410,6 +4445,46 @@ const aiOpBtn = $('aiOpBtn');         // ★ 09-19g C1：AI 远程操作员
  * ▎「🤖 AI」按钮 = 邀请/送走 AI 助理（emit ai-join/ai-leave）；
  * ▎按钮态以 room-state 的 isBot 字段为准（任何人开关，全房按钮同步——状态放唯一权威处）；
  * ▎成员列表的 bot 行：🤖 徽标 + "聆听中…"，没有网络点/音量条（它不消费媒体）。 */
+/* ★ 09-26 AI 助理"虚拟参会画面"（深度升级核心）：
+ * ▎bot 没有摄像头，但它是**看得见的参会者**——视频网格里有一块"AI 格子"：
+ *   五态动态头像（idle/thinking/speaking/happy）由服务器 ai-state 广播驱动；
+ *   宫格里是一格，演讲者视图进底部胶片条；离房/送走自动消失（生命周期=room-state.isBot）。
+ * ▎"开口说话"的语音部分复用既有 09-25 语音系统（speakAiText/语音开关），互不重复。 */
+let aiTileEl = null;
+const AI_STATE_LABEL = { idle: '聆听中…', listening: '聆听中…', thinking: '思考中…', speaking: '正在发言…', happy: '任务完成！' };
+
+function setAiState(st) {
+  if (!AI_STATES.includes(st)) return;
+  aiAvatar.state = st;
+  if (aiAvatar.rowEl) aiAvatar.rowEl.src = aiStateUrl(st);
+  if (aiTileEl) {
+    const img = aiTileEl.querySelector('img.ai-face');
+    if (img) img.src = aiStateUrl(st).replace('128', '256');
+    const label = aiTileEl.querySelector('.ai-status');
+    if (label) label.textContent = AI_STATE_LABEL[st];
+    aiTileEl.classList.toggle('speaking', st === 'speaking');
+    aiTileEl.classList.toggle('thinking', st === 'thinking');
+  }
+}
+
+function syncAiTile(present) {
+  const grid = document.getElementById('videoGrid');
+  if (!grid) return;
+  if (present && !aiTileEl) {
+    aiTileEl = document.createElement('div');
+    aiTileEl.className = 'video-box ai-tile';
+    aiTileEl.innerHTML =
+      '<div class="ai-face-wrap"><img class="ai-face" src="/avatars/ai/idle-256.png" alt="AI 助理"></div>' +
+      '<div class="video-label">AI 助理<span class="ai-status">聆听中…</span></div>';
+    grid.appendChild(aiTileEl);
+    applyLayout();
+  } else if (!present && aiTileEl) {
+    aiTileEl.remove();
+    aiTileEl = null;
+    applyLayout();
+  }
+}
+
 aiOpBtn.addEventListener('click', () => {
   socket.emit('ai-op', { goal: '演示：打开计算器按 7×8' });
   log('🛰️ AI 操作员任务已下发（被控端会弹授权卡——可拒绝/限时长）');
@@ -6440,6 +6515,33 @@ function initInsecureNotice() {
 if (!window.mediasoupClient) {
   log('❌ 找不到 mediasoup-client：请先执行 npm run build:sfu-vendor 生成 vendor/mediasoup-client.js');
 }
+// ★ 09-26 头像选择器：注册卡里的 9 个预设头像（点选高亮；注册时随 auth-register 提交）
+let pickedAvatar = null;
+(function buildAvatarPicker() {
+  const box = document.getElementById('authAvatars');
+  if (!box) return;
+  for (const av of PRESET_AVATARS) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'av-pick';
+    b.dataset.key = av.key;
+    b.title = av.name;
+    const img = document.createElement('img');
+    img.src = `/avatars/presets/${av.key}.png`;
+    img.alt = av.name;
+    b.appendChild(img);
+    const nm = document.createElement('span');
+    nm.textContent = av.name;
+    b.appendChild(nm);
+    b.addEventListener('click', () => {
+      box.querySelectorAll('.av-pick').forEach((x) => x.classList.remove('picked'));
+      b.classList.add('picked');
+      pickedAvatar = av.key;
+    });
+    box.appendChild(b);
+  }
+})();
+
 // ★ 09-19d 舒适性：日志面板可折叠——教学时展开，演示/开会时收起给画面让位
 logTitle.addEventListener('click', () => {
   const collapsed = logPanel.classList.toggle('collapsed');

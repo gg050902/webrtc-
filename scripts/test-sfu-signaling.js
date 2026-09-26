@@ -689,6 +689,7 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('09-18 /metrics 返回 Prometheus 文本（含 rooms/members 与 bytes 计数）',
      met.code === 200 && met.text.includes('# TYPE sfu_rooms_total gauge') &&
      met.text.includes('sfu_producer_bytes_total') && /sfu_members_total \d+/.test(met.text));
+  ok('09-19f /metrics 带 sfu_workers gauge（Worker 池大小）', /sfu_workers \d+/.test(met.text));
   // ★ 09-24 AI 用量可观测：调用次数/错误数/tokens/估算花费在同一份 metrics 面上
   ok('09-24 /metrics 含 AI 用量指标（调用/错误/tokens/花费 四组齐备）',
      met.text.includes('sfu_ai_llm_enabled') && met.text.includes('sfu_ai_llm_calls_total')
@@ -854,10 +855,33 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
     ok('09-19h G6 过期路径（默认 24h TTL 跳过实测——AUTH_TTL_MS=2000 启动可验）', true);
   }
 
+  // --- ★ 09-26：头像系统（注册带 avatar → 全链路贯通）---
+  let avTok = null;
+  try { await request(A.s, 'auth-register', { username: 'avuser', password: 'secret9', displayName: '头像哥', avatar: 'av-03' }); } catch (e) { /* 复跑已注册 */ }
+  try { avTok = (await request(A.s, 'auth-login', { username: 'avuser', password: 'secret9' })).data.token; } catch (e) {}
+  ok('09-26 头像注册+登录通过', !!avTok);
+  const avVerify = await request(A.s, 'auth-verify', { username: 'avuser', token: avTok });
+  ok('09-26 verify 返回预设头像（avatar=av-03）',
+     (avVerify.data || {}).user?.avatar === 'av-03');
+  // 头像绑定在 socket 身份上——让 A 登录 avuser 再触发快照
+  await request(A.s, 'auth-login', { username: 'avuser', password: 'secret9' });
+  const avStateP = waitEvent(A.s, 'room-state');
+  A.s.emit('member-state', { patch: { sharing: false } });
+  const avState = await Promise.race([avStateP, sleep(1200).then(() => null)]);
+  ok('09-26 room-state 显式投影带 avatar 字段（成员行头像数据源）',
+     !!avState && avState.members.some((m) => m.avatar === 'av-03'));
+  // ai-state 状态机：ask 应触发 thinking→speaking（监听持久收集）
+  try { await request(A.s, 'ai-join', {}); } catch (e) { /* 已在场 */ }
+  const aiStatesSeen = [];
+  A.s.on('ai-state', (p) => aiStatesSeen.push(p.state));
+  try { await request(A.s, 'ai-ask', { question: '头像测试' }); } catch (e) {}
+  await sleep(600);
+  ok('09-26 ai-ask 驱动头像状态机（出现 thinking 或 speaking）',
+     aiStatesSeen.includes('thinking') || aiStatesSeen.includes('speaking'));
+
+
   // --- ★ 09-19f：SFU 深造（多 Worker 池 + ping 探活）---
-  const met2 = await httpReq('GET', 'http://localhost:3001/metrics');
-  ok('09-19f /metrics 带 sfu_workers gauge（Worker 池大小）',
-     met2.code === 200 && /sfu_workers \d+/.test(met2.text));
+
   const pingT0 = Date.now();
   const pingResp = await new Promise((resolve) => A.s.emit('ping', {}, (r) => resolve(r)));
   ok('09-19f ping 探活信令回显 ack（RTT 探针可用）',
