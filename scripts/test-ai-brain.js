@@ -346,7 +346,7 @@ const USE_LLM = require('../sfu/ai/provider').aiEnabled();
     const r = await brain.answer('交付时间是什么时候？', LONG_MEETING);
     assert(r.totalDocs === LONG_MEETING.length, '应索引全部字幕，实际 ' + r.totalDocs);
     assert(r.usedHits > 0, '应有检索命中');
-    assert(/11 月 20 日/.test(r.text), '兜底答案应包含检索到的原文，实际：' + r.text);
+    assert(/11 月 20 (日|号)/.test(r.text), '答案应包含交付日期（日/号均可，LLM 口语化后常写“号”），实际：' + r.text);
   });
   await T('问答后记忆里有一轮（追问才有上下文）', async () => {
     const brain = new B.RoomBrain();
@@ -412,7 +412,7 @@ const USE_LLM = require('../sfu/ai/provider').aiEnabled();
     const b = new B.RoomBrain(8, { since: 99999 });
     const r = await b.answer('预算多少？', TWO_SESSIONS);
     assert(r.totalDocs === 0, '范围内应无文档，实际 ' + r.totalDocs);
-    assert(/没提到|没有提到|未提及|没有相关|没有找到/.test(r.text), '应如实说没提到，实际：' + r.text);
+    assert(/没提到|没有提到|未提及|没有相关|没有找到|没聊到/.test(r.text), '应如实说没提到（口语化“没聊到”也算），实际：' + r.text);
   });
   await T('端到端：范围内的答案**不含上一场会的内容**，且 scoped 标志为真', async () => {
     const b = new B.RoomBrain(8, { since: 4000 });
@@ -424,7 +424,7 @@ const USE_LLM = require('../sfu/ai/provider').aiEnabled();
      * 那样写会把**正确的拒答**判成失败（本次初版就踩了这个坑：1 失败但其实是对的）。
      * 正确的判据是"**没有泄露具体数值**"：999 这个数不该出现。 */
     assert(!/999/.test(r.text), '答案不该泄露上一场会的具体数值，实际：' + r.text);
-    assert(/没提到|没有提到|未提及|没有相关/.test(r.text), '应明确承认没提到，而不是含糊带过，实际：' + r.text);
+    assert(/没提到|没有提到|未提及|没有相关|没聊到/.test(r.text), '应明确承认没提到（口语化“没聊到”也算），实际：' + r.text);
   });
 
   /* ══════════ 六之三、实时会议看板（digest.js）★ 09-25 ══════════
@@ -636,7 +636,7 @@ const USE_LLM = require('../sfu/ai/provider').aiEnabled();
       const brain = new B.RoomBrain();
       const r = await brain.answer('交付时间是什么时候？', LONG_MEETING);
       assert(r.mock === false, '应走真模型');
-      assert(/11\s*月\s*20\s*日/.test(r.text), '答案应提到 11 月 20 日，实际：' + r.text);
+      assert(/11\s*月\s*20\s*(日|号)/.test(r.text), '答案应提到交付日期（日/号均可，LLM 口语化后常写“号”），实际：' + r.text);
     });
   }
 
