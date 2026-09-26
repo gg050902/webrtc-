@@ -220,6 +220,36 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     }
   });
 
+  await T('★ 完全换一套词问（无字面重叠）也能答对——靠 LLM 改写 + RRF 融合', async () => {
+    /* ▎这条守的是**同义词表原理上补不上**的那类缺口：
+     *   语料说"压测报告"，用户问「性能测试那件事谁在做？」
+     *   ——"测试"与"压测"没有共同 bigram，也不是能穷举的同义词关系
+     *     （领域内同义"性能测试/压力测试/压测"是**开放集合**，人工词表写不全）。
+     *   实测改造前：0 命中 → AI 答"没提到"。
+     *   现在：自适应触发（覆盖率不足）→ LLM 把问题改写成"压测/压力测试/负责人" →
+     *         多路 RRF 融合 → 召回正确那条。
+     * ▎断言两件事：① 答案对；② 证据链里**如实写出**"我改写了查询"——
+     *   因为"第一遍没找到、靠换个说法才找到"和"直接就找到了"是两种不同的确定程度。 */
+    streams.length = 0;
+    /* ⚠️ 必须用 askAndWait（它内部 ts 过滤 + 专用 botMsgs），**不要**自己
+     * `messages.slice(-1)[0]` 去抓"最后一条 ai-bot"——初版就是这么写的，
+     * 抓到了**上一步（预算问题）的回答**，于是断言拿一个不相干的问题在判我。
+     * 这正是 AGENTS 坑 44 那条（"异步测试里清空与触发的顺序是语义的一部分"）的
+     * 第二次复发：**症状看起来像"检索没生效"，实际是测试抓错了消息。** */
+    const { ack, msg: answer } = await askAndWait('性能测试那件事是谁在做？');
+    assert(ack && ack.data && ack.data.started, 'ai-ask 应成功：' + JSON.stringify(ack));
+    assert(answer, '应有回答');
+    assert(/李四|压测/.test(answer.text),
+      '应召回并答出"压测报告/李四"（改造前这里是"没提到"），实际：' + answer.text);
+    assert(!/没提到|没有提到/.test(answer.text), '不该回"没提到"，实际：' + answer.text);
+    // 证据链要如实披露"改写过"
+    const done = await waitStreamDone();
+    const trace = (done && done.trace) || '';
+    assert(/🔄/.test(trace), '证据链应披露"原问法召回不足、已改写"，实际：' + trace);
+    console.log('     回答：' + answer.text.slice(0, 80));
+    console.log('     证据链：' + trace);
+  });
+
   console.log('\n── ② 流式打字机 + 证据链元信息 ──');
   await T('ai-stream 有 start/增量/done 三段，且 done 帧带 trace', async () => {
     streams.length = 0;

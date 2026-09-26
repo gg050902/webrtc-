@@ -1913,6 +1913,10 @@ async function aiBrain(roomNumber, question, onDelta) {
     mock: r.mock, usage: r.usage, ms: r.ms, reason: r.reason,
     hits: r.hits, usedHits: r.usedHits, totalDocs: r.totalDocs, turns: r.turns, intent,
     scoped: r.scoped, allDocs: r.allDocs,
+    /* ★ 09-25：多查询改写信息必须**在包装层透传**，否则底层算出来了、
+     *   上层证据链却读不到（实测就是这么红的：AI 答对了，但证据链没披露"我改写过"）。
+     *   这类"内层有、外层没带出来"的漏接，是包装层最典型的失误。 */
+    rewrites: r.rewrites,
     evidence: boardEvidence.length ? boardEvidence : (r.hits || []).map((h) => ({ name: h.name, text: h.text, src: '字幕' })),
   };
 }
@@ -3697,6 +3701,13 @@ io.on('connection', (socket) => {
         : `📚 检索 ${r.totalDocs} 条字幕取 ${(r.hits || []).length} 条`);
     }
     if (r.turns > 1) traceParts.push(`💬 第 ${r.turns} 轮`);
+    /* ★ 09-25：把"多查询改写"写进证据链。它是**答案可信度的一部分**——
+     *   "我第一遍没找到，是靠把问题改写成别的说法才找到的"与"我直接就找到了"，
+     *   是两种不同的确定程度；静默处理等于偷偷降低了透明度。 */
+    if (r.rewrites) {
+      traceParts.push(`🔄 原问法召回不足（覆盖率 ${r.rewrites.topCoverBefore}），`
+        + `已用 ${r.rewrites.used} 条改写查询融合检索`);
+    }
     if (r.intent && r.intent !== 'question') {
       traceParts.push(`🎯 ${({ minutes: '生成纪要', recap: '回顾', operator: '远程操作' })[r.intent] || r.intent}`);
     }

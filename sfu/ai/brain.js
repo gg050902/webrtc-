@@ -332,9 +332,28 @@ class Retriever {
      *     我选择**接受**它而不是把门槛提到"共享 2 个 bigram"，因为那会误杀
      *     「啥时候交货」这类**只共享一个 bigram 但确实正确**的问法——
      *     错杀正确召回（AI 答"没提到"）比多给一条弱证据更伤信任；
-     *     而弱证据会被下游 LLM 兜住（系统提示明确要求证据不足时说"没提到"）。 */
+     *     而弱证据会被下游 LLM 兜住（系统提示明确要求证据不足时说"没提到"）。
+     *   ▎还有一道更大的鸿沟是这套判据**解决不了**的：**完全无语义重叠的改写**
+     *     （「性能测试那件事谁在做？」vs 语料里的"压测报告"——"测试"与"压测"
+     *      没有共同的 bigram，也不是同义词表能穷举的关系）。
+     *     那是**词汇表层面**的缺口，字面检索注定无能为力
+     *     → 交给 answer() 里的 **LLM 查询改写 + RRF 融合**兜（见该处注释）。 */
     const strong = new Uint8Array(N);
+    const matched = new Uint16Array(N);   // 每个文档命中了几个"有信息量的"查询 token
     const IDF_FREE_N = 3;   // 语料 ≤ 这个数时不筛信息量（频率没有统计意义）
+
+    /* ★ 覆盖率的分母：查询侧"有信息量的 token"总数（**含语料里根本没有的词**）。
+     * ▎为什么把"语料里没有的词"也算进分母：覆盖率要回答的是
+     *   "检索到的这条覆盖了用户问题的多少内容？"
+     *   ——用户问了 5 个内容词，语料里只有 1 个，覆盖率就该是 20%，而不是 100%。
+     *   这正是**"召回不足"的量化信号**：answer() 用它决定要不要去改写查询。 */
+    const qInf = new Set();
+    for (const t of new Set(qToks)) {
+      if (t.startsWith(UNIGRAM_PREFIX)) continue;
+      const df = this.postings.has(t) ? this.postings.get(t).size : 0;
+      if (N <= IDF_FREE_N || (df < N && df <= Math.floor(N * 0.5))) qInf.add(t);
+    }
+    const qInfN = Math.max(1, qInf.size);
 
     for (const t of new Set(qToks)) {
       const posting = this.postings.get(t);
@@ -349,7 +368,7 @@ class Retriever {
         const dl = this.docLen[idx] || 1;
         const denom = tf + this.k1 * (1 - this.b + this.b * (dl / this.avgdl));
         scores[idx] += w * idf * ((tf * (this.k1 + 1)) / denom);
-        if (informative) strong[idx] = 1;   // 有"有信息量的词级重叠" → 够格
+        if (informative) { strong[idx] = 1; matched[idx] += 1; }   // 有"有信息量的词级重叠" → 够格
       }
     }
 
@@ -366,7 +385,12 @@ class Retriever {
       }
       // 说话人加成：查询点名了某人 → 他说的句子 +35%
       if (speakers.has(d.name)) s *= 1.35;
-      out.push({ name: d.name, text: d.text, ts: d.ts, score: Number(s.toFixed(4)) });
+      out.push({
+        name: d.name, text: d.text, ts: d.ts, score: Number(s.toFixed(4)),
+        /* ★ 覆盖率：这条命中了用户问题的几分之几（0~1）。
+         *   它是回答侧判断"召回够不够"的依据 —— 见 answer() 的自适应改写。 */
+        cover: Number((matched[i] / qInfN).toFixed(3)),
+      });
     }
     out.sort((a, b) => b.score - a.score);
     /* ★ 09-25 把关顺序：先靠 `strong` 掩码判资格（尺度无关，见上），
@@ -378,6 +402,85 @@ class Retriever {
     const kept = out.filter((h) => h.score >= top * HIT_SCORE_FLOOR);
     return kept.slice(0, Math.max(1, Number(topK) || 6));
   }
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * 多查询检索（★ 09-25）：LLM 改写查询 + RRF 融合 —— 补上"词汇表缺口"
+ *
+ * ▎要解决的是同义词表**原理上解决不了**的那类问题（实测确认过）：
+ *   语料说"压测报告我负责"，用户问「**性能测试**那件事谁在做？」
+ *   ——"测试"与"压测"没有共同 bigram，也不是同义词表能穷举的关系
+ *   （"压力测试/性能测试/压测"这类**领域内同义**是开放集合，写不全）。
+ *   字面检索在这里注定无能为力，只能靠模型"把问题翻译成语料可能用的说法"。
+ *   实测：「性能测试那件事谁在做？」「这块压力大不大，扛得住吗？」改造前**都是 0 命中**。
+ *
+ * ▎为什么**自适应触发**、不是每次都改写（关键取舍）：
+ *   改写要多一次 LLM 调用（1~3 秒）。每条提问都付这个代价是不可接受的——
+ *   大多数问题第一次检索就命中了，白花这份延迟。
+ *   所以只在**召回不足**时才改写（0 命中，或覆盖率过低，见 REWRITE_TRIGGER_COVER）。
+ *   这叫 adaptive retrieval：**把昂贵手段留给真正需要它的少数情况**。
+ *
+ * ▎为什么用 RRF（Reciprocal Rank Fusion）融合而不是"分数相加"：
+ *   各条改写查询的 BM25 分**不在同一个尺度上**（查询长短不同、命中的词 IDF 不同），
+ *   直接相加会让某条查询凭分数尺度压过其它条。
+ *   RRF 只看**名次**（score = Σ 1/(k+rank)），天然尺度无关——
+ *   这与我前面踩过的坑（绝对阈值随语料规模漂移）是同一条教训的延续：
+ *   **能用排名就别用分数。**
+ * ══════════════════════════════════════════════════════════════ */
+const REWRITE_TRIGGER_COVER = 0.4;   // 覆盖率低于此值 → 认为召回不足，值得花一次改写
+const RRF_K = 60;                    // RRF 的平滑常数（业界常用 60）
+
+/** LLM 把用户问题改写成若干条"检索友好的说法"。无 key/失败 → 返回空数组（不抛错）。 */
+async function rewriteQuery(question) {
+  const q = String(question || '').trim();
+  if (!q || !AI.aiEnabled()) return [];
+  try {
+    const res = await AI.askLLM([
+      {
+        role: 'system',
+        content: '把用户对会议助理的提问，改写成 3 条用于**会议字幕全文检索**的查询。\n'
+          + '每条一行，不要编号、不要解释、不要标点开头。\n'
+          + '改写要求：\n'
+          + '① 用会议里**可能出现的正式说法**替换口语表达'
+          + '（例：用户说"性能测试那件事谁在做" → 可写成"压测 压力测试 负责人 负责"）；\n'
+          + '② 三条分别侧重：同义替换 / 拆出核心名词关键词 / 可能的缩写或英文；\n'
+          + '③ 保留原问题里出现的人名、数字、专有名词（TURN、API 这类）。',
+      },
+      { role: 'user', content: q },
+    ], { label: 'ai-query-rewrite', temperature: 0.3, maxTokens: 120, timeoutMs: 8000, mock: () => '' });
+    if (res.mock || !res.text) return [];
+    return String(res.text).split('\n')
+      .map((s) => s.replace(/^[\s\d\-–—.、)）*#]+/, '').trim())
+      .filter((s) => s.length >= 2)
+      .slice(0, 3);
+  } catch (e) {
+    return [];   // 改写失败绝不影响问答主链路（它只是"锦上添花"的那一步）
+  }
+}
+
+/**
+ * RRF 融合多路检索结果。
+ * @param {Array<Array>} lists 每路一个有序命中数组
+ * @param {number} topN 取前 N 条
+ */
+function rrfFuse(lists, topN = 6) {
+  const acc = new Map();
+  for (const list of lists) {
+    (list || []).forEach((h, rank) => {
+      // 用 ts+正文做唯一键：同一条字幕在不同查询里必须被认成"同一条"
+      const key = `${h.ts}|${h.text}`;
+      const cur = acc.get(key);
+      if (cur) { cur.score += 1 / (RRF_K + rank + 1); cur.via += 1; }
+      else acc.set(key, { hit: h, score: 1 / (RRF_K + rank + 1), via: 1 });
+    });
+  }
+  /* 排序：先看 RRF 分（被多路同时命中/名次靠前的更强）。
+   * 平手时用**原 BM25 分**兜底——RRF 丢掉了"有多相关"的强度信息，
+   * 但 RRF 分打平时那条更强的 BM25 显然更该排前面。 */
+  return [...acc.values()]
+    .sort((a, b) => (b.score - a.score) || (b.hit.score - a.hit.score))
+    .slice(0, topN)
+    .map((v) => ({ ...v.hit, via: v.via }));
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -752,7 +855,36 @@ class RoomBrain {
     const r = this.retriever(entries);
     // 检索查询串：考虑指代（把上一轮问题一起检索）
     const searchQ = this.memory.searchQuery(q);
-    const hits = r.search(searchQ, Number(opts.topK) || 6);
+    const topK = Number(opts.topK) || 6;
+    let hits = r.search(searchQ, topK);
+
+    /* ★ 09-25 自适应多查询检索：**只在召回不足时**才花一次 LLM 改写（见 rewriteQuery 注释）。
+     * ▎判据用"覆盖率"而不是"分数"：分数随语料规模漂移（踩过坑），
+     *   覆盖率（命中了用户问题的几分之几）是尺度无关的。
+     * ▎为什么"0 命中"也要改写：那正是词汇表缺口最典型的表现
+     *   （「性能测试那件事谁在做？」 vs 语料里的"压测报告"）。 */
+    let rewriteInfo = null;
+    const topCover = hits.length ? (hits[0].cover || 0) : 0;
+    const needRewrite = !hits.length || topCover < REWRITE_TRIGGER_COVER;
+    if (needRewrite) {
+      const alts = await rewriteQuery(q);
+      if (alts.length) {
+        const lists = [hits, ...alts.map((a) => r.search(a, topK))].filter((l) => l.length);
+        if (lists.length > 1) {
+          const fused = rrfFuse(lists, topK);
+          if (fused.length) {
+            hits = fused;
+            rewriteInfo = {
+              tried: alts.length,
+              used: lists.length - 1,
+              reason: hits.length ? 'cover-low' : 'no-hit',
+              topCoverBefore: Number(topCover.toFixed(2)),
+            };
+          }
+        }
+      }
+    }
+
     const ev = buildEvidenceBlock(hits, { maxChars: opts.maxChars });
 
     const sys = [
@@ -808,6 +940,11 @@ class RoomBrain {
       scoped: !!this.since,
       allDocs: Array.isArray(entries) ? entries.length : r.size,
       turns: this.memory.length,
+      /* ★ 09-25：多查询改写是否发生、融合了几路。
+       *   为什么要暴露出来而不是静默处理：这是**答案可信度的一部分**——
+       *   "我第一次没检索到，是靠把问题改写成别的说法才找到的"，
+       *   与"我直接就找到了"是两种不同的确定程度，用户有权知道。 */
+      rewrites: rewriteInfo,
     };
   }
 }
@@ -821,6 +958,9 @@ module.exports = {
   HIT_SCORE_MIN,
   HIT_SCORE_FLOOR,
   USE_UNIGRAM,
+  rewriteQuery,            // ★ 09-25：LLM 查询改写（无 key/失败返回 []，不抛错）
+  rrfFuse,                 // ★ 09-25：RRF 融合（纯函数，可单测）
+  REWRITE_TRIGGER_COVER,
   Retriever,
   ConversationMemory,
   RoomBrain,

@@ -201,6 +201,68 @@ const USE_LLM = require('../sfu/ai/provider').aiEnabled();
     assert(hits.length === 0, '无关查询应返回空，实际 ' + hits.length + ' 条');
   });
 
+  /* ══════════ 五之三、多查询检索（LLM 改写 + RRF 融合，★ 09-25）══════════
+   * ▎要解决的是同义词表**原理上解决不了**的缺口：语料说"压测报告"，
+   *   用户问「性能测试那件事谁在做？」——"测试"与"压测"没有共同 bigram，
+   *   也不是同义词表能穷举的关系（领域内同义是开放集合，写不全）。
+   *   实测改造前：该问法与「这块压力大不大」**都是 0 命中**。
+   *   这里守两件事：**融合逻辑正确**（纯函数可单测）+ **无 key 时绝不拖累主链路**。 */
+  console.log('\n── 五之三、多查询检索（LLM 改写 + RRF 融合）──');
+  await T('RRF：被多路同时命中的条目排更前（这正是"融合"的意义）', () => {
+    const a = [{ ts: 1, text: 'A', score: 9 }, { ts: 2, text: 'B', score: 2 }];
+    const b = [{ ts: 1, text: 'A', score: 0.5 }, { ts: 3, text: 'C', score: 8 }];
+    const out = B.rrfFuse([a, b], 5);
+    assert(out[0].text === 'A', 'A 在两路都出现，应排第一，实际 ' + out.map((h) => h.text).join(','));
+    assert(out[0].via === 2, 'A 的 via 应为 2（被两路命中），实际 ' + out[0].via);
+    assert(out.length === 3, '三条不同条目都应保留，实际 ' + out.length);
+  });
+  await T('RRF：同一条字幕在不同查询里被认成同一条（按 ts+正文去重）', () => {
+    const out = B.rrfFuse([[{ ts: 7, text: '同一条', score: 5 }], [{ ts: 7, text: '同一条', score: 1 }]], 5);
+    assert(out.length === 1, '应去重成一条，实际 ' + out.length);
+    assert(out[0].via === 2, 'via 应累计为 2');
+  });
+  await T('RRF：平手时用原 BM25 分兜底（RRF 丢了强度信息，得补回来）', () => {
+    // 两条都只在一路、名次相同 → RRF 分完全相等，此时应看谁的原分高
+    const out = B.rrfFuse([[{ ts: 1, text: '弱', score: 1 }], [{ ts: 2, text: '强', score: 9 }]], 5);
+    assert(out[0].text === '强', 'RRF 打平时应让原分高的在前，实际 ' + out[0].text);
+  });
+  await T('RRF 对空输入安全（不抛错、不返回脏数据）', () => {
+    assert(B.rrfFuse([], 3).length === 0);
+    assert(B.rrfFuse([[], []], 3).length === 0);
+    assert(B.rrfFuse([null, undefined], 3).length === 0);
+  });
+  await T('检索结果带"覆盖率"（answer 用它判断召回够不够；用比例而非分数）', () => {
+    const r = new B.Retriever(RECALL_CAPS);
+    const full = r.search('交付时间是什么时候？', 3);
+    assert(full.length && typeof full[0].cover === 'number', '命中应带 cover 字段');
+    assert(full[0].cover > 0 && full[0].cover <= 1, 'cover 应在 (0,1]，实际 ' + full[0].cover);
+    const weak = r.search('量子计算机的外太空探索进展如何呀', 3);
+    assert(weak.length === 0 || weak[0].cover < 0.5,
+      '语料外的问法覆盖率应很低，实际 ' + (weak[0] && weak[0].cover));
+  });
+  await T('无 key 时改写查询返回空数组（绝不拖累主链路、绝不抛错）', async () => {
+    const alts = await B.rewriteQuery('性能测试那件事谁在做？');
+    assert(Array.isArray(alts), '应返回数组');
+    if (!USE_LLM) assert(alts.length === 0, '无 key 应为空，实际 ' + JSON.stringify(alts));
+    assert(Array.isArray(await B.rewriteQuery('')), '空问题也要安全返回数组');
+  });
+  await T('★ 多查询融合真能补上"词汇表缺口"（真模型；无 key 时跳过）', async () => {
+    if (!USE_LLM) { console.log('     （无 key，跳过——Mock 轨已覆盖结构与降级行为）'); return; }
+    const caps = [
+      { name: '王五', text: '闲聊：今天天气不错', ts: 1 },
+      { name: '李四', text: '压测报告我负责，周五之前提交', ts: 2 },
+    ];
+    const r = new B.Retriever(caps);
+    const q = '性能测试那件事谁在做？';
+    assert(r.search(q, 3).length === 0, '前提：单查询命中不到（"测试"与"压测"无共同 bigram）');
+    const alts = await B.rewriteQuery(q);
+    assert(alts.length > 0, '应改写出一批说法，实际 ' + JSON.stringify(alts));
+    const fused = B.rrfFuse(alts.map((a) => r.search(a, 3)).filter((l) => l.length), 3);
+    assert(fused.length > 0, '融合后应能召回"压测报告"，改写：' + JSON.stringify(alts));
+    assert(/压测报告/.test(fused[0].text), 'Top1 应是那条压测发言，实际 ' + fused[0].text);
+    console.log('     改写：' + alts.join(' ｜ '));
+  });
+
   /* ══════════ 三、会话记忆 ══════════ */
   console.log('\n── 三、会话记忆（多轮不失忆）──');
   await T('记忆有界：超过上限丢最老的', () => {
