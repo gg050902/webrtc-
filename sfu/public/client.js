@@ -3058,7 +3058,7 @@ function renderMembers(members) {
       row.classList.add('ai-bot-row');
       const note = botHearingNote();   // 由最近一次快照/字幕事件维护的活状态
       row.classList.add('has-av');
-      row.innerHTML = `<span class="ai-av"><img src="/avatars/ai/face-256.png" alt=""></span>`
+      row.innerHTML = `<span class="ai-av"><img src="/avatars/ai/face-256.png?v=2" alt=""></span>`
         + `<span class="m-id">${ICONS.bot} ${escapeHtml(m.name || 'AI 小明')}`
         + `<span class="m-bot-note" title="AI 助理的实时状态">${escapeHtml(note)}</span></span>`;
       aiAvatar.rowEl = row.querySelector('.ai-av'); // ★ 09-26：状态机刷新时换五态图
@@ -4631,7 +4631,7 @@ function syncAiTile(present) {
     aiTileEl.className = 'video-box ai-tile';
     const waves = '<div class="ai-waves">' + '<i></i>'.repeat(7) + '</div>';
     aiTileEl.innerHTML =
-      '<div class="ai-face-wrap"><img class="ai-face" src="/avatars/ai/face-256.png" alt="AI 小明"></div>' +
+      '<div class="ai-face-wrap"><img class="ai-face" src="/avatars/ai/face-256.png?v=2" alt="AI 小明"></div>' +
       waves +
       '<div class="ai-speech" aria-live="polite"></div>' +
       '<div class="video-label">AI 小明<span class="ai-status">聆听中…</span></div>';
