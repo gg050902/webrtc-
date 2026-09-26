@@ -267,8 +267,8 @@ AI 助理（`@ai` 问答 / 📝 纪要 / 🛰️ 远程操作员）**没有密�
 echo "DEEPSEEK_API_KEY=sk-你的密钥" > .env
 npm run start:sfu      # 启动日志会写明：AI 模式 = LLM 还是 [Mock]
 npm run test:ai        # 双轨自检（有 key 跑满 10 项，无 key 跑 5 项并提示）
-npm run test:ai-brain  # AI 内核单测：检索/记忆/意图/行动项/**会议看板**（★ 有 key 时 63/63）
-npm run verify:ai      # 真服务器端到端：起真服务器 + 询真模型（★ 16/16）
+npm run test:ai-brain  # AI 内核单测：检索/记忆/意图/行动项/**会议看板**（★ 有 key 时 70/70）
+npm run verify:ai      # 真服务器端到端：起真服务器 + 询真模型（★ 17/17）
 npm run verify:board   # ★ 真浏览器端到端（CDP 驱动真 Edge，读真实 DOM + 截图存证）（★ 21/21）
 ```
 
@@ -471,8 +471,8 @@ npm run test:shutdown # 优雅退出：关 Worker / 关库 checkpoint / 幂等 /
 npm test           # Mesh 对照版信令：需先 npm start（连 localhost:3000）★ 2026-09-24 实测 36/36
 npm run test:smoke # SFU 前端无头冒烟（零依赖，不用起服务器）★ 2026-09-24 实测 136/136
 npm run test:ai    # AI 双轨自检：无 key 只跑 Mock 轨并提示怎么配；有 key 两条都跑 ★ 10/10
-npm run test:ai-brain # AI 内核单测（BM25 检索/会话记忆/意图分类/行动项/会议范围/实时看板）★ 63/63
-npm run verify:ai  # AI 真服务器端到端（起真服务器+真信令+真模型，验检索/记忆/意图/抗幻觉/参会语义）★ 16/16
+npm run test:ai-brain # AI 内核单测（BM25 检索/会话记忆/意图分类/行动项/会议范围/实时看板）★ 70/70
+npm run verify:ai  # AI 真服务器端到端（起真服务器+真信令+真模型，验检索/记忆/意图/抗幻觉/参会语义）★ 17/17
 npm run verify:board # ★ AI 看板真浏览器端到端（CDP 驱动真 Edge，验真实 DOM 渲染/语音链路/证据展开/行动项认领）★ 21/21
 npm run test:record # D+2 服务器侧录制端到端自测（ffmpeg 当媒体源→mediasoup→落盘，需已装 ffmpeg）
 npm run test:turn  # ICE 可达性实测（对 config 里每个 STUN/TURN 手搓 STUN Binding，3s 超时）
