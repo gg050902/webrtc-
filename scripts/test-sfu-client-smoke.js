@@ -1165,8 +1165,8 @@ const emit = (ev, payload) => {
    * 若某天有人给 chips 复制了一份发送逻辑，这条会红。 */
   const clientSrc = fs.readFileSync(path.join(PUB, 'client.js'), 'utf8');
   const askEmits = (clientSrc.match(/emit\('ai-ask'/g) || []).length;
-  ok('09-25 快捷问法与手打 @ai 共用同一条 ai-ask 链路（只有一处发送点）',
-    askEmits === 1 && /function sendAiQuestion/.test(clientSrc));
+  ok('09-25 快捷问法与手打 @ai 共用 sendAiQuestion；09-26b 唤醒词「小明」是合法的第二入口',
+    askEmits === 2 && /function sendAiQuestion/.test(clientSrc) && /AI_NICKNAME/.test(clientSrc));
 
   // 语音播报：默认关（绝不默认出声），且不支持时安全降级
   ok('09-25 AI 语音默认关闭（默认出声会惊吓用户）', /let aiVoiceOn = false/.test(clientSrc));

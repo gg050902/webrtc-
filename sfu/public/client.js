@@ -48,6 +48,54 @@ const avatarUrl = (kind) => kind === 'ai' ? `/avatars/ai/idle-128.png` : `/avata
 const aiStateUrl = (st) => `/avatars/ai/${AI_STATES.includes(st) ? st : 'idle'}-128.png`;
 let myAvatar = null; // 我的预设头像 key（登录/恢复后带回）
 
+/* ★ 09-26b 唤醒词：开会时商量提到「小明」，它就接话——
+ *   字幕成稿（emitCaption）里检测到名字 + AI 在场 → 自动把整句话作为提问发给 ai-ask。
+ *   改名字只需改这里（+server 的 bot 显示名）。 */
+const AI_NICKNAME = '小明';
+
+/* ★ 09-26b 矢量动画头像 v2（素材：apple-avatar/gufeng/handdraw 丫髥童子）——
+ *   静态 PNG 切换太僵硬，换成内联 SVG：呼吸浮动/眨眼/摇头由 CSS 关键帧驱动，
+ *   五态靠眼形（睁/弯）与嘴形（笑/张/平）的显隐切换，瞬时无跳变。 */
+function aiAvatarSvg(st, cls) {
+  const ST = { idle: 'st-idle', listening: 'st-listen', thinking: 'st-think', speaking: 'st-speak', happy: 'st-happy' }[st] || 'st-idle';
+  return `<div class="ai-svg ${cls || ''} ${ST}"><svg viewBox="0 0 200 200" width="100%" height="100%" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <radialGradient id="a-halo" cx="50%" cy="46%" r="52%">
+        <stop offset="0%" stop-color="#cfe6df" stop-opacity=".85"/><stop offset="100%" stop-color="#cfe6df" stop-opacity="0"/>
+      </radialGradient>
+      <linearGradient id="a-skin" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#fbeedd"/><stop offset="100%" stop-color="#f2ddc4"/>
+      </linearGradient>
+      <linearGradient id="a-hair" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#3b2f24"/><stop offset="100%" stop-color="#241c14"/>
+      </linearGradient>
+    </defs>
+    <ellipse class="halo" cx="100" cy="98" rx="92" ry="92" fill="url(#a-halo)"/>
+    <g class="head-grp">
+      <ellipse cx="100" cy="104" rx="54" ry="58" fill="url(#a-skin)"/>
+      <path d="M46 104 q4 -46 54 -46 q50 0 54 46 q-12 -26 -54 -26 q-42 0 -54 26 Z" fill="url(#a-hair)"/>
+      <path d="M46 100 q-6 22 2 34 q-14 -12 -12 -34 Z" fill="url(#a-hair)"/>
+      <path d="M154 100 q6 22 -2 34 q14 -12 12 -34 Z" fill="url(#a-hair)"/>
+      <path class="ribbon" d="M148 66 q14 -14 6 -28 q-4 12 -14 16 Z" fill="#b4594c"/>
+      <ellipse cx="70" cy="118" rx="10" ry="6.5" fill="#eda79c" opacity=".5"/>
+      <ellipse cx="130" cy="118" rx="10" ry="6.5" fill="#eda79c" opacity=".5"/>
+      <g class="eye-open">
+        <g class="eye"><ellipse cx="80" cy="107" rx="7.5" ry="9.5" fill="#241c14"/><circle cx="82.5" cy="103.5" r="2.6" fill="#fff"/></g>
+        <g class="eye"><ellipse cx="120" cy="107" rx="7.5" ry="9.5" fill="#241c14"/><circle cx="122.5" cy="103.5" r="2.6" fill="#fff"/></g>
+      </g>
+      <g class="eye-curve">
+        <path d="M71 108 q9 -9 18 0" stroke="#241c14" stroke-width="4.5" fill="none" stroke-linecap="round"/>
+        <path d="M111 108 q9 -9 18 0" stroke="#241c14" stroke-width="4.5" fill="none" stroke-linecap="round"/>
+      </g>
+      <path class="mouth-smile" d="M90 128 q10 9 20 0" stroke="#b4594c" stroke-width="3.4" fill="none" stroke-linecap="round"/>
+      <ellipse class="mouth-open" cx="100" cy="130" rx="8" ry="7" fill="#b4594c"/>
+      <path class="mouth-flat" d="M91 130 h18" stroke="#b4594c" stroke-width="3.4" fill="none" stroke-linecap="round"/>
+      <path d="M64 162 q36 22 72 0 l6 40 h-84 Z" fill="#5b8f86"/>
+      <path d="M100 176 v26" stroke="#e8dcc6" stroke-width="4" stroke-linecap="round"/>
+    </g>
+  </svg></div>`;
+}
+
 /* ★ 09-19e 去 AI 味·图标系统：彩色 emoji 换单色线性 SVG（stroke=currentColor 随按钮状态变色）——
  *   真产品的按钮都是单色图标+文字，彩色 emoji 堆在控件上是最大的「模板感」来源。
  *   所有图标 24 viewBox 手绘线性 path；静态按钮（index.html）与这里同款。 */
@@ -2930,7 +2978,7 @@ function renderMembers(members) {
       row.classList.add('ai-bot-row');
       const note = botHearingNote();   // 由最近一次快照/字幕事件维护的活状态
       row.classList.add('has-av');
-      row.innerHTML = `<img class="avatar-img ai-av" src="${aiStateUrl(aiAvatar.state)}" alt="">`
+      row.innerHTML = `<span class="ai-av">${aiAvatarSvg(aiAvatar.state, 'ai-av-mini')}</span>`
         + `<span class="m-id">${ICONS.bot} ${escapeHtml(m.name || 'AI 助理')}`
         + `<span class="m-bot-note" title="AI 助理的实时状态">${escapeHtml(note)}</span></span>`;
       aiAvatar.rowEl = row.querySelector('.ai-av'); // ★ 09-26：状态机刷新时换五态图
@@ -2941,7 +2989,7 @@ function renderMembers(members) {
       askBtn.addEventListener('click', () => {
         const inp = $('chatInput');
         if (inp) { inp.value = '@ai '; inp.focus(); }
-        log('🤖 在聊天框里输入你的问题（已自动带上 @ai 前缀）');
+        log(`🤖 在聊天框里输入你的问题（已自动带上 @ai 前缀）；开会时提到「${AI_NICKNAME}」它会自动接话`);
       });
       row.appendChild(askBtn);
       memberListEl.appendChild(row);
@@ -4453,19 +4501,46 @@ const aiOpBtn = $('aiOpBtn');         // ★ 09-19g C1：AI 远程操作员
 let aiTileEl = null;
 const AI_STATE_LABEL = { idle: '聆听中…', listening: '聆听中…', thinking: '思考中…', speaking: '正在发言…', happy: '任务完成！' };
 
-function setAiState(st) {
+function setAiState(st, speechText) {
   if (!AI_STATES.includes(st)) return;
   aiAvatar.state = st;
-  if (aiAvatar.rowEl) aiAvatar.rowEl.src = aiStateUrl(st);
+  // 成员行小头像：重渲染内联 SVG（换眼形/嘴形）
+  if (aiAvatar.rowEl) aiAvatar.rowEl.innerHTML = aiAvatarSvg(st, 'ai-av-mini');
+  // AI 格子：大头像 + 状态标签 + 发言字幕条
   if (aiTileEl) {
-    const img = aiTileEl.querySelector('img.ai-face');
-    if (img) img.src = aiStateUrl(st).replace('128', '256');
+    const wrap = aiTileEl.querySelector('.ai-face-wrap');
+    if (wrap) wrap.innerHTML = aiAvatarSvg(st, 'ai-face-svg');
     const label = aiTileEl.querySelector('.ai-status');
     if (label) label.textContent = AI_STATE_LABEL[st];
     aiTileEl.classList.toggle('speaking', st === 'speaking');
     aiTileEl.classList.toggle('thinking', st === 'thinking');
+    /* ★ 09-26b 发言字幕逐字化（用户反馈"AI 字幕太僵硬"）：
+     *   speaking 时把答案在格子上方的字幕条里**逐字打出**（标点带停顿——逗号长、
+     *   句号更长，模拟说话的呼吸），朗读感立刻不一样；归位时字幕淡出。
+     *   为什么不用流式 delta？Mock 轨没有流、LLM 流受网络节奏影响——本地逐字动画
+     *   在两种轨道上表现完全一致（确定性的"生动"）。 */
+    const bar = aiTileEl.querySelector('.ai-speech');
+    if (st === 'speaking' && speechText) {
+      bar.classList.add('show');
+      bar.textContent = '';
+      clearTimeout(aiSpeechTimer);
+      let i = 0;
+      const tick = () => {
+        if (!aiTileEl || i >= speechText.length) return;
+        bar.textContent += speechText[i];
+        const ch = speechText[i];
+        i += 1;
+        aiSpeechTimer = setTimeout(tick, /[，、；：]/.test(ch) ? 150 : /[。！？…]/.test(ch) ? 320 : 55);
+      };
+      aiSpeechTimer = setTimeout(tick, 250);
+    } else if (st !== 'speaking' && bar) {
+      clearTimeout(aiSpeechTimer);
+      bar.classList.remove('show');
+      setTimeout(() => { if (bar && !bar.classList.contains('show')) bar.textContent = ''; }, 400);
+    }
   }
 }
+let aiSpeechTimer = 0;
 
 function syncAiTile(present) {
   const grid = document.getElementById('videoGrid');
@@ -4474,8 +4549,9 @@ function syncAiTile(present) {
     aiTileEl = document.createElement('div');
     aiTileEl.className = 'video-box ai-tile';
     aiTileEl.innerHTML =
-      '<div class="ai-face-wrap"><img class="ai-face" src="/avatars/ai/idle-256.png" alt="AI 助理"></div>' +
-      '<div class="video-label">AI 助理<span class="ai-status">聆听中…</span></div>';
+      '<div class="ai-face-wrap">' + aiAvatarSvg('idle', 'ai-face-svg') + '</div>' +
+      '<div class="ai-speech" aria-live="polite"></div>' +
+      '<div class="video-label">AI 小明<span class="ai-status">聆听中…</span></div>';
     grid.appendChild(aiTileEl);
     applyLayout();
   } else if (!present && aiTileEl) {
@@ -5415,6 +5491,13 @@ function emitCaption(text) {
   capPushLog(entry);
   showCaptionBar(myDisplayName || '我', text, false);
   if (capHistoryPanel && !capHistoryPanel.classList.contains('hidden')) appendCapHistoryRow(entry);
+  /* ★ 09-26b 唤醒词：成稿里提到「小明」且 AI 在场 → 自动接话（整句作为提问）。
+   *   为什么放客户端：字幕在每端本地识别，谁嘴里说出"小明"谁触发——服务端
+   *   听不到字（它只有音频管线没有转写），这是当前架构下最自然的挂点。 */
+  if (AI_NICKNAME && text.includes(AI_NICKNAME) && lastMembers.some((m) => m.isBot)) {
+    socket.emit('ai-ask', { question: text });
+    log(`🤖 ${AI_NICKNAME} 听到你叫它了，正在组织回答…`);
+  }
   if (!chatDataProducer || chatDataProducer.closed) return; // SCTP 不在（没进房/重连中）→ 只显示本地
   try {
     chatDataProducer.send(JSON.stringify({

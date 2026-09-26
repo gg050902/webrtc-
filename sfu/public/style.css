@@ -2220,3 +2220,57 @@ body.rd-mode { overflow: hidden; }
   font-size: 10px; color: var(--accent);
   background: var(--accent-muted); border-radius: 999px;
 }
+
+/* ────────── 26. ★ 09-26b 矢量动画头像（丫髻童子）+ 发言字幕条 ──────────
+   静态 PNG 切换太僵硬 → 内联 SVG 矢量小人：呼吸/眨眼/摇头由 CSS 关键帧驱动，
+   五态只切眼形（睁/弯）与嘴形（笑/张/平），瞬时无跳变。 */
+.ai-svg { width: 100%; height: 100%; animation: aiBreathe 4.2s ease-in-out infinite; transform-origin: 50% 70%; }
+.ai-svg.speaking, .ai-svg.st-speak { animation-duration: 1.9s; }
+.ai-svg.st-happy { animation-duration: 2.6s; }
+.ai-svg .head-grp { animation: aiSway 6s ease-in-out infinite; transform-origin: 50% 90%; }
+.ai-svg .eye { animation: aiBlink 4.6s ease-in-out infinite; transform-origin: 50% 50%; }
+.ai-svg .ribbon { animation: aiRibbon 3.4s ease-in-out infinite; transform-origin: 80% 20%; }
+.ai-svg .halo { animation: aiGlow 4.2s ease-in-out infinite; }
+.ai-svg.st-think .head-grp { animation-duration: 9s; }
+.ai-svg.st-speak .halo { animation-duration: 1.9s; }
+@keyframes aiBreathe { 0%, 100% { transform: translateY(0) scale(1); } 50% { transform: translateY(-3.2%) scale(1.012); } }
+@keyframes aiSway { 0%, 100% { transform: rotate(-1.1deg); } 50% { transform: rotate(1.1deg); } }
+@keyframes aiBlink { 0%, 90%, 100% { transform: scaleY(1); } 94% { transform: scaleY(.08); } }
+@keyframes aiRibbon { 0%, 100% { transform: rotate(-5deg); } 50% { transform: rotate(7deg); } }
+@keyframes aiGlow { 0%, 100% { opacity: .28; } 50% { opacity: .55; } }
+/* 五态显隐（切 class 瞬时完成，不重排不跳变） */
+.st-idle   .mouth-smile, .st-happy .mouth-open { display: block; }
+.st-idle   .mouth-open,  .st-idle  .mouth-flat { display: none; }
+.st-listen .mouth-smile, .st-listen .mouth-open { display: none; }
+.st-listen .mouth-flat { display: block; }
+.st-speak  .mouth-smile, .st-think .mouth-smile { display: none; }
+.st-speak  .mouth-open,  .st-happy .mouth-open { display: block; }
+.st-speak  .mouth-flat,  .st-think .mouth-open, .st-think .mouth-flat { display: block; }
+.st-speak  .mouth-smile, .st-think .mouth-smile { display: none; }
+.st-idle   .eye-open, .st-speak .eye-open { display: block; }
+.st-idle   .eye-curve, .st-speak .eye-curve { display: none; }
+.st-listen .eye-open, .st-think .eye-open, .st-happy .eye-open { display: none; }
+.st-listen .eye-curve, .st-think .eye-curve, .st-happy .eye-curve { display: block; }
+/* 成员行小头像里的 SVG 裁剪 */
+.ai-av { display: block; width: 24px; height: 24px; border-radius: 50%; overflow: hidden; flex-shrink: 0; border: 1px solid var(--accent-border); background: var(--bg2); }
+.ai-av .ai-svg { width: 140%; height: 140%; margin: -18% 0 0 -20%; }
+/* 发言字幕条：AI 格子上方，逐字打出 */
+.ai-speech {
+  position: absolute;
+  left: 8px; right: 8px; bottom: 34px;
+  z-index: 4;
+  padding: 8px 12px;
+  font-size: 13px; line-height: 1.6;
+  color: var(--fg);
+  background: color-mix(in srgb, var(--bg0) 88%, transparent);
+  border: 1px solid rgba(216, 179, 106, .25);
+  border-radius: 10px;
+  box-shadow: var(--shadow-1);
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity .3s var(--ease), transform .3s var(--ease);
+  pointer-events: none;
+  max-height: 42%;
+  overflow: hidden;
+}
+.ai-speech.show { opacity: 1; transform: translateY(0); }

@@ -873,11 +873,14 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   // ai-state 状态机：ask 应触发 thinking→speaking（监听持久收集）
   try { await request(A.s, 'ai-join', {}); } catch (e) { /* 已在场 */ }
   const aiStatesSeen = [];
-  A.s.on('ai-state', (p) => aiStatesSeen.push(p.state));
+  let aiStateLast = null;
+  A.s.on('ai-state', (p) => { aiStatesSeen.push(p.state); aiStateLast = p; });
   try { await request(A.s, 'ai-ask', { question: '头像测试' }); } catch (e) {}
   await sleep(600);
   ok('09-26 ai-ask 驱动头像状态机（出现 thinking 或 speaking）',
      aiStatesSeen.includes('thinking') || aiStatesSeen.includes('speaking'));
+  ok('09-26b bot 改名「AI 小明」且 speaking 帧带全文（前端逐字字幕的数据源）',
+     !!aiStateLast && aiStateLast.state === 'speaking' && typeof aiStateLast.text === 'string' && aiStateLast.text.length > 0);
 
 
   // --- ★ 09-19f：SFU 深造（多 Worker 池 + ping 探活）---

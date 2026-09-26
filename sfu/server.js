@@ -1737,7 +1737,7 @@ function aiHearingStatus(roomNumber) {
  * ▎from 用 'ai-bot' 保持一致 → 前端气泡走既有的"机器同事"样式，无需新增分支。 */
 function emitBotSay(roomNumber, text, extra) {
   io.to(roomNumber).emit('chat-message', {
-    from: 'ai-bot', name: '🤖 AI 助理', text, ts: Date.now(),
+    from: 'ai-bot', name: '🤖 AI 小明', text, ts: Date.now(),
     ...(extra || {}),
   });
 }
@@ -1778,7 +1778,7 @@ function setAiBot(roomNumber, on, opts = {}) {
           const r = await buildMinutes(roomNumber, { type: 'segment', since: sinceMark.ts });
           sinceMark.ts = Date.now();
           io.to(roomNumber).emit('chat-message', {
-            from: 'ai-bot', name: '🤖 AI 助理',
+            from: 'ai-bot', name: '🤖 AI 小明',
             text: `🌙 值守分段纪要已生成：${r.path}（${r.mock ? '[Mock] ' : ''}本段 ${r.markdown.includes('（本时段没有字幕记录）') ? '无字幕' : '已汇总'}）`,
             ts: Date.now(),
           });
@@ -2615,7 +2615,7 @@ function broadcastRoomState(roomNumber) {
   //   它没有 socket/媒体，muted/camOff 都是"是"（它不推流，只"听"：见下方音频管线）
   if (room.aiBot) {
     members.push({
-      id: 'ai-bot', name: '🤖 AI 助理', isBot: true, avatar: 'ai',
+      id: 'ai-bot', name: '🤖 AI 小明', isBot: true, avatar: 'ai',
       owner: false, muted: true, camOff: true, sharing: false, hand: false, caption: true,
     });
   }
@@ -3727,12 +3727,12 @@ io.on('connection', (socket) => {
       // ★ 09-25：流式路径也要带证据原话（否则两条路径的信息披露不一致 = 两种可信度）
       hitList: r.evidence || [],
     });
-    io.to(roomNumber).emit('ai-state', { state: 'speaking' }); // ★ 09-26：答案播报期（TTS 朗读/字幕滚动）
+    io.to(roomNumber).emit('ai-state', { state: 'speaking', text: r.text }); // ★ 09-26b：播报期带全文（前端逐字字幕）
     // 兜底归位：各端 TTS 读完本地自然回 idle；无 TTS 端按答案长度估时归位
     setTimeout(() => io.to(roomNumber).emit('ai-state', { state: 'idle' }),
       Math.min(12000, 2000 + (r.text || '').length * 90));
     io.to(roomNumber).emit('chat-message', {
-      from: 'ai-bot', name: '🤖 AI 助理', text: r.text, ts: Date.now(), streamId,
+      from: 'ai-bot', name: '🤖 AI 小明', text: r.text, ts: Date.now(), streamId,
       /* ★ 09-24e：把"这条答案是怎么来的"一起广播出去——检索自几千条字幕里的哪几条、
        *   这是第几轮追问、意图是什么。**智能不该是玄学**：用户能看到 AI 真的去查了会议记录，
        *   而不是凭空编了一段话。这也是最有力的"AI 不是空壳"的现场证据。
@@ -3787,7 +3787,7 @@ io.on('connection', (socket) => {
         : await buildMinutes(socket.roomNumber, { type, since });
       const label = type === 'final' ? '终稿' : (type === 'merge' ? '跨段归并' : '分段');
       io.to(socket.roomNumber).emit('chat-message', {
-        from: 'ai-bot', name: '🤖 AI 助理',
+        from: 'ai-bot', name: '🤖 AI 小明',
         text: `📋 ${label}纪要已生成：${r.path}${r.mock ? '（[Mock] 本地模板）' : ''}`
           + (type === 'merge' ? `（归并了 ${r.sources} 份分段纪要）` : ''),
         ts: Date.now(),
