@@ -410,6 +410,7 @@ async function requestHandler(req, res) {
       iceServers: Array.isArray(CONFIG.iceServers) ? CONFIG.iceServers : [],
       videoSvc: !!CONFIG.videoSvc, // ★ D+3：VP9 SVC 开关（true = 摄像头改用单路 SVC 上传）
       authTtlMs: AUTH_TTL_MS, // ★ G6：token TTL（回归用它开短 TTL 实测过期路径）
+      asrEnabled: !!WHISPER_BIN, // ★ 09-27d：服务端转写开关（前端 Web Speech 失败时引导降级）
       // ★ 09-16 局域网交付：announcedIp 存在时，告诉前端"发给别的电脑的邀请链接长什么样"——
       //   服务器机自己访问的是 localhost，直接复制 location.href 别的电脑打不开
       lanUrl: ANNOUNCED_IP ? `https://${ANNOUNCED_IP}:${(tlsCfg.port || 3443)}` : null,
@@ -1669,22 +1670,53 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
       fs.mkdirSync(segDir, { recursive: true });
       let segIdx = 0;
       let alive = true;
-      pipe.alive = () => { alive = false; }; // producerclose/停用时置假
+      let curRec = null;
+      console.log(`🤖 AI 小明开始聆听：${String(memberId).slice(-4)} 的音频（8s 一段持续转写，说完约 5~10s 出字幕）`);
+      const doneSet = new Set();
+      /* ★ 09-27c 实修（用户反馈"AI 听不见"的根因）：原代码在这里写了
+       *   `pipe.alive = ...`，而 const pipe 声明在本函数**后面**（astats 公共尾部）——
+       *   TDZ 必然抛错 → 每次 ASR 管线启动即崩 → AI 永远听不见。
+       *   修法：whisper 分支自带 producerclose 监听（置 alive=false 并杀当前段进程），
+       *   不再触碰外部的 pipe。 */
+      c.on('producerclose', () => {
+        alive = false;
+        try { if (curRec) curRec.kill(); } catch (e) { /* 已退 */ }
+      });
+      // ★ 09-27c 灵敏度重构:单个 ffmpeg 持续 8s 分段(录音无空窗——旧串行模式
+      //   转写 10~20s 期间的语音全丢,是"不灵敏"的根因);下方循环只负责转写轮询。
+      curRec = require('child_process').spawn(FFMPEG_BIN, [
+        '-loglevel', 'error', '-protocol_whitelist', 'file,udp,rtp',
+        '-fflags', '+genpts', '-i', sdpFile,
+        '-ar', '16000', '-ac', '1',
+        '-f', 'segment', '-segment_time', '8', '-segment_format', 'wav',
+        '-reset_timestamps', '1',
+        path.join(segDir, 'seg-%04d.wav'),
+      ], { stdio: ['ignore', 'ignore', 'ignore'] });
       const recordLoop = async () => {
+        /* ★ 09-27c 灵敏度重构：单 ffmpeg 持续 8s 分段（录音无空窗——旧串行模式
+         *   转写 10~20s 期间的语音全丢，是“不灵敏”的根因）。转写改为**轮询已完成段**
+         *   （大小两次采样一致即写稳），串行 whisper（不并发打满 CPU）。 */
+        await new Promise((r) => setTimeout(r, 500)); // 等首段产生
         while (alive && rooms.get(roomNumber)) {
-          const wav = path.join(segDir, `seg-${Date.now()}.wav`);
-          await new Promise((r) => {
-            const rec = require('child_process').spawn(FFMPEG_BIN, [
-              '-loglevel', 'error', '-protocol_whitelist', 'file,udp,rtp',
-              '-fflags', '+genpts', '-i', sdpFile, '-t', '15',
-              '-ar', '16000', '-ac', '1', '-y', wav,
-            ], { stdio: ['ignore', 'ignore', 'ignore'] });
-            rec.on('exit', () => setTimeout(r, 300)); // 留缓冲：文件写完整
-          });
-          if (!alive || !rooms.get(roomNumber)) { try { fs.unlinkSync(wav); } catch (e) {} break; }
+          // ① 扫描“已写稳且未处理”的段
+          let wav = null;
+          try {
+            wav = fs.readdirSync(segDir)
+              .filter((f) => f.endsWith('.wav') && !doneSet.has(f))
+              .sort()
+              .map((f) => path.join(segDir, f))
+              .find((full) => {
+                try {
+                  return fs.statSync(full).size >= 40000; // ≥2.5s 语音（16k 单声道），太短视为静音
+                } catch (e) { return false; }
+              });
+          } catch (e) { /* 目录暂不可读 */ }
+          if (!wav) { await new Promise((r) => setTimeout(r, 800)); continue; }
+          if (!alive || !rooms.get(roomNumber)) break;
+          doneSet.add(wav);
           let size = 0;
           try { size = fs.statSync(wav).size; } catch (e) { continue; }
-          if (size < 20000) { try { fs.unlinkSync(wav); } catch (e) {} continue; } // 静音段(≈<1s 语音)跳过
+          if (size < 40000) { continue; } // 静音段跳过（已入 doneSet）
           // 转写（whisper CLI：输出同名 txt；模型 tiny 足够会议场景）
           const txtFile = wav.replace(/\.wav$/, '.txt');
 
@@ -1693,7 +1725,8 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
               && !/whisper(\.exe)?$/i.test(WHISPER_BIN)) return; // 形态白名单
           const wCmd = WHISPER_BIN === '__py__' ? process.execPath : WHISPER_BIN;
           const wArgs = (WHISPER_BIN === '__py__' ? ['-m', 'whisper'] : [])
-            .concat([wav, '--model', process.env.WHISPER_MODEL || 'tiny', '--language', 'zh',
+            .concat([wav, '--model', process.env.WHISPER_MODEL || 'small', '--language', 'zh',
+                     '--initial_prompt', '以下是普通话的句子。会议纪要、行动项。',
                      '--output_format', 'txt', '--output_dir', segDir]);
           await new Promise((r) => {
             require('child_process').execFile(wCmd, wArgs,
@@ -1702,6 +1735,7 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
           let text = '';
           try { text = fs.readFileSync(txtFile, 'utf8').trim(); } catch (e) {}
           try { fs.unlinkSync(wav); fs.unlinkSync(txtFile); } catch (e) {}
+          console.log(`🤖 [ASR] ${String(memberId).slice(-4)} 段转写：${text ? text.slice(0, 50) : '(这 15 秒没识别到语音)'}`);
           if (!text || !rooms.get(roomNumber)) continue;
           // 入字幕账本（source:'asr' 标记来源；与客户端字幕同一条权威副本路径）
           const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
@@ -1710,23 +1744,12 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
             ts: Date.now(), from: memberId, name: `成员 ${String(memberId).slice(-4)}`, text: text.slice(0, 500), asr: true,
           }) + '\n');
           if (!aiHearing.has(roomNumber)) aiHearing.set(roomNumber, new Map());
-          io.to(roomNumber).emit('chat-message', {
-            from: 'system', name: null,
-            text: `🎙️ [转写] ${String(memberId).slice(-4)}：${text.slice(0, 80)}`,
-            ts: Date.now(),
+          // ★ 09-27c：转写只上字幕条（asr-caption 事件）——不再刷聊天区（用户反馈"拉胯"）
+          io.to(roomNumber).emit('asr-caption', {
+            name: `成员 ${String(memberId).slice(-4)}`, text: text.slice(0, 200),
           });
           logEvent('info', 'asr-segment', { roomNumber, member: memberId, chars: text.length });
-          /* ★ 09-27b 服务端唤醒词：转写里提到「小明」→ AI 自动回答（与客户端
-           *   emitCaption 的唤醒词对等——语音说的和字幕写的都能叫动它）。 */
-          if (/小明|小鸣/.test(text) || /ai/i.test(text)) {
-            io.to(roomNumber).emit('ai-state', { state: 'thinking' });
-            try {
-              const r = await aiBrain(roomNumber, text.slice(0, 300));
-              io.to(roomNumber).emit('ai-state', { state: 'speaking', text: r.text });
-              setTimeout(() => io.to(roomNumber).emit('ai-state', { state: 'idle' }),
-                Math.min(12000, 2000 + r.text.length * 90));
-            } catch (e) { /* 回答失败不影响转写循环 */ }
-          }
+          await asrWakeAndAnswer(roomNumber, memberId, text); // ★ 09-27c：唤醒+回答抽成公共函数（自测同用）
           segIdx += 1;
         }
       };
@@ -1908,8 +1931,12 @@ function setAiBot(roomNumber, on, opts = {}) {
      *   quiet=true 时跳过：见 setAiBot 的 @param 注释（避免寒暄与答案抢道）。 */
     if (!was && !opts.quiet) {
       const h = aiHearingStatus(roomNumber);
+      // ★ 09-27c 文案修正：degraded 的原因有三种（ffmpeg 真不可用 / 管线启动失败 / 开麦比邀 AI 晚），
+      //   咬死"ffmpeg 不可用"会误导（尤其 whisper 模式下管线数含转写段）；按真相分三句说。
       const hear = h.degraded
-        ? '⚠️ 但本机 ffmpeg 不可用，我暂时**听不见**音频——字幕转写若不开启，我只能靠已有字幕作答。'
+        ? (FFMPEG_OK
+            ? '音频管线正在接入——如果你已开麦但我迟迟没反应，把这条截图发管理员查一下。'
+            : '⚠️ 本机 ffmpeg 不可用，我暂时**听不见**音频——字幕转写若不开启，我只能靠已有字幕作答。')
         : h.talkers === 0
           ? '房间里现在还没人开麦，等有人说话我就能听见。'
           : `已接入 ${h.live || h.talkers} 路音频，能听见正在说话的各位。`;
@@ -2053,6 +2080,23 @@ async function aiBrain(roomNumber, question, onDelta) {
  * ══════════════════════════════════════════════════════════════ */
 const AI_OP_STEP_MS = Number(process.env.AI_OP_STEP_MS) || 600;
 const AI_WARM_MS = (Number(process.env.AI_WARM_SEC) || 600) * 1000;
+
+/* ★ 09-27c 服务端唤醒+回答（从分段循环抽出成公共函数——真实管线与 TEST_ASR 自测共用）：
+ *   转写文本含「小明」→ aiBrain 自动回答；状态机 thinking→speaking→idle 全演。 */
+async function asrWakeAndAnswer(roomNumber, memberId, text) {
+  if (!/小明|小鸣/.test(text)) return;
+  io.to(roomNumber).emit('ai-state', { state: 'thinking' });
+  try {
+    const r = await aiBrain(roomNumber, String(text).slice(0, 300));
+    io.to(roomNumber).emit('ai-state', { state: 'speaking', text: r.text });
+    io.to(roomNumber).emit('chat-message', {
+      from: 'ai-bot', name: '🤖 AI 小明', text: r.text, ts: Date.now(),
+    });
+    setTimeout(() => io.to(roomNumber).emit('ai-state', { state: 'idle' }),
+      Math.min(12000, 2000 + r.text.length * 90));
+    logEvent('info', 'asr-wake-answer', { roomNumber, member: memberId });
+  } catch (e) { /* 回答失败不影响转写循环 */ }
+}
 
 /* ★ 09-27 服务端 ASR（字幕转写，用户点名“开启那个字幕转写”）：
  * ▶ 原理：AI 听觉管线（startAiAudioPipe）已把每路音频推给本机 ffmpeg——在此基础上
@@ -4476,6 +4520,7 @@ io.on('connection', (socket) => {
   workerReady.catch((err) => console.error('❌ 媒体引擎启动失败：', err.message));
 
   if (process.env.TEST_RECORD === '1') workerReady.then(() => runRecordSelfTest()); // ★ D+2 端到端自测（见下）
+  // ★ 09-27c ASR 转写验证独立在 scripts/test-asr.js（npm run test:asr）——server 内不新增 execFile 动态形态（Mimosa）
   const listenOn = LISTEN_IP === '127.0.0.1' ? 'localhost' : LISTEN_IP;
   // ★ 可交付体验：端口被占时给"人话"指引，而不是一屏堆栈（常见于 start-lan 已启动、
   //   又手动 npm run start:sfu 的双开场景）

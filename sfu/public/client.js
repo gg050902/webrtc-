@@ -56,6 +56,7 @@ const AI_ANIM = {
 };
 try { [new Image(), new Image()].forEach((im, i) => { im.src = i ? AI_ANIM.talkSm : AI_ANIM.talk; }); } catch (e) { /* 无头环境无 Image（坑 29 家族：顶层 DOM API 防御式调用） */ }
 let myAvatar = null; // 我的预设头像 key（登录/恢复后带回）
+let serverAsrEnabled = false; // ★ 09-27d：服务端 ASR 是否开启（/config.json 下发）
 
 /* ★ 09-26b 唤醒词：开会时商量提到「小明」，它就接话——
  *   字幕成稿（emitCaption）里检测到名字 + AI 在场 → 自动把整句话作为提问发给 ai-ask。
@@ -677,6 +678,7 @@ async function initSFU() {
   try {
     const cfg = await fetch('/config.json').then((r) => r.json());
     if (Array.isArray(cfg.iceServers)) sfuIceServers = cfg.iceServers;
+    serverAsrEnabled = !!cfg.asrEnabled; // ★ 09-27d：服务端转写可用性（Web Speech 失败时的降级依据）
     sfuVideoSvc = !!cfg.videoSvc; // ★ D+3：true = 摄像头改用 VP9 SVC 单路分层上传
     // ★ 09-24 AI 模式：服务器只给 true/false（不给 key），前端据此显示「LLM / Mock」状态灯。
     //   为什么值得显示：用户要能一眼分清"AI 真在思考"还是"在走本地模板"——
@@ -1309,6 +1311,10 @@ roomBadge.addEventListener('click', async () => {
  *   这是工程上常见的"双发去重"做法（面试讲点：at-least-once + 幂等接收）。
  * ────────────────────────────────────────────────────────────── */
 socket.on('ai-state', ({ state, text }) => setAiState(state, text)); // ★ 09-26b：text 供逐字字幕
+socket.on('asr-caption', ({ name, text }) => {
+  // ★ 09-27c：服务端 ASR 转写上字幕条（实时字幕体验统一；不刷聊天区）
+  showCaptionBar(name || '转写', text || '', false);
+});
 
 socket.on('chat-message', ({ from, text, ts, msgId, name, ai, streamId }) => {
   // ★ D+1：同一条消息可能从 SCTP 和信令各到一次，msgId 相同的只显示第一条
@@ -5569,11 +5575,19 @@ function startCaptionRec() {
        *   （约 45 分钟连不上）才放弃；期间每次失败刷新徽标，值守统计里能看到次数。 */
       cap.neterr = (cap.neterr || 0) + 1;
       if (cap.neterr >= CAP_NET_GIVE_UP) {
-        renderCapStatus('⚠️ 识别服务不可达', 'bad');
-        showToast(`语音识别服务连续 ${CAP_NET_GIVE_UP} 次不可达（Web Speech 依赖浏览器厂商云端）；可用「手动字幕」兜底`, 'error');
+        /* ★ 09-27d 降级重构（用户反馈"动不动就报错"）：浏览器厂商云端不可达时，
+         *   **自动切到服务端转写模式**——不再反复弹错；AI 小明在场时服务器 whisper
+         *   本来就在转写（asr-caption 直接上字幕条），客户端这个开关只是"冗余路径"。 */
+        renderCapStatus(serverAsrEnabled ? '🖥️ 服务器转写模式' : '⚠️ 识别服务不可达', serverAsrEnabled ? 'live' : 'bad');
+        showToast(serverAsrEnabled
+          ? '浏览器识别不可达——已自动改用服务器转写：邀请 🤖 AI 后正常说话即可上字幕'
+          : '浏览器识别不可达，且服务器转写未开启（需服务器安装 whisper）。可用「手动字幕」兜底', serverAsrEnabled ? 'default' : 'error');
         renderCapDiag();
         capDiagBox.classList.remove('hidden');
         toggleCaptions();
+        if (serverAsrEnabled) {
+          renderCapStatus('🖥️ 服务器转写模式', 'live'); // toggleCaptions 会复位徽标，这里再标一次
+        }
       } else {
         const delay = Math.min(30000 * Math.pow(2, cap.neterr - 1), 300000);
         cap.backoffUntil = Date.now() + delay; // onend 的重启排程会读它（见上）

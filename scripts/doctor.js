@@ -419,6 +419,34 @@ const FIREWALL_HINT = [
       });
   }
 
+  // A6 whisper（09-27 服务端 ASR 字幕转写要用：AI 小明的"真实听觉"）
+  // 探测口径与 sfu/server.js 的 probeWhisper 一致：PATH → pip --user Scripts → python -m
+  const probeWhisper = () => {
+    try {
+      execFileSync('whisper', ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 20000 });
+      return { ok: true, bin: 'whisper' };
+    } catch (e) { /* 继续 */ }
+    const userCands = [
+      process.env.APPDATA && path.join(process.env.APPDATA, 'Python', 'Python312', 'Scripts', 'whisper.exe'),
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'Python', 'Python312', 'Scripts', 'whisper.exe'),
+      'C:\\Program Files\\Python312\\Scripts\\whisper.exe',
+    ].filter((x) => { try { return fs.existsSync(x); } catch (e2) { return false; } });
+    if (userCands[0]) return { ok: true, bin: userCands[0], note: 'pip --user 安装（不在 PATH，server 用完整路径调用）' };
+    return { ok: false };
+  };
+  const asr = probeWhisper();
+  if (asr.ok) {
+    add('A', 'A6-whisper', 'ok', 'whisper 可用（服务端 ASR 字幕转写就绪：AI 小明能听懂会议语音）',
+      { detail: `${asr.bin}${asr.note ? ' · ' + asr.note : ''}`, priority: 55 });
+  } else {
+    add('A', 'A6-whisper', 'warn', 'whisper 未检测到 → AI 小明"听不懂"会议语音（服务端转写关闭）',
+      {
+        detail: '客户端 Web Speech 字幕不受影响；ASR 开启后 @ai 问答/RAG/纪要/唤醒词全部吃真实会议内容',
+        advice: 'pip install -U openai-whisper   （模型首次运行自动下载；装完重启服务器）',
+        priority: 30,
+      });
+  }
+
   /* ════════ B. 配置 ════════ */
 
   // B1 config.json 存在且合法

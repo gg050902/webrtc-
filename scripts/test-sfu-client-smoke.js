@@ -757,6 +757,10 @@ const emit = (ev, payload) => {
   });
   ok('值守：network 连败 4 次没被永久关（值守退避生效，4/12）',
     capBtnEl.innerHTML.includes('关字幕') && capStatusEl.textContent.includes('4/12'));
+  // ★ 09-27d 降级：连败到 12 次 → 自动切"服务器转写模式"（不再反复报错；服务端 asrEnabled 时）
+  guard('值守：模拟连败至放弃阈值', () => { for (let i = 0; i < 12; i++) liveRec.onerror({ error: 'network' }); });
+  ok('值守：连败达阈值后自动降级（徽标显示服务器转写模式或已关闭）',
+    capStatusEl.textContent.includes('服务器转写模式') || capStatusEl.textContent.includes('不可达'));
   // ④ 导出合并：导出时先拉服务器全档，和内存段拼成一份 txt
   guard('值守：导出记录（应先拉服务器全档）', () => documentStub.getElementById('capExportBtn').dispatch('click'));
   await new Promise((r) => setTimeout(r, 60));
