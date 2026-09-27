@@ -5372,7 +5372,8 @@ const cap = {
   hideTimer: 0,        // 字幕条"8 秒无字幕自动隐藏"定时器
   log: [],             // ★ 字幕账本（C2 前置）：{ts, from, name, text}，上限 500 条
   lastError: null,     // ★ 09-17c：最近一次失败{word, fix}——诊断卡要把它显示出来
-  neterr: 0,           // ★ 09-17c：network 错误的重试计数（3 次后停并给兜底指引）
+  neterr: 0,
+  asrChecked: false, // ★ 09-27d：/config.json 是否已补拉过           // ★ 09-17c：network 错误的重试计数（3 次后停并给兜底指引）
 };
 
 function capSupported() {
@@ -5574,7 +5575,27 @@ function startCaptionRec() {
        *   改成指数退避：30s→60s→120s→240s→5min 封顶，连续 CAP_NET_GIVE_UP 次
        *   （约 45 分钟连不上）才放弃；期间每次失败刷新徽标，值守统计里能看到次数。 */
       cap.neterr = (cap.neterr || 0) + 1;
-      if (cap.neterr >= CAP_NET_GIVE_UP) {
+      // ★ 09-27d：服务端转写可用时，**第一次 network 失败就立即降级**——
+      //   浏览器云端不可达是稳定状态，重试 45 分钟毫无意义（用户实测"动不动就报错"）；
+      //   不可用时才走原退避路径。
+      // ★ 09-27d 双保险：进房前拉取失败/未到时，现场补拉一次再判
+      if (!cap.asrChecked && typeof fetch === 'function') {
+        cap.asrChecked = true;
+        fetch('/config.json').then((r) => r.json()).then((c) => {
+          serverAsrEnabled = !!c.asrEnabled;
+          if (serverAsrEnabled && cap.on) {
+            renderCapStatus('🖥️ 服务器转写模式', 'live');
+            showToast('已切换：服务器转写（AI 小明在场时说话即上字幕）');
+          }
+        }).catch(() => {});
+      }
+      if (serverAsrEnabled) {
+        renderCapStatus('🖥️ 服务器转写模式', 'live');
+        showToast('浏览器识别不可达——已改用服务器转写：邀请 🤖 AI 后正常说话即可上字幕');
+        renderCapDiag();
+        toggleCaptions();
+        renderCapStatus('🖥️ 服务器转写模式', 'live'); // toggleCaptions 复位徽标后再标
+      } else if (cap.neterr >= CAP_NET_GIVE_UP) {
         /* ★ 09-27d 降级重构（用户反馈"动不动就报错"）：浏览器厂商云端不可达时，
          *   **自动切到服务端转写模式**——不再反复弹错；AI 小明在场时服务器 whisper
          *   本来就在转写（asr-caption 直接上字幕条），客户端这个开关只是"冗余路径"。 */
@@ -6753,6 +6774,16 @@ logTitle.addEventListener('click', () => {
   const collapsed = logPanel.classList.toggle('collapsed');
   document.querySelector('.app').classList.toggle('log-collapsed', collapsed);
 });
+
+// ★ 09-27d：页面加载即拉 /config.json——serverAsrEnabled 必须在"开字幕"**之前**
+//   就位（原来只在进房 initSFU 时拉，用户在预览页/进房前开字幕时降级依据是 false，
+//   Web Speech 失败就会走旧退避路径反复报错——实测反馈的"还是没转到 whisper"）。
+(async () => {
+  try {
+    const cfg0 = await fetch('/config.json').then((r) => r.json());
+    serverAsrEnabled = !!cfg0.asrEnabled;
+  } catch (e) { /* 离线时按 false */ }
+})();
 
 startLocalMedia();
 // ★ 第 33 步：非安全上下文时弹出安全提示横幅。放在 startLocalMedia 之后调用，

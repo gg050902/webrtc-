@@ -317,6 +317,10 @@ ctx.SPEAKER_HOLD_MS = 30; // ★ 09-18 演讲人交接迟滞的坐稳阈值—�
 rec.fetchCalls = [];
 ctx.fetch = async (url, opts = {}) => {
   rec.fetchCalls.push({ url: String(url), method: (opts.method || 'GET').toUpperCase(), body: opts.body || null });
+  // ★ 09-27d：/config.json 返回 asrEnabled:true——覆盖"Web Speech 失败立即降级"路径
+  if (String(url).includes('/config.json')) {
+    return { ok: true, status: 200, json: async () => ({ iceServers: [], asrEnabled: true, authTtlMs: 86400000 }) };
+  }
   let saved = 0;
   try { saved = (JSON.parse(opts.body || '{}').entries || []).length; } catch (e) { saved = 0; }
   return {
@@ -750,17 +754,18 @@ const emit = (ev, payload) => {
     !capHistPanelEl.classList.contains('hidden') && capSentryEl.textContent.includes('🌙 值守') &&
     capSentryEl.textContent.includes('已归档 5'));
   guard('值守：收起抽屉', () => documentStub.getElementById('capHistoryCloseBtn').dispatch('click'));
-  // ③ network 退避：连续失败 4 次仍没被永久关（老逻辑 3 次就停），徽标显示退避重试计数
+  // ③ ★ 09-27d 降级：fetch 桩返回 asrEnabled:true——network **第 1 次失败立即降级**
+  //   （浏览器云端不可达是稳定状态，退避 45 分钟毫无意义；此为用户实测反馈的重构）。
   const liveRec = rec.capInstances[rec.capInstances.length - 1];
-  guard('值守：模拟连续 4 次 network 失败', () => {
-    for (let i = 0; i < 4; i++) liveRec.onerror({ error: 'network' });
-  });
-  ok('值守：network 连败 4 次没被永久关（值守退避生效，4/12）',
-    capBtnEl.innerHTML.includes('关字幕') && capStatusEl.textContent.includes('4/12'));
-  // ★ 09-27d 降级：连败到 12 次 → 自动切"服务器转写模式"（不再反复报错；服务端 asrEnabled 时）
-  guard('值守：模拟连败至放弃阈值', () => { for (let i = 0; i < 12; i++) liveRec.onerror({ error: 'network' }); });
-  ok('值守：连败达阈值后自动降级（徽标显示服务器转写模式或已关闭）',
-    capStatusEl.textContent.includes('服务器转写模式') || capStatusEl.textContent.includes('不可达'));
+  guard('值守：模拟 network 失败 1 次', () => liveRec.onerror({ error: 'network' }));
+  ok('值守：network 失败 1 次即自动降级（字幕自动关闭+徽标切服务器转写模式）',
+    capBtnEl.innerHTML.includes('字幕') && !capBtnEl.innerHTML.includes('关字幕') &&
+    capStatusEl.textContent.includes('服务器转写模式'));
+  // 降级后重新开字幕 → 再失败 → 仍稳定降级（不反复报错）
+  guard('降级：重新开字幕', () => capBtnEl.dispatch('click'));
+  guard('降级：再次 network 失败', () => { const r2 = rec.capInstances[rec.capInstances.length - 1]; r2 && r2.onerror && r2.onerror({ error: 'network' }); });
+  ok('降级：重复失败仍稳定降级（不反复弹错）',
+    capStatusEl.textContent.includes('服务器转写模式'));
   // ④ 导出合并：导出时先拉服务器全档，和内存段拼成一份 txt
   guard('值守：导出记录（应先拉服务器全档）', () => documentStub.getElementById('capExportBtn').dispatch('click'));
   await new Promise((r) => setTimeout(r, 60));
