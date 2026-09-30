@@ -1379,6 +1379,7 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   const pending = await Promise.race([pendingP, sleep(3000).then(() => null)]);
   ok('09-30 口令正确但未授权 → 应答 granted:false 并进入待确认',
      !!deskReg2 && !deskReg2.error && deskReg2.data && deskReg2.data.granted === false);
+  console.log('    DEBUG desk-connect(确认路径) ack =', JSON.stringify(deskReg2));
   ok('09-30 设备码直连复用同一张授权信令（被控端收到 remote-request）',
      !!reqToAgent && reqToAgent.from === DC.id);
   ok('09-30 控制端收到 desk-pending（前端据此显示"等待对方确认"）',
