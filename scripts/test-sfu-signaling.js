@@ -1377,9 +1377,14 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   DC.s.emit('desk-connect', { deviceCode: CODE1, password: 'pw123' }, (r) => { deskReg2 = r; });
   const reqToAgent = await Promise.race([reqToAgentP, sleep(3000).then(() => null)]);
   const pending = await Promise.race([pendingP, sleep(3000).then(() => null)]);
+  /* ★ 09-30 实修（我自己写的断言里的时序坑）：ack 必须等一拍再读。
+   *   服务器是"先 emit 事件、后 return ok(callback)"，所以 desk-pending 比 ack **先**到客户端；
+   *   上面两个 Promise.race 一 resolve 就立刻断言 ack，读到的还是 null ——
+   *   症状是"事件全对、只有 ack 那条红"，极易误判成服务器应答写漏了。
+   *   与坑 44（异步测试要先清空再触发）同源：**断言读的必须是"已经到达"的那份数据**。 */
+  await sleep(400);
   ok('09-30 口令正确但未授权 → 应答 granted:false 并进入待确认',
      !!deskReg2 && !deskReg2.error && deskReg2.data && deskReg2.data.granted === false);
-  console.log('    DEBUG desk-connect(确认路径) ack =', JSON.stringify(deskReg2));
   ok('09-30 设备码直连复用同一张授权信令（被控端收到 remote-request）',
      !!reqToAgent && reqToAgent.from === DC.id);
   ok('09-30 控制端收到 desk-pending（前端据此显示"等待对方确认"）',
@@ -1421,18 +1426,23 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
      /^\d{6}$/.test(CODE2) && CODE2 !== CODE1);
 
   const DC2 = await client('DC2');
-  let unattendedAck = null;
-  const granted2P = waitEvent(DC2.s, 'desk-granted');
-  DC2.s.emit('desk-connect', { deviceCode: CODE2, password: 'secC' }, (r) => { unattendedAck = r; });
-  const granted2 = await Promise.race([granted2P, sleep(3000).then(() => null)]);
-  ok('09-30 安全密码 → 无人值守自动放行（ack 直接 granted:true，跳过人工确认）',
-     !!unattendedAck && !unattendedAck.error && unattendedAck.data.granted === true);
-  ok('09-30 无人值守同样发 desk-granted（前端两条路径只需监听一个事件）',
-     !!granted2 && granted2.unattended === true && granted2.hostId === DB.id);
+  /* 监听必须在**申请之前**挂好（坑 3 的老规矩）：无人值守那条分支里
+   * remote-state / desk-granted 都在 ack 之前发出，事后补监听 = 永远收不到。 */
+  const deskStates = [];
+  DB.s.on('remote-state', (p) => deskStates.push(p));
   const reqSnoopP = new Promise((res) => {
     DB.s.on('remote-request', () => res('unexpected-request'));
     setTimeout(() => res(null), 800);
   });
+  let unattendedAck = null;
+  const granted2P = waitEvent(DC2.s, 'desk-granted');
+  DC2.s.emit('desk-connect', { deviceCode: CODE2, password: 'secC' }, (r) => { unattendedAck = r; });
+  const granted2 = await Promise.race([granted2P, sleep(3000).then(() => null)]);
+  await sleep(400);   // 同上：ack 比事件后到，断言前必须等一拍
+  ok('09-30 安全密码 → 无人值守自动放行（ack 直接 granted:true，跳过人工确认）',
+     !!unattendedAck && !unattendedAck.error && unattendedAck.data.granted === true);
+  ok('09-30 无人值守同样发 desk-granted（前端两条路径只需监听一个事件）',
+     !!granted2 && granted2.unattended === true && granted2.hostId === DB.id);
   ok('09-30 无人值守不该再给被控端发确认请求（真的"无人"）',
      (await reqSnoopP) === null);
 
