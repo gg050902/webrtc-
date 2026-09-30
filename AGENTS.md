@@ -627,6 +627,105 @@
 > 重构为聚焦版（完成档压成存档表，AI 主攻=第 1 节，其余 G 项=第 2 节备选池）；
 > 基线复核实测：冒烟 **91/91**、信令 **73/73**；下一步 = AI 阶段 0（充 10 元拿 DeepSeek key 写 chat.js）。
 
+> **★ 09-28 服务端 ASR 成为唯一识别路径 + AI 多轮语音对话（"whisper 装了却没用上"事故修复）**——
+> 用户点名的三件事：whisper 已装 → **不要再用浏览器的** → 让 AI 参会能正常对话。
+> ① **根因（装了 ≠ 用上了）**：服务器用 `whisper --help` 判存活，而 whisper CLI 在
+>   **中文 Windows / GBK 控制台**下打印帮助会 UnicodeEncodeError → 退出码 1 →
+>   服务器认定"未装 whisper" → `asrEnabled=false` → 前端退回 Web Speech（用户看到的现象）。
+>   另一个兜底候选 `__py__` 把 `process.execPath`(node.exe) 配 `-m whisper` 用——永远失败。
+> ② **修法**：新增 **`sfu/ai/asr.js`（唯一实现层，与 password.js 同一条教训）**——
+>   所有 whisper 子进程带 `PYTHONIOENCODING=utf-8/PYTHONUTF8=1`；探测=「--help 退出码 0」；
+>   候选含 pip --user 路径与 `python -m whisper`；**形态白名单**防注入；
+>   **模型默认 tiny**（实测 4s 语音：tiny 4.2s / small 10.8s）、分段默认 5s、
+>   跨说话人并发闸 `ASR_CONCURRENCY`(默认 2)；`--initial_prompt` 强制简体输出。
+> ③ **多人会议真缺陷两处**：原来全体共用 `asr-<房间>/seg-%04d.wav`（**互相覆盖**）→
+>   改**按 memberId 分目录**；原来会读"正在写的半截文件"（丢句尾）→
+>   **跳过最新那段 + 两次采样稳定 + 收尾补转最后一段**。
+> ④ **ASR 字幕补喂 AI 看板**：抽 `ingestCaptions(room, entries)`（HTTP 归档与 ASR 共用），
+>   否则只用服务端转写的会里 AI 看板永远是空的。
+> ⑤ **前端契约反转**：`asrEnabled` 时 `toggleCaptions` **直接进服务端模式，绝不启动浏览器识别器**；
+>   配置改**记忆化 promise + 条件 await**（点击零延迟，修掉"依据未就位"）；
+>   服务端模式**自动邀请 AI**（音频管线=它的耳朵）；**看门狗加模式闸门**（否则每 30s 偷拉 Web Speech）；
+>   `asr-caption` 进本地历史但**不回传**（防重复入库）；AI 说话而语音没开时一次性提示开「AI 语音」。
+>   测试/排障入口：`window.__SFU_ASR__ = true/false` 强制字幕路径。
+> ⑥ **AI 多轮对话**：唤醒词容错（小明/小鸣/小名/小铭）+ **追问窗口**
+>   `config.aiChatWindowSec`（默认 20s，窗口内免唤醒继续聊，问句带说话人昵称）。
+> ⑦ **顺手修陷阱**：`config.example.json` 带 `//` 注释却被严格 `JSON.parse` 读
+>   → 复制即静默失效；新增 **`sfu/jsonc.js`**（注释剥离 + 尾逗号容错），server 与 doctor 共用。
+> ⑧ **回归（本次实测）**：新增 `npm run test:asr` **15/15**（探测/系统 TTS 真语音转写/唤醒与
+>   追问窗口/在线 asrEnabled/模板可解析）；信令 **154/154**；冒烟 **168/168**（+9 服务端字幕断言；
+>   浏览器路径用 `window.__SFU_ASR__` 覆盖后仍全绿）；`doctor` whisper 项变 ✅（16 通过/2 警告/0 失败）。
+> ⑨ ⚠️ **待人工浏览器验证**：两窗互看 → 点「字幕」显示"🖥️ 服务器转写（whisper）"且**不再报浏览器识别错** →
+>   说"小明，明天下午三点开会" → 5~10s 出字幕 + AI 回话（开「AI 语音」可听见）→
+>   紧接着**不喊名字**说"那后天呢"应被当追问继续答（多轮窗口生效）。
+
+> **★ 09-29 G6-② 房间权限分级（owner/admin/member/guest 四级）+ ASR 听觉管线持续分段化**——
+> ① **四级角色**：`roleOf(socket, room)`（owner=建房者 > admin=平台管理员 > member=登录用户 >
+>   guest=游客；owner 判定**优先于登录态**——没登录的建房者也是 owner）；
+>   `broadcastRoomState` 显式投影加 `role` 字段（与 avatar 同一批，房间令牌照旧进不了投影）；
+>   `bindIdentity` 加第 4 参 role，register/login/verify 三处调用点带上——socket 级身份随登录态走。
+> ② **权限点（最小集）**：kick-member = owner/admin（其余 `kick-denied`，reason 'not-owner'）；
+>   record-start = member 及以上（**游客不能录**——审计需要身份，fail fast 在业务校验之前）；
+>   说话/字幕/白板等"会议发言权"不做分级（全员平等是产品语义，不是遗漏）。
+> ③ **前端**：成员行新增 admin 盾形徽标（ICONS.shield，owner 有 crown 不重复挂）；
+>   踢人按钮入口从"仅房主"放开到"房主或 admin"（服务器仍是权威校验，前端只是入口）。
+> ④ **实修两处测试坑**：G8 块的 `adm` 是块级变量且 socket 早已 close——G6 断言引用它必然
+>   ReferenceError；改用**新客户端 + `auth-verify`**（verify 会 bindIdentity 带回 role）恢复
+>   socket 级管理员身份。`request()` 返回 `{data}` 包装——`create-room` 的房间号要取
+>   `resp.data.roomNumber`（直取顶层是 undefined，join 进"undefined 房"就挂死）。
+> ⑤ **回归（本次实测）**：信令 **160/160**（+6：owner/guest/member role 投影、四级各就各位、
+>   admin 非房主可踢、游客 record-start 被拒）+ 冒烟 **168/168** + **test:asr 15/15**（带真服务器）。
+> ⑥ **ASR 听觉管线持续分段化（本次早些时候）**：whisper 分支从"录 15s→转写→再录"（串行，
+>   **转写期间语音全丢**——用户"识别不灵敏"的根因之一）改为**单 ffmpeg 持续 `-f segment` 8s 分段
+>   + 轮询"写稳"段转写**（大小两次采样一致才转）；录与转并行，不再丢音频；
+>   管线启动即注册 aiAudioPipes（修 TDZ：`pipe.alive` 写在 `const pipe` 声明前 = "pipe before
+>   initialization" 崩溃，AI 听不见的直接根因）。
+> ⑦ **★ 常驻转写 worker（"不灵敏"的最大单一解）**：CLI 每转一段都要重启 Python + 重载模型
+>   （固定 2~4s+，10~14s 的段耗时里大半是这个）→ 新增 `sfu/ai/asr_worker.py`（stdin/stdout
+>   JSONL 协议，模型只加载一次）+ `asr.js` 的 `createResidentTranscriber()`（分段循环优先走
+>   worker，连崩 3 次自动回退 CLI，`ASR_WORKER=0` 强制关）；**spawn 安全形态**（Mimosa 复核）：
+>   可执行与参数全字面量（python/python3 二选一 + 写死脚本名），模型名走环境变量不进 argv；
+>   优雅退出补 kill（不关会留 python 进程占内存）。**实测**：同样 4s 语音，CLI 每段 10~14s →
+>   worker 第 1 次 13.4s（含加载）**第 2 次起 0.8~3.0s**；准确率实测 small 全对
+>   （"产品评审会"，tiny 转成"平省会"）→ **asrModel 默认 tiny→small**（config.example 同步）。
+> ⑧ **回归（本次实测）**：信令 **160/160**（+6：owner/guest/member role 投影、四级各就各位、
+>   admin 非房主可踢、游客 record-start 被拒）+ 冒烟 **168/168** + **test:asr 19/19**
+>   （+4：worker 启动转写/唤醒词/二次转写提速/kill 干净退场）。
+> ⑧b **★ 语音闭环端到端自测 `npm run test:asr-live`（TEST_ASR=1）**：照 TEST_RECORD 思路，
+>   TTS 合成带唤醒词的中文 → ffmpeg 以 opus RTP 推进收流 PlainTransport → **真实听觉管线**
+>   （startAiAudioPipe 同一段代码）→ 常驻 worker 转写 → 断言字幕账本出现 asr:true 且含语义
+>   关键词的条目。**首跑 PASS：转写「小明，帮我记一下明天下午三点的评审会。」逐字全对**
+>   （small 模型；首段 16.3s 含 worker 加载模型，后续段 3s 档）。房间级 ASR 管线从此有
+>   自动化回归——改管线代码不再只能靠真人开麦验证。
+> ⑧c **★ G6-③ 生产化 Next：密码强度 + 登录失败锁定**（路线图 0.3 第 5 条的第 2、3 缺口补掉）：
+>   注册密码 ≥ passwordMinLen（默认 8，env `AUTH_PASSWORD_MINLEN`/config 可调）且**至少两类字符**
+>   （字母/数字/符号——纯数字 8 位也会被拒）；只管**新注册**（老用户登录不受影响）；同一账号
+>   **连错 5 次锁定** AUTH_LOCK_MS（默认 15 分钟，可调），锁定期内**正确密码也拒**
+>   （防"5 错+1 对"撞库），成功即清零；**只对存在的账号计数**（对空气计数 = 锁人 DoS，
+>   也不泄露"该用户名已锁定"的存在性）。测试侧为不动历史密码，测试服务器用
+>   `AUTH_PASSWORD_MINLEN=6 + AUTH_LOCK_MS=2000` 让两条路径都可实测。
+> ⑨ **回归（本次实测）**：信令 **165/165**（+11：角色 6 条 + 强度 3 条 + 锁定 2 条）+
+>   冒烟 **168/168** + **test:asr 19/19** + **test:asr-live PASS** + **test:shutdown 9/9**
+>   （含 asrWorker.kill 清理）+ **test:store 49/49**。
+> ⑩ ⚠️ 待人工验证：admin 盾徽标/踢人、游客录制提示；真人开麦观感（合成语音已验完整链路）；
+>   弱密码注册被拒与"连错 5 次锁定"的真实提示文案。
+
+> **09-30 三连修复（用户反馈"AI 抢话 / 还在用浏览器识别 / 启动网址不对"）**——
+> ① **AI 抢话**：AI 回答默认用浏览器 TTS 朗读，用户说完唤醒词还在继续说 → AI 声音压上来。
+>   修成三层"让话"礼仪：**即时闸**（会议中 AnalyserNode 盯本地麦克风能量，峰值连续 8 帧
+>   ≈130ms 超阈 = 正在说话 → 立即 `speechSynthesis.cancel()`，比等 5s 字幕段快两个数量级；
+>   仅 AI 语音开着时运行、AI 没在说时空转、静音采样天然不误触发、replaceTrack 循环内重绑）
+>   + **字幕闸**（asr-caption 到达即 hush，排除 AI 自己的 TTS 回声）+ **迟到不读**
+>   （回答送达时用户 2.5s 内刚说过话 → 这轮不念，文字照常进气泡）。
+> ② **"还在用浏览器识别"加固**：客户端 toggleCaptions 原是"配置未到才 await"（留了时序竞态）
+>   → 改**无条件 await**（记忆化后只是微任务）；配置**拉取失败不再缓存失败结果**
+>   （原来一次网络抖动 = 永远落进浏览器模式）→ 下次点击重拉。另注：**Mesh 版（3000）没有
+>   服务器 ASR**，开到 3000 端口看到 Web Speech 是版本不对，不是 bug。
+> ③ **启动网址**：监听 0.0.0.0 时把 `https://0.0.0.0:3443` 打给用户——0.0.0.0 是监听语义
+>   不是访问语义，没法点（"不是本来的网址"根因）。改为一律打 `http://localhost:3001` +
+>   🔒 `https://localhost:3443`，另起一行 🌐 局域网地址给真实 IP（announcedIp 自动纠偏后）。
+> **回归**：冒烟 168/168 + 客户端/服务器语法过；服务器已重启（启动打印四行全可点）。
+
 ---
 
 ## 1. 项目一句话定位
@@ -717,9 +816,12 @@ webrtc/
 ├── .npmrc                 # ignore-scripts=true（防止 npm install 重编译 mediasoup worker，见坑 #12）
 ├── deploy/coturn/         # 自建 TURN 包（docker-compose.yml + turnserver.conf，09-15c）
 ├── sfu/                   # ★ SFU 版（mediasoup，端口 3001）
-│   ├── server.js          #   SFU 服务器（2036 行，分区 A~E）：静态托管 + 房间/密码 + 用户体系 + 媒体中枢 + 录制 + 面板 API
-│   ├── protocol.js        #   SFU 信令事件总表（222 行；房间/媒体/远程协助/A~F 各档事件，改 sfu 前后端先看）
-│   ├── config.example.json#   配置模板（端口/人数/listenIp/announcedIp/ICE/HTTPS/roomTtlSec/videoSvc）
+│   ├── server.js          #   SFU 服务器（分区 A~E）：静态托管 + 房间/密码 + 用户体系 + 媒体中枢 + 录制 + 面板 API
+│   ├── protocol.js        #   SFU 信令事件总表（房间/媒体/远程协助/A~F 各档事件，改 sfu 前后端先看）
+│   ├── ai/asr.js          #   ★ 09-28 服务端语音识别唯一实现层：whisper 探测（UTF-8 环境 + --help 口径 +
+│   │                      #     形态白名单）/ 转写（tiny 默认、简体提示词、并发闸 ASR_CONCURRENCY）/ 唤醒+追问窗口纯函数
+│   ├── jsonc.js           #   ★ 09-28 带注释 JSON 容错解析（example 模板可"复制即用"；server 与 doctor 共用）
+│   ├── config.example.json#   配置模板（端口/人数/listenIp/announcedIp/ICE/HTTPS/roomTtlSec/videoSvc/asrModel/asrSegmentSec/aiChatWindowSec）
 │   ├── config.json        #   实际配置（可缺省；start:lan 生成时含 lanUrl）
 │   ├── users.json         #   登录注册账号存储（scrypt 哈希）
 │   ├── recordings/        #   D+2 服务器侧录制产物（webm/mkv）
@@ -781,6 +883,7 @@ npm run test:shutdown  # ★ 09-24 优雅退出回归（关 Worker / 关库 WAL 
 npm run test:smoke     # SFU 版**前端**无头冒烟（假 DOM/假 mediasoup，零依赖不用起服务器）★ 2026-09-24 实测 136/136
 npm run admin:list     # ★ 09-24 管理员 CLI（另有 grant/revoke/adduser/passwd/purge；purge 默认干跑、`--yes` 才删）
 npm run test:ai        # AI 双轨自检（无 key 只跑 Mock 轨并提示，有 key 两条都跑）★ 10/10
+npm run test:asr       # ★ 09-28 服务端语音识别自测（探测必须成功 / 系统 TTS 真语音转写 / 唤醒与追问窗口 / 在线 asrEnabled / 配置模板可解析）★ 15/15
 npm run test:ai-brain  # ★ AI 智能内核单测（检索/记忆/意图/行动项）★ 30/30（Mock 26 + 真模型 4）
 npm run verify:ai      # ★ AI 真服务器端到端（起真服务器+真信令+真模型）★ 6/6
 npm run ai:chat        # AI 脚本：终端一问一答（教学阶段 0）／--q "问题" 单发
@@ -917,6 +1020,14 @@ node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU �
     GitHub/代理下载 `mediasoup-worker-3.26.0-win32-x64.tgz` → 放入 out/Release（两份：带 .exe 与不带）。
     媒体走 UDP，默认端口 40000~49999（sfu/server.js 顶部可用环境变量改）；
     `npm run build:sfu-vendor` 会重新打包 mediasoup-client（vendor 已生成，改依赖后才需重跑）。
+    ★ **09-30 更新（根因查清 + 在线自愈路径实测打通）**：postinstall 失败的**两层根因**——
+    ① Node 的 fetch（mediasoup 下载用）**不读 Windows 系统证书库**：加速器对 HTTPS 做 MITM，
+    它的 CA 只装在系统库里，Node 用自带 CA 包 → `unable to verify the first certificate`；
+    ② 下载失败回退 meson 本地编译，本机无 VS 工具链必挂。**开着加速器时一条命令即可在线装好**：
+    `NODE_OPTIONS=--use-system-ca npm rebuild mediasoup --ignore-scripts=false --foreground-scripts`
+    （Node 22.15+ 支持 `--use-system-ca`，本机 v24 实测：下载 2.0MB tgz → 校验通过 →
+    替换 worker.exe → 服务器"媒体引擎就绪"。`.npmrc` 注释已记同一配方）。
+    默认仍保持 ignore-scripts=true：无加速器的新机器离线也能 npm install（worker 手动放置兜底）。
 13. **SFU 新手三坑**：① Consumer 建完不 `await consumer.resume()` → 永远没画面；
     ② 房间空了不 `router.close()` → mediasoup 内存泄漏；③ 前端 create-room/join-room 是"不带回调"的 emit，
     服务器处理时若无条件调用 ack 回调会崩（sfu/server.js 已加 callback 守卫，新增事件要照做）。
@@ -1233,6 +1344,37 @@ node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU �
     断言放在离用户最近的地方，等于在验收接线。
     顺带：新增字段/事件时，顺手 grep 一下它该出现的所有包装层
     （搜索"return {"在包装函数里），比事后靠 E2E 红一次便宜。**
+
+57. **★ "装了 ≠ 用上了"：能力探测命令在该平台上必须真的成功**（09-28 实修，本次最贵一脚）**：
+    whisper 装好了（openai-whisper 20250625 + tiny/small 模型已缓存），但服务器一直报
+    "未检测到 whisper" → `asrEnabled=false` → 前端悄悄退回浏览器 Web Speech
+    （用户实测："不要再用浏览器的了"）。根因：探测用 `whisper --help` 判存活，而 whisper CLI
+    在 **Windows GBK 控制台**下打印帮助会 UnicodeEncodeError **退出码 1**；兜底候选 `__py__`
+    还把 `process.execPath`(node.exe) 配 `-m whisper` 用（永远失败）。
+    对策：① 探测口径固定为"命令跑通且退出码 0"，并**给所有会往 stdout 打非 ASCII 的子进程
+    UTF-8 环境**（`PYTHONIOENCODING=utf-8/PYTHONUTF8=1`）；② 同一能力只保留一个实现
+    （`sfu/ai/asr.js`），server / doctor / 自测共用；③ **给"能力开关"写断言**——
+    本次事故任何功能单测都不会红（函数都对），红的是那条没人写的
+    "`probeWhisper()` 必须返回 runner + `/config.json` 的 asrEnabled 必须为 true"。
+    推广：凡是"某能力装了就该生效"的地方（ffmpeg/whisper/TURN/openssl），
+    都要有一条"探测必须成功"的回归。
+
+58. **★ 多说话人共用文件名 = 互相覆盖**（09-28 实修）**：ASR 分段录音原先所有成员共用
+    `asr-<房间号>/seg-%04d.wav` —— A 的 `seg-0003.wav` 会被 B 的同名文件覆盖，
+    两人同时说话时转写直接错乱/丢失（**单人测试永远发现不了**）。
+    凡"每个实体各自产出一批文件"的场景，目录/文件名必须带实体标识
+    （`asr/<房间>/<memberId>/`），并且**测试要覆盖 ≥2 个并发实体**。
+
+59. **★ 读"正在被写入的文件"必须先确认它已封口**（09-28 实修）**：ffmpeg 分段录音时，
+    最新那一段仍在写入，而转写循环扫到"大小 ≥ 阈值"就转 → 每句话的尾巴丢在未落盘的部分。
+    对策：**跳过最新一段**（它必然在写）+ 两次采样大小一致做双保险 + 进程退出后**补转最后一段**；
+    收尾路径同样要覆盖（否则会议最后一句话永远丢）。
+
+60. **★ 复制带注释的配置模板 = 配置静默失效**（09-28 实修）**：`config.example.json` 里写满
+    `//` 注释（给人读的），README 让人"复制改名"，而加载器是严格 `JSON.parse`
+    → 注释成语法错 → 服务器 catch 后**按默认值继续跑**（"我明明配了却没生效"）。
+    对策：`sfu/jsonc.js` 提供字符串感知的注释剥离 + 尾逗号容错，server 与 doctor 共用；
+    文档模板必须能被"复制即用"，这类"照文档做反而出事"的坑要用测试钉住。
 
 
 ---

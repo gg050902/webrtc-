@@ -7,6 +7,9 @@
   "dbFile": "data/meeting.db",
   // ★ 09-24 管理员钦定：填了它，这个用户名注册时直接是 admin（不填则"首个注册的账号"自动成为 admin）
   "adminUsername": "your-admin-name",
+  // ★ 09-29 G6-③ 生产化：密码强度与登录锁定（环境变量 AUTH_PASSWORD_MINLEN / AUTH_LOCK_MS 优先）
+  "passwordMinLen": 8,        // 注册密码下限位数（另要求字母/数字/符号至少两类；只管新注册）
+  "loginLockMs": 900000,      // 同一账号连续错 5 次后的锁定时长（默认 15 分钟；重启服务器清零）
   "listenIp": "0.0.0.0",
   "announcedIp": "192.168.1.10",
   "rtcMinPort": 40000,
@@ -32,6 +35,17 @@
     }
   ],
   "roomTtlSec": 60,
+  // ★ 09-28 AI 语音对话（服务端 whisper 转写）：
+  //   asrModel      —— 转写模型。small(默认：常驻 worker 下每段只多约 2s，明显少错字，
+  //                    实测"产品评审会"tiny 转成"平省会"、small 全对) / base / tiny(最快最省内存)。
+  //                    环境变量 WHISPER_MODEL 优先级更高。
+  //   asrSegmentSec —— 每段录音长度秒数（3~15，默认 5）。越小越灵敏、越大上下文越完整。
+  //                    环境变量 ASR_SEGMENT_SEC 优先级更高；并发上限见 ASR_CONCURRENCY（默认 2）。
+  //   aiChatWindowSec —— ★ 追问窗口：AI 答完之后的这么多秒内，大家继续说**不用再喊"小明"**，
+  //                      当成追问继续聊（多轮对话）。设 0 = 关掉，退回"每句都要喊名字"。
+  "asrModel": "small",
+  "asrSegmentSec": 5,
+  "aiChatWindowSec": 20,
   // ★ 09-24 C4 房间内令牌（room token）：会议内容接口（/api/captions、/api/minutes、/minutes/*）
   //   的门禁开关。默认 true（安全默认值）：进房时给每个成员（含游客）发一张只对本房间有效的
   //   签名令牌，读内容要带它。设成 false 则退回旧行为（这些接口开放）——仅供本地调试/教学对比，

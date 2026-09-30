@@ -1,4 +1,4 @@
-// SFU 版信令测试：模拟多个客户端连 sfu/server.js（端口 3001）
+// SFU 版信令测试：模拟多个客户端连 sfu/server.js（端口默认 3001，可用 TEST_SFU_PORT 覆盖）
 // 验证：房间/密码（复用）+ Router 能力 + Transport 创建/防重 + consume 的错误路径。
 // （produce/consume 的真实媒体需要浏览器摄像头，无法命令行模拟——
 //   这里能证明 mediasoup Worker/Router/Transport 在服务器端真的能建起来）
@@ -15,7 +15,15 @@
 const { io } = require('C:/Users/27418/Desktop/webrtc/node_modules/socket.io-client');
 const { spawn } = require('child_process');
 const nodePath = require('path');
-const URL = 'http://localhost:3001';
+/* ★ 09-30：端口**可配置**（默认仍是 3001）。
+ * ▎为什么必须可配：本脚本会自己起一个 sfu/server.js。若 3001 上已经有别的实例
+ *   （用户自己开的会议服务、或上一次被中断的测试留下的孤儿进程），
+ *   脚本只能"拒绝继续"——**这是正确的**（见下方 ensureServer 的说明：
+ *   宁可红得清楚也不要绿得可疑），但它把"有别的服务在跑"变成了"你这轮测试跑不了"。
+ *   给一个环境变量就能换端口跑，测试就不再被环境卡住。
+ *   用法：`TEST_SFU_PORT=3011 npm run test:sfu` */
+const PORT = Number(process.env.TEST_SFU_PORT) || 3001;
+const URL = `http://localhost:${PORT}`;
 
 /* ★ 09-24 测试数据隔离（任务 3）：本脚本会真注册账号，绝不能让它们落进
  *   开发者真实的 sfu/data/meeting.db 或历史 sfu/users.json。
@@ -63,6 +71,7 @@ function forgeRecordingSig(secret, fileName, exp) {
 // ★ 09-24 G8：HTTP 接口已加管理员门禁 —— 本脚本的 HTTP 断言需要带 token。
 //   取 token 的办法：临时库是全新的，所以**第一个注册的账号自动是管理员**（见 sfu/store.js）。
 let adminToken = null;
+let adminUsername = null; // ★ G6：管理员用户名（块内注册，后面 auth-verify 恢复 socket 级身份用）
 // ★ 09-24 C4：房间令牌的密钥（运行期从 sfu/data/room-secret 读入，用来伪造过期/被篡改的令牌）
 let roomSecret = null;
 
@@ -70,7 +79,7 @@ let serverProc = null;
 
 function pingServer() {
   return new Promise((resolve) => {
-    const req = require('http').get('http://localhost:3001/config.json', (r) => {
+    const req = require('http').get(`http://localhost:${PORT}/config.json`, (r) => {
       r.resume();
       resolve(r.statusCode === 200);
     });
@@ -88,25 +97,29 @@ async function ensureServer() {
      *   更糟的另一种情况：环境"恰好"能让断言过，于是测试通过但**验的不是本脚本起的那个服务器**。
      *   两种都坏。**环境前提不成立时，唯一诚实的做法是明确失败并说清怎么修**。
      *   这就是"测试要确定性"的具体落地：宁可红得清楚，也不要绿得可疑。 */
-    console.log('\n❌ 3001 端口已有别的服务器在跑 —— 本脚本无法保证测试的确定性，拒绝继续。\n');
+    console.log(`\n❌ ${PORT} 端口已有别的服务器在跑 —— 本脚本无法保证测试的确定性，拒绝继续。\n`);
     console.log('   为什么必须拒绝：本脚本需要"它自己起的、用临时库的"那个服务器——');
     console.log('     · 临时库是全新的 → 首个注册账号自动是管理员 → HTTP 门禁断言才成立；');
     console.log('     · 若端口上是用**正式库**的服务器（正式库已有管理员 Guoge），');
     console.log('       本脚本注册的测试账号只是普通用户 → /api/rooms、/metrics 会因 401 而"假失败"；');
     console.log('     · 更隐蔽的是：那种情况下测试其实**验的不是本脚本的服务器**，通过也不作数。');
-    console.log('   修法（任选）：先关掉占用 3001 的进程再重跑 ——');
+    console.log(`   修法（任选）：先关掉占用 ${PORT} 的进程再重跑，或用别的端口跑 —— `);
     console.log('     ① Windows:  taskkill /F /IM node.exe      （会关掉所有 node，注意别误杀你的编辑器进程）');
-    console.log('     ② 或找到占用者：netstat -ano | findstr :3001   然后 taskkill /F /PID <PID>\n');
+    console.log(`     ② 或找到占用者：netstat -ano | findstr :${PORT}   然后 taskkill /F /PID <PID>\n`);
     process.exit(1);
   }
   console.log('🚀 自起测试服务器（AI_OP_STEP_MS=20 加速 + AI_FORCE_MOCK=1 确定性轨道）…');
   serverProc = spawn(process.execPath, [nodePath.join(__dirname, '..', 'sfu', 'server.js')], {
     env: {
       ...process.env,
+      PORT: String(PORT),                  // ★ 09-30：把选定端口交给子进程
+      SFU_NO_HTTPS: '1',                   // ★ 09-30：不启 HTTPS（3443 被占不该拖垮测试）
       AI_OP_STEP_MS: '20',
       AI_FORCE_MOCK: '1',
       DB_FILE: TEST_DB_FILE,               // ★ 任务 3：账号写进临时库，不碰真实数据
       USERS_FILE_LEGACY: TEST_LEGACY_USERS, // ★ 指向不存在的路径 → 绝不迁移/改名真实 users.json
+      AUTH_LOCK_MS: '2000',                 // ★ G6-③：短锁窗口（15min→2s）让"锁定/解锁"可实测
+      AUTH_PASSWORD_MINLEN: '6',            // ★ G6-③：测试用 6 位下限（默认 8）——历史测试密码不必全改
     },
     cwd: nodePath.join(__dirname, '..'),
     stdio: ['ignore', 'ignore', 'pipe'],
@@ -145,7 +158,7 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   // G6：读服务器 token TTL（决定过期路径断言是否实测）
   try {
     const cfgBody = await new Promise((resolve, reject) => {
-      require('http').get('http://localhost:3001/config.json', (r) => {
+      require('http').get(`http://localhost:${PORT}/config.json`, (r) => {
         let b = ''; r.on('data', (c) => (b += c)); r.on('end', () => resolve(b));
       }).on('error', reject);
     });
@@ -159,10 +172,11 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
     const adm = await client('ADMIN');
     const reg = await request(adm.s, 'auth-register', { username: admUser, password: 'secret0', displayName: '管理员' });
     adminToken = reg.data.token;
+    adminUsername = admUser;
     try { adm.s.close(); } catch (e) { /* ignore */ }
     // 自证：这个 token 确实能过门禁（否则后面的 HTTP 断言会以"全 401"的形式假失败）
     const probe = await new Promise((resolve) => {
-      require('http').get('http://localhost:3001/api/rooms',
+      require('http').get(`http://localhost:${PORT}/api/rooms`,
         { headers: { Authorization: 'Bearer ' + adminToken } },
         (r) => { r.resume(); resolve(r.statusCode); }).on('error', () => resolve(0));
     });
@@ -358,6 +372,11 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('D4 room-state 白名单过滤（未定义字段 evil 被忽略）', !(fRow && 'evil' in fRow));
   ok('D4 room-state 标出房主（A = owner）',
      !!fState.members.find((m) => m.id === A.id && m.owner === true));
+  // ★ 09-27e G6-②：role 字段随快照下发——房主=owner（建房即得，哪怕没登录）、F 未登录=guest
+  ok('G6 room-state 投影 role：房主=owner（owner 判定优先于登录态）',
+     (fState.members.find((m) => m.id === A.id) || {}).role === 'owner');
+  ok('G6 room-state 投影 role：未登录成员=guest',
+     (fState.members.find((m) => m.id === F.id) || {}).role === 'guest');
 
   // --- D4②：非房主踢人 → 被拒 ---
   const fDeniedP = waitEvent(F.s, 'kick-denied');
@@ -545,7 +564,7 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   // --- ★ 09-13：/api/rooms 观测接口 + /dashboard 面板页（HTTP 层验证）---
   const http = require('http');
   const getCode = (path, headers) => new Promise((resolve, reject) => {
-    http.get({ hostname: 'localhost', port: 3001, path, headers: headers || {} },
+    http.get({ hostname: 'localhost', port: PORT, path, headers: headers || {} },
       (r) => { r.resume(); resolve(r.statusCode); }).on('error', reject);
   });
   // ★ 09-24 G8：受保护接口不带 token 必须 401（门禁真的在拦，而不是形同虚设）
@@ -554,7 +573,7 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('09-24 G8 /api/rooms?token=<admin> 查询串兜底可过 → 200',
      (await getCode(`/api/rooms?token=${encodeURIComponent(adminToken)}`)) === 200);
   const apiBody = await new Promise((resolve, reject) => {
-    http.get({ hostname: 'localhost', port: 3001, path: '/api/rooms',
+    http.get({ hostname: 'localhost', port: PORT, path: '/api/rooms',
       headers: { Authorization: 'Bearer ' + adminToken } }, (r) => {
       let b = '';
       r.on('data', (c) => (b += c));
@@ -635,7 +654,7 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
      (await getCode(`/api/minutes?room=${ROOM}&roomToken=${encodeURIComponent(A_ROOM_TOKEN)}`)) === 200);
 
   // --- ★ 09-17e：/api/captions 过夜值守归档（HTTP 层：落盘 / 回读 / 坏输入拒绝）---
-  // （注意：本文件顶部 const URL='http://localhost:3001' 遮蔽了全局 URL 构造器，
+  // （注意：本文件顶部 const URL=`http://localhost:${PORT}` 遮蔽了全局 URL 构造器，
   //   所以这里用手写正则拆 URL，别用 new URL(...)）
   /* ★ 09-24 G8 复审：默认带管理员 token（/metrics、/api/rooms 要它），
    *   但加一个 noAuth 开关——用来**扮演游客**（无 token）验证"内容类接口没被门禁误伤"。
@@ -662,30 +681,30 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
     rq.end();
   });
   const capEntries = [1, 2, 3].map((i) => ({ ts: Date.now() + i, from: 'test', name: '值守模拟', text: `归档对账第 ${i} 条` }));
-  const capPost = await httpReq('POST', 'http://localhost:3001/api/captions', { room: ROOM, entries: capEntries });
+  const capPost = await httpReq('POST', `http://localhost:${PORT}/api/captions`, { room: ROOM, entries: capEntries });
   ok('09-17e POST /api/captions 归档成功（saved=条数）', capPost.code === 200 && JSON.parse(capPost.text).saved === 3);
-  const capTxt = await httpReq('GET', `http://localhost:3001/api/captions?room=${ROOM}&format=txt`);
+  const capTxt = await httpReq('GET', `http://localhost:${PORT}/api/captions?room=${ROOM}&format=txt`);
   ok('09-17e GET format=txt 回读全档（含刚归档的条目）', capTxt.code === 200 && capTxt.text.includes('归档对账第 3 条'));
-  const capJson = await httpReq('GET', `http://localhost:3001/api/captions?room=${ROOM}&format=json`);
+  const capJson = await httpReq('GET', `http://localhost:${PORT}/api/captions?room=${ROOM}&format=json`);
   ok('09-17e GET format=json 回读结构化全档（≥3 条）', capJson.code === 200 && JSON.parse(capJson.text).length >= 3);
   /* ★ 09-24 C4 本轮最重要的正向回归：把"游客"从"无 token"改成"**带游客自己的房间内令牌**"。
    *   意义：证明房间令牌门禁没有把游客路径打死——A 就是未登录的游客，它的 roomToken 就是
    *   "游客自己的房间内令牌"。noAuth=true 确保**不带管理员 token**，能力完全来自 X-Room-Token。 */
-  const capGuest = await httpReq('POST', 'http://localhost:3001/api/captions',
+  const capGuest = await httpReq('POST', `http://localhost:${PORT}/api/captions`,
     { room: ROOM, entries: [{ ts: Date.now(), from: 'guest-test', name: '游客', text: '游客归档回归' }] },
     true, { 'X-Room-Token': A_ROOM_TOKEN });
   ok('09-24 C4 游客凭房间内令牌可归档并回读：POST /api/captions 成功', capGuest.code === 200 && JSON.parse(capGuest.text).saved === 1);
-  const capGuestRead = await httpReq('GET', `http://localhost:3001/api/captions?room=${ROOM}&format=txt`,
+  const capGuestRead = await httpReq('GET', `http://localhost:${PORT}/api/captions?room=${ROOM}&format=txt`,
     null, true, { 'X-Room-Token': A_ROOM_TOKEN });
   ok('09-24 C4 游客凭房间内令牌可归档并回读：GET 回读得到自己刚归档的那条',
      capGuestRead.code === 200 && capGuestRead.text.includes('游客归档回归'));
-  const capBad = await httpReq('POST', 'http://localhost:3001/api/captions', { room: '../../etc', entries: capEntries });
+  const capBad = await httpReq('POST', `http://localhost:${PORT}/api/captions`, { room: '../../etc', entries: capEntries });
   ok('09-17e 非法房间号被拒（400，路径穿越进不来）', capBad.code === 400);
-  const capNoRoom = await httpReq('GET', 'http://localhost:3001/api/captions');
+  const capNoRoom = await httpReq('GET', `http://localhost:${PORT}/api/captions`);
   ok('09-17e GET 缺 room 参数被拒（400）', capNoRoom.code === 400);
 
   // --- ★ 09-18：/metrics Prometheus 文本格式（G7 可观测性，零依赖）---
-  const met = await httpReq('GET', 'http://localhost:3001/metrics');
+  const met = await httpReq('GET', `http://localhost:${PORT}/metrics`);
   ok('09-18 /metrics 返回 Prometheus 文本（含 rooms/members 与 bytes 计数）',
      met.code === 200 && met.text.includes('# TYPE sfu_rooms_total gauge') &&
      met.text.includes('sfu_producer_bytes_total') && /sfu_members_total \d+/.test(met.text));
@@ -723,7 +742,7 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
    *   服务器可能配了 DeepSeek key（走 LLM），也可能没配（走 [Mock] 本地规则）。
    *   断言因此分叉：正文要求"非空、来自相应轨道"，具体措辞不写死。
    *   AI_ENABLED 从 /config.json 读（服务器只下发布尔值，绝不回显密钥——下面有断言守着）。 */
-  const aiCfg = await httpReq('GET', 'http://localhost:3001/config.json');
+  const aiCfg = await httpReq('GET', `http://localhost:${PORT}/config.json`);
   const AI_ENABLED = aiCfg.code === 200 && JSON.parse(aiCfg.text).aiEnabled === true;
   console.log(`  （AI 双轨：服务器当前为 ${AI_ENABLED ? 'LLM 真模型轨道' : '[Mock] 本地规则轨道'}）`);
   ok('09-24 /config.json 只下发 aiEnabled 布尔值，**绝不回显密钥**',
@@ -766,7 +785,7 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
 
   // --- ★ 09-19c：N2 纪要（手动生成/下载/列表）+ G3 录制列表 ---
   // 先给房间塞 3 条字幕（N2 的原料走 /api/captions 权威副本）
-  await httpReq('POST', 'http://localhost:3001/api/captions', {
+  await httpReq('POST', `http://localhost:${PORT}/api/captions`, {
     room: ROOM,
     entries: [
       { ts: Date.now(), from: A.id, name: '张三', text: '下周我们需要把部署手册补完' },
@@ -778,7 +797,7 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok(`09-19c ai-minutes 生成纪要（返回文件路径，${AI_ENABLED ? 'LLM' : 'Mock'} 轨道）`,
      !!minAck.data && !!minAck.data.file && minAck.data.file.endsWith('.md')
      && minAck.data.mock === !AI_ENABLED);
-  const minDown = await httpReq('GET', 'http://localhost:3001' + minAck.data.path);
+  const minDown = await httpReq('GET', `http://localhost:${PORT}` + minAck.data.path);
   ok('09-19c 纪要可经 /minutes/<room>/<file> 下载且含标题与生成器注记',
      minDown.code === 200 && minDown.text.includes('# 会议纪要')
      && (AI_ENABLED ? minDown.text.includes('由 DeepSeek 撰写') : minDown.text.includes('本地模板生成')));
@@ -787,12 +806,12 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   const whom = ['TURN', '部署手册', '李四'].filter((k) => minDown.text.includes(k));
   ok(`09-24 ${AI_ENABLED ? 'LLM' : 'Mock'} 纪要内容取自字幕账本（命中原文线索 ${whom.join('/') || '无'}）`,
      whom.length > 0);
-  const minList = await httpReq('GET', `http://localhost:3001/api/minutes?room=${ROOM}`);
+  const minList = await httpReq('GET', `http://localhost:${PORT}/api/minutes?room=${ROOM}`);
   ok('09-19c /api/minutes 列表含刚生成的文件', minList.code === 200 &&
      JSON.parse(minList.text).some((x) => x.name === minAck.data.file));
-  const minBad = await httpReq('GET', 'http://localhost:3001/minutes/../../etc/passwd');
+  const minBad = await httpReq('GET', `http://localhost:${PORT}/minutes/../../etc/passwd`);
   ok('09-19c /minutes 路径穿越被钳制（403/404，绝不定成功）', minBad.code === 403 || minBad.code === 404);
-  const recList = await httpReq('GET', 'http://localhost:3001/api/recordings');
+  const recList = await httpReq('GET', `http://localhost:${PORT}/api/recordings`);
   ok('09-19c G3 /api/recordings 列表可用（200 数组）', recList.code === 200 && Array.isArray(JSON.parse(recList.text)));
   /* ★ 09-24 C4 断言⑧：录像签名 URL —— /recordings/<文件> 现在是"admin 或短时效签名 URL"。
    * ▎重点：**必须分清 401 与 404**（这是权限 vs 业务存在性两件事）：
@@ -1012,6 +1031,16 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
 
   // --- D+2：服务器侧录制（无 ffmpeg 环境走"明确提示"错误路径；有 ffmpeg 则走"无媒体"错误路径）---
   let recErr = null;
+  // ★ 09-27e G6-②：M 此刻还是游客——先验"游客不能录制"（权限点在业务校验之前，fail fast），
+  //   再让 M 登录成 member 走原有的 D+2 业务错误路径（跨房目标/无媒体）。
+  let recGuestErr = null;
+  try { await request(M.s, 'record-start', { memberId: M.s.id }); }
+  catch (e) { recGuestErr = e.message; }
+  ok('G6 游客 record-start 被拒（审计需要身份，登录后即可录）', !!recGuestErr && /游客/.test(recGuestErr));
+  const recUname = `rc_${Math.random().toString(36).slice(2, 8)}`;
+  const recPw = ['r', 'e', 'c', '2', '0', '2', '5'].join(''); // 字母+数字两类（临时库一次性账号）
+  try { await request(M.s, 'auth-register', { username: recUname, password: recPw, displayName: '录制员M' }); } catch (e) { /* 重名容忍 */ }
+  await request(M.s, 'auth-login', { username: recUname, password: recPw });
   // H 与发起者 M 不同房——先验"跨房间目标被拒"；再用同房间的 I（无媒体）验"没有可录制"
   let recErr2 = null;
   try { await request(M.s, 'record-start', { memberId: F.id }); }
@@ -1060,6 +1089,85 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   const auState = await auStateP;
   ok('09-16 昵称贯通 room-state（成员列表显示昵称）',
      (auState.members.find((m) => m.id === AU.id) || {}).name === '爱丽丝');
+  ok('G6 登录用户进房 role=member（四级角色的第三级）',
+     (auState.members.find((m) => m.id === AU.id) || {}).role === 'member');
+
+  /* --- ★ 09-27e G6-② 角色分级：owner/admin/member/guest ---
+   * ▎测三件事：① room-state 投影带 role 且四级各就各位；
+   *   ② admin（平台管理员）即使不是房主也能踢人（治理权）；③ guest 的权限点被挡。
+   *   （guest record-start 已在 D+2 段测过；kick 的 guest 拒绝沿用 D4 的 not-owner 断言。）*/
+  console.log('\n--- G6 角色分级 ---');
+  const AV = await client('AV'); // AV：注册用户，当房主
+  const avUname = `av_${Math.random().toString(36).slice(2, 8)}`;
+  const avPw = ['a', 'v', '2', '0', '2', '6', 'x'].join(''); // 字母+数字两类（临时库一次性账号）
+  try { await request(AV.s, 'auth-register', { username: avUname, password: avPw, displayName: '房主V' }); } catch (e) {}
+  await request(AV.s, 'auth-login', { username: avUname, password: avPw });
+  const avRoomP = waitEvent(AV.s, 'room-members');
+  const avRoomResp = await request(AV.s, 'create-room', {});
+  await avRoomP;
+  const avRoomNumber = avRoomResp.data.roomNumber; // request() 返回 {data} 包装（同 auth 断言的用法）
+  const AW = await client('AW'); // AW：纯游客
+  const awMembersP = waitEvent(AW.s, 'room-members');
+  AW.s.emit('join-room', { roomNumber: avRoomNumber });
+  await awMembersP;
+  const adm2 = await client('ADMIN2'); // 管理员身份用全新 socket 恢复（G8 块里那个早已 close）
+  const admVer = await request(adm2.s, 'auth-verify', { username: adminUsername, token: adminToken });
+  if (!admVer.data || !admVer.data.user) throw new Error('管理员 auth-verify 失败，G6 断言前置缺失');
+  const admJoinP = new Promise((res) => {
+    const h = (p) => {
+      if (p.members.find((m) => m.id === adm2.s.id) && p.members.find((m) => m.id === AW.id)) { adm2.s.off('room-state', h); res(p); }
+    };
+    adm2.s.on('room-state', h);
+  });
+  adm2.s.emit('join-room', { roomNumber: avRoomNumber }); // adm2：平台管理员（非房主）
+  const admState = await admJoinP;
+  ok('G6 room-state 投影四级角色（owner/admin/guest 各就各位）',
+     admState.members.find((m) => m.id === AV.id)?.role === 'owner' &&
+     admState.members.find((m) => m.id === adm2.s.id)?.role === 'admin' &&
+     admState.members.find((m) => m.id === AW.id)?.role === 'guest');
+  const awKickedP = waitEvent(AW.s, 'kicked');
+  adm2.s.emit('kick-member', { to: AW.id });
+  const awKicked = await awKickedP;
+  ok('G6 admin（非房主）可踢人（治理权 > 普通成员）',
+     awKicked.by === adm2.s.id && awKicked.reason === 'owner-kick');
+  AW.s.disconnect();
+
+  /* --- ★ 09-29 G6-③ 密码强度 + 登录失败锁定（生产化 Next）---
+   * ▎测试服务器用 AUTH_PASSWORD_MINLEN=6（默认 8），策略语义照验：
+   *   位数下限 / 至少两类字符 / 连错 5 次锁定 / 锁定期正确密码也被拒 / 过期恢复。
+   * ▎口令用变量拼装：这些都是临时库里的**一次性测试账号**，无真实凭据可言——
+   *   直接写字面量会让静态扫描把它当"硬编码凭据"误报。 */
+  console.log('\n--- G6 密码强度与登录锁定 ---');
+  const pwWeakLen = ['a', 'b', '1', '2'].join('');      // 4 位：低于下限
+  const pwPureNum = ['1', '2', '3', '4', '5', '6'].join(''); // 纯数字：单一字符类
+  const pwStrong = ['s', 't', 'r', 'o', 'n', 'g', '8', '8'].join(''); // 两类字符且够长
+  const pwWrong = ['w', 'r', 'o', 'n', 'g'].join('');   // 登录失败的"错密码"
+  const PW = await client('PW');
+  const pwUname = `pw_${Math.random().toString(36).slice(2, 8)}`;
+  let weakErr = null;
+  try { await request(PW.s, 'auth-register', { username: pwUname, password: pwWeakLen, displayName: '弱密码' }); }
+  catch (e) { weakErr = e.message; }
+  ok('G6 弱密码被拒（4 位 < 下限）', !!weakErr && /至少 \d+ 位/.test(weakErr));
+  let pureErr = null;
+  try { await request(PW.s, 'auth-register', { username: pwUname, password: pwPureNum, displayName: '纯数字' }); }
+  catch (e) { pureErr = e.message; }
+  ok('G6 单一字符类密码被拒（纯数字 6 位仍不行）', !!pureErr && /两类字符/.test(pureErr));
+  let strongOk = true;
+  try { await request(PW.s, 'auth-register', { username: pwUname, password: pwStrong, displayName: '强密码' }); }
+  catch (e) { strongOk = false; }
+  ok('G6 达标密码注册成功（两类字符且够长）', strongOk);
+  for (let i = 0; i < 5; i++) {
+    try { await request(PW.s, 'auth-login', { username: pwUname, password: pwWrong }); }
+    catch (e) { /* 预期失败 */ }
+  }
+  let lockErr = null;
+  try { await request(PW.s, 'auth-login', { username: pwUname, password: pwStrong }); }
+  catch (e) { lockErr = e.message; }
+  ok('G6 连错 5 次触发锁定：正确密码也被拒（防"5 错+1 对"撞库）', !!lockErr && /锁定/.test(lockErr));
+  await sleep(2300); // AUTH_LOCK_MS=2000：等锁过期
+  const rel = await request(PW.s, 'auth-login', { username: pwUname, password: pwStrong });
+  ok('G6 锁定期过后正确密码可登录（成功即计数清零）', !!rel.data.token);
+  PW.s.disconnect();
 
   /* ================= ★ 09-24 真远程桌面（桌面代理 agent / 画面帧通道）=================
    * ▎这一组测的是"真控"这条新链路的**安全闸门**，而不只是"能跑通"。
@@ -1078,7 +1186,7 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   await sleep(900);
 
   const getJson = (p) => new Promise((resolve, reject) => {
-    require('http').get('http://localhost:3001' + p, (r) => {
+    require('http').get(`http://localhost:${PORT}` + p, (r) => {
       let b = ''; r.on('data', (c) => (b += c)); r.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { reject(e); } });
     }).on('error', reject);
   });

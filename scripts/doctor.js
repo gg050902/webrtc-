@@ -301,7 +301,8 @@ function loadConfig() {
   if (!fs.existsSync(CONFIG_PATH)) return { exists: false, ok: false, cfg: {}, error: null };
   try {
     const raw = fs.readFileSync(CONFIG_PATH, 'utf8').replace(/^\uFEFF/, '');
-    const cfg = JSON.parse(raw);
+    // ★ 09-28：与 sfu/server.js 同一套 JSONC 容错（example 里带注释，复制即用）
+    const cfg = require(path.join(SFU_DIR, 'jsonc.js')).parseJsonc(raw);
     if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) throw new Error('顶层必须是一个 JSON 对象');
     return { exists: true, ok: true, cfg, error: null };
   } catch (e) {
@@ -420,28 +421,37 @@ const FIREWALL_HINT = [
   }
 
   // A6 whisper（09-27 服务端 ASR 字幕转写要用：AI 小明的"真实听觉"）
-  // 探测口径与 sfu/server.js 的 probeWhisper 一致：PATH → pip --user Scripts → python -m
-  const probeWhisper = () => {
-    try {
-      execFileSync('whisper', ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 20000 });
-      return { ok: true, bin: 'whisper' };
-    } catch (e) { /* 继续 */ }
-    const userCands = [
-      process.env.APPDATA && path.join(process.env.APPDATA, 'Python', 'Python312', 'Scripts', 'whisper.exe'),
-      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'Python', 'Python312', 'Scripts', 'whisper.exe'),
-      'C:\\Program Files\\Python312\\Scripts\\whisper.exe',
-    ].filter((x) => { try { return fs.existsSync(x); } catch (e2) { return false; } });
-    if (userCands[0]) return { ok: true, bin: userCands[0], note: 'pip --user 安装（不在 PATH，server 用完整路径调用）' };
-    return { ok: false };
-  };
-  const asr = probeWhisper();
+  /* ★ 09-28：探测口径改为**直接复用 sfu/ai/asr.js**——原来这里自己抄了一份
+   *   （`whisper --version`），而那个命令在 Windows GBK 控制台下退出码非 0，
+   *   于是体检报告与服务器实际能力可能不一致（服务器修好了、体检还说没有）。
+   *   同一个事实只能有一个实现：模块化之后，doctor / server / 自测三条路永远同结论。 */
+  const Asr = require(path.join(__dirname, '..', 'sfu', 'ai', 'asr.js'));
+  let asr = { ok: false, bin: null };
+  try {
+    const cands = [
+      ['whisper', []], ['whisper-cli', []], ['whisper.exe', []],
+      [process.env.APPDATA && path.join(process.env.APPDATA, 'Python', 'Python312', 'Scripts', 'whisper.exe'), []],
+      [process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'Python', 'Python312', 'Scripts', 'whisper.exe'), []],
+      ['python', ['-m', 'whisper']], ['python3', ['-m', 'whisper']], ['py', ['-3', '-m', 'whisper']],
+    ];
+    for (const [bin, pre] of cands) {
+      if (!bin) continue;
+      try {
+        // 探测命令与 asr.js 完全一致（--help + UTF-8 环境）——退出码 0 才算可用
+        execFileSync(bin, [...pre, '--help'],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 25000, env: Asr.PY_ENV });
+        asr = { ok: true, bin: pre.length ? `${bin} ${pre.join(' ')}` : bin };
+        break;
+      } catch (e) { /* 试下一个候选 */ }
+    }
+  } catch (e) { asr = { ok: false, bin: null }; }
   if (asr.ok) {
     add('A', 'A6-whisper', 'ok', 'whisper 可用（服务端 ASR 字幕转写就绪：AI 小明能听懂会议语音）',
-      { detail: `${asr.bin}${asr.note ? ' · ' + asr.note : ''}`, priority: 55 });
+      { detail: `${asr.bin} · 模型 ${Asr.DEFAULT_MODEL} · 每 ${Asr.DEFAULT_SEGMENT_SEC}s 一段`, priority: 55 });
   } else {
-    add('A', 'A6-whisper', 'warn', 'whisper 未检测到 → AI 小明"听不懂"会议语音（服务端转写关闭）',
+    add('A', 'A6-whisper', 'warn', 'whisper 未检测到 → AI 小明"听不懂"会议语音（服务端转写关闭，前端退回浏览器识别）',
       {
-        detail: '客户端 Web Speech 字幕不受影响；ASR 开启后 @ai 问答/RAG/纪要/唤醒词全部吃真实会议内容',
+        detail: '装好后服务端转写自动接管：@ai 问答/RAG/纪要/唤醒词全部吃真实会议内容，字幕不再依赖浏览器云端',
         advice: 'pip install -U openai-whisper   （模型首次运行自动下载；装完重启服务器）',
         priority: 30,
       });

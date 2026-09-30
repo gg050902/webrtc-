@@ -625,6 +625,11 @@ const emit = (ev, payload) => {
     !capBarEl.classList.contains('hidden') && capTextEl.innerHTML.includes('小张') && capTextEl.innerHTML.includes('我们开始吧'));
 
   // ② 本地开字幕 → 识别器启动 + member-state 上报 caption（房间状态机，成员列表 💬 数据源）
+  /* ★ 09-28：字幕路径契约变了——装了 whisper 时默认走**服务端转写**（用户点名
+   *   "不要再用浏览器的了"）。而下面这一大段验的是**浏览器兜底路径**，
+   *   所以用 client 的显式覆盖口（window.__SFU_ASR__）把路径钉死为 'browser'。
+   *   服务端模式本身在 ③h3b 里单独验。 */
+  ctx.__SFU_ASR__ = false;
   const capBtnEl = documentStub.getElementById('capBtn');
   guard('字幕：点开开关', () => capBtnEl.dispatch('click'));
   ok('字幕：识别器已启动且按钮进入开启态', rec.capStarts === 1 && capBtnEl.innerHTML.includes('关字幕'));
@@ -766,6 +771,38 @@ const emit = (ev, payload) => {
   guard('降级：再次 network 失败', () => { const r2 = rec.capInstances[rec.capInstances.length - 1]; r2 && r2.onerror && r2.onerror({ error: 'network' }); });
   ok('降级：重复失败仍稳定降级（不反复弹错）',
     capStatusEl.textContent.includes('服务器转写模式'));
+
+  /* ---- ③h3b ★ 09-28 服务端转写模式（首选路径，"不要再用浏览器的了"）：
+   *   ① whisper 可用时点字幕 → **绝不再启动浏览器识别器**（看门狗也不许偷偷拉起）；
+   *   ② AI 不在场时自动邀请（服务端转写挂在 AI 的音频管线上，"AI 参会"就是它的耳朵）；
+   *   ③ asr-caption 进来 → 上字幕条 + 进本地历史，但**不回传服务器**（服务器已落盘，防重复）。 ---- */
+  ctx.__SFU_ASR__ = true;
+  // 把 AI 请出房间：用来验证"开字幕会自动邀请 AI"
+  emit('room-state', { roomNumber: '123456', members: [{ id: socketStub.id, owner: true }], hostId: null, controllerId: null, expiresAt: null });
+  const startsBeforeServer = rec.capStarts;
+  const aiJoinsBefore = rec.emits.filter((e) => e === 'ai-join').length;
+  guard('服务端字幕：点开开关（whisper 可用）', () => capBtnEl.dispatch('click'));
+  ok('服务端字幕：不启动浏览器识别器（capStarts 不变）', rec.capStarts === startsBeforeServer);
+  ok('服务端字幕：按钮与徽标进入服务端模式',
+    capBtnEl.innerHTML.includes('服务端字幕') && capStatusEl.textContent.includes('服务器转写'));
+  ok('服务端字幕：自动邀请 AI 入会（它是服务端转写的耳朵）',
+    rec.emits.filter((e) => e === 'ai-join').length === aiJoinsBefore + 1);
+  // asr-caption → 上字幕条 + 进历史 + 不回传 SCTP
+  const sctpBeforeAsr = rec.sctpSends.length;
+  const capLogBefore = vm.runInContext('cap.log.length', ctx);
+  guard('服务端字幕：收到 asr-caption', () => emit('asr-caption', { name: '小张', text: '服务器转写的一句话' }));
+  ok('服务端字幕：上字幕条（说话人 + 文本）',
+    !capBarEl.classList.contains('hidden') && capTextEl.innerHTML.includes('小张') && capTextEl.innerHTML.includes('服务器转写的一句话'));
+  // 账本是 500 条环形（前面灌过 501 条），所以断言"最新一条是它"，不能断长度 +1
+  ok('服务端字幕：进本地历史账本（最新一条，带 asr 标记）',
+    vm.runInContext('cap.log[cap.log.length - 1].text', ctx) === '服务器转写的一句话' &&
+    vm.runInContext('cap.log[cap.log.length - 1].asr', ctx) === true);
+  ok('服务端字幕：不回传 SCTP（服务器已落盘，避免重复入库）', rec.sctpSends.length === sctpBeforeAsr);
+  ok('服务端字幕：单独记账 serverTotal', vm.runInContext('cap.sentry.serverTotal', ctx) >= 1);
+  guard('服务端字幕：点关开关', () => capBtnEl.dispatch('click'));
+  ok('服务端字幕：关掉只隐藏显示（提示服务器仍在转写）',
+    capStatusEl.textContent.includes('服务器仍在转写'));
+  ctx.__SFU_ASR__ = false; // 还原：后面若有用例碰字幕，仍走浏览器路径
   // ④ 导出合并：导出时先拉服务器全档，和内存段拼成一份 txt
   guard('值守：导出记录（应先拉服务器全档）', () => documentStub.getElementById('capExportBtn').dispatch('click'));
   await new Promise((r) => setTimeout(r, 60));
@@ -1035,10 +1072,20 @@ const emit = (ev, payload) => {
   const countAfterFirst = (chatElAfter.children || []).length;
   ok('AI 流式首帧建立了一个 AI 气泡', countAfterFirst === aiBaseCount + 1);
   guard('AI 流式追加增量', () => emit('ai-stream', { id: 'st-1', delta: '我是 AI 助理', done: false }));
+  /* ★ 09-30：增量现在是**按帧批量刷**的（rAF），所以断言必须**等一帧**再读 DOM。
+   *   ▎为什么这是对的、而不是"为了过测试而改断言"：
+   *     逐 token 写 DOM 会在每个 token 上触发一次强制 reflow（scrollHeight 读取），
+   *     一条 200 字答案 = 200 次同步布局 —— 这才是"AI 打字卡"的根因。
+   *     改成帧批量后**渲染时机本就不再是同步的**，测试必须跟着这个语义走
+   *     （项目里"异步断言"踩过两次：坑 44/48/55，都是断言没跟上真实时序）。
+   *     桩里的 rAF = setTimeout(0)，等一个宏任务即可。 */
+  await new Promise((r) => setTimeout(r, 20));
   // 注：打字机的文本挂在子节点上（见 client.js 的实修注释），所以要按子节点聚合读
   const aiBubble = (chatElAfter.children || [])[countAfterFirst - 1];
   const aiBubbleText = () => (aiBubble.children || []).map((c) => c.textContent || c.innerHTML || '').join(' ');
-  ok('AI 增量累积在同一气泡里（打字机不刷屏）', aiBubbleText().includes('你好，我是 AI 助理'));
+  ok('AI 增量累积在同一气泡里（打字机不刷屏）', aiBubbleText().includes('你好，我是 AI 助理'), aiBubbleText().slice(0, 60));
+  ok('AI 按帧批量渲染：一帧内多个增量合并且不丢字',
+     aiBubbleText().includes('你好，') && aiBubbleText().includes('我是 AI 助理'));
   ok('AI 生成中气泡带 streaming 态（打字光标）', aiBubble.classList.contains('streaming'));
   guard('AI 流式收尾', () => emit('ai-stream', { id: 'st-1', delta: '', done: true, mock: false }));
   ok('AI 收尾后摘掉 streaming 态', !aiBubble.classList.contains('streaming'));
@@ -1178,7 +1225,9 @@ const emit = (ev, payload) => {
     askEmits === 2 && /function sendAiQuestion/.test(clientSrc) && /AI_NICKNAME/.test(clientSrc));
 
   // 语音播报：默认关（绝不默认出声），且不支持时安全降级
-  ok('09-25 AI 语音默认关闭（默认出声会惊吓用户）', /let aiVoiceOn = false/.test(clientSrc));
+  // ★ 09-27d 取舍演化：用户点名"语音对话"——默认开（格子有醒目开关可关；localStorage 持久化）
+  ok('09-27d AI 语音默认开（语音对话的核心；开关可关且 localStorage 持久化）',
+    /let aiVoiceOn = true/.test(clientSrc) && /sfuAiVoice/.test(clientSrc));
   ok('09-25 AI 语音有不支持检测（speechSynthesis 缺失时按钮置灰，不做"点了没反应"）',
     /SPEECH_OK/.test(clientSrc) && /ai-voice-na/.test(clientSrc));
   ok('09-25 AI 语音会先洗掉 markdown 再念（不念出星号与表格竖线）',

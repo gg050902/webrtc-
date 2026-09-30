@@ -1,0 +1,73 @@
+# 密钥（★ 09-24：DeepSeek API key 放 .env，绝不入库）
+.env
+.env.*
+
+# ★ 09-24 跨网发布配置：可能含 TURN 的 username/credential，绝不入库
+#   （根目录这份是你的真配置；publish-mesh 下那份由 scripts/publish.js 生成）
+mesh.config.json
+publish-mesh/mesh.config.json
+publish-mesh/package-lock.json
+
+# 依赖
+node_modules/
+
+# 运行时产物（不入库：每人自己的数据与录制）
+sfu/recordings/
+sfu/config.json.bak-*
+.reasonix/
+reasonix.toml
+sfu/captions/
+sfu/minutes/
+sfu/logs/
+sfu/users.json
+# 迁移时对旧账号文件的改名备份（保留在磁盘，但不必入库）
+sfu/users.json.imported-*
+sfu/users.json.bak-*
+# ★ 09-24：账号/审计的 SQLite 运行时数据（meeting.db + 迁移产生的 .db-wal/.db-shm 一并挡住）
+sfu/data/
+sfu/config.json
+sfu/tls/
+*.log
+public/vendor/          # 由 npm run build:sfu-vendor 重新生成
+sfu/public/vendor/
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ★ 09-25 真浏览器验证的截图存证（体积大、可再生，不进版本库）
+sfu/shots/
+.mimosa/
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+bower_components/
+jspm_packages/
+__pycache__/
+site-packages/
+venv/
+coverage/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.egg-info/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）

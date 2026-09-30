@@ -98,7 +98,9 @@ async function waitJs(cdp, expr, timeout = 20000, label = '') {
 
   console.log('① 起服务器…');
   serverProc = spawn(process.execPath, [path.join(__dirname, '..', 'sfu', 'server.js')], {
-    env: { ...process.env, AI_FORCE_MOCK: '1', DB_FILE: TEST_DB_FILE, USERS_FILE_LEGACY: TEST_LEGACY_USERS },
+    env: { ...process.env,
+      // ★ 09-30：测试不启 HTTPS（3443 被占会让服务器 process.exit(1)，表现为"服务器未就绪"+一屏端口提示，看着像测试坏了、实则环境冲突）
+      SFU_NO_HTTPS: '1', AI_FORCE_MOCK: '1', DB_FILE: TEST_DB_FILE, USERS_FILE_LEGACY: TEST_LEGACY_USERS },
     cwd: path.join(__dirname, '..'), stdio: ['ignore', 'ignore', 'pipe'],
   });
   serverProc.stderr.on('data', (d) => process.stderr.write('[server] ' + d));

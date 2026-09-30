@@ -37,7 +37,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const logFile = path.join(os.tmpdir(), `ai-verify-${Date.now()}.log`);
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'sfu', 'server.js')], {
     env: {
-      ...process.env, PORT: String(PORT), MEDIASOUP_WORKER_NUM: '1',
+      ...process.env,
+      // ★ 09-30：测试不启 HTTPS（3443 被占会让服务器 process.exit(1)，表现为"服务器未就绪"+一屏端口提示，看着像测试坏了、实则环境冲突）
+      SFU_NO_HTTPS: '1', PORT: String(PORT), MEDIASOUP_WORKER_NUM: '1',
       // AI_DEBUG_SCOPE=1 → 打印 since（会议下界）与检索范围（排查范围问题时开）
       ...(process.env.AI_DEBUG_SCOPE ? { AI_DEBUG_SCOPE: '1' } : {}),
     },

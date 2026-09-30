@@ -50,7 +50,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // ── ① 起真服务器（独立临时库，绝不碰生产数据）──
   const logFile = path.join(os.tmpdir(), `board-verify-${Date.now()}.log`);
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'sfu', 'server.js')], {
-    env: { ...process.env, PORT: String(PORT), MEDIASOUP_WORKER_NUM: '1', DB_FILE },
+    env: { ...process.env,
+      // ★ 09-30：测试不启 HTTPS（3443 被占会让服务器 process.exit(1)，表现为"服务器未就绪"+一屏端口提示，看着像测试坏了、实则环境冲突）
+      SFU_NO_HTTPS: '1', PORT: String(PORT), MEDIASOUP_WORKER_NUM: '1', DB_FILE },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const logBuf = [];

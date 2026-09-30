@@ -49,7 +49,9 @@ console.log(`优雅退出回归（临时库：${dbFile}，端口：${PORT}）\n`
   // 启动服务器（临时库 + 指定端口 + 2.5 秒后主动触发优雅退出）
   const child = spawn(process.execPath, [path.join(ROOT, 'sfu', 'server.js')], {
     cwd: ROOT,
-    env: { ...process.env, DB_FILE: dbFile, PORT: String(PORT), TEST_SHUTDOWN_AFTER_MS: '2500' },
+    env: { ...process.env,
+      // ★ 09-30：测试不启 HTTPS（3443 被占会让服务器 process.exit(1)，表现为"服务器未就绪"+一屏端口提示，看着像测试坏了、实则环境冲突）
+      SFU_NO_HTTPS: '1', DB_FILE: dbFile, PORT: String(PORT), TEST_SHUTDOWN_AFTER_MS: '2500' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let out = '';

@@ -852,6 +852,17 @@ class RoomBrain {
    */
   async answer(question, entries, opts = {}) {
     const q = String(question || '').trim();
+    /* ★ 09-30 丝滑度：把"思考中"拆成**有信息量的阶段**回报给界面。
+     *   ▎为什么这件事比"把响应时间压下去"更值：
+     *     用户说的"卡"，很多时候不是真的慢，而是**看不出它在干什么**——
+     *     改造前整段等待只有一句静止的"思考中…"（若触发查询改写，要凭空多等 1~3 秒），
+     *     在用户眼里和卡死没有区别。
+     *     把阶段摊开（检索中 → 换说法再找 → 整理答案），等待就从"黑箱"变成"有进度"，
+     *     主观等待感显著下降。**这是零成本的体感优化**（不改延迟，改感知）。
+     *   ▎为什么由 brain 上报阶段而不是服务器猜：只有 brain 知道自己在做哪一步
+     *     （要不要改写、改写花了多久）。让上层猜 = 迟早与实际不符。 */
+    const phase = (p) => { try { if (opts.onPhase) opts.onPhase(p); } catch (e) { /* 上报失败不影响问答 */ } };
+    phase('retrieving');
     const r = this.retriever(entries);
     // 检索查询串：考虑指代（把上一轮问题一起检索）
     const searchQ = this.memory.searchQuery(q);
@@ -867,6 +878,7 @@ class RoomBrain {
     const topCover = hits.length ? (hits[0].cover || 0) : 0;
     const needRewrite = !hits.length || topCover < REWRITE_TRIGGER_COVER;
     if (needRewrite) {
+      phase('rewriting');   // ★ 09-30：这一步可能花 1~3 秒，必须让用户知道它在做什么
       const alts = await rewriteQuery(q);
       if (alts.length) {
         const lists = [hits, ...alts.map((a) => r.search(a, topK))].filter((l) => l.length);
@@ -919,9 +931,16 @@ class RoomBrain {
       return '根据会议记录：' + hits.slice(0, 2).map((h) => `${h.name}提到"${h.text.slice(0, 60)}"`).join('；');
     };
 
+    let genPhaseSent = false;
     const res = opts.onDelta
-      ? await AI.streamLLM(messages, { label: 'ai-answer', temperature: 0.25, timeoutMs: 20000, maxTokens: 400, mock: mockAnswer }, opts.onDelta)
+      ? await AI.streamLLM(messages, { label: 'ai-answer', temperature: 0.25, timeoutMs: 20000, maxTokens: 400, mock: mockAnswer }, (d) => {
+        // ★ 09-30：首个增量到达 = 模型开始吐字（此前的等待是"在憋"）。
+        //   只上报一次——每个 delta 都广播会把信令刷成洪水（反而更卡）。
+        if (!genPhaseSent) { genPhaseSent = true; phase('generating'); }
+        opts.onDelta(d);
+      })
       : await AI.askLLM(messages, { label: 'ai-answer', temperature: 0.25, timeoutMs: 15000, maxTokens: 400, mock: mockAnswer });
+    phase('done');
 
     /* ★ 09-24e 实修：这里原先漏了 `memory.push` —— 单测「问答后记忆里有一轮」直接失败。
      *   后果比想象严重：Memory 类本身写对了（有界、指代拼串都对），但**从来没人往里写**，

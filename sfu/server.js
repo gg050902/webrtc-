@@ -50,6 +50,26 @@ const Brain = require('./ai/brain');
  *   与 brain.js 的分工：brain = 按需检索+归纳（深但不实时）；digest = 持续抽取+原样呈现
  *   （实时但不归纳）。两者互补，详见 digest.js 文件头。 */
 const Digest = require('./ai/digest');
+/* ★ 09-28 服务端语音识别（ASR）唯一实现层
+ * ▎为什么抽成模块：探测与转写原先写在本文件里，踩了两个真 bug——
+ *   ① `whisper --help` 在 Windows GBK 控制台下 UnicodeEncodeError 崩溃（退出码 1）→
+ *      服务器误判"没装 whisper"→ asrEnabled=false → 前端退回浏览器识别（用户实测）；
+ *   ② 兜底候选把 node 当 python 用（process.execPath + `-m whisper`），永远失败。
+ *   现在探测/转写/唤醒判定都走 asr.js：编码环境与参数只写一遍，可被自测脚本直接复用。 */
+const Asr = require('./ai/asr');
+/* ★ 09-29 常驻 ASR worker（单例）：
+ * ▎CLI 转写每段都要重启 Python + 重载模型（固定 2~4s+），分段持续转写场景下
+ *   字幕滞后越滚越大——"识别不灵敏"的最大单一原因。worker 模型只加载一次，
+ *   每段只付纯转写时间（本机实测 tiny 0.8s / small 3.0s，对比 CLI 10~14s）。
+ * ▎失败自动回退：worker 连崩 3 次 alive=false → 调用点退回 CLI 路径，功能不降级；
+ *   ASR_WORKER=0 可强制关闭（排障用）。模型取 CONFIG.asrModel || Asr.DEFAULT_MODEL，
+ *   worker 启动后固定——配置改动需重启（教学取舍，写进日志）。 */
+let asrWorker = null;
+function getResidentAsr(model) {
+  if (process.env.ASR_WORKER === '0') return null;
+  if (!asrWorker) asrWorker = Asr.createResidentTranscriber({ model });
+  return asrWorker.dead ? null : asrWorker;
+}
 /* ★ 09-24 账号存储层：node:sqlite（零新依赖的真数据库）
  * ▎从"整文件 JSON 读写"换成 SQLite 的原因见 sfu/store.js 文件头。
  * ▎require 即完成：建库建表 + PRAGMA WAL + 旧 users.json 自动迁移（都在 store.js 里）。 */
@@ -71,9 +91,28 @@ const store = require('./store');
  */
 let CONFIG = {};
 try {
-  CONFIG = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'));
+  /* ★ 09-28：改走 JSONC 容错解析——config.example.json 里带注释（给人读的），
+   *   而 README 让人"复制 example 改名"；严格 JSON.parse 会把注释当语法错 →
+   *   静默回退默认值（"我明明配了却没生效"）。容错解析让复制即用。 */
+  CONFIG = require('./jsonc').parseJsonc(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'));
   console.log('📄 已加载 sfu/config.json');
 } catch (e) { /* 没有配置文件 = 全用默认值（本机演示模式） */ }
+
+/* ★ 09-30：给"自动化测试/基准脚本"一个**显式的 HTTPS 关闭开关**。
+ * ▎为什么需要它（这是测试基建的一个真实脆弱点）：
+ *   HTTPS 监听失败会走 friendlyPortError → `process.exit(1)`（本意是给"双开服务"的人话指引，
+ *   对人是合理的）。但**测试脚本 spawn 服务器时**，只要 3443 被别的东西占着
+ *   （残留进程、用户自己开的实例、上一次没杀干净的测试……），服务器就直接退出，
+ *   测试报出的是"服务器未就绪"+一屏端口提示——**看起来像测试坏了，其实是环境冲突**，
+ *   排查方向完全被带偏（我这次就绕了一圈）。
+ * ▎为什么不是"改配置文件"：`sfu/config.json` 是**用户的**配置（他开了 HTTPS 给手机用），
+ *   测试脚本不该去改它。给一个环境变量开关，比"临时改别人的配置再改回来"干净得多。
+ * ▎为什么默认仍开：HTTPS 对局域网手机访问是真实需求，只有测试/基准才应显式关掉。
+ * 用法：`SFU_NO_HTTPS=1 node sfu/server.js` */
+if (process.env.SFU_NO_HTTPS === '1' && CONFIG.https) {
+  CONFIG.https = { ...CONFIG.https, enabled: false };
+  console.log('🔓 SFU_NO_HTTPS=1：本次不启动 HTTPS（测试/基准用）');
+}
 
 const PORT = Number(process.env.PORT) || Number(CONFIG.port) || 3001; // ★ SFU 版单独端口，避免和 Mesh 版(3000)打架
 // SFU 后人数不再受"每人连所有人"的带宽墙限制，改成受"服务器带宽"限制。
@@ -410,7 +449,7 @@ async function requestHandler(req, res) {
       iceServers: Array.isArray(CONFIG.iceServers) ? CONFIG.iceServers : [],
       videoSvc: !!CONFIG.videoSvc, // ★ D+3：VP9 SVC 开关（true = 摄像头改用单路 SVC 上传）
       authTtlMs: AUTH_TTL_MS, // ★ G6：token TTL（回归用它开短 TTL 实测过期路径）
-      asrEnabled: !!WHISPER_BIN, // ★ 09-27d：服务端转写开关（前端 Web Speech 失败时引导降级）
+      asrEnabled: !!WHISPER, // ★ 09-27d/09-28：服务端转写开关（探测修正后，装了 whisper 即为 true；前端据此决定用服务端还是浏览器）
       // ★ 09-16 局域网交付：announcedIp 存在时，告诉前端"发给别的电脑的邀请链接长什么样"——
       //   服务器机自己访问的是 localhost，直接复制 location.href 别的电脑打不开
       lanUrl: ANNOUNCED_IP ? `https://${ANNOUNCED_IP}:${(tlsCfg.port || 3443)}` : null,
@@ -711,6 +750,24 @@ function readJsonBody(req, limit = 2 * 1024 * 1024) {
   });
 }
 
+/* ★ 09-28：字幕入库的唯一通道（HTTP 归档 与 服务端 ASR 转写共用）
+ * ▎为什么抽出来：服务端 whisper 转写原先直接 fs.appendFileSync 落盘，**绕过了 feedBoard**
+ *   → 在"只用服务端转写、没人开网页字幕"的会议里，AI 看板（决定/风险/行动项）永远是空的，
+ *   AI 也就没法主动说话——"AI 参会"变成半身不遂。
+ *   现在两条来源都走这里：落盘（权威副本）+ 喂看板（实时消化），行为完全一致。
+ * ▎纪律：看板是增值功能，必须 try 包住——它坏了不能影响字幕归档这条主干。 */
+function ingestCaptions(room, clean) {
+  const day = new Date().toISOString().slice(0, 10).replace(/-/g, ''); // UTC 日期做分档
+  const file = path.join(CAPTIONS_DIR, `cap-${room}-${day}.jsonl`);
+  fs.appendFileSync(file, `${clean.map((e) => JSON.stringify(e)).join('\n')}\n`);
+  try {
+    feedBoard(room, clean);
+  } catch (e) {
+    logEvent('warn', 'ai-board-feed-failed', { roomNumber: room, reason: String(e && e.message).slice(0, 120) });
+  }
+  return clean.length;
+}
+
 // POST：追加归档。房间号 6 位数字白名单（文件名直接用房间号拼，必须先钳住路径穿越）；
 // 单条只认 ts/from/name/text 四个字段并截长（防畸形/防滥用），坏条目不拖累整批。
 async function handleApiCaptions(req, res) {
@@ -731,27 +788,18 @@ async function handleApiCaptions(req, res) {
       res.end('entries 不能为空');
       return;
     }
-    const day = new Date().toISOString().slice(0, 10).replace(/-/g, ''); // UTC 日期做分档
-    const file = path.join(CAPTIONS_DIR, `cap-${room}-${day}.jsonl`);
     const clean = entries.map((e) => ({
       ts: Number(e && e.ts) || Date.now(),
       from: String((e && e.from) || '').slice(0, 64),
       name: String((e && e.name) || '').slice(0, 64),
       text: String((e && e.text) || '').slice(0, 500),
     }));
-    fs.appendFileSync(file, `${clean.map((e) => JSON.stringify(e)).join('\n')}\n`);
     /* ★ 09-25：字幕入库 = AI 的"听觉信号"到达服务器 → 顺手喂给实时看板。
      * ▎为什么挂在这里而不是新开一条信令：字幕本来就要经过这个端点落盘（复用既有通路，
-     *   不新增协议），而"落盘"与"消化"用的是同一批数据、同一时刻——天然该在一起。
-     * ▎为什么用 try 包住：看板是**增值功能**，它坏了绝不能影响字幕归档这条主干
-     *   （归档丢了就是真的丢数据，看板丢了只是少一块辅助信息，两者严重性不对等）。 */
-    try {
-      feedBoard(room, clean);
-    } catch (e) {
-      logEvent('warn', 'ai-board-feed-failed', { roomNumber: room, reason: String(e && e.message).slice(0, 120) });
-    }
+     *   不新增协议），而"落盘"与"消化"用的是同一批数据、同一时刻——天然该在一起。 */
+    const saved = ingestCaptions(room, clean);
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-    res.end(JSON.stringify({ saved: clean.length }));
+    res.end(JSON.stringify({ saved }));
   } catch (err) {
     res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end(`归档失败：${err.message}`);
@@ -1113,6 +1161,34 @@ setInterval(() => {
  *   auth-refresh = 显式续期信令（前端定时调，长期会话不中断）。 */
 const AUTH_TTL_MS = Number(process.env.AUTH_TTL_MS) || 24 * 3600 * 1000;
 const authTokens = new Map(); // token -> { username, role, expiresAt }
+
+/* ★ 09-29 G6-③ 生产化 Next：密码强度策略。
+ * ▎只管**新注册**——已注册用户的登录不受影响（老密码继续能用；将来的"平滑重哈希"
+ *   会在他们登录时按新参数重算，见路线图 0.3 第 5 条）。
+ * ▎规则：≥ passwordMinLen（默认 8，可配置）且至少两类字符（字母/数字/符号）。
+ *   纯数字 8 位这类一眼就能被撞库字典吃掉的口令，在"能跑一晚上、能传文件、能控制电脑"
+ *   的系统里属于必须拦下的软肋。 */
+function passwordStrengthError(pw) {
+  if (typeof pw !== 'string' || !pw) return '密码不能为空';
+  const minLen = Math.max(6, Number(process.env.AUTH_PASSWORD_MINLEN) || Number(CONFIG.passwordMinLen) || 8);
+  if (pw.length < minLen) return `密码至少 ${minLen} 位`;
+  let classes = 0;
+  if (/[a-zA-Z]/.test(pw)) classes += 1;
+  if (/[0-9]/.test(pw)) classes += 1;
+  if (/[^a-zA-Z0-9]/.test(pw)) classes += 1;
+  if (classes < 2) return '密码需包含至少两类字符（字母/数字/符号）';
+  return null;
+}
+
+/* ★ 09-29 登录失败锁定：同一账号连续错 5 次 → 锁定 AUTH_LOCK_MS（默认 15 分钟）。
+ * ▎**只对"存在的账号"计数**：对不存在的用户名也计数 = 任何人都能把任意名字锁死
+ *   （锁人 DoS），而且"该账号已锁定"本身就是一种用户名存在性泄露——两害都躲开。
+ * ▎锁定期内连**正确密码**也拒：把正确密码当"撞库的最后一次尝试"放行是老式错误——
+ *   现在的爆破器就是靠"5 错 + 1 对"混过去的。
+ * ▎内存态即可：重启清零（锁定是防爆破的减速带，不是审计记录——审计在库里）。 */
+const loginFails = new Map(); // username -> { count, lockedUntil }
+const AUTH_LOCK_MS = Number(process.env.AUTH_LOCK_MS) || Number(CONFIG.loginLockMs) || 15 * 60000;
+const AUTH_LOCK_MAX = 5;
 /* ★ 09-24 G8-②：token 里带上 role —— HTTP 层门禁（requireAdmin）拿 token 就能判断是不是管理员，
  *   不必再回查数据库。role 在**发 token 那一刻**从库里取（登录/注册时取一次），
  *   所以用 admin:grant 改了角色后，已发的旧 token 仍是旧角色直到重新登录——
@@ -1645,6 +1721,18 @@ function feedBoard(roomNumber, entries) {
   return r;
 }
 
+/* ★ 09-28：把 socket id 翻成"人话名字"——字幕/AI 上下文里显示昵称而不是"成员 3f2a"。
+ *   登录用户有 displayName（房间成员表里存 socket 本体）；游客回退短 id。 */
+function memberDisplayName(roomNumber, memberId) {
+  const room = rooms.get(roomNumber);
+  if (room) {
+    for (const m of room.members) {
+      if (m.id === memberId) return m.displayName || `成员 ${aiShortId(memberId)}`;
+    }
+  }
+  return `成员 ${aiShortId(memberId)}`;
+}
+
 // 单路音频管线：PlainTransport 把这路音频 RTP 推给本机 ffmpeg，astats 每 ~2s 吐一次 RMS
 async function startAiAudioPipe(roomNumber, producer, memberId) {
   const room = rooms.get(roomNumber);
@@ -1663,95 +1751,107 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
       sdpMediaSection(c, 'audio', port)].join('\r\n');
     const sdpFile = path.join(LOGS_DIR, `ai-${roomNumber}-${producer.id}.sdp`);
     fs.writeFileSync(sdpFile, sdp);
-    // ★ 09-27：whisper 可用 → **分段录音模式**（每 15s 一段 wav，段完转写入账本）；
-    //   不可用 → 原 astats 模式（只记响度）。两条路径都吃同一路 RTP。
-    if (WHISPER_BIN) {
-      const segDir = path.join(LOGS_DIR, `asr-${roomNumber}`);
+    /* ★ 09-28：whisper 可用 → 分段录音 + 逐段转写（"AI 的耳朵"正式上线）
+     *   不可用 → 原 astats 模式（只记响度）。两条路径都吃同一路 RTP。
+     * ▎本轮修掉的三个真缺陷（都是多人会议才会暴露的）：
+     *   ① **目录冲突**：原来所有成员共用 asr-<房间号>/seg-%04d.wav——A 的 seg-0003.wav
+     *      会被 B 的同名文件覆盖，两人同时说话时转写直接错乱/丢失。现在按 memberId 分目录；
+     *   ② **读半截文件**：原来扫到"大小 ≥40000"就转，而 ffmpeg 此刻可能正往最新那段写 →
+     *      每句话的尾巴丢在未落盘的部分。现在**跳过最新那段** + 两次采样大小一致双保险；
+     *   ③ **静音段白转**：短段直接删掉不进 whisper（省 CPU，也少些幻觉文本）。
+     * ▎收尾：producerclose 后把最后一段补转，别丢会议最后一句话。 */
+    if (WHISPER) {
+      const safeMember = String(memberId).replace(/[^\w-]/g, '').slice(-12) || 'm';
+      const segDir = path.join(LOGS_DIR, 'asr', roomNumber, safeMember);
       fs.mkdirSync(segDir, { recursive: true });
-      let segIdx = 0;
+      const speakerName = memberDisplayName(roomNumber, memberId);
+      // 分段秒数：config.json > 环境变量 > 默认（5s）。越小越灵敏、越大上下文越完整。
+      const segSec = Math.max(3, Math.min(15, Number(CONFIG.asrSegmentSec) || Asr.DEFAULT_SEGMENT_SEC));
+      const asrModel = CONFIG.asrModel || Asr.DEFAULT_MODEL;
       let alive = true;
       let curRec = null;
-      console.log(`🤖 AI 小明开始聆听：${String(memberId).slice(-4)} 的音频（8s 一段持续转写，说完约 5~10s 出字幕）`);
       const doneSet = new Set();
-      /* ★ 09-27c 实修（用户反馈"AI 听不见"的根因）：原代码在这里写了
-       *   `pipe.alive = ...`，而 const pipe 声明在本函数**后面**（astats 公共尾部）——
-       *   TDZ 必然抛错 → 每次 ASR 管线启动即崩 → AI 永远听不见。
-       *   修法：whisper 分支自带 producerclose 监听（置 alive=false 并杀当前段进程），
-       *   不再触碰外部的 pipe。 */
+      console.log(`🤖 AI 小明开始聆听：${speakerName}（${segSec}s 一段，模型 ${asrModel}，${getResidentAsr(asrModel) ? '常驻转写 worker' : 'CLI 逐段转写'}，说完约 ${segSec}~${segSec * 2}s 出字幕）`);
+
+      /* ★ 09-27c 实修（用户反馈"AI 听不见"的根因）：原代码在这里写了 `pipe.alive = ...`，
+       *   而 const pipe 声明在本函数**后面**（astats 公共尾部）——TDZ 必然抛错 →
+       *   每次 ASR 管线启动即崩 → AI 永远听不见。修法：whisper 分支自带
+       *   producerclose 监听（置 alive=false 并杀当前录音进程），不再触碰外部 pipe。 */
       c.on('producerclose', () => {
         alive = false;
         try { if (curRec) curRec.kill(); } catch (e) { /* 已退 */ }
       });
-      // ★ 09-27c 灵敏度重构:单个 ffmpeg 持续 8s 分段(录音无空窗——旧串行模式
-      //   转写 10~20s 期间的语音全丢,是"不灵敏"的根因);下方循环只负责转写轮询。
+      // 单个 ffmpeg 持续录音并分段（无空窗——旧串行模式在转写期间丢语音，是"不灵敏"的根因）
       curRec = require('child_process').spawn(FFMPEG_BIN, [
         '-loglevel', 'error', '-protocol_whitelist', 'file,udp,rtp',
         '-fflags', '+genpts', '-i', sdpFile,
         '-ar', '16000', '-ac', '1',
-        '-f', 'segment', '-segment_time', '8', '-segment_format', 'wav',
+        '-f', 'segment', '-segment_time', String(segSec), '-segment_format', 'wav',
         '-reset_timestamps', '1',
         path.join(segDir, 'seg-%04d.wav'),
       ], { stdio: ['ignore', 'ignore', 'ignore'] });
-      const recordLoop = async () => {
-        /* ★ 09-27c 灵敏度重构：单 ffmpeg 持续 8s 分段（录音无空窗——旧串行模式
-         *   转写 10~20s 期间的语音全丢，是“不灵敏”的根因）。转写改为**轮询已完成段**
-         *   （大小两次采样一致即写稳），串行 whisper（不并发打满 CPU）。 */
-        await new Promise((r) => setTimeout(r, 500)); // 等首段产生
-        while (alive && rooms.get(roomNumber)) {
-          // ① 扫描“已写稳且未处理”的段
-          let wav = null;
-          try {
-            wav = fs.readdirSync(segDir)
-              .filter((f) => f.endsWith('.wav') && !doneSet.has(f))
-              .sort()
-              .map((f) => path.join(segDir, f))
-              .find((full) => {
-                try {
-                  return fs.statSync(full).size >= 40000; // ≥2.5s 语音（16k 单声道），太短视为静音
-                } catch (e) { return false; }
-              });
-          } catch (e) { /* 目录暂不可读 */ }
-          if (!wav) { await new Promise((r) => setTimeout(r, 800)); continue; }
-          if (!alive || !rooms.get(roomNumber)) break;
-          doneSet.add(wav);
-          let size = 0;
-          try { size = fs.statSync(wav).size; } catch (e) { continue; }
-          if (size < 40000) { continue; } // 静音段跳过（已入 doneSet）
-          // 转写（whisper CLI：输出同名 txt；模型 tiny 足够会议场景）
-          const txtFile = wav.replace(/\.wav$/, '.txt');
 
-          // ★ 09-27c 安全加固（Mimosa）：WHISPER_BIN 只能是 probe 验证过的三种形态
-          if (WHISPER_BIN !== 'whisper' && WHISPER_BIN !== '__py__'
-              && !/whisper(\.exe)?$/i.test(WHISPER_BIN)) return; // 形态白名单
-          const wCmd = WHISPER_BIN === '__py__' ? process.execPath : WHISPER_BIN;
-          const wArgs = (WHISPER_BIN === '__py__' ? ['-m', 'whisper'] : [])
-            .concat([wav, '--model', process.env.WHISPER_MODEL || 'small', '--language', 'zh',
-                     '--initial_prompt', '以下是普通话的句子。会议纪要、行动项。',
-                     '--output_format', 'txt', '--output_dir', segDir]);
-          await new Promise((r) => {
-            require('child_process').execFile(wCmd, wArgs,
-              { timeout: 90000, windowsHide: true }, () => r());
-          });
-          let text = '';
-          try { text = fs.readFileSync(txtFile, 'utf8').trim(); } catch (e) {}
-          try { fs.unlinkSync(wav); fs.unlinkSync(txtFile); } catch (e) {}
-          console.log(`🤖 [ASR] ${String(memberId).slice(-4)} 段转写：${text ? text.slice(0, 50) : '(这 15 秒没识别到语音)'}`);
-          if (!text || !rooms.get(roomNumber)) continue;
-          // 入字幕账本（source:'asr' 标记来源；与客户端字幕同一条权威副本路径）
-          const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-          const capFile = path.join(CAPTIONS_DIR, `cap-${roomNumber}-${day}.jsonl`);
-          fs.appendFileSync(capFile, JSON.stringify({
-            ts: Date.now(), from: memberId, name: `成员 ${String(memberId).slice(-4)}`, text: text.slice(0, 500), asr: true,
-          }) + '\n');
-          if (!aiHearing.has(roomNumber)) aiHearing.set(roomNumber, new Map());
-          // ★ 09-27c：转写只上字幕条（asr-caption 事件）——不再刷聊天区（用户反馈"拉胯"）
-          io.to(roomNumber).emit('asr-caption', {
-            name: `成员 ${String(memberId).slice(-4)}`, text: text.slice(0, 200),
-          });
-          logEvent('info', 'asr-segment', { roomNumber, member: memberId, chars: text.length });
-          await asrWakeAndAnswer(roomNumber, memberId, text); // ★ 09-27c：唤醒+回答抽成公共函数（自测同用）
-          segIdx += 1;
+      // 一个段的完整处理：静音丢弃 → whisper 转写 → 入库 + 上字幕 + 唤醒判定
+      const handleSegment = async (full, baseName) => {
+        if (doneSet.has(baseName)) return false;
+        doneSet.add(baseName);
+        let size = 0;
+        try { size = fs.statSync(full).size; } catch (e) { return false; }
+        if (size < 40000) { try { fs.unlinkSync(full); } catch (e) { /* 已删 */ } return false; } // 静音/太短
+        // ★ 09-29：优先常驻 worker（省掉每段的模型加载）；不可用自动回退 CLI
+        const worker = getResidentAsr(asrModel);
+        const t0 = Date.now();
+        const text = worker
+          ? await worker.transcribe(full)
+          : await Asr.transcribeFile(WHISPER, full, { outDir: segDir, model: asrModel });
+        const via = worker ? '常驻' : 'CLI';
+        try { fs.unlinkSync(full); } catch (e) { /* 已删 */ }
+        if (!text || !rooms.get(roomNumber)) return false;
+        console.log(`🤖 [ASR/${via}] ${speakerName}（转写 ${((Date.now() - t0) / 1000).toFixed(1)}s）：${text.slice(0, 50)}`);
+        // 入库（落盘 + 喂 AI 看板，唯一通道）→ 上字幕条 → 唤醒/追问判定
+        ingestCaptions(roomNumber, [{
+          ts: Date.now(), from: memberId, name: speakerName, text: text.slice(0, 500), asr: true,
+        }]);
+        io.to(roomNumber).emit('asr-caption', { name: speakerName, text: text.slice(0, 200) });
+        logEvent('info', 'asr-segment', { roomNumber, member: memberId, chars: text.length });
+        await asrWakeAndAnswer(roomNumber, memberId, text, speakerName);
+        return true;
+      };
+
+      // 挑一个"已经写完"的段：排除最新（正在写）+ 两次采样大小一致
+      const pickReadySegment = async () => {
+        let names = [];
+        try {
+          names = fs.readdirSync(segDir).filter((f) => f.endsWith('.wav') && !doneSet.has(f)).sort();
+        } catch (e) { return null; }
+        if (names.length < 2) return null;            // 最新那段在写，等它封口
+        const baseName = names[names.length - 2];
+        const full = path.join(segDir, baseName);
+        try {
+          const s1 = fs.statSync(full).size;
+          await new Promise((r) => setTimeout(r, 250));
+          const s2 = fs.statSync(full).size;
+          if (s1 !== s2) return null;                 // 还在增长 → 下一轮再说
+          if (process.env.ASR_DEBUG_PICK) console.log(`[asr-pick] ${speakerName} → ${baseName} (${s1}B)`);
+          return { full, baseName };
+        } catch (e) { return null; }
+      };
+
+      const recordLoop = async () => {
+        await new Promise((r) => setTimeout(r, 300)); // 等首段产生
+        while (alive && rooms.get(roomNumber)) {
+          const pick = await pickReadySegment();
+          if (!pick) { await new Promise((r) => setTimeout(r, 500)); continue; }
+          try { await handleSegment(pick.full, pick.baseName); } catch (e) { /* 单段失败不拖垮循环 */ }
         }
+        // 收尾：把最后一段（ffmpeg 已停、不再增长）也转出来——别丢最后半句话
+        try {
+          const rest = fs.readdirSync(segDir).filter((f) => f.endsWith('.wav') && !doneSet.has(f)).sort();
+          for (const f of rest) {
+            if (!rooms.get(roomNumber)) break;
+            try { await handleSegment(path.join(segDir, f), f); } catch (e) { /* 收尾失败可忽略 */ }
+          }
+        } catch (e) { /* 目录已被清理 */ }
       };
       recordLoop();
       return;
@@ -1781,6 +1881,13 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
     const pipe = { transport: t, consumer: c, proc, memberId, producerId: producer.id, port, sdpFile };
     if (!aiAudioPipes.has(roomNumber)) aiAudioPipes.set(roomNumber, new Set());
     aiAudioPipes.get(roomNumber).add(pipe);
+    // ★ 09-27c：管线建成即追加"接入成功"播报——入会致辞的"正在接入"只是竞态快照
+    io.to(roomNumber).emit('ai-state', { state: 'listening' });
+    io.to(roomNumber).emit('chat-message', {
+      from: 'ai-bot', name: '🤖 AI 小明',
+      text: `🎧 已接入 ${String(memberId).slice(-4)} 的音频，正在聆听（说话带「小明」我就会回答）`,
+      ts: Date.now(),
+    });
     proc.on('exit', () => {
       const set = aiAudioPipes.get(roomNumber);
       if (set) set.delete(pipe);
@@ -1988,7 +2095,7 @@ function setAiBot(roomNumber, on, opts = {}) {
  * ▎返回值向后兼容：仍是 { text, mock, usage, ms, ... }，另**新增** hits/turns/intent，
  *   供 UI 摊开"这条答案是检索自哪几条字幕"（把智能做成可验证的，而不是让它变成玄学）。
  */
-async function aiBrain(roomNumber, question, onDelta) {
+async function aiBrain(roomNumber, question, onDelta, onPhase) {
   const room = rooms.get(roomNumber);
   const members = room ? [...room.members] : [];
   const talkRows = room ? [...room.talk.entries()].sort((a, b) => b[1] - a[1]) : [];
@@ -2054,7 +2161,7 @@ async function aiBrain(roomNumber, question, onDelta) {
     }
   }
 
-  const r = await brain.answer(q, entries, { extraContext, onDelta, topK: 6 });
+  const r = await brain.answer(q, entries, { extraContext, onDelta, onPhase, topK: 6 });
   if (process.env.AI_DEBUG_SCOPE) {
     console.log(`[scope-debug] answer since=${brain.since ? new Date(brain.since).toISOString() : 0} 全档=${entries.length} 范围内=${r.totalDocs} scoped=${r.scoped}`);
   }
@@ -2080,72 +2187,75 @@ async function aiBrain(roomNumber, question, onDelta) {
  * ══════════════════════════════════════════════════════════════ */
 const AI_OP_STEP_MS = Number(process.env.AI_OP_STEP_MS) || 600;
 const AI_WARM_MS = (Number(process.env.AI_WARM_SEC) || 600) * 1000;
+/* ★ 09-28 追问窗口（多轮对话的关键）：
+ *   AI 答完一句之后的 20s 内，大家继续说话**不必再喊"小明"**——这才是"对话"，
+ *   而不是"每句都要先喊名字的命令"。窗口内的话会作为追问继续喂给同一个会话记忆
+ *   （brain.js 的 turns 记忆），所以"它刚才说的第三点再展开"这类指代能接得住。
+ *   可用 config.aiChatWindowSec 调（0 = 关掉追问窗口，退回纯唤醒词模式）。 */
+const AI_CHAT_WINDOW_MS = Math.max(0, (Number(CONFIG.aiChatWindowSec) || 20) * 1000);
 
-/* ★ 09-27c 服务端唤醒+回答（从分段循环抽出成公共函数——真实管线与 TEST_ASR 自测共用）：
- *   转写文本含「小明」→ aiBrain 自动回答；状态机 thinking→speaking→idle 全演。 */
-async function asrWakeAndAnswer(roomNumber, memberId, text) {
-  if (!/小明|小鸣/.test(text)) return;
+/* ★ 09-27c 服务端唤醒+回答（从分段循环抽出成公共函数——真实管线与自测共用）：
+ *   转写文本含「小明」（或在其追问窗口内）→ aiBrain 自动回答；状态机 thinking→speaking→idle 全演。
+ * ▎★ 09-28 升级为**多轮对话**：
+ *   ① 唤醒：句子里喊了名字（shouldWake，容忍识别把名字听岔成小鸣/小名/小铭）；
+ *   ② 追问：AI 刚答完的 AI_CHAT_WINDOW_MS 内，后续发言直接算追问（不用再喊名字）——
+ *      每接一次话就把窗口往后推，形成连续的"聊得起来"的对话；
+ *   ③ 归属：字幕与问答都用说话人的**昵称**（memberDisplayName），AI 的上下文里才知道是谁说的。
+ */
+async function asrWakeAndAnswer(roomNumber, memberId, text, speakerName) {
+  const room = rooms.get(roomNumber);
+  if (!room || !room.aiBot) return;                       // 助理不在场就不接话（它得有"嘴"）
+  const clean = String(text || '').trim();
+  if (clean.length < 2) return;
+  const now = Date.now();
+  const woken = Asr.shouldWake(clean);
+  const followUp = !woken && Asr.isFollowUp(room.aiChatUntil, now);
+  if (!woken && !followUp) return;                        // 既没叫名字、也不在追问窗口 → 只是普通发言
+  if (AI_CHAT_WINDOW_MS > 0) room.aiChatUntil = now + AI_CHAT_WINDOW_MS; // 窗口顺延
+
+  const who = speakerName || memberDisplayName(roomNumber, memberId);
+  logEvent('info', 'asr-wake-answer', { roomNumber, member: memberId, via: woken ? 'wake' : 'follow-up' });
   io.to(roomNumber).emit('ai-state', { state: 'thinking' });
   try {
-    const r = await aiBrain(roomNumber, String(text).slice(0, 300));
+    /* 追问时把"是谁在问"带进问题里：brain 的会话记忆是房间级的，
+     * 模型只有知道说话人，才能答对"我刚才说的那个"这类指代。 */
+    const question = followUp ? `（${who} 继续说）${clean}` : clean;
+    const r = await aiBrain(roomNumber, question.slice(0, 300));
     io.to(roomNumber).emit('ai-state', { state: 'speaking', text: r.text });
     io.to(roomNumber).emit('chat-message', {
       from: 'ai-bot', name: '🤖 AI 小明', text: r.text, ts: Date.now(),
     });
     setTimeout(() => io.to(roomNumber).emit('ai-state', { state: 'idle' }),
       Math.min(12000, 2000 + r.text.length * 90));
-    logEvent('info', 'asr-wake-answer', { roomNumber, member: memberId });
   } catch (e) { /* 回答失败不影响转写循环 */ }
 }
 
 /* ★ 09-27 服务端 ASR（字幕转写，用户点名“开启那个字幕转写”）：
  * ▶ 原理：AI 听觉管线（startAiAudioPipe）已把每路音频推给本机 ffmpeg——在此基础上
- *   改为 **15s 分段落盘 wav → whisper 命令行转写 → 追加进字幕账本 jsonl（source:'asr'）**。
+ *   改为 **分段录音（默认 5s） → whisper 命令行转写 → 入库字幕账本（asr:true）**。
  *   账本一旦有真实转写，@ai 问答/RAG/纪要/唤醒词全部自动升级（不再依赖客户端 Web Speech）。
- * ▶ 依赖：`pip install -U openai-whisper`（首次运行自动下载模型，需能访 HuggingFace）；
- *   未检测到 whisper → 启动时明确提示安装方式，功能静默关闭（客户端 Web Speech 字幕仍可用）。
- * ▶ 隐私边界：音频不出本机（whisper 本地推理）；模型 tiny/base 即可，中文效果已够用。 */
-let WHISPER_BIN = null;      // 检测到的 whisper 可执行文件（null = 未可用）
+ * ▶ 依赖：`pip install -U openai-whisper`（模型首次运行自动下载，需能访 HuggingFace）；
+ *   未检测到 whisper → 启动时明确提示安装方式，功能静默关闭（前端此时才退回浏览器字幕）。
+ * ▶ 隐私边界：音频不出本机（whisper 本地推理）；模型 tiny 即可，中文会议场景够用。
+ * ▎★ 09-28 起：**探测与转写全部委托给 sfu/ai/asr.js**（唯一实现层）——
+ *   原先写在这里的两处坑（GBK 下 --help 崩溃导致误判"未安装"、兜底候选把 node 当 python）
+ *   都在模块里修掉了，此处只保留"拿到 runner 之后怎么用"。 */
+let WHISPER = null;          // probe 出来的 whisper runner（null = 本机不可用）
 let whisperProbed = false;
-function probeWhisper() {
-  if (whisperProbed) return Promise.resolve(WHISPER_BIN);
+async function probeWhisper() {
+  if (whisperProbed) return WHISPER;
   whisperProbed = true;
-  const { execFile } = require('child_process');
-  // ★ 09-27b：候选含 pip --user 的 whisper.exe 完整路径（Windows 上 pip --user
-  //   装的 exe 在 %APPDATA%/Python/Python312/Scripts，不在服务 PATH）+ python -m 兜底
-  // pip --user 安装位置的显式枚举（版本目录名 Python312 里的 312 是 Python 主次版本，
-  // 不是 Node 的——直接枚举常见位置 + fs 存在性过滤，比字符串拼接可靠）
-  const fsx = require('fs');
-  const userCands = [
-    process.env.APPDATA && path.join(process.env.APPDATA, 'Python', 'Python312', 'Scripts', 'whisper.exe'),
-    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'Python', 'Python312', 'Scripts', 'whisper.exe'),
-    'C:' + path.sep + 'Program Files' + path.sep + 'Python312' + path.sep + 'Scripts' + path.sep + 'whisper.exe',
-  ].filter(Boolean);
-  const cands = ['whisper', 'whisper-cli', 'whisper.exe',
-    ...userCands.filter((x) => { try { return fsx.existsSync(x); } catch (e) { return false; } }),
-    '__py__',
-  ];
-  return new Promise((resolve) => {
-    let i = 0;
-    const tryNext = () => {
-      if (i >= cands.length) {
-        console.log('🎙 服务端转写（ASR）未开启：未检测到 whisper。安装： pip install -U openai-whisper （重启生效）；客户端 Web Speech 字幕不受影响');
-        return resolve(null);
-      }
-      const c = cands[i++];
-      // ★ 09-27b：候选 '__py__' = 用本机 python 以模块方式跑（pip --user 装的
-      //   whisper.exe 不在 PATH——模块方式跨机最稳）
-      const cmd = c === '__py__' ? process.execPath : c;
-      const args = c === '__py__' ? ['-m', 'whisper', '--help'] : ['--help'];
-      execFile(cmd, args, { timeout: 8000, windowsHide: true }, (err) => {
-        if (err) return tryNext();
-        WHISPER_BIN = c;
-        console.log(`🎙 服务端转写（ASR）已开启：${c}（每路音频 15s 分段转写入字幕账本，AI 小明能听懂会议内容了）`);
-        resolve(WHISPER_BIN);
-      });
-    };
-    tryNext();
-  });
+  try {
+    WHISPER = await Asr.probeWhisper();
+  } catch (e) {
+    WHISPER = null;
+  }
+  if (WHISPER) {
+    console.log(`🎙 服务端转写（ASR）已开启：${WHISPER.label}（模型 ${Asr.DEFAULT_MODEL}，每 ${Asr.DEFAULT_SEGMENT_SEC}s 一段写入字幕账本，AI 小明能听懂会议内容了）`);
+  } else {
+    console.log('🎙 服务端转写（ASR）未开启：未检测到 whisper。安装： pip install -U openai-whisper （重启生效）；此时前端才回退浏览器识别');
+  }
+  return WHISPER;
 } // ★ 09-26d 冷场阈值（默认 10 分钟无发言→AI 主动暖场）
 const AI_OP_MAX_MS = Number(process.env.AI_OP_MAX_MS) || 30000;
 let aiOpBusy = false;      // 全服务器同一时刻只跑一个 AI 操作任务（简单互斥）
@@ -2806,6 +2916,18 @@ function renderActionTable(actions) {
   return ['| 负责人 | 事项 | 期限 |', '| --- | --- | --- |', ...rows].join('\n');
 }
 
+/* ★ 09-27e G6-② 角色判定：owner(房主) > admin(平台管理员) > member(登录用户) > guest(游客)。
+ * ▎权限点（最小集，逐条看得见）：
+ *   kick-member：owner/admin；record-start：member 及以上（游客不能录——审计需要身份）；
+ *   其余（说话/字幕/白板/暖场开关）全员平等——会议的"说话权"不做分级。 */
+function roleOf(socket, room) {
+  if (!socket) return 'guest';
+  if (room && room.ownerId === socket.id) return 'owner';
+  if (socket.role === 'admin') return 'admin';
+  if (socket.username) return 'member';
+  return 'guest';
+}
+
 function broadcastRoomState(roomNumber) {
   const room = rooms.get(roomNumber);
   if (!room) return;
@@ -2816,6 +2938,7 @@ function broadcastRoomState(roomNumber) {
     id: m.id,
     name: m.displayName || null,           // ★ 09-16：昵称（成员列表显示用）
     avatar: m.avatar || null,              // ★ 09-26：预设头像 key（前端拼 /avatars/presets/XX.png）
+    role: roleOf(m, room),                 // ★ 09-27e G6-②：角色（owner/admin/member/guest）
     owner: m.id === room.ownerId,          // 房主（建房的人）——踢人权限在他手里
     muted: !!(m.state && m.state.muted),   // 前端上报的"我静音了吗"
     camOff: !!(m.state && m.state.camOff), // 前端上报的"我关摄像头了吗"
@@ -3208,15 +3331,17 @@ io.on('connection', (socket) => {
    * ▎三个动作共用"成功后把身份绑到 socket"的逻辑：之后的聊天广播/成员快照
    *   都能带上昵称（不用每条消息自带身份——身份在连接上，这是服务端会话的意义）。
    */
-  const bindIdentity = (username, displayName, avatar) => {
+  const bindIdentity = (username, displayName, avatar, role) => {
     socket.username = username;
     socket.displayName = displayName;
     if (avatar) socket.avatar = avatar; // ★ 09-26：头像随身份绑定（room-state 广播用）
+    socket.role = role || 'guest';      // ★ 09-27e G6-②：角色随身份绑定（owner 仍以 room.ownerId 为准）
   };
   socket.on('auth-register', ({ username, password, displayName, avatar: avatarKey } = {}, callback) => {
     if (!callback) return;
     if (!validUsername(username)) return fail(callback, '用户名需 2~16 位（中英文/数字/下划线）');
-    if (typeof password !== 'string' || password.length < 6) return fail(callback, '密码至少 6 位');
+    const strengthErr = passwordStrengthError(password);
+    if (strengthErr) return fail(callback, strengthErr);
     /* ★ 09-24 修顺序 bug：限流检查必须**先于**落库。
      *   旧代码是"先 saveUsers 再 rateLimit"，于是被限流拒绝的注册请求**账号已经写进文件**了——
      *   这正是 users.json 里堆了 69 个 a_xxxxxx 之类测试账号的元凶：测试反复跑，
@@ -3235,7 +3360,7 @@ io.on('connection', (socket) => {
       return fail(callback, '用户名已被注册');
     }
     const token = issueToken(username);
-    bindIdentity(username, created.displayName, created.avatar);
+    bindIdentity(username, created.displayName, created.avatar, created.role);
     logEvent('info', 'auth-register', { username, role: created.role, avatar: created.avatar || null });
     try { store.appendAudit('auth-register', username, { role: created.role }); } catch (e) { /* 审计失败不挡注册 */ }
     if (created.role === 'admin') {
@@ -3250,9 +3375,30 @@ io.on('connection', (socket) => {
     const u = store.getUser(username);
     // 用户不存在与密码错误给同一句提示：不向试探者泄露"用户名是否存在"
     if (!rateLimit(`login:${clientIp(socket)}`, 20, 60000)) return fail(callback, '尝试过于频繁，请一分钟后再试');
-    if (!u || hashPassword(password, u.salt) !== u.hash) return fail(callback, '用户名或密码不对');
+    // ★ 09-29 失败锁定检查：锁定期内一律拒绝（连正确密码也是——防"5 错 + 1 对"式撞库）
+    const lf = u && loginFails.get(username);
+    if (lf && lf.lockedUntil) {
+      if (Date.now() < lf.lockedUntil) {
+        const left = Math.ceil((lf.lockedUntil - Date.now()) / 1000);
+        return fail(callback, `失败次数过多，已锁定，请 ${left} 秒后再试`);
+      }
+      loginFails.delete(username); // 锁已过期：从零开始
+    }
+    if (!u || hashPassword(password, u.salt) !== u.hash) {
+      if (u) { // ★ 只对存在的账号计数（对空气计数 = 锁人 DoS）
+        const rec = loginFails.get(username) || { count: 0, lockedUntil: 0 };
+        rec.count += 1;
+        if (rec.count >= AUTH_LOCK_MAX) {
+          rec.lockedUntil = Date.now() + AUTH_LOCK_MS;
+          logEvent('warn', 'auth-locked', { username, ip: clientIp(socket) });
+        }
+        loginFails.set(username, rec);
+      }
+      return fail(callback, '用户名或密码不对');
+    }
+    loginFails.delete(username); // 登录成功：失败计数清零
     const token = issueToken(username);
-    bindIdentity(username, u.displayName, u.avatar);
+    bindIdentity(username, u.displayName, u.avatar, u.role);
     console.log(`👤 登录成功: ${username}`);
     ok(callback, { user: { username, displayName: u.displayName, avatar: u.avatar || null }, token });
   });
@@ -3260,7 +3406,7 @@ io.on('connection', (socket) => {
     if (!callback) return;
     const u = store.getUser(username);
     if (!u || !validToken(token, username)) return fail(callback, '登录态已失效，请重新登录');
-    bindIdentity(username, u.displayName, u.avatar);
+    bindIdentity(username, u.displayName, u.avatar, u.role);
     ok(callback, { user: { username, displayName: u.displayName, avatar: u.avatar || null } });
   });
   // ★ 09-19h G6-①：显式滑动续期（前端每小时调一次，长期值守不掉线）
@@ -3440,6 +3586,123 @@ io.on('connection', (socket) => {
     ok(callback, { roomNumber, memberId: socket.id, roomToken: socket.roomToken });
   });
 
+  /* =============================================================================
+   * ★ 09-30 借鉴 billd-desk：远程控制「设备码」配对（脱离"必须先开会建房"）
+   * =============================================================================
+   * ▎要解决的痛点（用户实测："想远程控自己的电脑,得先假装开一场会"）：
+   *   原来的真桌面链路是：人在浏览器 create-room → 把房号抄给被控端 agent →
+   *   agent --room 进房 → 人进房点「控制电脑」。房号成了"临时"的、每次都要现建现抄。
+   *
+   * ▎billd-desk / ToDesk 的做法（我们取的是「思想」，不是它的原生客户端）：
+     每台"被控设备"有一个**稳定的设备码 + 连接密码**；主控端**只输码+密码**即可请求连接；
+   *   被控端可「手动同意」或配一个「安全密码」实现**无人值守自动放行**。
+   *
+   * ▎我们怎么在零依赖 + 现有管线上落地（关键取舍）：
+   *   不新造一套控制协议——**设备码 = 一个私有"桌面房间"的房号**（同样 6 位数字），
+   *   agent 注册时服务器替它把房间建好（标 isDesk），连接密码即房间密码。
+   *   之后 remote-request / remote-answer / remote-input / remote-frame 门禁**一字不改照用**，
+   *   因为它们只认"同房间的一对成员 + remoteCtl 登记"。我们只是把"建房+进房+请求"这三步
+   *   从人肉操作换成两条信令自动完成。复用 = 少一半 bug。
+   *
+   * ▎诚实边界（写进注释也写进文档）：
+   *   - 设备码是**内存态**（agent 掉线/重启会换新码）——持久化"我的常用设备"是下一步；
+   *   - 连接密码/安全密码存内存并明文比对（演示级；真实产品应哈希 + TLS，本项目靠 HTTPS 自签兜底）。
+   */
+
+  // 轻量进房：控制端"设备码直连"时只做门禁需要的最小登记，
+  //   不触发媒体订阅/成员广播（否则会把整套会议逻辑拖进来，画面/推流都不该动）。
+  const deskEnterRoom = (roomNumber) => {
+    const room = rooms.get(roomNumber);
+    socket.join(roomNumber);            // 收得到 io.to(房号) 的 remote-state 等广播
+    room.members.add(socket);           // 让 isRoommate() 认得这对控制关系
+    socket.roomNumber = roomNumber;
+    socket.joinedAt = Date.now();
+    socket.state = { muted: false, camOff: false, sharing: false, hand: false };
+  };
+
+  /* 被控端（agent）用"设备码"注册 —— 替代原来"先手动建房再 --room 加入"的别扭流程 */
+  socket.on('desk-register', async ({ name, platform, browser, connectPassword, securePassword, code } = {}, callback) => {
+    // 设备码：给定了就用（去重），没给就现生成一个没占用的 6 位码（= 房号）
+    let deviceCode = /^\d{6}$/.test(String(code || '')) ? String(code) : '';
+    if (deviceCode && rooms.has(deviceCode)) return fail(callback, '该设备码已被占用');
+    if (!deviceCode) deviceCode = generateRoomNumber();
+
+    rooms.set(deviceCode, {
+      password: String(connectPassword || '').slice(0, 64) || null, // 连接密码 = 房间密码
+      members: new Set(),
+      router: null,
+      ownerId: socket.id,
+      audioObserver: null,
+      producerOwner: new Map(),
+      createdAt: Date.now(),
+      talk: new Map(),
+      // ★ 桌面房间专属字段
+      isDesk: true,
+      agentId: null,                    // 进房后回填
+      connectPassword: String(connectPassword || '').slice(0, 64),
+      securePassword: String(securePassword || '').slice(0, 64), // 空 = 必须人工确认
+    });
+
+    socket.isAgent = true;
+    socket.agentInfo = { platform: String(platform || '').slice(0, 40), browser: String(browser || '').slice(0, 40) };
+    socket.displayName = '🖥️ ' + (String(name || '').trim().slice(0, 20) || '桌面代理');
+
+    const okJoin = await joinRoom(deviceCode);
+    if (!okJoin) { rooms.delete(deviceCode); return fail(callback, '内部错误：桌面房间创建失败'); }
+    rooms.get(deviceCode).agentId = socket.id;
+
+    const unattended = !!rooms.get(deviceCode).securePassword;
+    console.log(`🖥️ 桌面设备注册：设备码 ${deviceCode}（${socket.displayName}，${unattended ? '🔓 无人值守' : '🔒 需人工确认'}）`);
+    logEvent('info', 'desk-register', { deviceCode, by: socket.id, unattended });
+    ok(callback, { deviceCode, roomNumber: deviceCode, name: socket.displayName });
+  });
+
+  /* 控制端凭"设备码 + 连接密码"直连（浏览器 / 手机都用这条，不用先进会议） */
+  socket.on('desk-connect', ({ deviceCode, password } = {}, callback) => {
+    if (socket.roomNumber) return fail(callback, '已在房间里');
+    if (!/^\d{6}$/.test(String(deviceCode || ''))) return fail(callback, '设备码格式不对（应为 6 位数字）');
+    if (!rateLimit(`desk:${socket.id}`, 10, 60000)) return fail(callback, '请求过于频繁');
+
+    const room = rooms.get(deviceCode);
+    if (!room || !room.isDesk) return fail(callback, '设备不在线（请先在被控端启动桌面代理）');
+    const agent = [...room.members].find((m) => m.id === room.agentId);
+    if (!agent) return fail(callback, '设备不在线（代理已断开）');
+    // 连接密码校验（没设密码则免验）
+    if (room.connectPassword && room.connectPassword !== String(password || '')) {
+      return fail(callback, '连接密码不对');
+    }
+    // 互斥：这台设备正在被别人控制 → 拒绝
+    const ctl = remoteCtl.get(deviceCode);
+    if (ctl && ctl.controllerId && ctl.controllerId !== socket.id) return fail(callback, 'busy');
+
+    socket.displayName = socket.displayName || '控制端';
+    deskEnterRoom(deviceCode);
+    logEvent('info', 'desk-connect', { deviceCode, controller: socket.id });
+
+    // 分支①：无人值守 —— 安全密码匹配 → 服务器直接授予控制（跳过被控端人工确认）。
+    //   授权的"生死簿"仍在 remoteCtl，其余门禁（remote-input/remote-frame）照旧生效。
+    if (room.securePassword && room.securePassword === String(password || '')) {
+      const entry = { hostId: room.agentId, controllerId: socket.id, expiresAt: null, timer: null };
+      remoteCtl.set(deviceCode, entry);
+      // 房间两端的 socket 都已 join(房号)，这一条广播同时让 agent 开推流、让控制端开控制台
+      io.to(deviceCode).emit('remote-state', { hostId: room.agentId, controllerId: socket.id, expiresAt: null });
+      socket.emit('desk-granted', { hostId: room.agentId, hostName: agent.displayName, unattended: true });
+      console.log(`🖱️ 设备码 ${deviceCode}：${socket.id} 凭安全密码无人值守接管（被控 ${room.agentId}）`);
+      return ok(callback, { granted: true, hostId: room.agentId, hostName: agent.displayName });
+    }
+
+    // 分支②：需人工确认 —— 把请求转给被控端代理，走它原有的"终端按 y/拒绝"逻辑。
+    //   agent 确认后发 remote-answer → 通用授权处理器登记 remoteCtl + 广播 remote-state；
+    //   控制端从 remote-state 里发现"我被授予了对这台设备的控制" → 打开桌面控制台。
+    agent.emit('remote-request', { from: socket.id });
+    socket.emit('desk-pending', { hostId: room.agentId, hostName: agent.displayName });
+    console.log(`🖱️ 设备码 ${deviceCode}：${socket.id} 申请控制（等待被控端确认）`);
+    return ok(callback, { granted: false, hostId: room.agentId, hostName: agent.displayName });
+  });
+
+  /* 桌面房间里的代理离线 → 设备码即刻作废（不像会议房那样留 60s 宽限，
+   * 因为"设备"没人时留着码也没意义，反而给旧码占用） */
+
   // 聊天（SFU 版方案 A：走服务器广播——见 SFU-BLUEPRINT.md 5.4）
   // ★ D+1 起聊天有两条路（前端双发 + 按 msgId 去重）：主路 = SCTP 数据通道（广播语义），
   //   兜底 = 这条信令广播（数据通道还没建立/建立失败的人也能收到）。服务器原样带 msgId。
@@ -3546,6 +3809,10 @@ io.on('connection', (socket) => {
     io.to(to).emit('remote-answer', { from: socket.id, ok: true, expiresAt });        // 回执给申请者
     io.to(roomNumber).emit('remote-state', { hostId: socket.id, controllerId: to, expiresAt }); // 广播全房
     broadcastRoomState(roomNumber);                                                   // ★ D4：快照同步
+    // ★ 09-30 设备码：桌面房间的"需人工确认"路径授权成功后，给控制端补一条确定性 open 信号。
+    //   为什么单独发：控制端是"设备码直连"轻量进房的，没走会议那套 room-members，
+    //   前端不会自动 openRemoteDesk；这条 desk-granted 就是告诉它"对方已放行，可以开控制台了"。
+    if (room.isDesk) io.to(to).emit('desk-granted', { hostId: socket.id, hostName: socket.displayName, unattended: false });
     console.log(`🖱️ 房间 ${roomNumber}：${to} 开始控制 ${socket.id}（授权方）`
       + (expiresAt ? `，${Math.round(durationMs / 1000)} 秒后自动到期` : '，不限时'));
   });
@@ -3683,9 +3950,11 @@ io.on('connection', (socket) => {
     const roomNumber = socket.roomNumber;
     const room = rooms.get(roomNumber);
     if (!room || !to) return;
-    if (room.ownerId !== socket.id) {          // 权限门禁：不是房主 → 拒绝
+    // ★ 09-27e G6-② 权限分级：owner/admin 可踢（member/guest 不行）
+    const kickerRole = roleOf(socket, room);
+    if (kickerRole !== 'owner' && kickerRole !== 'admin') {
       socket.emit('kick-denied', { to, reason: 'not-owner' });
-      console.log(`[!] ${socket.id} 想踢 ${to}，但他不是房主`);
+      console.log(`[!] ${socket.id} 想踢 ${to}，角色 ${kickerRole} 不足`);
       return;
     }
     const target = [...room.members].find((m) => m.id === to);
@@ -3825,6 +4094,10 @@ io.on('connection', (socket) => {
    */
   socket.on('record-start', async ({ memberId, producerId } = {}, callback) => {
     if (!socket.roomNumber) return fail(callback, '还没进房间');
+    // ★ 09-27e G6-② 权限点：游客不能录——录制产物是会议留痕，审计需要身份
+    if (roleOf(socket, rooms.get(socket.roomNumber)) === 'guest') {
+      return fail(callback, '游客不能录制（登录后即可）');
+    }
     if (!FFMPEG_OK) {
       // ★ 09-17c：开机只做快探测（PATH），没找到时在这里才做一次深扫（winget 包目录），
       //   这样"启动慢"的问题不会转嫁到"录制永远不可用"上
@@ -3922,9 +4195,15 @@ io.on('connection', (socket) => {
      *   而 chat-message 走的是既有聊天台账（导出/去重/离线补帧都靠它）。
      *   增量先行保证手感，终态兜底保证不丢——和字幕"容忍丢 / 问答不容忍丢"同一套双路哲学。 */
     io.to(roomNumber).emit('ai-stream', { id: streamId, delta: '', done: false, start: true, mock: AI.aiEnabled() === false });
-    io.to(roomNumber).emit('ai-state', { state: 'thinking' }); // ★ 09-26：动态头像状态机（LLM 推理期）
+    io.to(roomNumber).emit('ai-state', { state: 'thinking', phase: 'retrieving' }); // ★ 09-26 动态头像；09-30 带阶段
     const r = await aiBrain(roomNumber, question, (delta) => {
       io.to(roomNumber).emit('ai-stream', { id: streamId, delta, done: false });
+    }, (phase) => {
+      /* ★ 09-30：把 brain 的真实阶段透传给界面（检索中 / 换说法再找 / 整理答案）。
+       *   为什么值得单开一条上报：用户口中的"卡"多半是"看不出它在干什么"——
+       *   一句静止的"思考中…"和卡死没有区别；有阶段就有进度感。
+       *   这是**零延迟成本的体感优化**。 */
+      io.to(roomNumber).emit('ai-state', { state: 'thinking', phase });
     });
     /* ★ 09-24e：done 帧把"检索过程"一起送给前端（流式路径的增量期还不知道检索结果，
      *   等 aiBrain 返回才有）。前端在 done 时把它插进气泡——这样流式与一次性两条路径
@@ -4476,7 +4755,11 @@ io.on('connection', (socket) => {
          *   现在房间进入 TTL 宽限期（Router 不关、号码不回收），宽限期内原号可回归。
          *   真实产品的"会议不散场"语义（掉线重连 / 暂离）由此而来。
          */
-        if (room.members.size === 0) {
+        if (room.isDesk && room.agentId === socket.id) {
+          // ★ 09-30 设备码：被控代理离线 → 这台"设备"下线，桌面房间即刻销毁、设备码作废
+          //   （不進 TTL 宽限：设备没人时留着码没意义，反而白占一个 6 位号）
+          destroyRoom(socket.roomNumber, 'agent-offline');
+        } else if (room.members.size === 0) {
           scheduleRoomTtl(socket.roomNumber); // 宽限期到点才 destroyRoom
         } else {
           // ★ D+4：房主走了 → 房主位迁给"最早进房"的幸存者（分布式所有权的最小实现：
@@ -4520,8 +4803,12 @@ io.on('connection', (socket) => {
   workerReady.catch((err) => console.error('❌ 媒体引擎启动失败：', err.message));
 
   if (process.env.TEST_RECORD === '1') workerReady.then(() => runRecordSelfTest()); // ★ D+2 端到端自测（见下）
+  if (process.env.TEST_ASR === '1') workerReady.then(() => runAsrSelfTest()); // ★ 09-29 语音闭环端到端自测（见下）
   // ★ 09-27c ASR 转写验证独立在 scripts/test-asr.js（npm run test:asr）——server 内不新增 execFile 动态形态（Mimosa）
-  const listenOn = LISTEN_IP === '127.0.0.1' ? 'localhost' : LISTEN_IP;
+  // ★ 09-30：打印的网址必须"能点"——0.0.0.0 是**监听**语义，不是**访问**语义，
+  //   打给用户看的一律 localhost（本机打开）；局域网/跨机地址单独一行给真实 IP。
+  const listenOn = 'localhost';
+  const lanIpForPrint = ANNOUNCED_DECISION.ip || detectLocalIps()[0] || null;
   // ★ 可交付体验：端口被占时给"人话"指引，而不是一屏堆栈（常见于 start-lan 已启动、
   //   又手动 npm run start:sfu 的双开场景）
   const friendlyPortError = (port) => (err) => {
@@ -4559,6 +4846,10 @@ io.on('connection', (socket) => {
     }
     console.log(`📊 实时观测面板: http://${listenOn}:${PORT}/dashboard`);
     console.log(`（Mesh 版在 http://localhost:3000，两个版本互不干扰）`);
+    // ★ 09-30：跨机地址单独一行给真实 IP（0.0.0.0 打出来没法点；"不是本来的网址"就是它）
+    if (LISTEN_IP !== '127.0.0.1' && lanIpForPrint) {
+      console.log(`🌐 局域网访问: ${httpsServer ? `https://${lanIpForPrint}:${tlsCfg.port || 3443}` : `http://${lanIpForPrint}:${PORT}`}（另一台设备打开；自签证书点"继续访问"）`);
+    }
     console.log(`打开 2~8 个浏览器窗口：第 1 个创建房间拿号，其余凭号加入`);
     if (LISTEN_IP === '127.0.0.1') {
       console.log(`⚠️ 当前只监听本机。跨机访问请设 MEDIASOUP_LISTEN_IP=0.0.0.0 + ANNOUNCED_IP，见 README「跨网络部署」`);
@@ -4678,6 +4969,116 @@ async function runRecordSelfTest() {
   }
 }
 
+/* ★ 09-29 ASR 端到端自测（TEST_ASR=1 时随服务器启动）：
+ * ▎要解决什么？语音闭环（TTS 语音 → RTP → AI 听觉管线 → 常驻 worker 转写 → 字幕账本）
+ *   之前只有"分段件"验证（test:asr 验 worker/转写/唤醒逻辑），**整条房间级管线没有自动化
+ *   回归**——改管线代码只能靠真人开麦说话才知道坏没坏。照 TEST_RECORD 的思路：
+ *   用 ffmpeg 自己当"说话的人"，把一段 TTS 合成的中文语音以 RTP 推进 mediasoup，
+ *   让 AI 听觉管线走完整链路，最后断言字幕账本里出现带 asr:true 的转写文本。
+ * ▎验证四件事：管线启动（聆听日志）；账本出现 asr:true 条目；文本含语义关键词；
+ *   收尾干净（producer.close 后管线自动退出）。
+ * ▎用法：npm run test:asr-live（= TEST_ASR=1 TEST_ASR_EXIT=1 node sfu/server.js）
+ */
+async function runAsrSelfTest() {
+  console.log('🧪 [TEST_ASR] 语音闭环端到端自测开始（TTS → RTP → 听觉管线 → worker 转写 → 账本）…');
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const os = require('os');
+  const execFileP = (bin, args, opts) => new Promise((resolve, reject) => {
+    require('child_process').execFile(bin, args, opts, (err, stdout, stderr) => (err ? reject(err) : resolve(stdout)));
+  });
+  try {
+    // ① 等 ffmpeg 与 whisper 探测收敛（两个都是启动期异步探测）
+    for (let i = 0; !FFMPEG_OK && i < 30; i++) await sleep(100);
+    if (!FFMPEG_OK) throw new Error('ffmpeg 不可用');
+    for (let i = 0; !WHISPER && i < 100; i++) await sleep(100);
+    if (!WHISPER) throw new Error('whisper 不可用（语音闭环没有耳朵）');
+    // ② TTS 合成一句带唤醒词的中文（与 scripts/test-asr.js 同款做法）
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'asr-live-'));
+    const wav = path.join(dir, 'speech.wav');
+    const sentence = '小明，帮我记一下明天下午三点的评审会。';
+    const ps = [
+      'Add-Type -AssemblyName System.Speech',
+      '$s = New-Object System.Speech.Synthesis.SpeechSynthesizer',
+      "$zh = $s.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Culture.Name -like 'zh*' } | Select-Object -First 1",
+      "if (-not $zh) { throw 'no-zh-voice' }",
+      '$s.SelectVoice($zh.VoiceInfo.Name)',
+      '$fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)',
+      `$s.SetOutputToWaveFile('${wav.replace(/'/g, "''")}', $fmt)`,
+      `$s.Speak('${sentence}')`,
+      '$s.Dispose()',
+    ].join('; ');
+    await execFileP('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps],
+      { timeout: 60000, windowsHide: true });
+    if (!fs.existsSync(wav) || fs.statSync(wav).size < 10000) throw new Error('TTS 合成失败（无中文音色？）');
+    console.log(`🧪 [TEST_ASR] TTS 语音就绪（${(fs.statSync(wav).size / 1024).toFixed(0)}KB）：${sentence}`);
+    // ③ 独立 Router + 收流 PlainTransport（comedia=true：等 ffmpeg 先发 RTP）
+    const router = await worker.createRouter({ mediaCodecs });
+    const ingest = await router.createPlainTransport({
+      listenIp: { ip: '127.0.0.1' }, comedia: true, rtcpMux: true,
+    });
+    const producer = await ingest.produce({
+      kind: 'audio',
+      rtpParameters: {
+        codecs: [{
+          mimeType: 'audio/opus', payloadType: 96, clockRate: 48000, channels: 2,
+          parameters: {}, rtcpFeedback: [],
+        }],
+        encodings: [{ ssrc: 33333333 }],
+      },
+    });
+    // ④ 造一个最小房间（真实房间的"人说话"就是生产出这路 producer，此处等价）
+    const selfRoom = {
+      roomNumber: 'SELFASR', router, ownerId: 'selftest-member',
+      members: new Set([{ id: 'selftest-member', displayName: '自测说话人' }]),
+      aiBot: true, createdAt: Date.now(), state: {},
+    };
+    rooms.set(selfRoom.roomNumber, selfRoom);
+    // ⑤ 启动真实听觉管线（与浏览器开会完全同一段代码）
+    await startAiAudioPipe('SELFASR', producer, 'selftest-member');
+    // ⑥ ffmpeg 把 TTS 语音推进来（payloadType/SSRC 与上面约定一致）
+    const sender = require('child_process').spawn(FFMPEG_BIN, [
+      '-loglevel', 'error',
+      '-re', '-i', wav,
+      '-c:a', 'libopus', '-b:a', '48k',
+      '-payload_type', '96', '-ssrc', '33333333',
+      '-f', 'rtp', `rtp://127.0.0.1:${ingest.tuple.localPort}`,
+    ], { stdio: ['ignore', 'ignore', 'pipe'] });
+    sender.stderr.on('data', (d) => console.log(`🧪 [源] ${d.toString().trim()}`));
+    await sleep(2000);
+    // ⑦ 轮询字幕账本：等 asr:true 且含语义关键词的条目（转写 5s 段 + worker 应在 60s 内出结果）
+    const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const capFile = path.join(CAPTIONS_DIR, `cap-SELFASR-${day}.jsonl`);
+    const deadline = Date.now() + 90000;
+    let hit = null;
+    while (Date.now() < deadline && !hit) {
+      try {
+        const lines = fs.readFileSync(capFile, 'utf8').split('\n').filter(Boolean);
+        for (const line of lines) {
+          try {
+            const e = JSON.parse(line);
+            if (e.asr === true && /小明|评审|三点|三點|下午/.test(e.text || '')) { hit = e; break; }
+          } catch (e) { /* 坏行跳过 */ }
+        }
+      } catch (e) { /* 文件还没出现 */ }
+      if (!hit) await sleep(1000);
+    }
+    // ⑧ 收尾：先断 RTP 源（管线会在 producerclose 后自动退场），再清测试痕迹
+    sender.kill();
+    await sleep(500);
+    producer.close();
+    await sleep(500);
+    rooms.delete(selfRoom.roomNumber);
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* 忽略 */ }
+    try { fs.rmSync(capFile, { force: true }); } catch (e) { /* 忽略 */ }
+    if (!hit) throw new Error('90s 内字幕账本未出现 asr 转写（管线某段断了，看上方聆听/转写日志）');
+    console.log(`🧪 [TEST_ASR] PASS —— 转写并入库：「${hit.text}」（说话人 ${hit.name}）`);
+    if (process.env.TEST_ASR_EXIT === '1') process.exit(0);
+  } catch (err) {
+    console.error(`🧪 [TEST_ASR] FAIL —— ${err.message}`);
+    if (process.env.TEST_ASR_EXIT === '1') process.exit(1);
+  }
+}
+
 /* ══════════════════════════════════════════════════════════════
  * 第 Z 部分：优雅退出（Ctrl+C / kill / 容器停止）
  *
@@ -4720,6 +5121,8 @@ async function gracefulShutdown(signal) {
   }
   // ③ 关库：显式 close 才会做 WAL checkpoint，把 -wal 收进主库
   try { store.closeDb(); } catch (e) { /* 忽略 */ }
+  // ④ 关常驻 ASR worker（★ 09-29：不关会留一个 python 进程占着模型内存）
+  try { if (asrWorker) asrWorker.kill(); } catch (e) { /* 忽略 */ }
 
   clearTimeout(hardTimer);
   console.log('👋 已安全退出（Worker 已关、数据库已 checkpoint）。');

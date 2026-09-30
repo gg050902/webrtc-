@@ -172,6 +172,7 @@ const ICONS = {
   bot: svgIcon('<rect x="5" y="8.5" width="14" height="9.5" rx="3"/><circle cx="9.5" cy="13.2" r="1" fill="currentColor" stroke="none"/><circle cx="14.5" cy="13.2" r="1" fill="currentColor" stroke="none"/><path d="M12 8.5V5.5M9 5.5h6"/>'),
   leave: svgIcon('<path d="M14 12H5M8.5 8.5L5 12l3.5 3.5"/><path d="M13 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/>'),
   crown: svgIcon('<path d="M4.5 17.5h15L18 9l-3.8 3.2L12 6l-2.2 6.2L6 9l-1.5 8.5z"/>'),
+  shield: svgIcon('<path d="M12 3.5l7 2.5v5.2c0 4.6-3 7.9-7 9.3-4-1.4-7-4.7-7-9.3V6l7-2.5z"/>'), // ★ G6-②：平台管理员
   clip: svgIcon('<path d="M8.5 12.5l5.5-5.5a3 3 0 0 1 4.2 4.2l-7.5 7.5a5 5 0 0 1-7.1-7.1L11 4.2"/>'),
   door: svgIcon('<rect x="13" y="4" width="6" height="16" rx="1"/><path d="M3 12h7M7.5 8.5L11 12l-3.5 3.5"/>'),
   cursor: svgIcon('<path d="M5 3.5l7 16.5 2.1-6.9L21 11 5 3.5z"/>'),
@@ -1312,8 +1313,24 @@ roomBadge.addEventListener('click', async () => {
  * ────────────────────────────────────────────────────────────── */
 socket.on('ai-state', ({ state, text }) => setAiState(state, text)); // ★ 09-26b：text 供逐字字幕
 socket.on('asr-caption', ({ name, text }) => {
-  // ★ 09-27c：服务端 ASR 转写上字幕条（实时字幕体验统一；不刷聊天区）
-  showCaptionBar(name || '转写', text || '', false);
+  /* ★ 09-27c：服务端 ASR 转写上字幕条（实时字幕体验统一；不刷聊天区）
+   * ★ 09-28：三处强化——
+   *   ① 只在"字幕开着"时显示（用户关掉字幕就不打扰；服务端仍在转写、仍在喂 AI）；
+   *   ② 进本地字幕历史（标记 asr:true → 不再回传服务器，避免与服务器自己的落盘重复）；
+   *   ③ bumpBotHeard()：服务端转写是 AI"的确在听"的更强证据，兼顾听觉指示器。 */
+  if (!cap.on) return;
+  const entry = { ts: Date.now(), from: 'asr', name: name || '转写', text: text || '', asr: true };
+  capPushLog(entry);
+  showCaptionBar(entry.name, entry.text, false);
+  if (capHistoryPanel && !capHistoryPanel.classList.contains('hidden')) appendCapHistoryRow(entry);
+  bumpBotHeard();
+  /* ★ 09-30 抢话修复③：真人在说话 → 记时间戳 + AI 立即闭嘴。
+   *   排除 AI 自己（外放时服务端可能把 AI 的 TTS 回声也转写出来——那是"AI 在说"，
+   *   不是"有人在打断"，不能因此掐断它自己的下一句）。 */
+  if (!/AI 小明|ai-bot/i.test(name || '')) {
+    lastUserSpeechTs = Date.now();
+    hushAiSpeech();
+  }
 });
 
 socket.on('chat-message', ({ from, text, ts, msgId, name, ai, streamId }) => {
@@ -1323,7 +1340,10 @@ socket.on('chat-message', ({ from, text, ts, msgId, name, ai, streamId }) => {
   /* ★ 09-25：语音播报放在**去重判断之前**——因为流式回答的终态会在下一行被 early-return
    *   丢掉（增量已渲染过），若把播报放在 appendChat 里，流式答案就永远不会被念出来。
    *   这类"顺序错了功能静默失效"的坑，只能靠把它写在注释里记住。 */
-  if (from === 'ai-bot') speakAiText(text);
+  if (from === 'ai-bot') {
+    speakAiText(text);
+    maybeHintAiVoice(); // ★ 09-28：语音没开时提示一次"可以听它说话"（对话闭环的手感所在）
+  }
   // ★ 09-24：带 streamId 的是流式回答的"终态"——增量已经在同一个气泡里渲染过了，
   //   这里再插一条就是两遍。（终态仍然必要：给中途进房/丢过流事件的人兜底）
   if (streamId && aiStreamDone.has(streamId)) return;
@@ -1352,6 +1372,32 @@ const aiStreamNodes = new Map();   // streamId -> 正在打字中的气泡 DOM
 const aiStreamDone = new Set();    // 已靠增量渲染完成的 streamId（终态消息据此去重）
 const streamTraces = new Map();    // ★ 09-24e streamId -> 待补的"检索过程"文字（done 帧到达时插入气泡）
 const streamHits = new Map();      // ★ 09-25 streamId -> 待补的"证据原话"列表（同上）
+
+/* ★ 09-30：流式增量的**按帧批量刷新**（详见 ai-stream delta 分支的注释）。
+ * ▎用 Map 存 rAF id 而不是一个全局变量：理论上可以有多个流同时在跑
+ *   （一般不会，但用全局变量一旦并发就会互相取消、表现为"某个答案少字"，
+ *   这类 bug 极难复现——从一开始就按 id 隔离，代价只是多一个 Map）。 */
+const streamFlushRaf = new Map();  // streamId -> rAF id
+function scheduleStreamFlush(id, box) {
+  if (streamFlushRaf.has(id)) return;          // 本帧已排过队，继续攒批
+  streamFlushRaf.set(id, requestAnimationFrame(() => {
+    streamFlushRaf.delete(id);
+    applyStreamBuf(box);
+  }));
+}
+/** 立即刷新（done 收尾用：不能让最后几个字卡在缓冲里） */
+function flushStreamNow(id, box) {
+  const raf = streamFlushRaf.get(id);
+  if (raf) { try { cancelAnimationFrame(raf); } catch (e) { /* 无头桩可能没有 */ } streamFlushRaf.delete(id); }
+  applyStreamBuf(box);
+}
+function applyStreamBuf(box) {
+  if (!box || !box.buf) return;
+  box.textEl.classList.remove('typing');
+  box.textEl.textContent += box.buf;   // textContent 而非 innerHTML：增量是远程文本，天然免疫 XSS
+  box.buf = '';
+  chatList.scrollTop = chatList.scrollHeight;   // 与文本写在**同一帧**，只触发一次布局
+}
 
 socket.on('ai-stream', ({ id, delta, done, mock, trace, hitList }) => {
   let box = aiStreamNodes.get(id);
@@ -1382,11 +1428,23 @@ socket.on('ai-stream', ({ id, delta, done, mock, trace, hitList }) => {
     aiStreamNodes.set(id, box);
   }
   if (delta) {
-    box.textEl.classList.remove('typing');
-    box.textEl.textContent += delta;          // textContent 而非 innerHTML：增量是远程文本，天然免疫 XSS
-    chatList.scrollTop = chatList.scrollHeight;
+    /* ★ 09-30 丝滑度修复：增量**按帧批量刷**，不再每来一个字就写一次 DOM。
+     *   ▎为什么（这是"AI 打字卡"的主因，不是模型慢）：
+     *     改造前每个 delta 都执行
+     *       `textContent += delta` 然后 `chatList.scrollTop = chatList.scrollHeight`。
+     *     **读 `scrollHeight` 会强制同步布局**（forced reflow）——因为它要求浏览器
+     *     立刻算完刚刚被改动的文本的最终尺寸。于是一条 200 字的答案 =
+     *     **200 次强制 reflow**，主线程被打断 200 次，打字观感就是"一顿一顿的"。
+     *   ▎为什么合并到 rAF：一帧内的多个 delta 合成一次 DOM 写入 + 一次 scrollTop，
+     *     reflow 次数从"每 token 一次"降到"每帧至多一次"（≈60/s 上限，且通常远低于）。
+     *     逐字**视觉上依旧连续**（人眼分辨不出 16ms 内的攒批），但主线程不再被打断。
+     *   ▎为什么把 scrollTop 也挪进 flush：它和 textContent 写在同一个帧里，
+     *     浏览器只需在帧末算一次布局，而不是每写一个 token 算一次。 */
+    box.buf = (box.buf || '') + delta;
+    scheduleStreamFlush(id, box);
   }
   if (done) {
+    flushStreamNow(id, box);   // ★ 09-30：先把握在缓冲里的字刷出去，否则末尾会少一截
     box.node.classList.remove('streaming');
     const mode = mock ? 'Mock' : 'LLM';
     box.nameEl.innerHTML += `<span class="msg-ai-mode${mock ? ' mock' : ''}" title="这条答案由${mock ? '本地规则（未接 LLM）' : 'DeepSeek 模型'}生成">${mode}</span>`;
@@ -2894,8 +2952,9 @@ function initBoardActions() {
  * ▎为什么不用云 TTS：又贵又要网又要把会议内容发给第三方——
  *   而这个场景只需要"把已经确定的文本念出来"，浏览器原生能力完全够用。
  * ══════════════════════════════════════════════════════════════ */
-let aiVoiceOn = false;
-try { aiVoiceOn = localStorage.getItem('sfuAiVoice') === '1'; } catch (e) { /* 隐私模式等：默认关 */ }
+// ★ 09-27d：默认开（用户点名“语音对话”——格子有醒目开关可关；隐私模式默认开，朗读失败静默）
+let aiVoiceOn = true;
+try { aiVoiceOn = localStorage.getItem('sfuAiVoice') !== '0'; } catch (e) { /* 默认开 */ }
 
 const SPEECH_OK = typeof window !== 'undefined' && 'speechSynthesis' in window;
 
@@ -2919,10 +2978,22 @@ function speakableText(md) {
     .slice(0, 300);   // 太长的答案念不完会妨碍开会，截断
 }
 
+/* ★ 09-28：AI 说话但"语音"没开时，提示一次怎么听（对话闭环的手感所在）。
+ *   只提示一次（每次会话），避免变成骚扰；语音已开/浏览器不支持则完全不提。 */
+let aiVoiceHinted = false;
+function maybeHintAiVoice() {
+  if (aiVoiceOn || !SPEECH_OK || aiVoiceHinted) return;
+  aiVoiceHinted = true;
+  showToast('🔈 想直接"听"小明说话？点控制坞的「AI 语音」开关即可（浏览器语音合成，零依赖）');
+}
+
 function speakAiText(text) {
   if (!aiVoiceOn || !SPEECH_OK) return;
   const say = speakableText(text);
   if (!say) return;
+  /* ★ 09-30 抢话修复②：回答送达时用户**还在说话**（2.5s 内刚有字幕）→ 这轮不念。
+   *   文字照样进聊天气泡，丢的只是朗读——人跟人对话，对方话没说完就插话是失礼。 */
+  if (Date.now() - lastUserSpeechTs < 2500) return;
       try {
       /* ★ 09-26e 语音去 AI 味——三层优化：
        *  ① 音色策略：自然神经音色优先（Online (Natural) / Premium / 常见自然音色名）——
@@ -2975,6 +3046,23 @@ function speakAiText(text) {
 }
 let aiSpeakQueue = [];   // 分句朗读队列
 let aiSpeakDeadline = 0; // 本轮朗读截止时刻（超时保护）
+let lastUserSpeechTs = 0; // ★ 09-30：最近一次"有人在说话"的时刻（字幕信号驱动）
+
+/* ★ 09-30 抢话修复①：用户一开口，AI 立即闭嘴。
+ * ▎抢话的体验根源：AI 回答用浏览器 TTS 朗读（默认开），而人说完唤醒词往往还在
+ *   继续说（"小明，帮我记一下……顺便……"）——AI 的声音直接压在用户的尾句上。
+ *   人类对话的礼仪是：对方开口，我就让。
+ * ▎触发点：新字幕到达（服务端 asr-caption / 本地识别结果都算"有人在说话"）。
+ *   用字幕当 VAD，不引入任何新依赖、不加复杂度。 */
+function hushAiSpeech() {
+  if (!SPEECH_OK) return;
+  try {
+    if (aiSpeakQueue.length || window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+      aiSpeakQueue.length = 0;
+      window.speechSynthesis.cancel();
+    }
+  } catch (e) { /* 播报失败绝不影响会议功能 */ }
+}
 
 function updateAiVoiceUi() {
   const btn = $('aiVoiceBtn');
@@ -2988,6 +3076,74 @@ function updateAiVoiceUi() {
       : 'AI 语音播报（默认关）：开启后 AI 说的话会用浏览器语音念出来');
   btn.disabled = !SPEECH_OK || !myRoom;   // 不支持语音 / 还没进房 → 不可点
   if (!SPEECH_OK) btn.classList.add('ai-voice-na');
+  // ★ 09-30 抢话修复：语音开着就要有人盯"用户是否在说话"（即时闭嘴闸）；关了就撤岗
+  if (aiVoiceOn) startAiHushWatcher(); else stopAiHushWatcher();
+}
+
+/* ★ 09-30 抢话修复⑤（即时版）：会议中用 AnalyserNode 盯本地麦克风能量——
+ *   峰值连续超阈 ≈ 正在说话 → 立刻 hushAiSpeech()。字幕是 5s 段粒度（要等段结束
+ *   +转写完才到），靠字幕"闭嘴"最慢 8s；本机能量是 50ms 级的即时信号。
+ * ▎只在 AI 语音开着时运行（语音关了没人抢话，白占 CPU）；AI 没在说时循环近乎空转；
+ *   静音后轨道送来的是全零采样，天然不会误触发；设备热切换（replaceTrack）不派发
+ *   任何事件 → 在循环里比对轨道引用、变了就静默重绑。 */
+const AI_HUSH_THRESHOLD = 0.055; // 峰值阈值：说话明显越线，呼吸/键盘噪声够不着
+const AI_HUSH_FRAMES = 8;        // 连续超阈帧数（60fps 下 ≈130ms）才算"人声"而非一下碰撞
+let aiHush = { ctx: null, source: null, analyser: null, buf: null, raf: 0, track: null, hits: 0 };
+
+function bindAiHush(track) {
+  try { if (aiHush.source) aiHush.source.disconnect(); } catch (e) { /* 忽略 */ }
+  aiHush.track = track || null;
+  aiHush.analyser = null;
+  aiHush.source = null;
+  if (!track || !aiHush.ctx) return;
+  try {
+    aiHush.source = aiHush.ctx.createMediaStreamSource(new MediaStream([track]));
+    aiHush.analyser = aiHush.ctx.createAnalyser();
+    aiHush.analyser.fftSize = 512;
+    aiHush.source.connect(aiHush.analyser); // 只分析不外放（防啸叫）
+    aiHush.buf = new Float32Array(512);
+  } catch (e) { aiHush.analyser = null; }
+}
+
+function startAiHushWatcher() {
+  try {
+    if (!SPEECH_OK || !aiVoiceOn || aiHush.ctx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (typeof AC !== 'function') return;
+    aiHush.ctx = new AC();
+    if (typeof aiHush.ctx.createAnalyser !== 'function') { try { aiHush.ctx.close(); } catch (e) {} aiHush.ctx = null; return; }
+    bindAiHush(localStream && localStream.getAudioTracks()[0]);
+    const loop = () => {
+      if (!aiHush.ctx) return;
+      try {
+        // 设备热切换：轨道换了 → 静默重绑；没麦克风的阶段 analyser 为 null，空转
+        const cur = localStream && localStream.getAudioTracks()[0];
+        if (cur !== aiHush.track) bindAiHush(cur);
+        if (aiHush.analyser && window.speechSynthesis && window.speechSynthesis.speaking) {
+          aiHush.analyser.getFloatTimeDomainData(aiHush.buf);
+          let peak = 0;
+          for (let i = 0; i < aiHush.buf.length; i++) { const v = Math.abs(aiHush.buf[i]); if (v > peak) peak = v; }
+          aiHush.hits = peak > AI_HUSH_THRESHOLD ? aiHush.hits + 1 : 0;
+          if (aiHush.hits >= AI_HUSH_FRAMES) {
+            aiHush.hits = 0;
+            lastUserSpeechTs = Date.now();
+            hushAiSpeech();
+          }
+        } else {
+          aiHush.hits = 0;
+        }
+      } catch (e) { /* 看门式兜底：任何异常都不打断循环 */ }
+      aiHush.raf = requestAnimationFrame(loop);
+    };
+    aiHush.raf = requestAnimationFrame(loop);
+  } catch (e) { aiHush.ctx = null; /* 失败不影响会议 */ }
+}
+
+function stopAiHushWatcher() {
+  if (aiHush.raf) { cancelAnimationFrame(aiHush.raf); aiHush.raf = 0; }
+  try { if (aiHush.source) aiHush.source.disconnect(); } catch (e) { /* 忽略 */ }
+  try { if (aiHush.ctx) aiHush.ctx.close(); } catch (e) { /* 忽略 */ }
+  aiHush = { ctx: null, source: null, analyser: null, buf: null, raf: 0, track: null, hits: 0 };
 }
 
 function initAiVoice() {
@@ -3163,6 +3319,7 @@ function renderMembers(members) {
       badges.appendChild(s);
     };
     if (m.owner) addBadge(ICONS.crown, '房主（可移出成员）');
+    if (m.role === 'admin' && !m.owner) addBadge(ICONS.shield, '平台管理员'); // ★ G6-②：admin 徽标（房主已有 crown，不重复挂）
     if (m.sharing) addBadge(ICONS.screen, '正在共享屏幕');
     if (m.muted) addBadge(ICONS.micOff, '已静音');
     if (m.camOff) addBadge(ICONS.camOff, '摄像头已关');
@@ -3211,12 +3368,12 @@ function renderMembers(members) {
       fileBtn.addEventListener('click', () => pickFileFor(m.id));
       badges.appendChild(fileBtn);
 
-      // ★ D4：房主可以移出成员（服务器会再校验一次权限，前端只是入口）
-      if (me && me.owner) {
+      // ★ D4：房主/平台管理员可以移出成员（服务器 roleOf 再校验一次权限，前端只是入口）
+      if (me && (me.owner || me.role === 'admin')) {
         const kickBtn = document.createElement('button');
         kickBtn.className = 'mini';
         kickBtn.innerHTML = ICONS.door;
-        kickBtn.title = '移出房间（仅房主可用）';
+        kickBtn.title = me.owner ? '移出房间（房主可用）' : '移出房间（平台管理员可用）';
         kickBtn.addEventListener('click', () => kickMember(m.id));
         badges.appendChild(kickBtn);
       }
@@ -4601,10 +4758,25 @@ const aiOpBtn = $('aiOpBtn');         // ★ 09-19g C1：AI 远程操作员
  * ▎"开口说话"的语音部分复用既有 09-25 语音系统（speakAiText/语音开关），互不重复。 */
 let aiTileEl = null;
 const AI_STATE_LABEL = { idle: '聆听中…', listening: '聆听中…', thinking: '思考中…', speaking: '正在发言…', happy: '任务完成！' };
+/* ★ 09-30：把"思考中"拆成**有信息量的阶段**。
+ * ▎为什么这是最划算的体感优化：用户说的"卡"，多半不是真的慢，而是**看不出它在干什么**。
+ *   改造前整段等待只有一句静止的"思考中…"；若触发查询改写还要凭空多等 1~3 秒——
+ *   在用户眼里和卡死没有区别。摊开阶段后，等待从"黑箱"变成"有进度"，
+ *   而且每一句都**说了实话**（它确实在做这件事），不掺任何"假进度条"手法。 */
+const AI_PHASE_LABEL = {
+  retrieving: '正在翻会议记录…',
+  rewriting: '第一遍没找到，换个说法再找…',
+  generating: '正在组织回答…',
+  done: '正在发言…',
+};
 
-function setAiState(st, speechText) {
+function setAiState(st, speechText, phase) {
   if (!AI_STATES.includes(st)) return;
   aiAvatar.state = st;
+  /* ★ 09-30：思考态优先显示**具体阶段**（"正在翻会议记录…"），拿不到阶段才退回泛化文案。
+   *   阶段文案只对 thinking 生效——其它状态（聆听/发言/完成）没有阶段概念，
+   *   硬套会说出"正在翻会议记录"却其实在发言这种假话。 */
+  const thinkLabel = (st === 'thinking' && phase && AI_PHASE_LABEL[phase]) || null;
   /* ★ 09-27 说话动画切换：speaking 换"嘴部开合" talk 图，其余状态回呼吸 idle 图。
    *  两张都是透明 WebP 循环动画，直接换 src（已预加载，无白闪）。 */
   const talk = st === 'speaking';
@@ -4623,7 +4795,7 @@ function setAiState(st, speechText) {
   if (aiAvatar.rowEl) aiAvatar.rowEl.classList.toggle('speaking', st === 'speaking');
   if (aiTileEl) {
     const label = aiTileEl.querySelector('.ai-status');
-    if (label) label.textContent = AI_STATE_LABEL[st];
+    if (label) label.textContent = thinkLabel || AI_STATE_LABEL[st];
     aiTileEl.classList.toggle('speaking', st === 'speaking');
     aiTileEl.classList.toggle('thinking', st === 'thinking');
     aiTileEl.classList.toggle('happy', st === 'happy');
@@ -4697,6 +4869,8 @@ boardBtn.addEventListener('click', () => {
 // 白板画布的画笔输入三件套（坐标相对画布归一化）
 boardCanvas.addEventListener('pointerdown', (e) => {
   if (e.button === 2) return;
+  wbRectCache = boardCanvas.getBoundingClientRect();  // ★ 本笔期间缓存，避免每 move 强制 reflow
+  wbPending.length = 0;
   const p = boardPoint(e);
   boardDrawing = true;
   applyBoardOp(boardColor, 'start', p.x, p.y);
@@ -4706,12 +4880,36 @@ boardCanvas.addEventListener('pointerdown', (e) => {
 boardCanvas.addEventListener('pointermove', (e) => {
   if (!boardDrawing) return;
   const p = boardPoint(e);
+  /* ★ 09-30 性能修复：**本地点立即画**（跟手，不能等帧），但**网络发送按帧合并**。
+   *   ▎为什么必须拆开这两件事（这是白板"延迟"的根因）：
+   *     改造前每次 pointermove 都发一条 SCTP 消息 → **一次拖拽 = 300~1000 条**。
+   *     真机高回报率鼠标（500~1000Hz）下就是每秒上千条小消息，
+   *     发送缓冲排队 + 对端逐条 JSON.parse 并重绘 → 延迟随拖拽累积，越画越滞后。
+   *     本地回环测不出来（CPU 只花 9ms），**真机跨网才会显形**。
+   *   ▎做法与"远程控制"那条路径同构（ctlMove 每帧只发最新位置）——
+   *     白板此前是这个范式**唯一的缺口**。差别在于白板**不能丢点**
+   *     （丢点=笔画断裂，而鼠标移动丢中间点无所谓），所以是"按帧**打包**"而非"只留最新"。 */
   applyBoardOp(boardColor, 'draw', p.x, p.y);
-  sendBoard('draw', p);
+  wbPending.push(p);
+  if (!wbRafId) {
+    wbRafId = requestAnimationFrame(() => {
+      wbRafId = 0;
+      flushBoardPoints();
+    });
+  }
 });
+/** 把本帧累积的点**打包成一条**消息发出去（实测：300 点拖拽 302 条 → 约 5~15 条） */
+function flushBoardPoints() {
+  if (!wbPending.length) return;
+  sendBoard('draw', null, wbPending.slice());
+  wbPending.length = 0;
+}
 const boardEndStroke = () => {
   if (!boardDrawing) return;
   boardDrawing = false;
+  if (wbRafId) { cancelAnimationFrame(wbRafId); wbRafId = 0; }
+  flushBoardPoints();       // 收笔前把最后一帧的点补发掉，否则笔尾会缺一小段
+  wbRectCache = null;
   sendBoard('end');
 };
 boardCanvas.addEventListener('pointerup', boardEndStroke);
@@ -4719,8 +4917,17 @@ boardCanvas.addEventListener('pointerleave', boardEndStroke);
 // 浅底白板禁用浏览器右键菜单（与桌面区同款）
 boardCanvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
+/* ★ 09-30：笔画期间的 rect 缓存。
+ * ▎为什么必须缓存：`getBoundingClientRect()` 会**强制同步布局**（forced reflow）。
+ *   改造前每次 pointermove 都调一次 → 一次拖拽 300~1000 次强制 reflow，
+ *   叠在正在重绘的 canvas 上，主线程被拖住——这是"画起来发涩"的第二个来源。
+ *   rect 在一笔之内不会变，所以缓存是安全的；失效点只有收笔与 resize（后者已清）。 */
+let wbRectCache = null;
+let wbPending = [];        // 本帧累积的待发送点
+let wbRafId = 0;           // 待执行的 rAF id（0 = 没有排队）
+
 function boardPoint(e) {
-  const rect = boardCanvas.getBoundingClientRect();
+  const rect = wbRectCache || boardCanvas.getBoundingClientRect();
   return {
     x: Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)),
     y: Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height)),
@@ -4735,6 +4942,7 @@ function fitBoardCanvas() {
   if (!parent) return;
   const rect = parent.getBoundingClientRect();
   if (rect.width < 2) return;
+  wbRectCache = null;   // ★ 09-30：尺寸变了，缓存的那份 rect 立即失效（否则坐标会错位）
   const dpr = window.devicePixelRatio || 1;
   boardCanvas.width = Math.round(rect.width * dpr);
   boardCanvas.height = Math.round((rect.height - 46) * dpr); // 减标题栏高度
@@ -4744,16 +4952,31 @@ function fitBoardCanvas() {
   ctx.lineJoin = 'round';
   redrawBoard();
 }
-function applyBoardOp(color, op, x, y) {
+function applyBoardOp(color, op, x, y, batch) {
   if (op === 'start') {
     boardStrokes.push({ color, pts: [{ x, y }] });
     drawBoardDot(color, x, y);
   } else if (op === 'draw') {
     const s = boardStrokes[boardStrokes.length - 1];
     if (!s) return;
-    const p0 = s.pts[s.pts.length - 1];
-    s.pts.push({ x, y });
-    drawBoardSegment(s.color, p0.x, p0.y, x, y);
+    /* ★ 09-30：支持**一批点**一次画完（对端按帧打包发来的）。
+     *   ▎为什么要一批一起画而不是逐点调：逐个点会变成 N 次 beginPath/stroke，
+     *     而连续的段本可以用**一条路径**一次描边——canvas 的 stroke 调用开销
+     *     主要在状态设置与路径提交，合并后 GPU/光栅化只有一次。
+     *   ▎同时把点一次 push 进账本：账本是 undo/重绘的依据，必须与画出来的严格一致。 */
+    const list = batch && batch.length ? batch : [{ x, y }];
+    const ctx = boardCanvas.getContext('2d');
+    const { w, h } = boardCssSize();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    let p0 = s.pts[s.pts.length - 1];
+    ctx.moveTo(p0.x * w, p0.y * h);
+    for (const pt of list) {
+      s.pts.push({ x: pt.x, y: pt.y });
+      ctx.lineTo(pt.x * w, pt.y * h);
+    }
+    ctx.stroke();   // ← 整批只描一次边（不是每段一次）
   } else if (op === 'undo') {
     for (let i = boardStrokes.length - 1; i >= 0; i--) {
       if (boardStrokes[i].color === color) { boardStrokes.splice(i, 1); break; }
@@ -4764,16 +4987,8 @@ function applyBoardOp(color, op, x, y) {
     redrawBoard();
   }
 }
-function drawBoardSegment(color, x0, y0, x1, y1) {
-  const { w, h } = boardCssSize();
-  const ctx = boardCanvas.getContext('2d');
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(x0 * w, y0 * h);
-  ctx.lineTo(x1 * w, y1 * h);
-  ctx.stroke();
-}
+/* ★ 09-30：`drawBoardSegment`（单段描边）已删除——它的两个调用点都改成了
+ *   "一批点一次描边"，留着就是幽灵代码（防 AI 通病五戒之一：改完要清死代码）。 */
 function drawBoardDot(color, x, y) {
   const { w, h } = boardCssSize();
   const ctx = boardCanvas.getContext('2d');
@@ -4786,14 +5001,23 @@ function redrawBoard() {
   const { w, h } = boardCssSize();
   const ctx = boardCanvas.getContext('2d');
   ctx.clearRect(0, 0, w, h);
+  /* ★ 09-30：**一笔一条路径**（而不是一段一次 stroke）。
+   *   ▎为什么：改造前每个线段都自己 beginPath/stroke——一笔 500 点就是 500 次描边，
+   *     撤销/清空/resize 时整屏重放直接卡住（实测递增到 4.3ms 且随点数线性增长）。
+   *     合并成一条路径后，同一笔的所有线段一次提交，开销与**笔数**相关而非**点数**。 */
   for (const s of boardStrokes) {
-    for (let i = 0; i < s.pts.length; i++) {
-      const p = s.pts[i];
-      if (i === 0) drawBoardDot(s.color, p.x, p.y);
-      else {
-        const q = s.pts[i - 1];
-        drawBoardSegment(s.color, q.x, q.y, p.x, p.y);
-      }
+    if (!s.pts.length) continue;
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(s.pts[0].x * w, s.pts[0].y * h, 2.2, 0, Math.PI * 2);   // 起笔圆点
+    ctx.fillStyle = s.color;
+    ctx.fill();
+    if (s.pts.length > 1) {
+      ctx.beginPath();
+      ctx.moveTo(s.pts[0].x * w, s.pts[0].y * h);
+      for (let i = 1; i < s.pts.length; i++) ctx.lineTo(s.pts[i].x * w, s.pts[i].y * h);
+      ctx.stroke();
     }
   }
 }
@@ -4808,15 +5032,29 @@ function handleBoardMessage(from, message) {
     const text = typeof message === 'string' ? message : new TextDecoder().decode(message);
     const msg = JSON.parse(text);
     if (msg.type !== 'board') return;
-    applyBoardOp(msg.color || boardColorFor(from), msg.op, msg.x, msg.y);
+    /* ★ 09-30：优先读**批量点**（新格式 pts 数组），退回单点（老格式 x/y）。
+     *   ▎为什么保留单点分支：协议升级必须**向后兼容**——
+     *     房间里只要有一个旧版本客户端（没刷新页面的人）还在，它发的就是单点消息。
+     *     不兼容的话会表现为"某些人的笔迹画不出来"，极难排查。
+     *     多花的代价只是一个 `||` 判断。 */
+    applyBoardOp(msg.color || boardColorFor(from), msg.op, msg.x, msg.y, msg.pts);
   } catch (e) { /* 坏消息不炸频道 */ }
 }
-function sendBoard(op, p) {
+function sendBoard(op, p, batch) {
   if (!boardDataProducer || boardDataProducer.closed) return;
-  boardDataProducer.send(JSON.stringify({
+  const payload = {
     type: 'board', msgId: `${socket.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-    op, x: p ? p.x : undefined, y: p ? p.y : undefined, color: boardColor,
-  }));
+    op, color: boardColor,
+  };
+  if (p) { payload.x = p.x; payload.y = p.y; }
+  /* ★ 09-30：一批点走 `pts`（坐标已四舍五入到 3 位小数）。
+   *   ▎为什么四舍五入：归一化坐标本来就只有 3~4 位有效数字（画布 900px → 1px ≈ 0.001），
+   *     而 JS 默认会序列化成 17 位小数（"0.12345678901234567"）——
+   *     每条消息平白多出 3~4 倍字节。对**按帧打包的大批点**尤其致命。 */
+  if (batch && batch.length) {
+    payload.pts = batch.map((q) => [Number(q.x.toFixed(3)), Number(q.y.toFixed(3))]);
+  }
+  boardDataProducer.send(JSON.stringify(payload));
 }
 
 /* ──────────────────────────────────────────────────────────────
@@ -5367,6 +5605,12 @@ fxBgFile.addEventListener('change', () => {
  * ────────────────────────────────────────────────────────────── */
 const cap = {
   on: false,           // 字幕开关（=true 时识别器断了要自动拉起）
+  /* ★ 09-28 字幕的两条路径（用户点名"不要再用浏览器的了"）：
+   *   'server'  = 服务端 whisper 转写（首选：不依赖浏览器厂商云端、不吃本页 CPU、
+   *               而且和 AI 的"耳朵"是同一条链路——转写同时喂字幕/AI 看板/问答）；
+   *   'browser' = 浏览器 Web Speech（兜底：只在服务器没装 whisper 时才用）；
+   *   'off'     = 关。 */
+  mode: 'off',
   rec: null,           // 当前 SpeechRecognition 实例
   restartTimer: 0,     // onend 自动重启的防抖定时器
   hideTimer: 0,        // 字幕条"8 秒无字幕自动隐藏"定时器
@@ -5473,19 +5717,100 @@ function renderCapDiag() {
   }
 }
 
-function toggleCaptions() {
+/* ★ 09-28：字幕路径的**显式覆盖口**（测试与排障用，沿用 window.CAP_WD_MS 的惯例）。
+ *   __SFU_ASR__ = true  → 强制服务端转写模式；false → 强制浏览器模式；不设 = 按 /config.json。
+ *   为什么要这个口子：冒烟测试要能分别验证"两条路"，而 /config.json 是记忆化拉取
+ *   （进程内只拉一次），不能在一条测试里靠改 fetch 桩来回切换。 */
+function asrPathForced() {
+  try {
+    const v = window.__SFU_ASR__;
+    return typeof v === 'boolean' ? v : null;
+  } catch (e) { return null; }
+}
+
+/* ★ 09-28：/config.json 的**记忆化承诺**——"开字幕"必须先知道服务器有没有 ASR 才能选路径。
+ *   原来页面加载时 fire-and-forget，用户点得早就读到 false → 又去启浏览器识别
+ *   （实测反馈的"还是没转到 whisper"）。现在点击时 await 同一个 promise（不重复请求）。 */
+let asrCfgPromise = null;
+let serverAsrKnown = false; // ★ 09-28：/config.json 是否已落地（决定"点击时要不要 await"）
+function ensureAsrConfig() {
+  if (!asrCfgPromise) {
+    asrCfgPromise = fetch('/config.json', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((cfg) => {
+        if (cfg) {
+          serverAsrEnabled = !!cfg.asrEnabled;
+          if (Array.isArray(cfg.iceServers)) sfuIceServers = cfg.iceServers;
+          if (typeof cfg.videoSvc === 'boolean') sfuVideoSvc = cfg.videoSvc;
+          if (typeof cfg.aiEnabled === 'boolean') { sfuAiEnabled = cfg.aiEnabled; updateAiModeUi(); }
+          if (cfg.lanUrl) lanUrl = cfg.lanUrl;
+        } else {
+          /* ★ 09-30：拉取失败**不缓存失败结果**（asrCfgPromise 归零）——否则服务器明明有
+           *   whisper，一次网络抖动就让用户永远落进"浏览器识别"的错误路径（实测反馈
+           *   "调用的还是浏览器的 Speech"的一个可能来源）。下次点击会重新拉一次。 */
+          asrCfgPromise = null;
+        }
+        serverAsrKnown = true;   // 成功或失败都算"问过了"（失败按 asrEnabled=false 兜底）
+        return cfg;
+      })
+      .catch(() => { serverAsrKnown = true; asrCfgPromise = null; return null; });
+  }
+  return asrCfgPromise;
+}
+
+/* ★ 09-28：服务端转写模式（首选路径）——
+ * ▎为什么不再启动浏览器识别（用户明确要求 + 真实现状）：
+ *   Web Speech 走浏览器厂商云端，国内网络经常不可达（实测报 network 错误），
+ *   而 whisper 就在本机跑：不上云、不吃本页 CPU、字幕与 AI 的"耳朵"是同一条链路
+ *   （服务端转写同时喂字幕条 / AI 看板 / @ai 问答）——一条数据流服务三件事。
+ * ▎为什么自动邀请 AI：服务端音频管线是挂在"AI 小明的耳朵"上的（bot 在会才有管线），
+ *   所以要字幕就得把 AI 请进来。这也正是"AI 参会"的自然入口。
+ * ▎边界（诚实）：浏览器端这个开关只控制"显示与否"，服务器在 AI 在场时始终在转写；
+ *   要真正停下，请点 🤖 送走 AI。 */
+function enableServerCaptionMode() {
+  cap.on = true;
+  cap.mode = 'server';
+  cap.neterr = 0;
+  if (!cap.sentry.startedAt) cap.sentry.startedAt = Date.now();
+  setIconBtn(capBtn, ICONS.cc, '服务端字幕');
+  renderCapStatus('🖥️ 服务器转写（whisper）', 'live');
+  reportMyState({ caption: true });
+  log('💬 已启用服务端转写：你的麦克风音频经 SFU 送到服务器，由本机 whisper 识别后上字幕（不走浏览器云端）');
+  if (!lastMembers.some((m) => m.isBot)) {
+    socket.emit('ai-join'); // 任何成员都可邀请（服务器侧有守卫；仅服务端转写需要它在场）
+    log('🤖 已自动邀请 AI 小明入会——它是服务端转写的"耳朵"（送走 AI 即停止转写）');
+  }
+  showToast('🖥️ 服务端转写已开启：正常说话即可上字幕（本机 whisper，不依赖浏览器识别）');
+}
+
+async function toggleCaptions() {
   if (cap.on) {
     // 关：不再自动重启 + 停识别器（onend 会触发，但 wantRestart 已 false）
+    const wasServer = cap.mode === 'server';
     cap.on = false;
+    cap.mode = 'off';
     clearTimeout(cap.restartTimer);
     cap.restartTimer = 0; // ★ 第 30 步：排程句柄归零——看门狗靠「无排程」判断是否该接管
     if (cap.rec) { try { cap.rec.stop(); } catch (e) { /* 已停则忽略 */ } cap.rec = null; }
     setIconBtn(capBtn, ICONS.cc, '字幕');
-    renderCapStatus('未开启');
+    renderCapStatus(wasServer ? '🖥️ 服务器仍在转写' : '未开启');
     reportMyState({ caption: false }); // ★ 09-17b：字幕开关进房间状态机（成员列表 💬 徽标）
-    log('💬 实时字幕已关闭');
+    log(wasServer
+      ? '💬 已隐藏字幕（服务器在 AI 在场时仍在转写并记入账本；要彻底停止请点 🤖 送走 AI）'
+      : '💬 实时字幕已关闭');
     return;
   }
+
+  /* ★ 09-28：先确认服务器有没有 ASR，再决定走哪条路——
+   *   有 whisper → 服务端转写（默认，不再碰浏览器识别）；
+   *   没有      → 才退回浏览器 Web Speech（下面的自检与退避逻辑原样保留）。
+   * ▎09-30 改为**无条件 await**：记忆化后除第一次外都是微任务级开销（肉眼不可感），
+   *   但能根除"页面刚加载、配置未到、用户抢先点击 → 误进浏览器模式"的时序竞态。
+   *   显式覆盖（window.__SFU_ASR__）优先级最高——测试/排障用。 */
+  const forced = asrPathForced();
+  if (forced === null) await ensureAsrConfig();
+  const useServer = forced === null ? serverAsrEnabled : forced;
+  if (useServer) { enableServerCaptionMode(); return; }
 
   /* ★ 09-17c：开之前先自检——把"必然失败"扼杀在点击那一刻，并直接告诉他怎么修 */
   const pre = capPreflight();
@@ -5500,6 +5825,7 @@ function toggleCaptions() {
   }
 
   cap.on = true;
+  cap.mode = 'browser';
   cap.neterr = 0;               // 重试预算清零
   if (!cap.sentry.startedAt) cap.sentry.startedAt = Date.now(); // ★ 第 30 步：值守计时起点（首次开字幕）
   setIconBtn(capBtn, ICONS.cc, '关字幕');
@@ -5534,6 +5860,10 @@ function startCaptionRec() {
       else interim += text;                  // 半句：只本地跳动，不广播
     }
     if (interim) { showCaptionBar(myDisplayName || '我', interim, true); renderCapStatus('🎙️ 识别中…', 'live'); }
+    /* ★ 09-30 抢话修复④：浏览器识别模式下本地结果同样是"我在说话"信号
+     *   （半句也算——用户一开口就该让 AI 闭嘴，不必等整句定稿）。 */
+    if (interim || event.results.length) lastUserSpeechTs = Date.now();
+    if (interim) hushAiSpeech();
   };
   rec.onend = () => {
     cap.rec = null;
@@ -5667,6 +5997,15 @@ function handleCaptionMessage(from, msg) {
 
 function capPushLog(entry) {
   cap.log.push(entry);
+  /* ★ 09-28：服务端转写（entry.asr = true）**只进本地历史、不再上行**。
+   * ▎为什么不回传：服务器在转写那一刻已经自己落盘了（那是权威副本，feedBoard 也喂过了）；
+   *   再回传一次就是同一条字幕重复入库——纪要/看板的统计会翻倍（"谁发言多"直接失真）。
+   *   单独记 serverTotal：值守统计里能分清"本地上行"与"服务端转写"两个来源。 */
+  if (entry && entry.asr) {
+    cap.sentry.serverTotal = (cap.sentry.serverTotal || 0) + 1;
+    if (cap.log.length > 500) cap.log.splice(0, cap.log.length - 500);
+    return;
+  }
   /* ★ 09-25 重构：把"保留历史"与"上传队列"**拆成两个独立的东西**。
    * ▎为什么必须拆（原本是一体的，且拆之前做不到"实时上行"）：
    *   原实现是 `cap.log` 既当热窗口又当上传队列——只有它涨到 500 条才把旧的剪去上传。
@@ -5955,6 +6294,7 @@ const capReportBtn = $('capReportBtn');   // ★ 第 31 步：值守日报按钮
 cap.sentry = {
   startedAt: 0,    // 首次开字幕的时间戳（值守计时起点；关字幕不清零——一夜的账要留着看）
   total: 0,        // 累计入账条数（含已归档的——内存里已经没有的也算，见 capPushLog）
+  serverTotal: 0,  // ★ 09-28：服务端 whisper 转写的条数（这条不上行，单独记）
   restarts: 0,     // 看门狗拉起识别器的次数（onend 的 300ms 常规续命不算在内）
   queue: [],       // ★ 09-25：待上行队列（与 cap.log 解耦；见 capPushLog 的注释）
   batch: [],       // 待落盘的溢出字幕（POST 失败滞留这里，兜底重试会再发）
@@ -6028,7 +6368,10 @@ let capWdStreak = 0;
 function capSentryWatchdog() {
   setTimeout(() => {
     try {
-      if (cap.on && !cap.rec && !cap.restartTimer) {
+      /* ★ 09-28：只在**浏览器识别模式**下才拉起——服务端转写模式 rec 永远是 null，
+       *   不设这道闸门看门狗会每 30s 偷偷启动一个 Web Speech 识别器（"不要再用浏览器的"
+       *   就白改了，而且用户会看到云端报错）。 */
+      if (cap.on && cap.mode === 'browser' && !cap.rec && !cap.restartTimer) {
         cap.sentry.restarts++;
         log(`🌙 值守看门狗：识别器失联，第 ${cap.sentry.restarts} 次自动拉起`);
         startCaptionRec();               // 内部有 try/catch，启动失败不会抛出来
@@ -6053,6 +6396,7 @@ function renderCapSentry() {
   const dur = mins >= 60 ? `${Math.floor(mins / 60)}h${String(mins % 60).padStart(2, '0')}m` : `${mins}m`;
   capSentryStats.textContent =
     `🌙 值守 ${dur} · ${s.total} 条 · 重启 ${s.restarts} · 已归档 ${s.archived}` +
+    ((s.serverTotal || 0) ? ` · 服务端转写 ${s.serverTotal}` : '') + // ★ 09-28：服务端 whisper 那条路的条数
     (s.drops ? ` · 丢 ${s.drops}` : '');
 }
 setInterval(renderCapSentry, 30000);
@@ -6778,12 +7122,9 @@ logTitle.addEventListener('click', () => {
 // ★ 09-27d：页面加载即拉 /config.json——serverAsrEnabled 必须在"开字幕"**之前**
 //   就位（原来只在进房 initSFU 时拉，用户在预览页/进房前开字幕时降级依据是 false，
 //   Web Speech 失败就会走旧退避路径反复报错——实测反馈的"还是没转到 whisper"）。
-(async () => {
-  try {
-    const cfg0 = await fetch('/config.json').then((r) => r.json());
-    serverAsrEnabled = !!cfg0.asrEnabled;
-  } catch (e) { /* 离线时按 false */ }
-})();
+// ★ 09-28：改为预热 ensureAsrConfig() 的**记忆化 promise**——点击时还会 await 一次，
+//   保证"点得比网络快"也不会误判（见 toggleCaptions 开头的 await）。
+ensureAsrConfig();
 
 startLocalMedia();
 // ★ 第 33 步：非安全上下文时弹出安全提示横幅。放在 startLocalMedia 之后调用，
