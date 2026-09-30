@@ -1233,6 +1233,35 @@ const emit = (ev, payload) => {
   ok('09-25 AI 语音会先洗掉 markdown 再念（不念出星号与表格竖线）',
     /function speakableText/.test(clientSrc) && /\\\*\\\*\(\[\^\*\]\*\)\\\*\\\*/.test(clientSrc));
 
+  /* ---- ★ 09-30 远程画面自适应帧率：把**控制律**钉死 ----
+   * ▎为什么这类性能逻辑必须单测：它是整个自适应机制里唯一会"调错"的地方，
+   *   调错的表现是画面忽快忽慢（比固定帧率更难受），而在真机上极难复现。
+   *   抽成纯函数 `rdDecideFps` 后就能穷举边界——性能代码同样需要确定性。 */
+  const ctxRun = (expr) => vm.runInContext(expr, ctx);
+  ok('09-30 自适应控制律已抽成纯函数（可断言，不靠"跑起来看着还行"）',
+    typeof ctxRun('typeof rdDecideFps') === 'string' && ctxRun('typeof rdDecideFps') === 'function');
+  // 链路好（帧率跟得上 + RTT 低）→ 升
+  ok('09-30 跟得上且 RTT 低 → 升 2 帧', ctxRun('rdDecideFps({actualFps:12, targetFps:12, rttMs:30})') === 14);
+  // 明显跟不上 → 降
+  ok('09-30 帧率只有目标 60% 以下 → 降 2 帧', ctxRun('rdDecideFps({actualFps:5, targetFps:12, rttMs:30})') === 10);
+  // RTT 高 → 降（即使帧率看着还行）
+  ok('09-30 RTT > 250ms → 降（高延迟下提帧率只会让延迟更糟）',
+    ctxRun('rdDecideFps({actualFps:12, targetFps:12, rttMs:400})') === 10);
+  // 死区：跟不上不下、也不升（防震荡）
+  ok('09-30 处于死区（60%~90%）→ 保持不动（防震荡是自适应的生命线）',
+    ctxRun('rdDecideFps({actualFps:9, targetFps:12, rttMs:50})') === 12);
+  // RTT 未测到（null）时按"链路未知"处理：跟得上就允许升
+  ok('09-30 RTT 未知时也安全（有样本就按帧率判，不因缺数据卡死）',
+    ctxRun('rdDecideFps({actualFps:12, targetFps:12, rttMs:null})') === 14);
+  // 上下界钳制
+  ok('09-30 上限钳制在 24fps', ctxRun('rdDecideFps({actualFps:30, targetFps:24, rttMs:10})') === 24);
+  ok('09-30 下限钳制在 6fps（再低就不叫"实时画面"了）',
+    ctxRun('rdDecideFps({actualFps:1, targetFps:6, rttMs:500})') === 6);
+  // 门禁：控制端发出的帧率建议必须被限制在合法区间（服务器与代理各钳一次）
+  ok('09-30 建议值经服务器与代理双重钳制（控制端不能传任意值改被控端行为）',
+    /Math\.max\(2, Math\.min\(24/.test(fs.readFileSync(path.join(__dirname, '..', 'sfu', 'server.js'), 'utf8'))
+    && /Math\.max\(2, Math\.min\(24/.test(fs.readFileSync(path.join(__dirname, '..', 'agent', 'index.js'), 'utf8')));
+
   /* ════════════════════════════════════════════════════════════════
    * ★ 09-24 真远程桌面（控制端控制台）—— 前端契约断言
    *   ▎这一组守的是"两条控制路径不能串"：控制代理 = 真远程桌面控制台（canvas + 真注入），

@@ -25,7 +25,13 @@ const fs = require('fs');
 const { Cdp } = require('../agent/cdp');
 const { RemoteAgent } = require('../agent/index');
 
-const SERVER = 'http://127.0.0.1:3001';
+/* ★ 09-30：端口可配 + 占用时**明确拒绝**（同 test-agent 的修法，见其文件顶部说明）。
+ * ▎这里原先没有"复用"分支，但仍有**同一个隐忧**：端口被占时 spawn 出来的服务器
+ *   会 EADDRINUSE 直接退出，而下面的 `if (await ping()) break` **照样能 ping 通**
+ *   ——ping 到的是**端口上那个别人的服务器**。于是测试通过，验的却不是本次代码。
+ *   **假绿比假红危险得多**：假红会有人去查，假绿没有任何人会发现。 */
+const PORT = Number(process.env.TEST_E2E_PORT) || 3013;
+const SERVER = `http://127.0.0.1:${PORT}`;
 const OUT = path.join(os.tmpdir(), 'wb-rd-shots');
 fs.mkdirSync(OUT, { recursive: true });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -97,8 +103,17 @@ async function waitJs(cdp, expr, timeout = 20000, label = '') {
   try { if (process.stdin) process.stdin.isTTY = false; } catch (e) {}
 
   console.log('① 起服务器…');
+  /* ★ 09-30：先确认端口是空的。被占就**明确拒绝**，绝不"ping 通了就用"
+   *   （那样可能是别人的服务器，测试会假绿）。 */
+  if (await ping()) {
+    console.log(`\n❌ ${PORT} 端口已被占用——本脚本需要"自己起的、跑本次代码的"服务器，拒绝继续。\n`);
+    console.log(`   修法：先关掉占用 ${PORT} 的进程（netstat -ano | findstr :${PORT} → taskkill /F /PID <PID>），`);
+    console.log('        或换端口跑：TEST_E2E_PORT=3014 npm run test:e2e\n');
+    process.exit(1);
+  }
   serverProc = spawn(process.execPath, [path.join(__dirname, '..', 'sfu', 'server.js')], {
     env: { ...process.env,
+      PORT: String(PORT),
       // ★ 09-30：测试不启 HTTPS（3443 被占会让服务器 process.exit(1)，表现为"服务器未就绪"+一屏端口提示，看着像测试坏了、实则环境冲突）
       SFU_NO_HTTPS: '1', AI_FORCE_MOCK: '1', DB_FILE: TEST_DB_FILE, USERS_FILE_LEGACY: TEST_LEGACY_USERS },
     cwd: path.join(__dirname, '..'), stdio: ['ignore', 'ignore', 'pipe'],

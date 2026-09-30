@@ -9,7 +9,7 @@
   <link rel="manifest" href="manifest.webmanifest" />
   <meta name="theme-color" content="#14100a" />
   <title>會 · 智能多人视频会议（WebRTC SFU）</title>
-  <link rel="stylesheet" href="style.css?v=20260927b" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存（本次为第 33 步横幅样式） -->
+  <link rel="stylesheet" href="style.css?v=20260930" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存（本次为 09-30 设备码入口 + 画质档样式） -->
 </head>
 <body>
   <!-- ★ 09-24（第 33 步）安全上下文提示横幅 —— 只在 http + IP 访问时出现。
@@ -84,7 +84,26 @@
         <button id="authRegisterBtn" class="btn">注 册</button>
       </div>
       <button id="authGuestBtn" class="auth-guest">游客进入（不登录）→</button>
+      <!-- ★ 09-30 借鉴 billd-desk：远程控制设备码直连入口（不用先开会） -->
+      <button id="authDeskBtn" class="auth-guest">🖥️ 用设备码远程控电脑 →</button>
       <div id="authMsg" class="auth-msg"></div>
+    </div>
+  </div>
+
+  <!-- ★ 09-30 借鉴 billd-desk 的「设备码配对」：主控端只输设备码(+连接密码)即可直连被控桌面，
+       不用先建房/进会议。被控端由 `node agent/index.js` 启动后打印设备码。 -->
+  <div id="deskOverlay" class="auth-overlay hidden">
+    <div class="auth-card">
+      <div class="auth-caps">Remote Desktop · Pair by Code</div>
+      <div class="auth-title">远程桌面</div>
+      <div class="auth-sub">在被控电脑上运行桌面代理拿到「设备码」，这里输码即可连接（可设连接密码）</div>
+      <input id="deskCode" class="room-input auth-input" placeholder="设备码（6 位数字）" maxlength="6" inputmode="numeric" autocomplete="off" />
+      <input id="deskPass" class="room-input auth-input" type="password" placeholder="连接密码（被控端没设就留空）" maxlength="64" autocomplete="off" />
+      <div class="auth-btns">
+        <button id="deskConnectBtn" class="btn primary">连 接</button>
+        <button id="deskBackBtn" class="btn">返 回</button>
+      </div>
+      <div id="deskMsg" class="auth-msg"></div>
     </div>
   </div>
 
@@ -540,6 +559,13 @@
       <input id="rdUrl" class="rd-url" placeholder="输入网址后回车，例：bilibili.com" spellcheck="false" autocomplete="off">
       <button id="rdGo" class="btn rd-ibtn" title="打开网址">前往</button>
       <button id="rdMax" class="btn rd-ibtn" title="最大化对方浏览器窗口">⛶</button>
+      <!-- ★ 09-30 画质档（流畅/标准/高清/自动）：走 remote-input 的 {kind:'quality'} 老通道新语义 -->
+      <span class="rd-q">
+        <button id="rdQAuto" class="btn rd-ibtn is-on" title="自动：按实测帧率弱网降档">自动</button>
+        <button id="rdQSmooth" class="btn rd-ibtn" title="流畅：5fps 低画质，公网/弱网用">流畅</button>
+        <button id="rdQStd" class="btn rd-ibtn" title="标准：12fps 中画质">标准</button>
+        <button id="rdQHD" class="btn rd-ibtn" title="高清：20fps 高画质，局域网用">高清</button>
+      </span>
       <span id="rdState" class="rd-state">连接中…</span>
       <button id="rdRelease" class="btn danger">退出控制</button>
     </header>

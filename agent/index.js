@@ -52,6 +52,9 @@ function parseArgs(argv) {
     quality: 55,
     fps: 12,
     durationMs: 30 * 60 * 1000, // 单次授权时长，默认 30 分钟（和限时授权 A6 一致）
+    code: '',               // ★ 09-30 设备码：给定则用固定码，留空 = 服务器现生成
+    connectPassword: '',    // ★ 09-30 连接密码（主控进得来要输对；空 = 免密）
+    securePassword: '',     // ★ 09-30 安全密码（非空 = 无人值守自动放行）
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -67,6 +70,9 @@ function parseArgs(argv) {
       case '--quality': out.quality = Math.max(20, Math.min(90, Number(next()) || 55)); break;
       case '--fps': out.fps = Math.max(2, Math.min(30, Number(next()) || 12)); break;
       case '--minutes': out.durationMs = Math.max(1, Number(next()) || 30) * 60 * 1000; break;
+      case '--code': out.code = String(next() || '').trim(); break;
+      case '--connect-password': out.connectPassword = next() || ''; break;
+      case '--secure-password': out.securePassword = next() || ''; break;
       case '--headless': out.headless = true; break;
       case '--auto-allow': out.autoAllow = true; break;
       case '-h': case '--help': out.help = true; break;
@@ -79,13 +85,17 @@ function parseArgs(argv) {
 const USAGE = `
 被控端桌面代理 —— 让远端的手机/电脑真真切切操作你这台电脑的浏览器
 
-用法：
-  node agent/index.js --room 123456 [选项]
+用法（★ 09-30 二选一）：
+  node agent/index.js                        # 设备码模式（推荐）：启动即得一个设备码，主控端输码即连
+  node agent/index.js --room 123456 [选项]   # 老用法：进一个已建好的会议房间
 
 选项：
-  --room <6位房间号>   必填。先在被控电脑的浏览器里建好房间，再把房间号填这里
+  --code <6位数字>     设备码模式下固定设备码（重连不变）；默认服务器现生成
+  --connect-password <pw>  连接密码：主控端要输对才进得来（空 = 免密）
+  --secure-password <pw>   安全密码：非空 = 无人值守，主控端输这个码直接自动放行、无需按 y
+  --room <6位房间号>   老用法。先在被控电脑的浏览器里建好房间，再把房间号填这里
   --server <地址>      会议服务器，默认 http://127.0.0.1:3001
-  --password <密码>    房间密码（房间设了密码就要填）
+  --password <密码>    房间密码（老用法房间设了密码才填）
   --name <名字>        成员列表里显示的名字，默认取本机主机名
   --url <网址>         被控浏览器启动时打开的页面，默认 about:blank
   --fps <2~30>         画面帧率上限，默认 12（公网建议 6~8）
@@ -94,6 +104,8 @@ const USAGE = `
   --auto-allow         自动放行控制请求（演示无人值守用；有风险，见文档）
   --headless           无头模式（不出窗口，测试用）
   -h, --help           看这段说明
+
+提示：控制端在浏览器页面「远程桌面」入口输 设备码(+连接密码) 即可连，不用先开会。
 `;
 
 /* =====================================================================================
@@ -129,6 +141,16 @@ function decodeCtlFrame(buf) {
 
 const BTN_NAME = ['left', 'middle', 'right', 'left'];    // 帧里的 btn: 0=左 1=中 2=右
 
+/* ★ 09-30 借鉴 billd 的"画质档"：把散落的 quality/fps/尺寸收成三档预设，
+ *   控制端可实时切（走 remote-input 的 {kind:'quality'} 新语义），弱网时自动降档。
+ *   取值依据：CDP screencast 是 JPEG 逐帧，公网带宽是第一瓶颈——
+ *     流畅档压到 5fps/q30（滚动/看视频不卡），高清档 20fps/q80（局域网看细节）。 */
+const QUALITY_PRESETS = {
+  smooth:   { quality: 30, fps: 5,  maxWidth: 1280, maxHeight: 800 },
+  standard: { quality: 55, fps: 12, maxWidth: 1600, maxHeight: 1000 },
+  hd:       { quality: 80, fps: 20, maxWidth: 1920, maxHeight: 1200 },
+};
+
 /* =====================================================================================
  *  三、RemoteAgent 主体
  * ===================================================================================== */
@@ -148,6 +170,10 @@ class RemoteAgent {
     this._pendingReq = null;
     this._allowAll = cfg.autoAllow;      // 运行期间可被终端命令切换
     this.exitOnShutdown = false;         // ★ 只有 CLI 入口才置 true（被 require 时不能随便 exit）
+    // ★ 09-30 设备码：没给 --room 就走 desk-register（服务器替这台设备建私有桌面房、发设备码）
+    this.deskMode = !cfg.room;
+    this.deviceCode = '';
+    this.qualityPreset = 'standard';     // 当前画质档（供 status/自适应回退）
   }
 
   log(...a) { console.log(...a); }
@@ -198,38 +224,60 @@ class RemoteAgent {
     });
   }
 
-  /* 以"桌面代理"身份进房 —— 服务器用 agent-hello 而不是 join-room，
-   * 就是为了能在成员列表里把"机器"和"人"分开显示（🖥️ 徽标、"控制这台电脑"按钮文案）。 */
+  /* 以"桌面代理"身份进房 —— 两条路（★ 09-30 借鉴 billd 加了"设备码"这条）：
+   *   ① 兼容老用法：--room 指定了房间 → agent-hello 进那个既有会议房（人先建房再抄号）。
+   *   ② 设备码用法（推荐）：没给 --room → desk-register，服务器替这台设备建一个私有桌面房，
+   *      回一个稳定的「设备码」，主控端只输码+连接密码就能连，不用再演"开会"。 */
   hello() {
-    this.sock.emit('agent-hello', {
-      roomNumber: this.cfg.room,
-      password: this.cfg.password,
-      name: this.cfg.name,
-      platform: `${process.platform} ${os.release()}`,
-      browser: this.cdp.browserVersion || '',
-    }, (res) => {
-      /* ⚠️ 这里有个必须记住的约定（踩过）：socket.io 的"请求-应答"回调收到的是
-       *   `{ data: ... }` 或 `{ error: '...' }` **包了一层**，
-       *   不是直接的数据对象。我一开始写成 `res.roomNumber` / `res.ok === false`，
-       *   结果是：**进房失败也照样打印"已就绪"，房间号还显示 undefined** ——
-       *   又是一次"假成功"（同 joinRoom 那个 bug 一个家族）。
-       *   教训：跨进程/跨语言的接口，第一件事是把返回结构打出来看一眼，别靠猜。 */
-      if (!res || res.error) {
-        this.log(`❌ 进房失败：${(res && res.error) || '无应答（服务器没回？）'}`);
-        return this.shutdown('进房失败');
-      }
-      const data = res.data || {};
-      this.roomNumber = data.roomNumber;
-      this.log('');
-      this.log('  ┌──────────────────────────────────────────────────────────┐');
-      this.log('  │  🖥️  桌面代理已就绪，现在等控制端来连                      │');
-      this.log('  └──────────────────────────────────────────────────────────┘');
+    const platform = `${process.platform} ${os.release()}`;
+    const browser = this.cdp.browserVersion || '';
+
+    // ① 老用法：进指定房号
+    if (!this.deskMode) {
+      this.sock.emit('agent-hello', {
+        roomNumber: this.cfg.room, password: this.cfg.password, name: this.cfg.name,
+        platform, browser,
+      }, (res) => this.onHelloAck(res, '房间号'));
+      return;
+    }
+
+    // ② 设备码注册（--code 给了就复用同一码，重连后设备码不变；没给则服务器每次现生成）
+    this.sock.emit('desk-register', {
+      name: this.cfg.name, platform, browser,
+      code: this.cfg.code,
+      connectPassword: this.cfg.connectPassword,
+      securePassword: this.cfg.securePassword,
+    }, (res) => this.onHelloAck(res, '设备码'));
+  }
+
+  // 进房/注册应答的公共处理（socket.io 回调包了一层 {data}/{error}，踩过，见下方注释）
+  onHelloAck(res, label) {
+    /* ⚠️ 必须记住的约定（踩过）：socket.io 的"请求-应答"回调收到的是
+     *   `{ data: ... }` 或 `{ error: '...' }` **包了一层**，不是直接的数据对象。
+     *   写成 `res.roomNumber` 会"假成功"：进房失败也照样打印"已就绪"、号还显示 undefined。 */
+    if (!res || res.error) {
+      this.log(`❌ ${label}注册失败：${(res && res.error) || '无应答（服务器没回？）'}`);
+      return this.shutdown(`${label}注册失败`);
+    }
+    const data = res.data || {};
+    this.roomNumber = data.roomNumber || data.deviceCode;
+    this.deviceCode = data.deviceCode || data.roomNumber;
+    this.log('');
+    this.log('  ┌──────────────────────────────────────────────────────────┐');
+    this.log('  │  🖥️  桌面代理已就绪，现在等控制端来连                      │');
+    this.log('  └──────────────────────────────────────────────────────────┘');
+    if (this.deskMode) {
+      this.log(`     ★ 设备码：${this.deviceCode}      连接密码：${this.cfg.connectPassword || '（无）'}`);
+      this.log(`     控制端打开会议页 → 「远程桌面」入口 → 输设备码${this.cfg.connectPassword ? '+连接密码' : ''}即可连接`);
+      this.log(`     授权方式：${this.cfg.securePassword ? '🔓 无人值守（凭安全密码自动放行）'
+        : (this._allowAll ? '自动放行（--auto-allow）' : '每次在本终端按 y 确认')}`);
+    } else {
       this.log(`     房间号：${data.roomNumber}      我的名字：🖥️ ${this.cfg.name}`);
       this.log(`     控制端打开会议页面 → 进入同一房间 → 点我这格的「控制电脑」`);
       this.log(`     授权方式：${this._allowAll ? '自动放行（--auto-allow）' : '每次在本终端按 y 确认'}`);
-      this.log('');
-      this.printHelp();
-    });
+    }
+    this.log('');
+    this.printHelp();
   }
 
   printHelp() {
@@ -259,6 +307,22 @@ class RemoteAgent {
     });
 
     // 控制端发来的输入（二进制帧 / JSON 命令），两种形态都从这里进
+    /* ★ 09-30 闭环自适应帧率：控制端实测链路后回传建议帧率，这里只调**本地限流间隔**
+     *   （`_frameGap`）——抓屏本身不用重启（我们没把 fps 交给 CDP 的 everyNthFrame，
+     *    而是自己按 `_lastFrameAt` 丢帧），所以调它**零抖动、下一帧即生效**。
+     *   ▎为什么放在被控端而不是让控制端丢帧：控制端丢帧只能省**它自己**的渲染，
+     *     省不掉**链路带宽**与**被控端的编码/发送开销**——那才是瓶颈所在。
+     *     要省就必须在源头（抓屏侧）降频。 */
+    sock.on('remote-quality', ({ fps } = {}) => {
+      const f = Number(fps);
+      if (!Number.isFinite(f)) return;                       // 服务器已钳制，这里再兜一层
+      const clamped = Math.max(2, Math.min(24, Math.round(f)));
+      const gap = Math.round(1000 / clamped);
+      if (gap === this._frameGap) return;                    // 没变就不动（避免无意义日志与抖动）
+      this._frameGap = gap;
+      this.log(`⚙️ 链路自适应：抓屏帧率 → ${clamped} fps（控制端实测反馈）`);
+    });
+
     sock.on('remote-input', ({ event } = {}) => {
       if (!event) return;
       let msg = null;
@@ -337,9 +401,10 @@ class RemoteAgent {
     this._frameCount = 0;
     this._frameBytes = 0;
 
+    const dim = this._maxDim || { maxWidth: 1920, maxHeight: 1200 }; // 画质档切过就用档位尺寸，否则给足上限
     await this.cdp.startScreencast({
       quality: this.cfg.quality,
-      maxWidth: 1920, maxHeight: 1200,   // 上限给足：小窗口输出小图，最大化后自动变清晰
+      maxWidth: dim.maxWidth, maxHeight: dim.maxHeight,
       onFrame: (b64) => this.sendFrame(b64),
     });
 
@@ -358,6 +423,20 @@ class RemoteAgent {
     this.controllerId = null;
     clearInterval(this._statTimer);
     this.cdp.stopScreencast().catch(() => {});
+  }
+
+  /* ★ 09-30 运行时切画质档：改 quality/fps（丢帧间隔）+ 重开一路 screencast 换编码参数。
+   *   注意 fps 变化只是把 minFrameGap 拉开/收紧；quality 与尺寸靠 cdp.setScreencast 生效。 */
+  applyQuality(preset) {
+    const p = QUALITY_PRESETS[preset];
+    if (!p) { this.log(`   ⚠️ 未知画质档：${preset}`); return; }
+    this.qualityPreset = preset;
+    this.cfg.quality = p.quality;
+    this.cfg.fps = p.fps;
+    this._frameGap = Math.round(1000 / p.fps);
+    this._maxDim = { maxWidth: p.maxWidth, maxHeight: p.maxHeight };
+    this.log(`   🎚️ 画质档 → ${preset}（q${p.quality} / ${p.fps}fps / ≤${p.maxWidth}×${p.maxHeight}）`);
+    if (this.streaming) this.cdp.setScreencast({ quality: p.quality, maxWidth: p.maxWidth, maxHeight: p.maxHeight }).catch(() => {});
   }
 
   sendFrame(b64) {
@@ -444,6 +523,11 @@ class RemoteAgent {
           await this.cdp.evaluate('history.back()').catch(() => {});
           break;
 
+        case 'quality':
+          // ★ 09-30 画质档：控制端切"流畅/标准/高清"或弱网自适应降档，走老通道新语义
+          this.applyQuality(msg.preset);
+          break;
+
         default:
           break;
       }
@@ -516,9 +600,16 @@ class RemoteAgent {
 async function main() {
   const cfg = parseArgs(process.argv.slice(2));
   if (cfg.help) { console.log(USAGE); return; }
-  if (!/^\d{6}$/.test(cfg.room)) {
+  // ★ 09-30：--room 变成可选。给了 = 进既有会议房（老用法）；不给 = 设备码模式（推荐）
+  if (cfg.room && !/^\d{6}$/.test(cfg.room)) {
     console.log(USAGE);
-    console.error('❌ --room 必须是 6 位数字房间号\n');
+    console.error('❌ --room 若指定，必须是 6 位数字房间号\n');
+    process.exitCode = 1;
+    return;
+  }
+  if (cfg.code && !/^\d{6}$/.test(cfg.code)) {
+    console.log(USAGE);
+    console.error('❌ --code（设备码）若指定，必须是 6 位数字\n');
     process.exitCode = 1;
     return;
   }
@@ -527,7 +618,7 @@ async function main() {
   console.log('  ╔══════════════════════════════════════════════════════════╗');
   console.log('  ║   🖥️  远程桌面 · 被控端代理                               ║');
   console.log('  ╚══════════════════════════════════════════════════════════╝');
-  console.log(`     房间 ${cfg.room} · 服务器 ${cfg.server} · 画质 ${cfg.quality} / 上限 ${cfg.fps}fps`);
+  console.log(`     ${cfg.room ? '房间 ' + cfg.room : '设备码模式（启动后服务器发码）'} · 服务器 ${cfg.server} · 画质 ${cfg.quality} / 上限 ${cfg.fps}fps`);
   console.log('');
 
   const agent = new RemoteAgent(cfg);

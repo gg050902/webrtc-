@@ -31,7 +31,21 @@ const { io } = require('C:/Users/27418/Desktop/webrtc/node_modules/socket.io-cli
 const { RemoteAgent } = require('../agent/index');
 const { findBrowserBin } = require('../agent/cdp');
 
-const SERVER = 'http://127.0.0.1:3001';
+/* ★ 09-30：**专用测试端口** + 端口被占时"明确拒绝"（不再复用别人的服务器）。
+ * ▎为什么必须改（本轮实修的假绿事故）：
+ *   本脚本原先写的是 `if (await ping()) { console.log('⚠️ 3001 已有服务器，复用它'); return; }`
+ *   ——只要 3001 上有任何服务器（**用户自己开的会议服务、或上一次被中断的测试留下的孤儿进程**）
+ *   就复用它继续跑。后果：**测试验的不是本次代码**。
+ *   本轮就是这么被坑的：我新加的 `remote-quality` 断言全红，
+ *   排查半天以为是门禁/接线问题，**真实原因是那台服务器是旧代码的孤儿进程**。
+ *   更危险的是反面——它也可能**全绿**：那不是"通过"，是"验了个不存在的东西"。
+ * ▎`test-sfu-signaling.js` 早就修过同一个反模式，并写下了正确判据：
+ *   "环境前提不成立时，唯一诚实的做法是明确失败并说清怎么修。宁可红得清楚，也不要绿得可疑。"
+ *   这里是把它**补齐**（同一项目里同一个坑只修一半 = 半迁移，等于没修）。
+ * ▎改用 3012 而不是继续用 3001：3001 是**用户日常开发服务的默认端口**，
+ *   用一个跟它不同的号，从根上减少"撞车"的机会。 */
+const PORT = Number(process.env.TEST_AGENT_PORT) || 3012;
+const SERVER = `http://127.0.0.1:${PORT}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ★ 09-24 测试数据隔离（任务 3）：本测试会起真服务器，账号必须写进临时库，
@@ -64,12 +78,23 @@ function ping() {
 }
 
 async function ensureServer() {
-  if (await ping()) { console.log('⚠️  3001 已有服务器，复用它\n'); return; }
+  /* ★ 09-30：端口被占 → **明确拒绝**，绝不复用（理由见文件顶部 PORT 的注释）。
+   *   为什么"复用"最坏：它让测试结果与本次代码**脱钩**——既可能假红（像本轮），
+   *   也可能假绿（验了旧行为/别的东西），而两种都不会有任何提示。 */
+  if (await ping()) {
+    console.log(`\n❌ ${PORT} 端口已被占用——本脚本需要"自己起的、跑本次代码的"服务器，拒绝继续。\n`);
+    console.log('   为什么不能复用端口上那个：它可能是别的版本（用户自己开的服务、或上次测试的孤儿进程），');
+    console.log('   于是断言验的**不是本次代码**——既可能假红，也可能假绿，且全程没有任何提示。\n');
+    console.log(`   修法（任选）：① 先关掉占用 ${PORT} 的进程：`);
+    console.log(`                    netstat -ano | findstr :${PORT}   然后 taskkill /F /PID <PID>`);
+    console.log('                ② 或换个端口跑：TEST_AGENT_PORT=3013 npm run test:agent\n');
+    process.exit(1);
+  }
   console.log('🚀 自起测试服务器…');
   serverProc = spawn(process.execPath, [path.join(__dirname, '..', 'sfu', 'server.js')], {
     env: { ...process.env,
       // ★ 09-30：测试不启 HTTPS（3443 被占会让服务器 process.exit(1)，表现为"服务器未就绪"+一屏端口提示，看着像测试坏了、实则环境冲突）
-      SFU_NO_HTTPS: '1', AI_FORCE_MOCK: '1', DB_FILE: TEST_DB_FILE, USERS_FILE_LEGACY: TEST_LEGACY_USERS },
+      PORT: String(PORT), SFU_NO_HTTPS: '1', AI_FORCE_MOCK: '1', DB_FILE: TEST_DB_FILE, USERS_FILE_LEGACY: TEST_LEGACY_USERS },
     cwd: path.join(__dirname, '..'),
     stdio: ['ignore', 'ignore', 'pipe'],
   });
@@ -189,6 +214,39 @@ const TEST_PAGE = 'data:text/html;charset=utf-8,' + encodeURIComponent(`<!doctyp
   ok('⑤ 代理把真实画面帧回传到控制端', gotFrame && !!f0);
   ok('⑥ 帧是合法 JPEG（FFD8 魔数 —— 证明是真抓屏，不是占位图）',
      !!f0 && (f0[0] === 0xFF && f0[1] === 0xD8));
+
+  /* ---- ★ 09-30 闭环自适应帧率：控制端实测链路 → 回传建议 → 被控端真的降频 ----
+   * ▎为什么要端到端断言而不只单测控制律：
+   *   控制律对不代表**链路通**——这条链要穿过
+   *   控制端 → 服务器门禁 → 被控端 handler → `_frameGap` 四处，
+   *   任何一处漏接线都会表现为"自适应静默失效"（画面永远 12fps，但没人报错）。
+   *   本项目在"跨层传递没接上"上已经吃过三次亏（AGENTS 坑 56），
+   *   所以这里直接断言**被控端的实际状态变化**，而不是断言"消息发出去了"。 */
+  const gapBefore = agent._frameGap;
+  const fpsBefore = Math.round(1000 / gapBefore);
+  const want = fpsBefore > 8 ? fpsBefore - 4 : fpsBefore + 4;   // 挑一个必然不同的值
+  CTL.s.emit('remote-quality', { to: agent.sock.id, fps: want });
+  const applied = await waitFor(() => Math.round(1000 / agent._frameGap) === want, 3000);
+  ok('⑥b 闭环自适应：控制端回传建议帧率 → 被控端真的改了抓屏频率',
+    applied, `期望 ${want}fps，实际 ${Math.round(1000 / agent._frameGap)}fps`);
+  /* ⚠️ 这里有一个**两层范围**的设计，断言别搞混（我第一版就搞混了）：
+   *   · **策略范围 6~24**：控制端自适应算法**只会**在这个区间里取值（见 client 的 RD_FPS_MIN/MAX）
+   *     ——它是"正常该用多少"的业务判断。
+   *   · **硬安全范围 2~24**：服务器与代理对**任何**请求的绝对钳制（见两处 Math.max(2, Math.min(24)))
+   *     ——它是"再怎么乱传也不许超出"的兜底，比策略更宽。
+   *   两层分开是有意的：策略以后要调（比如允许 3fps 的超省流档）时，
+   *   不该顺带放宽"别人能不能给我设成 0.1fps"这条安全线。 */
+  CTL.s.emit('remote-quality', { to: agent.sock.id, fps: 999 });
+  await sleep(400);
+  ok('⑥c 越界建议被钳到硬上限（不能借自适应把对端拖垮）',
+    Math.round(1000 / agent._frameGap) === 24, `实际 ${Math.round(1000 / agent._frameGap)}fps`);
+  CTL.s.emit('remote-quality', { to: agent.sock.id, fps: 1 });
+  await sleep(400);
+  ok('⑥d 过低建议被钳到硬下限 2fps（硬线比策略线更宽，见上方两层说明）',
+    Math.round(1000 / agent._frameGap) === 2, `实际 ${Math.round(1000 / agent._frameGap)}fps`);
+  // 复位，避免影响后续帧率相关断言
+  CTL.s.emit('remote-quality', { to: agent.sock.id, fps: fpsBefore });
+  await sleep(300);
 
   // 动态验证"变化才推帧"：让页面动起来，帧数应当持续增长
   await agent.cdp.evaluate('setInterval(() => { document.body.style.background = "hsl(" + (Date.now()/20 % 360) + ",60%,90%)"; }, 60)');

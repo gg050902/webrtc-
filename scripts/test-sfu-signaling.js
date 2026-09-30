@@ -1325,6 +1325,147 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   await sleep(400);
   ok('09-24 撤权后画面通道立即关闭（授权撤了就不该再有帧）', frames.length === beforeRelease);
 
+  /* ================= ★ 09-30 设备码配对直连（学 billd-desk 的取长补短）=================
+   * ▎这一段测的是"远程控制不必先开会"这条新入口。设计要点（见 sfu/server.js 09-30 注释块）：
+   *   **设备码 = 一个私有"桌面房间"的房号**，所以 remote-request/answer/input/frame 四道门禁
+   *   一字未改就能复用。因此下面的断言分两类：
+   *     ① 新信令自己的语义（发码/去重/口令/无人值守/互斥/掉线作废）；
+   *     ② **复用是否真的成立**——桌面房间里画面帧照样走三道闸（这条最该测：
+   *        如果"复用"其实是"绕过门禁"，那安全性就是假象，测试必须当场红）。
+   */
+  console.log('\n--- 09-30 设备码配对直连 ---');
+
+  // ① 被控端注册：服务器替它建好桌面房间，回一个 6 位设备码（= 房号）
+  const DA = await client('DA');
+  let deskReg1 = null;
+  DA.s.emit('desk-register', {
+    name: '我的电脑', platform: 'win32', browser: 'Edg/test', connectPassword: 'pw123',
+  }, (r) => { deskReg1 = r; });
+  await sleep(800);
+  const CODE1 = (deskReg1 && deskReg1.data && deskReg1.data.deviceCode) || '';
+  ok('09-30 desk-register 返回 6 位设备码（设备码就是私有桌面房间的房号）', /^\d{6}$/.test(CODE1));
+  ok('09-30 注册应答带 🖥️ 前缀名（控制端界面显示"连的是哪台机器"）',
+     /^🖥️/.test(String((deskReg1 && deskReg1.data && deskReg1.data.name) || '')));
+
+  // ② 设备码去重：两台设备不能共用一个码（指定 code 撞上已有房号必须明确拒绝，
+  //    否则两台机器的画面会混进同一个房间 —— 这是"复用房间"方案唯一新增的风险面）
+  const DUP = await client('DUP');
+  let deskDup = null;
+  DUP.s.emit('desk-register', { code: CODE1, connectPassword: 'x' }, (r) => { deskDup = r; });
+  await sleep(600);
+  ok('09-30 指定设备码撞号被拒（两台设备不可能共用一个码）', !!deskDup && !!deskDup.error);
+  DUP.s.disconnect();
+
+  // ③ 控制端三条失败路径：码不存在 / 密码错 / 已在别的房间
+  const DC = await client('DC');
+  let deskNoDevice = null;
+  DC.s.emit('desk-connect', { deviceCode: '999999', password: 'pw123' }, (r) => { deskNoDevice = r; });
+  await sleep(500);
+  ok('09-30 设备码不存在/不是桌面房 → 明确失败（不静默挂起）',
+     !!deskNoDevice && /设备不在线/.test(String(deskNoDevice.error || '')));
+
+  let deskBadPw = null;
+  DC.s.emit('desk-connect', { deviceCode: CODE1, password: 'wrong' }, (r) => { deskBadPw = r; });
+  await sleep(500);
+  ok('09-30 连接密码不对被拒（口令是进门第一关）',
+     !!deskBadPw && /连接密码/.test(String(deskBadPw.error || '')));
+
+  // ④「需人工确认」路径：连接密码对 → 控制端只做轻量进房，请求转给被控端等它点头
+  const reqToAgentP = waitEvent(DA.s, 'remote-request');
+  const pendingP = waitEvent(DC.s, 'desk-pending');
+  let deskReg2 = null;
+  DC.s.emit('desk-connect', { deviceCode: CODE1, password: 'pw123' }, (r) => { deskReg2 = r; });
+  const reqToAgent = await Promise.race([reqToAgentP, sleep(3000).then(() => null)]);
+  const pending = await Promise.race([pendingP, sleep(3000).then(() => null)]);
+  ok('09-30 口令正确但未授权 → 应答 granted:false 并进入待确认',
+     !!deskReg2 && !deskReg2.error && deskReg2.data && deskReg2.data.granted === false);
+  ok('09-30 设备码直连复用同一张授权信令（被控端收到 remote-request）',
+     !!reqToAgent && reqToAgent.from === DC.id);
+  ok('09-30 控制端收到 desk-pending（前端据此显示"等待对方确认"）',
+     !!pending && pending.hostId === DA.id);
+
+  // ⑤ 被控端确认后：控制端拿到 desk-granted（桌面控制台据此打开），
+  //    并且**画面帧在桌面房间里照样走三道闸**——证明"复用"不等于"绕过门禁"
+  const grantedP = waitEvent(DC.s, 'desk-granted');
+  const deskFrames = [];
+  DC.s.on('remote-frame', (p) => deskFrames.push(p));
+  DA.s.emit('remote-answer', { to: DC.id, ok: true, durationMs: 0 });
+  const granted = await Promise.race([grantedP, sleep(3000).then(() => null)]);
+  ok('09-30 人工确认路径授权成功 → 控制端收到 desk-granted（openRemoteDesk 的触发点）',
+     !!granted && granted.hostId === DA.id && granted.unattended === false);
+  await sleep(300);
+  DA.s.emit('remote-frame', { to: DC.id, frame: new Uint8Array(1024).fill(3) });
+  await sleep(500);
+  ok('09-30 桌面房间复用画面帧通道（授权在册 → 帧抵达控制端）', deskFrames.length === 1);
+  // 反向：同一桌面房间里冒名发帧的"别的代理"不存在，但**超大帧**这条体量闸必须照样生效
+  DA.s.emit('remote-frame', { to: DC.id, frame: new Uint8Array(950 * 1024) });
+  await sleep(500);
+  ok('09-30 体量闸在桌面房间同样生效（复用管线 = 复用安全策略）', deskFrames.length === 1);
+
+  // ⑥ 释放控制 → 帧通道立刻关（和会议房同一条 clearRemoteCtl 路径）
+  DA.s.emit('remote-release');
+  await sleep(500);
+  DA.s.emit('remote-frame', { to: DC.id, frame: new Uint8Array(256) });
+  await sleep(400);
+  ok('09-30 释放后桌面房间同样断帧（授权收回即刻生效）', deskFrames.length === 1);
+
+  // ⑦「无人值守」路径：安全密码匹配 → 服务器直接登记 remoteCtl，不等人工确认
+  const DB = await client('DB');
+  let deskReg3 = null;
+  DB.s.emit('desk-register', { name: '机房服务器', connectPassword: 'pwC', securePassword: 'secC' },
+    (r) => { deskReg3 = r; });
+  await sleep(800);
+  const CODE2 = (deskReg3 && deskReg3.data && deskReg3.data.deviceCode) || '';
+  ok('09-30 第二台设备注册成功（各自独立设备码）',
+     /^\d{6}$/.test(CODE2) && CODE2 !== CODE1);
+
+  const DC2 = await client('DC2');
+  let unattendedAck = null;
+  const granted2P = waitEvent(DC2.s, 'desk-granted');
+  DC2.s.emit('desk-connect', { deviceCode: CODE2, password: 'secC' }, (r) => { unattendedAck = r; });
+  const granted2 = await Promise.race([granted2P, sleep(3000).then(() => null)]);
+  ok('09-30 安全密码 → 无人值守自动放行（ack 直接 granted:true，跳过人工确认）',
+     !!unattendedAck && !unattendedAck.error && unattendedAck.data.granted === true);
+  ok('09-30 无人值守同样发 desk-granted（前端两条路径只需监听一个事件）',
+     !!granted2 && granted2.unattended === true && granted2.hostId === DB.id);
+  const reqSnoopP = new Promise((res) => {
+    DB.s.on('remote-request', () => res('unexpected-request'));
+    setTimeout(() => res(null), 800);
+  });
+  ok('09-30 无人值守不该再给被控端发确认请求（真的"无人"）',
+     (await reqSnoopP) === null);
+
+  // ⑧ 互斥：一台设备同时只能有一个控制端（防"两个人抢一只鼠标"）
+  const DC3 = await client('DC3');
+  let busyAck = null;
+  DC3.s.emit('desk-connect', { deviceCode: CODE2, password: 'secC' }, (r) => { busyAck = r; });
+  await sleep(600);
+  ok('09-30 设备正被别人控制时第二个控制端被拒（busy）',
+     !!busyAck && /busy|正在/.test(String(busyAck.error || '')));
+  // 被控端侧的 remote-state 也要收到（它据此开始推流）
+  const stateSeen = await new Promise((res) => {
+    const h = (p) => { if (p.hostId === DB.id) { DB.s.off('remote-state', h); res(p); } };
+    DB.s.on('remote-state', h);
+    DB.s.emit('member-state', { patch: {} });
+    setTimeout(() => res(null), 2000);
+  });
+  ok('09-30 无人值守授权后 remote-state 抵达被控端（代理据此开推流）',
+     !!stateSeen && stateSeen.controllerId === DC2.id);
+
+  // ⑨ 设备掉线 = 设备码立即作废（桌面房不走 60s 空房宽限：没人控制的"设备码"留着只会占号）
+  DB.s.disconnect();
+  await sleep(900);
+  const DC4 = await client('DC4');
+  let offlineAck = null;
+  DC4.s.emit('desk-connect', { deviceCode: CODE2, password: 'secC' }, (r) => { offlineAck = r; });
+  await sleep(600);
+  ok('09-30 代理掉线后设备码即刻作废（旧码不会连到幽灵会话）',
+     !!offlineAck && /设备不在线/.test(String(offlineAck.error || '')));
+
+  // 清理（本段新增连接全部请出去，别把桌面房间留给后面的断言当噪声）
+  for (const c of [DA, DC, DC2, DC3, DC4]) { try { c.s.disconnect(); } catch (e) { /* ignore */ } }
+  await sleep(500);
+
   // 清理
   AG.s.disconnect();
   CTL.s.disconnect();

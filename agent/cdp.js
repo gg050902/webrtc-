@@ -290,14 +290,21 @@ class Cdp {
   async startScreencast({ quality = 55, maxWidth = 1280, maxHeight = 800, everyNthFrame = 1, onFrame } = {}) {
     if (this._screencastOn) return this;
     this._frameCb = onFrame || null;
+    // 记住当前推流参数，供运行时 setScreencast 画质档切换时"沿用帧回调、只换编码参数"
+    this._scOpts = { quality, maxWidth, maxHeight, everyNthFrame };
 
-    this.on('Page.screencastFrame', (p) => {
-      // ★ 先 ack 再回调：ack 是"我收到了"，越早越好，否则浏览器会等你
-      this._send(this.pageWs, 'Page.screencastFrameAck', { sessionId: p.sessionId }).catch(() => {});
-      if (typeof this._frameCb === 'function' && p.data) {
-        try { this._frameCb(p.data, p.metadata || {}); } catch (e) { /* 下游炸不影响抓屏 */ }
-      }
-    });
+    // ★ 监听器只绑一次：切画质档会 stop→start 多次调用本函数，若每次都 this.on(...)
+    //   会叠加多个 'Page.screencastFrame' 监听器 → 每帧重复 ack + 重复回调 → 重复推流。
+    if (!this._scListenerBound) {
+      this._scListenerBound = true;
+      this.on('Page.screencastFrame', (p) => {
+        // ★ 先 ack 再回调：ack 是"我收到了"，越早越好，否则浏览器会等你
+        this._send(this.pageWs, 'Page.screencastFrameAck', { sessionId: p.sessionId }).catch(() => {});
+        if (typeof this._frameCb === 'function' && p.data) {
+          try { this._frameCb(p.data, p.metadata || {}); } catch (e) { /* 下游炸不影响抓屏 */ }
+        }
+      });
+    }
 
     await this._send(this.pageWs, 'Page.startScreencast', {
       format: 'jpeg', quality, maxWidth, maxHeight, everyNthFrame,
@@ -305,6 +312,23 @@ class Cdp {
     this._screencastOn = true;
     this.log(`🎬 已开始推流（jpeg q${quality}，上限 ${maxWidth}×${maxHeight}，变化才推帧）`);
     return this;
+  }
+
+  /** ★ 09-30 运行时切画质档：控制端点"流畅/标准/高清"时换 quality/尺寸。
+   *   CDP 没有"改参"接口，只能 stop→start 重开一路；帧回调（_frameCb）保持不变，
+   *   所以下游 sendFrame 无感知。没在推流就只记账，等 startScreencast 时生效。 */
+  async setScreencast({ quality, maxWidth, maxHeight } = {}) {
+    this._scOpts = {
+      ...this._scOpts,
+      quality: quality != null ? quality : (this._scOpts && this._scOpts.quality) || 55,
+      maxWidth: maxWidth != null ? maxWidth : (this._scOpts && this._scOpts.maxWidth) || 1280,
+      maxHeight: maxHeight != null ? maxHeight : (this._scOpts && this._scOpts.maxHeight) || 800,
+    };
+    if (!this._screencastOn) return this;                 // 还没推流：只记参数，开流时自然带上
+    const cb = this._frameCb;
+    try { await this._send(this.pageWs, 'Page.stopScreencast'); } catch (e) { /* ignore */ }
+    this._screencastOn = false;
+    return this.startScreencast({ ...this._scOpts, onFrame: cb });
   }
 
   /** 换一帧回调（比如换了控制者，画面要发给别人） */

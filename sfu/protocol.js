@@ -292,4 +292,24 @@ module.exports = {
   //   agent 在此基础上多了两种**走老通道的新语义**（服务器只需是合法对象，不解析内容）：
   //     { kind:'navigate', url }  地址栏 → 真导航（Page.navigate，能开任意真实网站）
   //     { kind:'window', state }  最大化 / 还原 / 最小化 / 全屏（Browser.setWindowBounds）
+  //     { kind:'quality', preset } ★ 09-30 画质档：'smooth'|'standard'|'hd' → agent 运行时换
+  //       screencast 的 quality/fps/尺寸（老通道新语义，服务器仍不解析、原样透传 + 门禁）
+
+  /* ══ ★ 09-30 借鉴 billd-desk：远程控制「设备码」配对（脱离"必须先开会建房"）══
+   * ▎痛点：原来想远程控自己电脑，得先在浏览器 create-room、把房号抄给 agent、再进房点控制。
+   * ▎取长：billd/ToDesk 让每台被控设备有稳定「设备码 + 连接密码」，主控只输码+密码即可连，
+   *   被控端可「人工同意」或配「安全密码」实现「无人值守自动放行」。
+   * ▎落地（关键 = 复用，不新造控制协议）：设备码就是一个私有"桌面房间"的房号（6 位数字），
+   *   agent 注册时服务器替它建房（标 isDesk）；remote-request/answer/input/frame 门禁一字不改。
+   * ▎诚实边界：设备码是内存态（代理掉线即换码、房间即刻销毁），连接/安全密码内存明文比对（演示级）。 */
+  DESK_REGISTER: 'desk-register', // 被控端(agent)→S { name?, platform?, browser?, connectPassword?, securePassword?, code? }
+  //   应答 { deviceCode, roomNumber, name }。给 code 就用（去重），没给服务器现生成 6 位码。
+  //   securePassword 非空 = 无人值守；connectPassword = 房间密码（主控要输对才进得来）。
+  DESK_CONNECT: 'desk-connect', // 控制端→S { deviceCode, password } 应答 { granted, hostId, hostName }
+  //   校验链：格式→在线(有 isDesk 房且代理在册)→连接密码→互斥(busy)。控制端做**轻量进房**
+  //   （只 join+进 members，不触发会议那套媒体订阅）。
+  //   无人值守：安全密码匹配 → 服务器直接登记 remoteCtl 并广播 remote-state（agent 见 state 即开推流）。
+  //   需确认：转 remote-request 给代理，代理终端按 y → 通用 remote-answer 授权链路照旧。
+  DESK_GRANTED: 'desk-granted', // S→控制端 { hostId, hostName, unattended }（两条路径授权成功后确定性通知开控制台）
+  DESK_PENDING: 'desk-pending', // S→控制端 { hostId, hostName }（已发出请求，等被控端在终端确认）
 };

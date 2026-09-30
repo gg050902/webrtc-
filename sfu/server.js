@@ -3668,7 +3668,10 @@ io.on('connection', (socket) => {
     const agent = [...room.members].find((m) => m.id === room.agentId);
     if (!agent) return fail(callback, '设备不在线（代理已断开）');
     // 连接密码校验（没设密码则免验）
-    if (room.connectPassword && room.connectPassword !== String(password || '')) {
+    // 连接口令校验：没设连接密码则免验；否则连接密码或安全密码任一匹配即放行
+    //   （安全密码是"固定无人值守口令"，它当然也要能过"进门"这一关）。
+    const pw = String(password || '');
+    if (room.connectPassword && pw !== room.connectPassword && pw !== room.securePassword) {
       return fail(callback, '连接密码不对');
     }
     // 互斥：这台设备正在被别人控制 → 拒绝
@@ -3843,6 +3846,33 @@ io.on('connection', (socket) => {
    *   所以先用 ArrayBuffer.isView 识别二进制帧，跳过字段数过滤（定长 16 字节
    *   本身就是上限，不存在大包问题）；转发原样透传，服务器不解析内容。
    */
+  /* ★ 09-30 远程画面**闭环自适应**：控制端把"我这边实测的链路状况"回传给被控端，
+   *   让被控端调整抓屏帧率。方向是 **控制端 → 被控端**（与 remote-input 同向）。
+   *
+   * ▎为什么需要（这是远程控制"流畅性"的根子）：
+   *   抓屏帧率此前是**开机参数写死的**（默认 12fps，CLI 可改但中途不能变）。
+   *   于是只有两种结果：网好时白白浪费带宽（12fps 的画面明显发涩），
+   *   网差时帧持续堆积（越堆越延迟）。**固定参数在变化的网络上必然有一半时间是错的。**
+   *
+   * ▎为什么反馈必须来自控制端而不是被控端自己猜：
+   *   被控端只能看到"我发出去了"，看不到"对方收得怎么样"——
+   *   发送方的本地队列在 UDP/SCTP 语义下**不代表链路状态**。
+   *   真正知道状况的是接收端（它量得到帧到达间隔与 RTT）。
+   *   这是"能观测到的人才有资格做决策"的典型例子。
+   *
+   * ▎为什么门禁照抄 remote-input：它是同一条授权链路上的控制面消息。
+   *   若这里放宽，等于给"未授权的旁观者"开了一个能干扰别人画面的口子。
+   *   参数也做白名单式钳制（只认 fps，并夹到 2~24）——
+   *   不能让控制端传任意字段/任意值去改被控端行为。 */
+  socket.on('remote-quality', ({ to, fps } = {}) => {
+    if (!socket.roomNumber || !to) return;
+    const ctl = remoteCtl.get(socket.roomNumber);
+    if (!ctl || ctl.controllerId !== socket.id || ctl.hostId !== to) return; // 门禁同 remote-input
+    const f = Number(fps);
+    if (!Number.isFinite(f)) return;
+    io.to(to).emit('remote-quality', { fps: Math.max(2, Math.min(24, Math.round(f))) });
+  });
+
   socket.on('remote-input', ({ to, event } = {}) => {
     if (!socket.roomNumber || !to || !event || typeof event !== 'object') return;
     // A5①：二进制帧（ArrayBuffer / TypedArray 视图）没有"字段"概念，跳过轻量过滤

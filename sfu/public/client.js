@@ -6635,6 +6635,84 @@ let rdHostId = null;            // 我正在控制的桌面代理 id（null = �
 let rdFrames = 0;
 let rdDrawing = false;
 let rdPendingAb = null;         // 只留最新一帧：画面实时性 > 完整性（堆积只会看到"过去"）
+
+/* ══════════════════════════════════════════════════════════════
+ * ★ 09-30 远程画面**闭环自适应帧率**（控制端这一半：测量 + 反馈）
+ *
+ * ▎要解决的问题：抓屏帧率是**开机参数写死的**（默认 12fps）。
+ *   固定参数在变化的网络上必然有一半时间是错的——
+ *   网好时白白浪费带宽（12fps 的画面明显发涩），网差时帧持续堆积（越堆越延迟）。
+ *
+ * ▎为什么要**控制端**来决策：只有接收端量得到"帧到得够不够快"。
+ *   发送端看自己的本地队列不代表链路状态（丢帧语义下尤其如此）。
+ *   这是"能观测到的人才有资格做决策"。
+ *
+ * ▎为什么用"中位数间隔"而不是平均值：平均值会被一两次长卡顿拉偏，
+ *   而我们要判断的是"稳态下够不够快"。中位数对偶发毛刺天然免疫。
+ *
+ * ▎为什么要防抖动（滞回 + 最小间隔 + 起步保护）：
+ *   自适应控制器最容易写成"震荡器"——调高→立刻过载→调低→又空闲→调高……
+ *   用户看到的画面会忽快忽慢，比固定参数更难受。所以：
+ *     · 至少 4 秒才允许调一次；
+ *     · 窗口内帧数太少（<8）**不决策**（静止画面本来就不出帧，不能当成"链路差"）；
+ *     · 升/降阈值分开（90% 才升、60% 才降），中间留出死区；
+ *     · 只在 2~24 范围内动（服务器与代理还会再钳一次）。
+ * ══════════════════════════════════════════════════════════════ */
+let rdLastFrameAt = 0;
+let rdIntervals = [];            // 最近若干帧的到达间隔（ms）
+let rdTargetFps = 12;            // 当前建议帧率（起步值 = 代理默认，先不打扰它）
+let rdQualityAt = 0;             // 上次调参时间
+const RD_QUALITY_MIN_GAP = 4000; // 最小调参间隔（防震荡）
+const RD_FPS_MIN = 6;
+const RD_FPS_MAX = 24;
+
+function rdNoteFrame() {
+  const now = Date.now();
+  if (rdLastFrameAt) {
+    rdIntervals.push(now - rdLastFrameAt);
+    if (rdIntervals.length > 30) rdIntervals.shift();   // 只留最近 30 帧
+  }
+  rdLastFrameAt = now;
+  rdAdaptQuality();
+}
+
+/* 自适应**决策律**：抽成纯函数（无副作用、不碰 DOM/全局）。
+ * ▎为什么值得单独抽出来：这是整个自适应机制里**唯一有判断逻辑**的地方，
+ *   也是唯一会"调错"的地方（调错的表现是画面忽快忽慢）。
+ *   抽成纯函数后可以用穷举断言把控制律钉死（见冒烟测试），
+ *   而不是只能"跑起来看着还行"——性能类逻辑恰恰最需要可断言的确定性。
+ * @returns {number} 建议帧率（已钳制在范围与档位步长内） */
+function rdDecideFps({ actualFps, targetFps, rttMs }) {
+  let next = targetFps;
+  if (actualFps < targetFps * 0.6 || (rttMs != null && rttMs > 250)) {
+    next = targetFps - 2;                              // 明显跟不上 / 链路很慢 → 降
+  } else if (actualFps >= targetFps * 0.9 && (rttMs == null || rttMs < 120)) {
+    next = targetFps + 2;                              // 跟得上且链路快 → 试着提
+  }
+  return Math.max(RD_FPS_MIN, Math.min(RD_FPS_MAX, next));
+}
+
+function rdAdaptQuality() {
+  if (!rdHostId) return;
+  const now = Date.now();
+  if (now - rdQualityAt < RD_QUALITY_MIN_GAP) return;
+  if (rdIntervals.length < 8) return;                   // 样本太少（静止画面）→ 不决策
+  const sorted = rdIntervals.slice().sort((a, b) => a - b);
+  const medianMs = sorted[Math.floor(sorted.length / 2)];
+  if (!medianMs || medianMs <= 0) return;
+  const actualFps = 1000 / medianMs;
+  const rtt = typeof netRttMs === 'number' ? netRttMs : null;
+
+  const next = rdDecideFps({ actualFps, targetFps: rdTargetFps, rttMs: rtt });
+  if (next === rdTargetFps) { rdQualityAt = now; rdIntervals.length = 0; return; }
+
+  rdTargetFps = next;
+  rdQualityAt = now;
+  rdIntervals.length = 0;                                // 换档后重新采样，别拿旧数据继续判
+  socket.emit('remote-quality', { to: rdHostId, fps: next });
+  setRdState(`✅ 实时画面 · ${next}fps 自适应`);
+}
+
 let rdMoveRaf = 0;
 let rdMovePending = null;
 let rdWheelAccum = 0;
@@ -6666,6 +6744,7 @@ function rdFit() {
  * 环境不支持时降级为"只记状态不画"——保证逻辑（计数/状态/授权）在任何环境都可测。 */
 async function rdDrawFrame(ab) {
   rdFrames++;
+  if (typeof rdFrameCounter === 'number') rdFrameCounter++;   // ★ 09-30 供自适应画质统计（每 3s 归零重算实测帧率）
   if (rdHintEl && rdFrames === 1) rdHintEl.classList.add('hidden');
   try {
     if (typeof createImageBitmap === 'function' && typeof Blob === 'function') {
@@ -6720,6 +6799,14 @@ function openRemoteDesk(hostId, info) {
   rdHostId = hostId;
   rdFrames = 0;
   rdPendingAb = null;
+  /* ★ 09-30：每次开新的控制会话都把自适应状态归零。
+   *   为什么必须重置：上一次会话（可能是几小时前、也可能是另一台机器）攒下的
+   *   帧间隔样本与本档位，**不能**拿来判断这条新链路——否则开局就会按错误的历史
+   *   去升/降帧率（典型症状：新会话一开始画面就明显偏卡或偏浪费）。 */
+  rdLastFrameAt = 0;
+  rdIntervals.length = 0;
+  rdTargetFps = 12;
+  rdQualityAt = Date.now();   // 起步给一个"冷静期"，别一上来就调参
   if (rdConsoleEl) rdConsoleEl.classList.remove('hidden');
   if (document.body && document.body.classList) document.body.classList.add('rd-mode');
   if (rdHintEl && rdHintEl.classList) { rdHintEl.classList.remove('hidden'); rdHintEl.textContent = '正在等对方电脑的第一帧画面…'; }
@@ -6748,6 +6835,7 @@ function closeRemoteDesk(sendRelease) {
 /* ---- 画面：被控端推来的帧直接画出来 ---- */
 socket.on('remote-frame', ({ frame } = {}) => {
   if (!rdHostId || !frame) return;
+  rdNoteFrame();            // ★ 09-30：记录到达间隔 → 驱动自适应帧率（见 rdAdaptQuality）
   rdPendingAb = frame;      // 覆盖式缓冲：网络慢时只画最新，不排队播旧画面
   rdPumpFrames();
 });
@@ -6930,6 +7018,129 @@ rdBtn('rdBack', () => rdSend({ kind: 'back' }));
 rdBtn('rdReload', () => rdSend({ kind: 'refresh' }));
 rdBtn('rdMax', () => { rdSend({ kind: 'window', state: 'maximized' }); showToast('⛶ 已请求最大化对方窗口', 'info'); });
 rdBtn('rdRelease', () => closeRemoteDesk(true));
+
+/* =====================================================================================
+ * ★ 09-30 借鉴 billd-desk —— 两块增强远程控制体验：
+ *   ① 「设备码」直连：主控端在登录页点「用设备码远程控电脑」→ 输码(+连接密码)即连，
+ *      不用先建房/进会议。被授权后（无人值守立即，或对方终端按 y 后）打开真桌面控制台。
+ *   ② 画质档 + 弱网自适应：控制台上有 自动/流畅/标准/高清 四颗，切换发 {kind:'quality'}；
+ *      "自动"档每 3s 量实测帧率，卡了就降档、稳了再升档——把 billd 的"画质/流畅"做成实时可用。
+ * 两块都复用现有管线（desk-connect 只登记门禁、quality 走 remote-input 老通道），不新造轮子。
+ * ===================================================================================== */
+
+// ---- ① 设备码直连入口 ----
+const deskOverlay = $('deskOverlay');
+const deskCodeEl = $('deskCode');
+const deskPassEl = $('deskPass');
+const deskMsgEl = $('deskMsg');
+let deskPendingHost = null;     // 已请求、等对方确认的那台设备 id
+
+function setDeskMsg(t) { if (deskMsgEl) deskMsgEl.textContent = t; }
+
+const authDeskBtn = $('authDeskBtn');
+if (authDeskBtn && authDeskBtn.addEventListener) {
+  authDeskBtn.addEventListener('click', () => {
+    if (authOverlay) authOverlay.classList.add('hidden');
+    if (deskOverlay) deskOverlay.classList.remove('hidden');
+    setTimeout(() => { try { deskCodeEl && deskCodeEl.focus(); } catch (e) {} }, 50);
+  });
+}
+const deskBackBtn = $('deskBackBtn');
+if (deskBackBtn && deskBackBtn.addEventListener) {
+  deskBackBtn.addEventListener('click', () => {
+    if (deskOverlay) deskOverlay.classList.add('hidden');
+    if (authOverlay) authOverlay.classList.remove('hidden');
+    setDeskMsg('');
+  });
+}
+
+async function doDeskConnect() {
+  const deviceCode = String(deskCodeEl && deskCodeEl.value || '').trim();
+  const password = String(deskPassEl && deskPassEl.value || '');
+  if (!/^\d{6}$/.test(deviceCode)) { setDeskMsg('设备码应为 6 位数字'); return; }
+  setDeskMsg('正在连接…');
+  try {
+    const resp = await request('desk-connect', { deviceCode, password });
+    const d = (resp && resp.data) || {};
+    if (d.granted) {
+      // 无人值守：服务器已授权，desk-granted 事件也会到；这里直接开控制台
+      openRemoteDesk(d.hostId, { name: d.hostName });
+      if (deskOverlay) deskOverlay.classList.add('hidden');
+      setDeskMsg('');
+    } else {
+      // 需人工确认：等对方在它的终端按 y → 届时收 desk-granted 再开
+      deskPendingHost = d.hostId;
+      setDeskMsg('已发送请求，等待对方在被控电脑上确认…');
+    }
+  } catch (err) {
+    const m = (err && err.message) || '连接失败';
+    setDeskMsg(m === 'busy' ? '该设备正被别人控制' : '❌ ' + m);
+  }
+}
+rdBtn('deskConnectBtn', doDeskConnect);
+if (deskCodeEl && deskCodeEl.addEventListener) deskCodeEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') doDeskConnect(); });
+if (deskPassEl && deskPassEl.addEventListener) deskPassEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') doDeskConnect(); });
+
+// 授权成功（两条路径都会发）→ 打开控制台。这是设备码路径专用信号，
+//   与会议里"点成员行控制电脑"走的 remote-answer 分支互不影响。
+socket.on('desk-granted', ({ hostId, hostName } = {}) => {
+  if (!hostId) return;
+  deskPendingHost = null;
+  if (deskOverlay) deskOverlay.classList.add('hidden');
+  if (authOverlay) authOverlay.classList.add('hidden');
+  openRemoteDesk(hostId, { name: hostName || ('设备 ' + hostId) });
+});
+
+// ---- ② 画质档 + 弱网自适应 ----
+const RD_PRESETS = {
+  smooth:   { fps: 5,  label: '流畅' },
+  standard: { fps: 12, label: '标准' },
+  hd:       { fps: 20, label: '高清' },
+};
+const RD_ORDER = ['smooth', 'standard', 'hd'];
+let rdPreset = 'standard';   // 当前生效档
+let rdAuto = true;           // 自动档：按实测帧率升降
+let rdFrameCounter = 0;      // 3s 窗口内收到的帧数（rdPumpFrames 里累加）
+
+function setRdPreset(preset, byAuto) {
+  if (!RD_PRESETS[preset]) return;
+  rdPreset = preset;
+  rdSend({ kind: 'quality', preset });
+  // 高亮当前档按钮（自动模式下高亮"自动"）
+  const map = { rdQSmooth: 'smooth', rdQStd: 'standard', rdQHD: 'hd' };
+  Object.entries(map).forEach(([id, p]) => {
+    const el = $(id); if (el && el.classList) el.classList.toggle('is-on', !rdAuto && p === preset);
+  });
+  const autoEl = $('rdQAuto'); if (autoEl && autoEl.classList) autoEl.classList.toggle('is-on', rdAuto);
+  if (!byAuto) setRdState(`🎚️ 画质：${RD_PRESETS[preset].label}${rdAuto ? '' : '（手动）'}`);
+}
+
+const rdQualityBtn = (id, preset) => rdBtn(id, () => {
+  rdAuto = (preset === 'auto');
+  if (rdAuto) { setRdPreset(rdPreset, true); showToast('🎚️ 画质：自动（按网络升降档）', 'info'); }
+  else setRdPreset(preset, false);
+});
+rdQualityBtn('rdQAuto', 'auto');
+rdQualityBtn('rdQSmooth', 'smooth');
+rdQualityBtn('rdQStd', 'standard');
+rdQualityBtn('rdQHD', 'hd');
+
+/* 弱网自适应：每 3s 看一次实测帧率。
+ *   - 明显低于当前档目标（画面卡）→ 往下降一档（先到最吃紧的"流畅"）；
+ *   - 帧率贴着当前档上限、且不是最高档 → 试探性升一档。
+ * 只统计"有在变画面"的情况：静止时 screencast 本就不推帧，帧率 0 不代表卡，
+ *   所以要求窗口内至少收到过 1 帧才判定（否则静止页面会被误降档）。 */
+setInterval(() => {
+  if (!rdHostId || !rdAuto) { rdFrameCounter = 0; return; }
+  const fps = rdFrameCounter / 3;
+  rdFrameCounter = 0;
+  if (fps < 0.5) return;                        // 几乎没帧 = 静止或没画面，不据此判断
+  const idx = RD_ORDER.indexOf(rdPreset);
+  const target = RD_PRESETS[rdPreset].fps;
+  if (fps < target * 0.55 && idx > 0) setRdPreset(RD_ORDER[idx - 1], true);   // 卡 → 降档
+  else if (fps >= target * 0.9 && idx < RD_ORDER.length - 1) setRdPreset(RD_ORDER[idx + 1], true); // 稳 → 升档
+}, 3000);
+
 
 // 窗口尺寸变了要重新排版画面（否则转屏后画面会溢出或缩成一条）
 if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', rdFit);

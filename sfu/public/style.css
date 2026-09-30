@@ -1713,6 +1713,10 @@ body.rd-mode { overflow: hidden; }
   white-space: nowrap;
 }
 .rd-ibtn { padding: 5px 10px; font-size: 14px; line-height: 1; }
+/* ★ 09-30 画质档组（流畅/标准/高清/自动）：紧凑分段，当前档鎏金高亮 */
+.rd-q { display: inline-flex; gap: 4px; padding: 2px; border: 1px solid var(--border); border-radius: 999px; }
+.rd-q .rd-ibtn { padding: 4px 9px; font-size: 12.5px; border-radius: 999px; border: none; background: transparent; }
+.rd-q .rd-ibtn.is-on { background: var(--accent-muted); color: var(--gold, var(--accent)); font-weight: 600; }
 .rd-url {
   flex: 1 1 240px;
   min-width: 150px;
