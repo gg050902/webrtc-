@@ -248,7 +248,7 @@ Socket.IO 收发"信令消息"，媒体在 SFU 版由服务器转发、在 Mesh 
 | | 前端（浏览器） | 后端（Node.js 服务器） |
 |---|---|---|
 | **跑在哪** | 每位参会者自己的浏览器标签页里 | 一台常驻的电脑/云服务器（你本机即可演示） |
-| **代码位置（SFU 主版本）** | `sfu/public/`：`index.html` + `style.css` + `client.js`（**第 1~33 步**，28 = 滤镜，29 = 实时字幕，30 = 过夜值守，31 = 值守日报，32 = 移动端/PWA，33 = 安全上下文提示）+ `dashboard.html`（观测面板）+ `vendor/` | `sfu/server.js`（分区 A~E）+ `store.js` + `password.js` + `protocol.js` + `config.json`（可选配置） |
+| **代码位置（SFU 主版本）** | `sfu/public/`：`index.html` + `style.css` + `client.js`（**第 1~39 步**，28 = 滤镜，29 = 实时字幕，30 = 过夜值守，31 = 值守日报，32 = 移动端/PWA，33 = 安全上下文提示，34 = 进房前 ICE 预检，35 = 首页 hero，36 = AI 操作会议实体，37 = 字幕延迟读数，38 = 播报延迟读数，39 = 延迟进日报）+ `dashboard.html`（观测面板）+ `vendor/` | `sfu/server.js`（分区 A~E）+ `store.js` + `password.js` + `protocol.js` + `config.json`（可选配置） |
 | **对应 Mesh 对照版** | `public/`：`client.js`（第 1~16 步 + 第 19~25 步 = A/D 档同步升级） | `server.js`（根目录，信令邮局） |
 | **职责：采集** | `getUserMedia` 开摄像头/麦克风、`getDisplayMedia` 抓屏幕 | 不采集，只收浏览器送上来的媒体 |
 | **职责：信令** | 发 create-room / join-room / produce / consume 等事件 | Socket.IO 接收转发：房间号生成、密码校验、协商撮合 |
@@ -500,7 +500,7 @@ webrtc/
     ├── recordings/         #   D+2 服务器侧录制产物（webm/mkv，经 /recordings/<file> 下载）
     ├── tls/                #   HTTPS 自签证书（https.enabled 时自动生成）
     └── public/             #   前端：几乎同 Mesh 版，多了 mediasoup-client
-        ├── index.html / style.css / client.js（**第 1~33 步**）
+        ├── index.html / style.css / client.js（**第 1~39 步**）
         ├── dashboard.html  #   实时观测面板（/dashboard，2s 轮询 /api/rooms）
         └── vendor/         # socket.io.min.js + mediasoup-client.js（本地打包，勿动）
 ```
