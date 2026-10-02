@@ -3494,6 +3494,12 @@ socket.on('room-control', ({ action, byName } = {}) => {
   else if (action === 'captions-off' && cap.on) { toggleCaptions(); done = '已关闭实时字幕'; }
   else if (action === 'view-grid') { if (setViewMode('gallery')) done = '已切到宫格视图'; }
   else if (action === 'view-speaker') { if (setViewMode('speaker')) done = '已切到演讲者视图'; }
+  /* ★ 2026-10-03 新增两个白板动作：**复用按钮背后同一对函数**（undoBoard/clearBoard），
+   *   而不是在这里再写一遍 applyBoardOp + sendBoard。
+   *   ▸ 白板不必 boardOn 才执行：账本与画布是同一份，收起状态下的清空/撤销
+   *     在重新打开时照样要成立（且 sendBoard 会连带把"整笔"上报归档，两处不会漂移）。 */
+  else if (action === 'board-undo') { undoBoard(); done = '已撤销白板最近一笔'; }
+  else if (action === 'board-clear') { clearBoard(); done = '已清空白板'; }
   if (done) showToast(`🤖 ${who}：${done}（全房间同步）`, 'info');
   /* ★ 2026-10-03 执行回执：把"这条指令在我身上真的生效了没有"报回服务器。
    *   服务器分别计「发出数」与「被执行数」，**两者的差就是"AI 说了但没做"的运行时证据**
@@ -5338,14 +5344,21 @@ for (const def of BOARD_COLORS) {
   });
   boardColorsEl.appendChild(dot);
 }
-$('boardUndoBtn').addEventListener('pointerdown', () => {
+/* ★ 2026-10-03 白板的"撤销一笔 / 清空整块"抽成具名函数。
+ * ▎为什么抽：按钮回调之外现在有**第二个调用者**——AI 房间动作（第 36 步的 room-control）。
+ *   同一条 LEARN 5.45.3 的教训：内联在回调里就没法被别处（也没法被测试）调用，
+ *   而"AI 清空白板"和"人点清空"必须是**同一条代码路径**，否则两边的行为会慢慢不一样
+ *   （比如一边广播了归档、另一边忘了）。 */
+function undoBoard() {
   applyBoardOp(boardColor, 'undo');
   sendBoard('undo');
-});
-$('boardClearBtn').addEventListener('pointerdown', () => {
+}
+function clearBoard() {
   applyBoardOp(boardColor, 'clear');
   sendBoard('clear');
-});
+}
+$('boardUndoBtn').addEventListener('pointerdown', undoBoard);
+$('boardClearBtn').addEventListener('pointerdown', clearBoard);
 $('boardCloseBtn').addEventListener('click', () => boardOverlay.classList.add('hidden'));
 
 const boardBtn = $('boardBtn');

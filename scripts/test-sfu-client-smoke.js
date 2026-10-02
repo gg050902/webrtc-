@@ -1479,7 +1479,7 @@ const emit = (ev, payload) => {
   const rcBlock = (clientSrc.match(/socket\.on\('room-control'([\s\S]*?)\n\}\);/) || [, ''])[1];
   const cliActions = (rcBlock.match(/action === '([a-z-]+)'/g) || []).map((s) => s.replace(/.*'([a-z-]+)'.*/, '$1'));
   ok('2026-10-02 服务器白名单与客户端处理表**一一对应**（少一个分支=AI 说了但没做）',
-     srvActions.length >= 6 &&
+     srvActions.length >= 8 &&
      srvActions.slice().sort().join(',') === cliActions.slice().sort().join(','));
   ok('2026-10-02 房间级动作表里没有"动用户设备"的事（摄像头/共享/静音别人一律不走这条路）',
      !/camera|screen|share|mute|kick|file|clipboard/i.test(srvActions.join(',')) &&

@@ -884,6 +884,32 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   await sleep(400);
   ok('2026-10-02 「把白板关掉」识别成 board-close（中文"关"必须排在"开"前面判，否则跨词误命中）',
      rcA.length === 1 && rcA[0].action === 'board-close');
+  /* ★ 2026-10-03 新加的两个白板动作。断言重点不是"能识别"，而是**不被老规则抢走**：
+   *   「把白板清空」里同时出现"白板"和"清"，如果 clear 排在 open 之后，
+   *   就会被 open 那条宽松动词表命中 → AI 回"白板已经打开"而画布没动，
+   *   正是第 36 步最不该出现的失败（症状是"它答应了，什么都没做"）。 */
+  const rcT3 = Date.now();
+  const rcClearP = new Promise((resolve) => {
+    const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcT3) { A.s.off('chat-message', h); resolve(m); } };
+    A.s.on('chat-message', h);
+  });
+  rcA.length = 0; rcB.length = 0;
+  await request(A.s, 'ai-ask', { question: '把白板清空' });
+  await Promise.race([rcClearP, sleep(9000).then(() => null)]);
+  await sleep(400);
+  ok('2026-10-03 「把白板清空」→ board-clear（不被 board-open 抢走，全房都收到）',
+     rcA.length === 1 && rcA[0].action === 'board-clear' && rcB.length === 1);
+  const rcT4 = Date.now();
+  const rcUndoP = new Promise((resolve) => {
+    const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcT4) { A.s.off('chat-message', h); resolve(m); } };
+    A.s.on('chat-message', h);
+  });
+  rcA.length = 0;
+  await request(A.s, 'ai-ask', { question: '撤销刚才那一笔' });
+  await Promise.race([rcUndoP, sleep(9000).then(() => null)]);
+  await sleep(400);
+  ok('2026-10-03 「撤销刚才那一笔」→ board-undo（没有"白板"两个字也要认，课堂上常这么说）',
+     rcA.length === 1 && rcA[0].action === 'board-undo');
   ok('2026-10-02 room-control 广播里不带任何设备/隐私字段（只发"做什么"）',
      rcA.length > 0 && Object.keys(rcA[0]).sort().join(',') === 'action,byName,ts');
   const rcT2 = Date.now();
