@@ -30,7 +30,7 @@ const SERVER_JS = path.join(__dirname, '..', 'sfu', 'server.js');
 const OUT = path.join(os.tmpdir(), 'e2e-media-shots');
 const TEST_DB_FILE = path.join(os.tmpdir(), `e2e-media-${process.pid}-${Date.now()}.db`);
 const TEST_LEGACY_USERS = path.join(os.tmpdir(), `e2e-media-legacy-${process.pid}.json`);
-const SHOT_NAMES = ['A-建房侧-双人在会', 'B-加入侧-双人在会']; // 截图文件名白名单
+const SHOT_NAMES = ['A-建房侧-双人在会', 'B-加入侧-双人在会', 'B-首页hero-手机390']; // 截图文件名白名单（索引即 shot 的 idx，加档位要同步加名字）
 
 let checks = 0, issues = 0;
 const chk = (cond, msg) => {
@@ -273,6 +273,36 @@ const VIDEO_STATS = `JSON.stringify((() => {
   await sleep(4000);   // 交回自动后服务器下一轮 tick（2s）会升回去，给两拍
   const wBack = Number(await A.evaluate(VW)) || 0;
   chk(wBack >= wAfter, `交回服务器自动选层后画面没被锁死在低层（videoWidth=${wBack}）`);
+
+  /* ⑪ ★ 2026-10-03 首页 hero 的手机形态（390×844）
+   * ▎为什么放到这条 e2e 里：hero 是本轮新加的、又是"用户第一眼"，
+   *   而它最容易坏的地方恰恰是**小屏放不放得下**——
+   *   实测就踩过一次：`.hero` 用 align-items:center + overflow:hidden，
+   *   内容比屏幕高时把文案顶出容器上沿被裁掉（.hero-copy 的 y = -101），
+   *   用户看到的就是"标题和打字机凭空消失"。这条断言就是那次的哨兵。 */
+  console.log('⑪ 断言：首页 hero 在 390×844 下放得下、文案不被裁…');
+  await B._send(B.pageWs, 'Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
+  await B.evaluate('location.href = "/"');
+  await sleep(3500);
+  const heroMobile = JSON.parse(await B.evaluate(`(() => {
+    const g = (s) => document.querySelector(s);
+    const pre = document.getElementById('prejoin');
+    const gg = [...document.querySelectorAll('button')].find(x=>/游客进入/.test(x.textContent));
+    if (gg) gg.click();
+    const rect = (s) => { const e = g(s); if (!e) return null; const r = e.getBoundingClientRect(); return { y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }; };
+    return JSON.stringify({
+      vw: innerWidth, docW: document.documentElement.scrollWidth,
+      preScroll: pre ? pre.scrollHeight > pre.clientHeight : null,
+      blurb: rect('.hero-blurb'), typed: rect('.hero-typed'), pills: rect('.hero-pills'),
+      typedText: (document.getElementById('heroTyped')||{}).textContent || '',
+    });
+  })()`));
+  chk(heroMobile.docW <= heroMobile.vw + 1, `手机视口无横向溢出（视口 ${heroMobile.vw}，文档宽 ${heroMobile.docW}）`);
+  chk(heroMobile.blurb && heroMobile.blurb.y >= 0, `模糊引导语在可视区内（y=${heroMobile.blurb && heroMobile.blurb.y}，被裁掉时这里是负数）`);
+  chk(heroMobile.typed && heroMobile.typed.y >= 0 && heroMobile.typedText.length > 4,
+    `打字机主句可见且在出字（y=${heroMobile.typed && heroMobile.typed.y}，"${String(heroMobile.typedText).slice(0, 10)}…"）`);
+  chk(heroMobile.pills && heroMobile.pills.y >= 0, `胶囊 CTA 可见（y=${heroMobile.pills && heroMobile.pills.y}）`);
+  await shot(A, 0);
 
   console.log(`\n结果：${checks - issues}/${checks} 通过，${issues} 失败（截图目录 ${OUT}）`);
   const fail = issues > 0;

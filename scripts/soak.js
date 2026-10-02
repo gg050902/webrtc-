@@ -8,7 +8,8 @@
 //   npm run soak                      # 正经过夜：默认 7 小时，早上看报告
 //   npm run soak -- --minutes 2      # 压缩自测（几分钟验证链路全通）
 //   node scripts/soak.js --hours 1 --rate 20 --url http://localhost:3001
-//   ADMIN_TOKEN=<token> npm run soak  # ★ 09-24：/api/rooms 与 /api/captions 现在要管理员 token
+//   默认**不需要任何 token**：值守脚本模拟的是普通参会者，用它进房拿到的房间令牌即可
+//   ADMIN_TOKEN=<token> npm run soak  # 可选：加上它才会顺带核对 /api/rooms 全景快照
 // ▎ADMIN_TOKEN 怎么拿：会议页用管理员账号登录 → 控制台 JSON.parse(localStorage.wb_auth).token
 // ▎退出码：0 = 全程零错误且归档对账一致；1 = 有错误/对账不平（CI 或睡前自检可用）。
 // ▎心跳落盘：sfu/logs/soak-<启动时刻>.log（每 10 分钟一行 + 结束报告），早上可回放整夜。
@@ -68,9 +69,20 @@ const rss0 = process.memoryUsage().rss;
 
   // 1) 建房（拿 6 位号，同时证明信令 + 房间链路活着）
   const createdP = waitEvent('room-created');
+  /* ★ 2026-10-03 抓**房间内令牌**（09-24 C4：进房成功时服务器单播给本人，游客也有）。
+   *   soak 是"门禁上线后没人管的那批脚本"之一：它还按"归档接口不要凭证"跑，
+   *   于是整条耐久自测每天 401、报"对账不平"——数字看着像服务器坏了，其实是脚本自己过期。
+   *   同坑 57 那条纪律：**同一个改动只迁移一半 = 等于没迁移**。
+   *   监听器必须在 create-room 之前注册（坑 3），所以这里用一次性 Promise。 */
+  const tokenP = new Promise((resolve) => {
+    socket.once('room-members', (p) => resolve((p && p.roomToken) || ''));
+  });
   await request('create-room', {});
   const { roomNumber } = await createdP;
-  heartbeat(`✅ 房间已建：${roomNumber}（值守期间保持常驻连接）`);
+  const roomToken = await tokenP;
+  const ROOM_HEADERS = roomToken ? { 'X-Room-Token': roomToken } : {};
+  if (!roomToken) heartbeat('⚠️ 没拿到房间令牌——归档会失败（服务器版本过旧？或 roomTokenRequired 被关）');
+  heartbeat(`✅ 房间已建：${roomNumber}（值守期间保持常驻连接${roomToken ? '，已取到房间令牌' : ''}）`);
 
   // 2) 三类定时流量：字幕归档 POST（每分钟 rate 条）/ 面板健康 GET（每 30s）/ 心跳（每 10 分钟）
   const entryOf = (n) => ({
@@ -85,7 +97,7 @@ const rss0 = process.memoryUsage().rss;
     try {
       const res = await fetch(`${URL_BASE}/api/captions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...AUTH_HEADERS },
+        headers: { 'Content-Type': 'application/json', ...ROOM_HEADERS },
         body: JSON.stringify({ room: String(roomNumber), entries }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}${res.status === 401 ? '（需要 ADMIN_TOKEN）' : ''}`);
@@ -98,6 +110,21 @@ const rss0 = process.memoryUsage().rss;
     }
   };
   const healthOnce = async () => {
+    /* ★ 2026-10-03 分两档：**没给 ADMIN_TOKEN 就只探"服务活着"**（/config.json 是公开端点），
+     *   给了才去核对全景快照。绝不把"我没权限"报成"服务不可用"——
+     *   这条区分 09-24 那轮已经写进 watch.js，当时就是漏了 soak。 */
+    if (!ADMIN_TOKEN) {
+      try {
+        const res = await fetch(`${URL_BASE}/config.json`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await res.json();
+        state.gets++;
+      } catch (err) {
+        state.errors++;
+        heartbeat(`❌ 存活探测失败：${err.message}`);
+      }
+      return;
+    }
     try {
       const res = await fetch(`${URL_BASE}/api/rooms`, { headers: AUTH_HEADERS });
       if (!res.ok) throw new Error(`HTTP ${res.status}${res.status === 401 ? '（需要 ADMIN_TOKEN）' : ''}`);
@@ -143,7 +170,7 @@ const rss0 = process.memoryUsage().rss;
     // 对账：POST 累计的条数 == GET 回读的行数（值守"一条不丢"的核心断言）
     let back = -1;
     try {
-      const res = await fetch(`${URL_BASE}/api/captions?room=${roomNumber}&format=json`, { headers: AUTH_HEADERS });
+      const res = await fetch(`${URL_BASE}/api/captions?room=${roomNumber}&format=json`, { headers: ROOM_HEADERS });
       if (res.ok) back = (await res.json()).length;
       else throw new Error(`HTTP ${res.status}${res.status === 401 ? '（需要 ADMIN_TOKEN）' : ''}`);
     } catch (err) {
