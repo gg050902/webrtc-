@@ -1429,11 +1429,26 @@ const emit = (ev, payload) => {
     /return BOARD_COLORS\[h % BOARD_COLORS\.length\]\.v;/.test(clientSrc));
   /* ▎观测面板也要有守卫：它的"沉默故障"是**整块新指标不显示**，
    *   而这恰好是最不容易被发现的一类（没有报错、旧数字还在）。 */
-  const dashSrc = fs.readFileSync(path.join(PUB, 'dashboard.html'), 'utf8');
+  const dashSrc = fs.readFileSync(path.join(__dirname, '..', 'sfu', 'public', 'dashboard.html'), 'utf8');
   ok('2026-10-03 观测面板渲染语音与协作四组新指标（且 collab 缺失时不炸）',
     /const cb = data\.collab \|\| \{\}/.test(dashSrc) &&
     /转写引擎/.test(dashSrc) && /AI 应答次数/.test(dashSrc) &&
     /房间动作/.test(dashSrc) && /白板归档笔数/.test(dashSrc));
+  /* ---- ★ 2026-10-03 密钥分域（补掉 AGENTS 写着的最后一条诚实边界）----
+   * ▎"一把密钥只干一件事"。房间令牌与录像签名过去共用主密钥，
+   *   任何一处被攻破另一处一起塌。现在各派生一把子密钥。
+   * ▎断言为什么是结构式的：跨域拒绝这件事**没法只靠 HTTP 造出来**
+   *   （要能拿旧密钥签一个合法 payload，就等于已经攻破密钥了）。
+   *   能钉住的是三条真实的形状：① 每次 HMAC 都必须显式带 key（漏一个参数就会
+   *   静默用错密钥，而 Node 不会报错）；② 两个用途字符串必须不同；
+   *   ③ 过渡期的双验必须**先试新域再试旧密钥**（反过来会让新令牌走旧路径校验）。 */
+  ok('2026-10-03 密钥分域：每次 HMAC 都显式带密钥（漏参数会静默用错密钥）',
+    !/hmacSha256\((?![^,]*,)/.test(srvSrc.replace(/const hmacSha256 = [^\n]*\n/g, '')) &&
+    /deriveTokenKey\('room-token'\)/.test(srvSrc) && /deriveTokenKey\('recording-url'\)/.test(srvSrc));
+  ok('2026-10-03 分域是"签发立刻换、校验过渡期双收"（不把别人手里的旧链接一夜作废）',
+    /hmacSha256\(payloadB64, ROOM_TOKEN_KEY\)/.test(srvSrc) &&
+    /\[ROOM_TOKEN_KEY, LEGACY_TOKEN_KEY\]/.test(srvSrc) &&
+    /\[RECORDING_URL_KEY, LEGACY_TOKEN_KEY\]/.test(srvSrc));
   ok('2026-10-02 同一轮的后半句是"追加"（replace:false，绝不 cancel 掉正在念的上一句）',
     /function enqueueAiSpeech\(say, \{ replace = true \}/.test(clientSrc) &&
     /if \(replace\) \{[\s\S]{0,600}?window\.speechSynthesis\.cancel\(\);[\s\S]{0,200}?aiSpeakPumping = false;/.test(clientSrc));

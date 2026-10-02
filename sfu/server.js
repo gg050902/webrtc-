@@ -1635,16 +1635,34 @@ function loadOrCreateRoomSecret() {
 }
 const ROOM_TOKEN_SECRET = loadOrCreateRoomSecret();
 
+/* ★ 2026-10-03 **密钥分域**（补掉 AGENTS 里写着的最后一条诚实边界）：
+ *   房间令牌与录像签名链接过去**共用同一把 SECRET**。今天两者格式不同、实际混淆不出来，
+ *   但密码学上的规矩是"一把密钥只干一件事"——共用意味着任何一处签名方案被攻破，
+ *   另一处也一起塌；将来给录像签名加新语义时，还会不小心影响房间令牌的校验。
+ * ▎做法：从主密钥派生两把子密钥（HMAC(master, "前缀:用途")），主密钥不再直接签任何令牌。
+ * ▎兼容照实处理（这类改动最容易做错的就是这里）：**签发**立刻换新子密钥；
+ *   **校验**在过渡期内"新域 or 旧裸密钥"都接受。
+ *   只改校验不改签发是没用的——旧令牌是**别人手里已经存在的链接**，
+ *   一刀切换掉等于把人家下载好的录像链接一夜作废。过渡期长度由令牌自身 exp 决定
+ *   （录像 1 小时、房间令牌 24 小时），到期自然收敛，不需要额外清理代码。 */
+const TOKEN_KEY_PURPOSE_PREFIX = 'sfu-token-v2:';
+const deriveTokenKey = (purpose) =>
+  crypto.createHmac('sha256', ROOM_TOKEN_SECRET).update(TOKEN_KEY_PURPOSE_PREFIX + purpose).digest();
+const ROOM_TOKEN_KEY = deriveTokenKey('room-token');
+const RECORDING_URL_KEY = deriveTokenKey('recording-url');
+/** 过渡期兼容用的旧裸密钥（分域之前所有签名都是用它算的）。 */
+const LEGACY_TOKEN_KEY = ROOM_TOKEN_SECRET;
+
 // base64url（URL 安全：+ → -、/ → _、去尾 = ）——放进 URL 查询串/请求头都不用再转义
 const b64url = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const fromB64url = (s) => Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
-const hmacSha256 = (data) => crypto.createHmac('sha256', ROOM_TOKEN_SECRET).update(data).digest();
+const hmacSha256 = (data, key) => crypto.createHmac('sha256', key).update(data).digest();
 
 /* 给某个房间签发一张令牌 —— 只在"这个 socket 进房成功"时对**它自己**调用（绝不给别人签）。 */
 function signRoomToken(room) {
   const now = Date.now();
   const payloadB64 = b64url(JSON.stringify({ room: String(room), iat: now, exp: now + ROOM_TOKEN_TTL_MS }));
-  return payloadB64 + '.' + b64url(hmacSha256(payloadB64));
+  return payloadB64 + '.' + b64url(hmacSha256(payloadB64, ROOM_TOKEN_KEY));
 }
 /* 校验：签名匹配 + 未过期 + room 一致。任何一步失败返回 false（不抛），供 requireRoomAccess 用。 */
 function verifyRoomToken(token, room) {
@@ -1654,11 +1672,15 @@ function verifyRoomToken(token, room) {
     if (dot <= 0 || dot === token.length - 1) return false;
     const payloadB64 = token.slice(0, dot);
     const sig = token.slice(dot + 1);
-    const expect = hmacSha256(payloadB64);
     const got = fromB64url(sig);
-    // timingSafeEqual 要求等长；长度不等直接判false（也顺手挡掉畸形输入）
-    if (got.length !== expect.length) return false;
-    if (!crypto.timingSafeEqual(got, expect)) return false;
+    /* 新域优先，旧裸密钥只作过渡期兼容（令牌自带 exp，过期自然失效）。
+     * timingSafeEqual 要求等长；长度不等直接跳过——也顺手挡掉畸形输入。 */
+    let sigOk = false;
+    for (const key of [ROOM_TOKEN_KEY, LEGACY_TOKEN_KEY]) {
+      const expect = hmacSha256(payloadB64, key);
+      if (got.length === expect.length && crypto.timingSafeEqual(got, expect)) { sigOk = true; break; }
+    }
+    if (!sigOk) return false;
     const obj = JSON.parse(fromB64url(payloadB64).toString('utf8'));
     if (!obj || typeof obj !== 'object') return false;
     if (typeof obj.exp !== 'number' || Date.now() > obj.exp) return false; // 过期
@@ -1670,22 +1692,26 @@ function verifyRoomToken(token, room) {
 /* ★ 录像的"短时效签名 URL"：/recordings/<文件名> 改成 admin 或签名 URL 才放行。
  * ▎为什么要它：单个录像此前只靠"能力 = 文件名"（文件名含 6 位房号 + 可估的时间戳）——
  *   同样属弱能力。改成签名 URL 后，链接自带过期时间，泄露也只在一小时窗口内。
- * ▎签名内容 fileName + '|' + exp 用同一把 SECRET 做 HMAC；exp 是绝对毫秒时间戳。
+ * ▎签名内容 fileName + '|' + exp；★ 2026-10-03 起用**录像专用子密钥** RECORDING_URL_KEY
+ *   签（不再与房间令牌共用主密钥），exp 是绝对毫秒时间戳。
  * ▎诚实边界：签名 URL 同样是 Bearer（谁拿到谁下），只是加了"一小时过期"这道闸。
  */
 function signRecordingUrl(fileName, ttlMs = 3600000) {
   const exp = Date.now() + ttlMs;
-  const sig = hmacSha256(fileName + '|' + exp).toString('hex');
+  const sig = hmacSha256(fileName + '|' + exp, RECORDING_URL_KEY).toString('hex');
   return `/recordings/${encodeURIComponent(fileName)}?exp=${exp}&sig=${sig}`;
 }
 function verifyRecordingSig(fileName, exp, sig) {
   try {
     const e = Number(exp);
     if (!Number.isFinite(e) || Date.now() > e) return false;        // 缺失/过期
-    const expect = hmacSha256(fileName + '|' + e);                  // Buffer
     const got = Buffer.from(String(sig || ''), 'hex');
-    if (got.length !== expect.length) return false;
-    return crypto.timingSafeEqual(got, expect);
+    /* 新域 + 旧裸密钥都收（分域前签发的链接还在别人手里，1 小时窗口内不该突然 401）。 */
+    for (const key of [RECORDING_URL_KEY, LEGACY_TOKEN_KEY]) {
+      const expect = hmacSha256(fileName + '|' + e, key);
+      if (got.length === expect.length && crypto.timingSafeEqual(got, expect)) return true;
+    }
+    return false;
   } catch (err) { return false; }
 }
 const clientIp = (socket) => (socket.handshake && socket.handshake.address) || 'unknown';
