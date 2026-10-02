@@ -753,6 +753,14 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
      met.code === 200 && met.text.includes('# TYPE sfu_rooms_total gauge') &&
      met.text.includes('sfu_producer_bytes_total') && /sfu_members_total \d+/.test(met.text));
   ok('09-19f /metrics 带 sfu_workers gauge（Worker 池大小）', /sfu_workers \d+/.test(met.text));
+  /* ★ 2026-10-03 G7 扩展：语音链路与协作动作的计数进 /metrics。
+   * ▎断言为什么要"先制造一次动作、再看计数动没动"：只断言"这一行存在"，
+   *   等于只验了模板拼字符串——计数器接错了地方照样绿。
+   *   （同坑 41/56 那条纪律：**有状态被写入的功能，要有一条"写进去没有"的断言**。） */
+  ok('2026-10-03 /metrics 含语音与协作五组计数（引擎/段数/应答/房间动作/白板）',
+     met.text.includes('sfu_ai_asr_segments_total') && met.text.includes('sfu_ai_asr_seconds_total')
+     && met.text.includes('sfu_ai_answers_total') && met.text.includes('sfu_room_control_total')
+     && met.text.includes('sfu_board_records_total'));
   // ★ 09-24 AI 用量可观测：调用次数/错误数/tokens/估算花费在同一份 metrics 面上
   ok('09-24 /metrics 含 AI 用量指标（调用/错误/tokens/花费 四组齐备）',
      met.text.includes('sfu_ai_llm_enabled') && met.text.includes('sfu_ai_llm_calls_total')
@@ -899,6 +907,26 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   await sleep(400);
   const bs3 = await boardOf('clear');
   ok('2026-10-03 「清空」后账本为空（晚来的人不会看到一屏旧笔迹）', bs3.length === 0);
+  /* ★ 2026-10-03 计数器"真的在动"（G7 扩展的下半条断言）。
+   * ▎为什么不能只测"metrics 里有这一行"：那只验了模板拼字符串，
+   *   计数器接错了地方（或压根没接）照样绿——坑 41/56 那条纪律在这儿同样适用。
+   * ▎放在白板这一段之后跑：此时 AI 已在房里，room-control 与 board 都是刚被真实触发过的。 */
+  /* ▎numOf 取不到要返回 **0 而不是 -1**：counter 第一次出现时从 0 跳到 1，
+   *   若按 -1 算就变成"应该等于 0"，一条正确的实现会被断言判成失败。 */
+  const metBefore = await httpReq('GET', `http://localhost:${PORT}/metrics`);
+  const numOf = (txt, key) => { const m = new RegExp(key.replace(/[{}]/g, '\\$&') + ' (\\d+)').exec(txt); return m ? Number(m[1]) : 0; };
+  A.s.emit('board-record', { op: 'stroke', color: '#3a5a7a', pts: [[0.2, 0.3], [0.4, 0.5]] });
+  await request(A.s, 'ai-ask', { question: '切到宫格视图' });
+  await sleep(1500);
+  const met2 = await httpReq('GET', `http://localhost:${PORT}/metrics`);
+  ok('2026-10-03 计数器真的在动（画一笔 → board stroke +1；AI 切视图 → room-control view-grid +1）',
+     numOf(met2.text, 'sfu_board_records_total{op="stroke"}') > numOf(metBefore.text, 'sfu_board_records_total{op="stroke"}') &&
+     numOf(met2.text, 'sfu_room_control_total{action="view-grid"}') ===
+       numOf(metBefore.text, 'sfu_room_control_total{action="view-grid"}') + 1);
+  const snapJson = JSON.parse((await httpReq('GET', `http://localhost:${PORT}/api/rooms`)).text);
+  ok('2026-10-03 面板与监控同源（/api/rooms 的 collab 与 /metrics 读同一个计数器，不另算一份）',
+     !!snapJson.collab && !!snapJson.collab.asrEngine &&
+     snapJson.collab.board.stroke === numOf(met2.text, 'sfu_board_records_total{op="stroke"}'));
   /* ★ 2026-10-03 这条断言改成"等**满足条件的那一条**快照"，而不是"等下一条快照"。
    *   起因是上面白板那组测试会反复 join/disjoin 临时客户端，每一次都触发一条
    *   room-state 广播——"下一条"完全可能是别人进出房引起的、bot 还在里面的旧快照。

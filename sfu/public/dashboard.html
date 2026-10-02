@@ -173,13 +173,29 @@ function render(data) {
   const totalMembers = data.rooms.reduce((a, r) => a + r.counts.members, 0);
   const totalProducers = data.rooms.reduce((a, r) => a + r.counts.producers, 0);
   const totalConsumers = data.rooms.reduce((a, r) => a + r.counts.consumers, 0);
+  /* ★ 2026-10-03 语音链路与协作动作的概览（数据与 /metrics 同源，都读服务器那个 COLLAB）。
+   * ▎平均转写耗时用"累计秒 ÷ 累计段"算，比再发一次探针便宜，而且它就是真实分布；
+   *   颜色按阈值给：**看得见边界**是这块面板存在的全部理由。 */
+  const cb = data.collab || {};
+  const asrEngines = Object.entries(cb.asr || {});
+  const asrTxt = asrEngines.length
+    ? asrEngines.map(([k, v]) => `${k} ${Math.round((v.sec / (v.n || 1)) * 10) / 10}s`).join(' · ')
+    : '还没转写过';
+  const asrColor = /whisper|CLI|常驻/i.test(asrEngines.map(([k]) => k).join(',')) && cb.asrEngine !== 'whisper'
+    ? 'color:#d3b877' : 'color:#9ecf7a';
+  const throttled = Object.values(cb.throttled || {}).reduce((a, n) => a + n, 0);
+  const boardRejected = (cb.board && cb.board.rejected) || 0;
   document.getElementById('overview').innerHTML = `
     <div class="stat"><div class="num">${data.rooms.length}</div><div class="lbl">房间数</div></div>
     <div class="stat"><div class="num">${totalMembers}</div><div class="lbl">参会人数</div></div>
     <div class="stat"><div class="num">${totalProducers}</div><div class="lbl">上传媒体路数</div></div>
     <div class="stat"><div class="num">${totalConsumers}</div><div class="lbl">转发中 Consumer</div></div>
     <div class="stat"><div class="num">${data.worker.pid ?? '--'}</div><div class="lbl">mediasoup Worker PID</div></div>
-    <div class="stat"><div class="num" style="${data.recordingCount ? '' : 'color:#8a8070'}">⏺ ${data.recordingCount}</div><div class="lbl">服务器录制中（D+2）</div></div>`;
+    <div class="stat"><div class="num" style="${data.recordingCount ? '' : 'color:#8a8070'}">⏺ ${data.recordingCount}</div><div class="lbl">服务器录制中（D+2）</div></div>
+    <div class="stat"><div class="num" style="font-size:20px">${cb.asrEngine || '--'}</div><div class="lbl">转写引擎 · ${asrTxt} <span style="${asrColor}">●</span></div></div>
+    <div class="stat"><div class="num">${cb.answers || 0}<span style="font-size:14px;color:#8a8070"> / 拦 ${throttled}</span></div><div class="lbl">AI 应答次数（被闸拦下）</div></div>
+    <div class="stat"><div class="num">${Object.values(cb.roomControl || {}).reduce((a, n) => a + n, 0)}</div><div class="lbl">房间动作（AI 操作实体）</div></div>
+    <div class="stat"><div class="num" style="${boardRejected ? 'color:#e0636f' : ''}">${(cb.board && cb.board.stroke) || 0}<span style="font-size:14px;color:#8a8070"> / 拒 ${boardRejected}</span></div><div class="lbl">白板归档笔数（被拒）</div></div>`;
 
   /* ② 房间卡 */
   const roomsEl = document.getElementById('rooms');

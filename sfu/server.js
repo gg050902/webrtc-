@@ -928,6 +928,16 @@ async function snapshotRooms() {
     now: Date.now(),
     worker: { pid: worker ? worker.pid : null, count: workers.length }, // count = 多 Worker 池大小（09-19f）
     recordingCount: recordSessions.size, // ★ D+2：全服务器进行中的录制数
+    /* ★ 2026-10-03 语音与协作计数器一并进快照：面板吃 /api/rooms、监控吃 /metrics，
+     *   两边读的是**同一个 COLLAB 对象**——不另算一份，免得两个地方说法不同（坑 47）。 */
+    collab: {
+      asrEngine: serverAsrEngineLabel(),
+      asr: COLLAB.asr,
+      answers: COLLAB.answers,
+      throttled: COLLAB.throttled,
+      roomControl: COLLAB.roomControl,
+      board: COLLAB.board,
+    },
     rooms: list,
   };
 }
@@ -937,6 +947,25 @@ async function snapshotRooms() {
  *   再补进程自身的 rss / 运行时长。Grafana / 任何 Prometheus 兼容抓取端直接认。
  * ▎格式纪律：# HELP/# TYPE 注释 + key{label} value 行；字节/秒数一律累计值（counter）。
  */
+/* ★ 2026-10-03 G7 可观测性扩展：语音链路与协作动作的计数器。
+ * ▎为什么值得单独记：这三条链路（耳朵/脑子/画布）的故障全是**沉默故障**——
+ *   转写退回 CLI、应答被闸拦掉、白板归档被拒，用户侧都只表现为"它没反应"，
+ *   而服务器日志翻完也看不出现在还在不在发生。计数进 /metrics 之后，
+ *   watch.js 与 Grafana 才有"退化"这件事的抓手（同坑 57/65 的判据：结论要能被下游证伪）。
+ * ▎口径：全部是**累计值**（counter），差值才有意义；按引擎/动作分维度。 */
+const COLLAB = {
+  asr: {},            // via -> { n, sec }（转写段数与累计耗时）
+  answers: 0,         // AI 真答出去的次数
+  throttled: {},      // reason -> n（被哪道闸拦下：dup / echo / inflight / interval）
+  roomControl: {},    // action -> n
+  board: { stroke: 0, undo: 0, clear: 0, rejected: 0 },
+};
+function bump(obj, key) { obj[key] = (obj[key] || 0) + 1; }
+function bumpAsr(via, ms) {
+  const s = COLLAB.asr[via] || (COLLAB.asr[via] = { n: 0, sec: 0 });
+  s.n += 1; s.sec += (ms || 0) / 1000;
+}
+
 const PROCESS_START = Date.now();
 function buildMetrics(snap) {
   const L = [];
@@ -979,6 +1008,29 @@ function buildMetrics(snap) {
   L.push(`sfu_ai_tts_enabled ${aiTtsState.enabled ? 1 : 0}`);
   help('sfu_ai_asr_engine_qwen', 'gauge', '1 when the Qwen3-ASR (DashScope) engine is active for new transcriptions');
   L.push(`sfu_ai_asr_engine_qwen ${(asrEngineMode() !== 'whisper' && QwenAsr.readKey()) ? 1 : 0}`);
+  /* ★ 2026-10-03 语音链路与协作动作的累计计数（口径见上面 COLLAB 的注释） */
+  help('sfu_ai_asr_segments_total', 'counter', 'Transcribed audio segments, by engine that actually did it');
+  for (const [via, s] of Object.entries(COLLAB.asr)) {
+    L.push(`sfu_ai_asr_segments_total{engine="${via}"} ${s.n}`);
+  }
+  help('sfu_ai_asr_seconds_total', 'counter', 'Cumulative wall-clock spent transcribing, by engine');
+  for (const [via, s] of Object.entries(COLLAB.asr)) {
+    L.push(`sfu_ai_asr_seconds_total{engine="${via}"} ${s.sec.toFixed(1)}`);
+  }
+  help('sfu_ai_answers_total', 'counter', 'How many times the AI assistant actually replied');
+  L.push(`sfu_ai_answers_total ${COLLAB.answers}`);
+  help('sfu_ai_answer_throttled_total', 'counter', 'Replies suppressed by a gate (dup/echo/inflight/interval)');
+  for (const [r, n] of Object.entries(COLLAB.throttled)) {
+    L.push(`sfu_ai_answer_throttled_total{reason="${r}"} ${n}`);
+  }
+  help('sfu_room_control_total', 'counter', 'Room-level actions applied (board/captions/layout), by action');
+  for (const [a, n] of Object.entries(COLLAB.roomControl)) {
+    L.push(`sfu_room_control_total{action="${a}"} ${n}`);
+  }
+  help('sfu_board_records_total', 'counter', 'Whiteboard archive operations accepted by the server, by op');
+  for (const k of ['stroke', 'undo', 'clear', 'rejected']) {
+    L.push(`sfu_board_records_total{op="${k}"} ${COLLAB.board[k]}`);
+  }
   help('sfu_room_members', 'gauge', 'Members per room');
   for (const r of rooms) L.push(`sfu_room_members{room="${r.roomNumber}"} ${r.counts.members}`);
   help('sfu_producer_bytes_total', 'counter', 'Cumulative bytes forwarded per producer');
@@ -2247,6 +2299,10 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
         dbg(baseName, `engine=${engine} via=${via || 'none'} text=${JSON.stringify(String(text).slice(0, 24))}`);
         try { fs.unlinkSync(full); } catch (e) { /* 已删 */ }
         if (!text || !rooms.get(roomNumber)) return false;
+        /* ★ 2026-10-03 记账：**只有真出了字幕才算一次转写**。
+         *   被能量闸/清洗挡掉的段不计——否则"退化到 CLI"会被一堆被丢弃的静音段
+         *   在指标里伪装成"引擎很忙"，那正是我们要能一眼看出的事。 */
+        bumpAsr(via, Date.now() - t0);
         console.log(`🤖 [ASR/${via}] ${speakerName}（转写 ${((Date.now() - t0) / 1000).toFixed(1)}s）：${text.slice(0, 50)}`);
         // 累积进当前语句 + 字幕条显示"累积中的句子"（interim：不进历史、不触发唤醒）
         const u = utterances.get(memberId) || { text: '', lastAt: 0 };
@@ -2668,6 +2724,7 @@ function applyRoomAction(roomNumber, action, byName) {
   const room = rooms.get(roomNumber);
   if (!room) return { ok: false, why: 'no-room' };
   io.to(roomNumber).emit('room-control', { action, byName: byName || 'AI 小明', ts: Date.now() });
+  bump(COLLAB.roomControl, action);
   logEvent('info', 'room-control', { roomNumber, action, by: byName || 'ai-bot' });
   console.log(`🎛 [room-control] ${roomNumber} · ${byName || 'AI 小明'} → ${spec.cn}`);
   return { ok: true, cn: spec.cn, done: spec.done };
@@ -2846,11 +2903,16 @@ async function asrWakeAndAnswer(roomNumber, memberId, text, speakerName) {
          *   ③ 三道闸**都不顺延追问窗口**（原先一进函数就 `aiChatUntil = now + 20s`，
          *      于是被丢弃的噪音也在给窗口续命 → 风暴期间窗口永远不会关）。 */
   if (room.aiAnswering) {
+    bump(COLLAB.throttled, 'inflight');
     logEvent('debug', 'ai-answer-busy-drop', { roomNumber, via: woken ? 'wake' : 'follow-up' });
     return;
   }
-  if (followUp && room.aiLastAnswerTs && now - room.aiLastAnswerTs < AI_ASR_ANSWER_MIN_MS) return;
+  if (followUp && room.aiLastAnswerTs && now - room.aiLastAnswerTs < AI_ASR_ANSWER_MIN_MS) {
+    bump(COLLAB.throttled, 'interval');
+    return;
+  }
   if (AI_CHAT_WINDOW_MS > 0) room.aiChatUntil = now + AI_CHAT_WINDOW_MS; // 窗口顺延（只在这次真的接话时）
+  COLLAB.answers += 1;   // ★ 过了所有闸、这次**真的**要答了才计数（"AI 今天答了几次话"的口径）
 
   const who = speakerName || memberDisplayName(roomNumber, memberId);
   logEvent('info', 'asr-wake-answer', { roomNumber, member: memberId, via: woken ? 'wake' : 'follow-up' });
@@ -4954,18 +5016,23 @@ io.on('connection', (socket) => {
     if (!room || !Array.isArray(room.boardLedger)) return;   // 不在房间 / 桌面房没有白板
     const op = String(msg.op || '');
     if (op === 'clear') {
+      bump(COLLAB.board, 'clear');
       room.boardLedger = [];
       appendBoardLine(roomNumber, { ts: Date.now(), by: socket.id, op: 'clear' });
       return;
     }
     if (op === 'undo') {
       const removed = room.boardLedger.pop();
-      if (removed) appendBoardLine(roomNumber, { ts: Date.now(), by: socket.id, op: 'undo', color: removed.color });
+      if (removed) {
+        bump(COLLAB.board, 'undo');
+        appendBoardLine(roomNumber, { ts: Date.now(), by: socket.id, op: 'undo', color: removed.color });
+      }
       return;
     }
     if (op === 'stroke') {
       const s = sanitizeBoardStroke(msg.color, msg.pts);
-      if (!s) return;                                        // 校验不过直接丢，绝不塞脏数据
+      if (!s) { COLLAB.board.rejected += 1; return; }    // 校验不过直接丢，绝不塞脏数据（并记一笔被拒）
+      bump(COLLAB.board, 'stroke');
       room.boardLedger.push(s);
       if (room.boardLedger.length > BOARD_LEDGER_MAX) room.boardLedger.splice(0, room.boardLedger.length - BOARD_LEDGER_MAX);
       appendBoardLine(roomNumber, { ts: Date.now(), by: socket.id, op: 'stroke', color: s.color, n: s.pts.length });

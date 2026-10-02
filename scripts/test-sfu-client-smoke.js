@@ -1427,6 +1427,13 @@ const emit = (ev, payload) => {
   ok('2026-10-03 白板颜色初值与兜底都是 hex 字符串（strokeStyle 收到对象会被静默忽略）',
     /let boardColor = BOARD_COLORS\[0\]\.v;/.test(clientSrc) &&
     /return BOARD_COLORS\[h % BOARD_COLORS\.length\]\.v;/.test(clientSrc));
+  /* ▎观测面板也要有守卫：它的"沉默故障"是**整块新指标不显示**，
+   *   而这恰好是最不容易被发现的一类（没有报错、旧数字还在）。 */
+  const dashSrc = fs.readFileSync(path.join(PUB, 'dashboard.html'), 'utf8');
+  ok('2026-10-03 观测面板渲染语音与协作四组新指标（且 collab 缺失时不炸）',
+    /const cb = data\.collab \|\| \{\}/.test(dashSrc) &&
+    /转写引擎/.test(dashSrc) && /AI 应答次数/.test(dashSrc) &&
+    /房间动作/.test(dashSrc) && /白板归档笔数/.test(dashSrc));
   ok('2026-10-02 同一轮的后半句是"追加"（replace:false，绝不 cancel 掉正在念的上一句）',
     /function enqueueAiSpeech\(say, \{ replace = true \}/.test(clientSrc) &&
     /if \(replace\) \{[\s\S]{0,600}?window\.speechSynthesis\.cancel\(\);[\s\S]{0,200}?aiSpeakPumping = false;/.test(clientSrc));
