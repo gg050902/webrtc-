@@ -285,11 +285,37 @@ roomPasswordInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') tryJoinRoom();
 });
 
+/* ★ 2026-10-03 与主版本（sfu/）同步的一条修复（AGENTS 坑 57 的"半迁移"纪律：
+ *   同一个坑只修一半 = 等于没修）。SFU 那边先修的，症状是用户被原生弹窗循环卡住：
+ *   服务器重启 → 房间（内存结构）没了 → 重连拿旧 myRoom 再 join → room-not-found
+ *   → **原生模态框阻塞主线程** → 点掉 → 又重连 → 又弹。
+ *   两个错叠加：① 用阻塞模态报一个会重复发生的事件；② `myRoom` 从来没有作废路径
+ *   （进过房就永远自认为在房里，徽标还挂着死房号）。
+ *   Mesh 版没有 D6 那套"重连自动重回房间"的状态机，所以循环风险比 SFU 低，
+ *   但**"房间已经没了、界面还以为在房里"这个错状态两边都有**，因此一并修。
+ * ▎Mesh 的 enterRoom 只动了三样东西（徽标/面板/离开按钮），这里就对称地复原三样，
+ *   不去发明新状态（对照版保持简单是它的教学价值）。 */
+function giveUpRoom(why) {
+  const gone = myRoom;
+  myRoom = null;
+  roomBadge.classList.add('hidden');
+  roomPanel.classList.remove('hidden');
+  leaveBtn.disabled = true;
+  resetRoomButtons();
+  log(`🚪 房间 ${gone || '(无)'} 已经不在了：${why} —— 已退回加入页，不会再自动去敲这扇门`);
+}
+
 // 房间号不存在（输错了 / 房间已散会 / 格式不对）
 socket.on('room-not-found', ({ roomNumber }) => {
   log(`❌ 房间 ${roomNumber || '(空)'} 不存在：可能输错了，或对方已结束会议`);
+  if (myRoom) {
+    giveUpRoom('这个号已经不存在（多半是服务器重启过，或最后一人离开后房间被回收）');
+    showToast(`房间 ${roomNumber || ''} 已不存在——请核对房间号，或直接创建一个新房间`, 'error');
+    return;
+  }
   resetRoomButtons();
-  alert(`房间 ${roomNumber || ''} 不存在，请核对房间号，或直接创建一个新房间`);
+  if (roomInput) { roomInput.value = ''; roomInput.focus(); }
+  showToast(`房间 ${roomNumber || ''} 不存在，请核对房间号（或点「创建房间」开一个新的）`, 'error');
 });
 
 // 房间在，但需要密码 / 密码不对（第 2.9 节新增事件）
@@ -300,7 +326,7 @@ socket.on('room-wrong-password', ({ roomNumber }) => {
     roomInput.value = roomNumber;           // 邀请链接直达失败时：房间号已填好，只差密码
     roomPasswordInput.focus();              // 光标直接放到密码框，输入完回车即可
   }
-  alert(`房间 ${roomNumber || ''} 需要密码，请输入正确密码后再加入`);
+  showToast(`房间 ${roomNumber || ''} 需要密码，请输入正确密码后再加入`, 'error');
 });
 
 // ③ 点右上角房间号徽标 → 复制邀请链接（对方打开即自动进房）
@@ -780,7 +806,7 @@ socket.on('peer-left', ({ id }) => {
 socket.on('room-full', ({ max }) => {
   log(`❌ 房间已满（最多 ${max} 人），请稍后再试`);
   resetRoomButtons(); // 允许重新尝试（换房间号或创建新的）
-  alert(`房间已满（最多 ${max} 人）`);
+  showToast(`房间已满（最多 ${max} 人），请稍后再试`, 'error');
 });
 
 /* ──────────────────────────────────────────────────────────────
@@ -979,7 +1005,7 @@ function requestRemoteControl(remoteId) {
 }
 
 /* ---- 页面内嵌 UI：授权卡片 + toast ----
- * ▎为什么不用 confirm()/alert()？
+ * ▎为什么不用 confirm() 或任何原生模态框？
  *   浏览器原生弹窗在"页面失焦 / 用户勾过'阻止此页面再弹窗'"时会静默返回 false，
  *   表现为"点了允许却收到拒绝"——教学演示不可靠。这里全部换成页面里的 DOM，
  *   一定弹得出来、一定点得到。这也是真实软件的做法（自己的 UI 自己画）。
