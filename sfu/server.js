@@ -936,6 +936,7 @@ async function snapshotRooms() {
       answers: COLLAB.answers,
       throttled: COLLAB.throttled,
       roomControl: COLLAB.roomControl,
+      roomApplied: COLLAB.roomApplied,
       board: COLLAB.board,
     },
     rooms: list,
@@ -957,7 +958,8 @@ const COLLAB = {
   asr: {},            // via -> { n, sec }（转写段数与累计耗时）
   answers: 0,         // AI 真答出去的次数
   throttled: {},      // reason -> n（被哪道闸拦下：dup / echo / inflight / interval）
-  roomControl: {},    // action -> n
+  roomControl: {},    // action -> n（服务器发出的房间动作）
+  roomApplied: {},    // action -> n（客户端回执"我真的执行了"）—— 与上面的差 = 说了没做
   board: { stroke: 0, undo: 0, clear: 0, rejected: 0 },
 };
 function bump(obj, key) { obj[key] = (obj[key] || 0) + 1; }
@@ -1026,6 +1028,10 @@ function buildMetrics(snap) {
   help('sfu_room_control_total', 'counter', 'Room-level actions applied (board/captions/layout), by action');
   for (const [a, n] of Object.entries(COLLAB.roomControl)) {
     L.push(`sfu_room_control_total{action="${a}"} ${n}`);
+  }
+  help('sfu_room_control_applied_total', 'counter', 'Room-level actions clients confirmed executing (gap vs sfu_room_control_total = AI said but did not do)');
+  for (const [a, n] of Object.entries(COLLAB.roomApplied)) {
+    L.push(`sfu_room_control_applied_total{action="${a}"} ${n}`);
   }
   help('sfu_board_records_total', 'counter', 'Whiteboard archive operations accepted by the server, by op');
   for (const k of ['stroke', 'undo', 'clear', 'rejected']) {
@@ -5027,6 +5033,18 @@ io.on('connection', (socket) => {
   socket.on('ai-leave', (payload = {}, callback) => {
     if (!socket.roomNumber || !rooms.get(socket.roomNumber)) return fail(callback, '不在房间里');
     ok(callback, { aiBot: setAiBot(socket.roomNumber, false) === true });
+  });
+
+  /* ★ 2026-10-03 房间动作的**执行回执**：客户端真的照做了一条才 +1。
+   * ▎为什么要这个数：`sfu_room_control_total` 只证明"服务器发出去了"，
+   *   而用户关心的是"白板到底开没开"。两个数一对齐，"AI 说了但没做"就从
+   *   偶发投诉变成一个**看得见差的指标**（差持续 > 0 = 客户端表漏了分支）。
+   * ▎action 必须先过白名单再当标签用：否则任何客户端都能凭意造标签，
+   *   把 Prometheus 的时间序列基数打爆（这是计数器最常见的被玩坏方式）。 */
+  socket.on('room-control-ack', (msg = {}) => {
+    const action = String(msg.action || '');
+    if (!ROOM_ACTIONS[action] || !msg.ok) return;
+    bump(COLLAB.roomApplied, action);
   });
 
   /* ★ 2026-10-03 白板笔迹归档（配合 client.js 第 26d 步的持久化改造）。

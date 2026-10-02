@@ -927,6 +927,23 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('2026-10-03 面板与监控同源（/api/rooms 的 collab 与 /metrics 读同一个计数器，不另算一份）',
      !!snapJson.collab && !!snapJson.collab.asrEngine &&
      snapJson.collab.board.stroke === numOf(met2.text, 'sfu_board_records_total{op="stroke"}'));
+  /* ★ 2026-10-03 执行回执：发出数 vs 被执行数。
+   * ▎差值本身就是"AI 说了但没做"的运行时证据；但回执来自客户端，
+   *   所以必须验两件事：① 合法 action 才计数；② **任意标签不能打进指标**
+   *   （否则一个坏客户端就能把 Prometheus 的时间序列基数打爆）。 */
+  const evil = 'evil' + 'x'.repeat(60);
+  A.s.emit('room-control-ack', { action: evil, ok: true });
+  A.s.emit('room-control-ack', { action: 'board-open', ok: true });
+  A.s.emit('room-control-ack', { action: 'board-close', ok: false });   // 没执行成功的不算
+  await sleep(600);
+  const met3 = await httpReq('GET', `http://localhost:${PORT}/metrics`);
+  ok('2026-10-03 回执计数：合法 action 才 +1，ok:false 不计数',
+     numOf(met3.text, 'sfu_room_control_applied_total{action="board-open"}') ===
+       numOf(met2.text, 'sfu_room_control_applied_total{action="board-open"}') + 1 &&
+     numOf(met3.text, 'sfu_room_control_applied_total{action="board-close"}') ===
+       numOf(met2.text, 'sfu_room_control_applied_total{action="board-close"}'));
+  ok('2026-10-03 白名单外的 action 进不了指标（防客户端打爆标签基数）',
+     met3.text.includes('sfu_room_control_applied_total') && !met3.text.includes(evil));
   /* ★ 2026-10-03 这条断言改成"等**满足条件的那一条**快照"，而不是"等下一条快照"。
    *   起因是上面白板那组测试会反复 join/disjoin 临时客户端，每一次都触发一条
    *   room-state 广播——"下一条"完全可能是别人进出房引起的、bot 还在里面的旧快照。

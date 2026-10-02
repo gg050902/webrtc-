@@ -1387,7 +1387,17 @@ const emit = (ev, payload) => {
      srvActions.length >= 6 &&
      srvActions.slice().sort().join(',') === cliActions.slice().sort().join(','));
   ok('2026-10-02 房间级动作表里没有"动用户设备"的事（摄像头/共享/静音别人一律不走这条路）',
-     !/camera|screen|share|mute|kick|record|file|clipboard/i.test(srvActions.join(',')));
+     !/camera|screen|share|mute|kick|file|clipboard/i.test(srvActions.join(',')) &&
+    /record/i.test(srvSrc));   // 断言本身有效的前提：这个正则真的能命中"录制"这类词（防变量名写错把断言变成空转）
+  /* ▎录制为什么也**不在**这张表里（有意为之，不是漏掉）：record-start 有角色门禁
+   *   （游客不能录），而 AI 本身没有身份角色——让它直接开录等于给它越权，
+   *   与 C1「授权绝不豁免」是同一条纪律。所以 record 单独钉一条，防止将来"顺手加上"。 */
+  ok('2026-10-03 房间动作表不含录制（AI 没有角色，不能替人越权录制）',
+    !/record/i.test(srvActions.join(',')));
+  /* 执行回执：报的是"本地是否真的执行了"（done 非空），不是"我收到了"。
+   * 只报"收到"的话，这个指标永远等于发出数、差值恒为 0 = 白做。 */
+  ok('2026-10-03 房间动作回执报的是"真的执行了"（不是"我收到了"）',
+    /socket\.emit\('room-control-ack', \{ action, ok: !!done \}\)/.test(clientSrc));
   ok('2026-10-02 动作路由排在 LLM 之前（tools-first：先做事再说话，坑 38）',
      /const roomAction = detectRoomAction\(q\);[\s\S]{0,600}?intent: 'room-action'[\s\S]{0,400}?classifyIntent/.test(srvSrc));
   ok('2026-10-02 中文规则把"关"排在"开"前面判（否则「把白板关掉」会命中"打开白板"）',     (() => {

@@ -3463,6 +3463,11 @@ socket.on('room-control', ({ action, byName } = {}) => {
   else if (action === 'view-grid') { if (setViewMode('gallery')) done = '已切到宫格视图'; }
   else if (action === 'view-speaker') { if (setViewMode('speaker')) done = '已切到演讲者视图'; }
   if (done) showToast(`🤖 ${who}：${done}（全房间同步）`, 'info');
+  /* ★ 2026-10-03 执行回执：把"这条指令在我身上真的生效了没有"报回服务器。
+   *   服务器分别计「发出数」与「被执行数」，**两者的差就是"AI 说了但没做"的运行时证据**
+   *   ——比只靠"两张表结构一致"的断言更强，而且不阻塞回答（回执是异步计数，没人等它）。
+   *   注意这里报的是**本地是否真的执行了**（done 非空），不是"我收到了"。 */
+  try { socket.emit('room-control-ack', { action, ok: !!done }); } catch (e) { /* 回执失败不影响界面 */ }
 });
 
 /* ★ 2026-10-03 白板账本补发：晚进房/刷新的人不再面对一块空白画布。
