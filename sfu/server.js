@@ -2514,8 +2514,8 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
       const recordLoop = async () => {
         await new Promise((r) => setTimeout(r, 300)); // 等首段产生
         while (alive && rooms.get(roomNumber)) {
-          // ★ 语句组装：静音间隙超过 UTTERANCE_GAP_MS → 成句（入账本+定稿字幕+唤醒判定）。
-          //   ⚠️ 必须在轮询之前查——说完话后不再有新段，放 continue 之后成句就永远不会执行
+          // ★ 语句组装：静音间隙超过 UTTERANCE_GAP_MS → 成句（入账本+上字幕+唤醒判定）。
+          //   ⚠️ 必须在转写之前查——说完话后不再有新段，放 continue 之后成句就永远不会执行
           //   （实测：账本空、AI 永不应答的假失败根因）。
           try {
             const now = Date.now();
@@ -2523,18 +2523,20 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
               if (now - u.lastAt > UTTERANCE_GAP_MS) await finalizeUtterance(mid);
             }
           } catch (e) { /* 成句失败不拖垮循环 */ }
-          const pick = await pickReadySegment();
-          if (!pick) { await new Promise((r) => setTimeout(r, 300)); continue; }
-          try { await handleSegment(pick.full, pick.baseName); } catch (e) { /* 单段失败不拖垮循环 */ }
-          // 清理已被跳过/处理完的旧段（Windows 上文件仍被 ffmpeg 写着时删不掉，下轮再试）
-          try {
-            for (const f of fs.readdirSync(segDir)) {
-              if (doneSet.has(f)) { try { fs.unlinkSync(path.join(segDir, f)); } catch (e) { /* 占用中 */ } }
-            }
-          } catch (e) { /* 目录清理竞态 */ }
-          // ★ 09-30f 静音早转写（抢跑）：说完静音超阈值且"正在写的段"有足够音频 →
-          //   快照转写（doneSet 先占位防双跑；handleSegment 删的是快照副本，原文件继续写）。
-          //   尾巴丢失窗口 ≤ 当前窗剩余：只在"刚说完话"时触发，概率低；ASR_FLUSH=0 关闭。
+          /* ══ ★ 2026-10-03 静音抢跑**挪到常规转写之前**（实测延迟从 6.97s 里的 wait=4.2s 来）══
+           * ▎原来的顺序是 pick → (没封口段就 continue) → 抢跑。而"刚说完话"这一刻恰恰
+           *   **没有新封口的段**（说话的那 4s 窗还在写），于是 continue 直接跳过抢跑代码——
+           *   抢跑只在"凑巧有封口段"时才执行，等于每隔一个分段边界才有机会一次（4s 一等）。
+           *   实测拆分正好对上：wait 4.2s（调度在等边界）vs trans 1.2s（模型根本不慢）。
+           *   ▎**瓶颈不是模型，是我们的事件循环把最该抢跑的时刻跳过了。**
+           *   改成每轮都先判抢跑，再处理封口段；两者都没活干才睡 300ms。
+           * ▎诚实记录：改完在同一 fixture 上复测，总延迟没有立刻下降（wait 4.0s vs 4.2s）。
+           *   原因是这里的 wait 主要被**上一段还在串行转写**占着（首轮 qwen-local 单段 6.7s），
+           *   不是等分段边界。顺序仍然是对的（原来那条路径在"刚说完话"时根本走不到），
+           *   但它值不回"立刻变快"这个说法——所以把数字写在这儿，别让它变成一条口头优化。
+           *   ▎下一刀的靶子也因此清楚了：**转写串行**（loop 里 await handleSegment），
+           *     不是模型速度；ASR_CONCURRENCY 允许 2 路，而这里一次只用一路。
+           * ▎语义不变的部分：doneSet 占位防双跑、快照 copy 合法截断、ASR_FLUSH=0 逃生舱。 */
           if (process.env.ASR_FLUSH !== '0' && alive && lastVoiceTs && Date.now() - lastVoiceTs > FLUSH_MS) {
             try {
               const all = fs.readdirSync(segDir).filter((f) => f.startsWith('seg-') && f.endsWith('.wav')).sort();
@@ -2552,6 +2554,15 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
               }
             } catch (e) { /* 抢跑失败不影响常规转写 */ }
           }
+          const pick = await pickReadySegment();
+          if (!pick) { await new Promise((r) => setTimeout(r, 300)); continue; }
+          try { await handleSegment(pick.full, pick.baseName); } catch (e) { /* 单段失败不拖垮循环 */ }
+          // 清理已被跳过/处理完的旧段（Windows 上文件仍被 ffmpeg 写着时删不掉，下轮再试）
+          try {
+            for (const f of fs.readdirSync(segDir)) {
+              if (doneSet.has(f)) { try { fs.unlinkSync(path.join(segDir, f)); } catch (e) { /* 占用中 */ } }
+            }
+          } catch (e) { /* 目录清理竞态 */ }
         }
         // 收尾：把最后一段（ffmpeg 已停、不再增长）也转出来——别丢最后半句话
         try {
