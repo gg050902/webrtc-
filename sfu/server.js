@@ -2485,16 +2485,19 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
           return;
         }
         room.lastAsrUtterance = { norm: n, ts: now, from: memberId };
-        ingestCaptions(roomNumber, [{
-          ts: now, from: memberId, name: speakerName, text, asr: true,
-        }]);
-        /* ★ 2026-10-03 带出"说完→上字幕"的实测延迟（口径见 COLLAB.capLat 注释）。
+        /* ★ 2026-10-03 延迟读数**先算后入库**：把它一并写进字幕账本，
+         *   这样早上那份值守日报能直接证明"这一夜的字幕有多快"，
+         *   而不是只有一个"当时在 /metrics 里看过"的口头保证。
          *   上限 120s：lastVoiceTs 只在 RMS 高于阈值时刷新，若某段音频之后人就再没出声，
          *   陈旧时间戳会把延迟虚报成几分钟——那种值对"要不要再降延迟"毫无参考价值，
-         *   宁可报 0（前端不显示）。 */
+         *   宁可写 0（前端与日报都不显示）。 */
         const latMs = lastVoiceTs && now > lastVoiceTs && now - lastVoiceTs < 120000
           ? now - lastVoiceTs : 0;
         bumpCapLat(latMs);
+        ingestCaptions(roomNumber, [{
+          ts: now, from: memberId, name: speakerName, text, asr: true,
+          lat: latMs || undefined,   // 缺字段而不是 0：读的人要能分清"没量到"与"量到 0"
+        }]);
         io.to(roomNumber).emit('asr-caption', {
           name: speakerName, text: text.slice(0, 200), latMs,
           /* 拆分（末段口径）：界面悬浮提示与 /metrics 都靠它回答"慢在哪一段" */

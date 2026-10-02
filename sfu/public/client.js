@@ -1492,6 +1492,11 @@ socket.on('asr-caption', ({ name, text, interim, latMs, stage } = {}) => {
    *   **不进历史**；成句后的定稿（无 interim）才进历史（Otter 分段不被碎片污染）。 */
   if (!cap.on) return;
   const entry = { ts: Date.now(), from: 'asr', name: name || '转写', text: text || '', asr: true, interim: !!interim };
+  /* ★ 2026-10-03 把服务器实测的"说完→上字幕"一起存进本地账本：
+   *   值守日报因此能报告"这一夜字幕平均多快"，而不是只在当时屏幕上闪一下。
+   *   只存定稿（interim 的延迟没有意义），且缺字段就缺着——不写 0，
+   *   读的人要能分清"没量到"与"量到 0 毫秒"。 */
+  if (!interim) { const lm = Number(latMs); if (Number.isFinite(lm) && lm > 0) entry.lat = lm; }
   showCaptionBar(entry.name, entry.text, true);
   if (!interim) {
     capPushLog(entry);
@@ -3378,6 +3383,8 @@ const pendingServerTts = new Map(); // ★ 2026-10-01：ts → 文本（服务�
  *   ▸ 为什么要 DOM 节点：语音比文字晚到几秒是常态，事后没有节点就无处可贴。
  *   ▸ 声明在本文件后段没问题——这里全是事件回调里才执行的代码（顶层不读它，不会撞 TDZ）。 */
 const voiceAnswerAt = new Map();
+/* 播报延迟的滚动窗口（值守日报吃这个）：{ ts, ms }，只留最近 60 条 */
+const aiVoiceLats = [];
 /* ★ 2026-10-02 语音流水线带来一个新的时序：第一句的音频可能**比 chat-message 先到**
  * （LLM 刚吐完第一句就去合成了）。这时 pendingServerTts 里还没有这条 ts，等气泡到达时
  * 再塞进去就成了一条"永远不会被销掉"的账——万一之后来了 ai-tts-fail，会把已经念过的
@@ -6368,6 +6375,10 @@ function noteVoiceLatency(ts) {
   const chip = document.createElement('span');
   chip.className = 'msg-voice-lat';
   chip.textContent = `🔊 ${(ms / 1000).toFixed(1)}s 后开口`;
+  /* 同一条数据还要进值守日报（第 30 步的账本只记字幕，播报延迟得另存一份滚动窗口）。
+   * 上限 60 条：一场长会里 AI 不会答几百次，超了就是环形剪旧段（同 cap.log 的做法）。 */
+  aiVoiceLats.push({ ts, ms });
+  if (aiVoiceLats.length > 60) aiVoiceLats.shift();
   chip.title = '这条答案：文字上屏 → 真的听见第一句声音，服务器合成 + 传输 + 排队都算在里面。'
     + '慢通常是本地 Qwen 音色在 CPU 上合成（RTF>1）；浏览器朗读几乎是 0s。';
   /* 贴在气泡正文与时间行之间；节点不足时直接挂末尾（假 DOM 与真 DOM 都不炸） */
@@ -7186,24 +7197,19 @@ setInterval(() => {
  *   = 全档；两边按设计不重叠（归档的都是已从内存剪掉的）。
  * ▎产物：Blob 下载 report-<房间号>-<日期>.md（同字幕导出的下载路径）。
  * ────────────────────────────────────────────────────────────── */
-capReportBtn.addEventListener('click', async () => {
-  // ① 合并全档：先拉服务器归档（没进房/拉失败就只用内存窗口，日报照样能出）
-  let all = cap.log.slice();
-  if (myRoom && typeof fetch === 'function') {
-    try {
-      const res = await fetch(`/api/captions?room=${encodeURIComponent(String(myRoom))}&format=json`, {
-        headers: roomTokenHeader(), // ★ 09-24 C4：日报回读同样要房间内令牌
-      });
-      if (res.ok) all = (await res.json()).concat(cap.log);
-    } catch (err) { /* 服务器不可达：用内存窗口出简版 */ }
-  }
-  if (!all.length) {
-    showToast('还没有字幕记录，出不了日报', 'error');
-    return;
-  }
-  all.sort((a, b) => (a.ts || 0) - (b.ts || 0));
-
-  // ② 统计：时间范围 / 说话人占比 / 每小时分布
+/* ★ 2026-10-03 把"拼 markdown"从点击回调里抽成具名函数。
+ * ▎为什么要抽：原来整段统计 + 拼串写死在 addEventListener 的回调里，**没有任何测试能调用它**——
+ *   于是"日报里到底有没有链路质量这一节"这种问题只能靠人肉点一下看。
+ *   本项目一路的原则是"断言写在离用户最近的地方"，而要能写断言，先得能被调用。
+ *   （纯函数化 = 免费拿到可测性；这也是坑 41 的正解：有状态写入的东西要有"写进去没有"的断言。）
+ * @param all      全档字幕（服务器归档 + 内存热窗口，已按 ts 排序）
+ * @param sentry   cap.sentry（值守统计）
+ * @param voiceLats 播报延迟滚动窗口 [{ ts, ms }]
+ * @returns {{md:string, speakerCount:number, durMin:number}}
+ *   ▸ 返回对象而不只是字符串：日志行要用的"几位说话人/跨度多久"**必须由同一趟统计给出**，
+ *     让调用方再算一遍就是"一个概念两个来源"（坑 47）——两处算法漂移时，
+ *     屏幕上会出现"日报说 4 人、日志说 3 人"这种自己跟自己吵架的输出。 */
+function buildSentryReport(all, sentry, voiceLats) {
   const first = all[0].ts, last = all[all.length - 1].ts;
   const durMin = Math.max(1, Math.round((last - first) / 60000));
   const bySpeaker = new Map();
@@ -7217,9 +7223,7 @@ capReportBtn.addEventListener('click', async () => {
   const speakers = [...bySpeaker.entries()].sort((a, b) => b[1] - a[1]);
   const hours = [...byHour.entries()].sort((a, b) => a[0].localeCompare(b[0]));
   const maxHour = Math.max(...hours.map(([, n]) => n));
-
-  // ③ 拼 markdown（全 textContent 安全字符，Blob 下载同字幕导出）
-  const s = cap.sentry;
+  const s = sentry || {};
   const lines = [];
   lines.push(`# 值守日报 · 房间 ${myRoom || '(未知)'}`);
   lines.push('');
@@ -7227,6 +7231,30 @@ capReportBtn.addEventListener('click', async () => {
   lines.push(`- 首条字幕：${new Date(first).toLocaleTimeString()} · 末条：${new Date(last).toLocaleTimeString()}（跨度约 ${durMin} 分钟）`);
   lines.push(`- 字幕总数：${all.length} 条 · 说话人 ${speakers.length} 人`);
   if (s.startedAt) lines.push(`- 值守健康：时长 ${Math.floor((Date.now() - s.startedAt) / 3600000)}h${Math.floor(((Date.now() - s.startedAt) / 60000) % 60)}m · 识别器重启 ${s.restarts} 次 · 已归档 ${s.archived} 条${s.drops ? ` · 丢弃 ${s.drops} 条` : ''}`);
+  /* ★ 2026-10-03 第 39 步：链路质量段——早上那份报告要能**自己证明这一夜有多快**。
+   * ▎为什么单独立一节而不是塞进"值守健康"那行：值守健康讲"有没有断过"（可用性），
+   *   延迟讲"通的时候有多慢"（体验）——一夜没断但每句慢 8s，是两种完全不同的结论。
+   * ▎字幕延迟从**账本里读**（服务器把 lat 写进每条定稿字幕），播报延迟从前端窗口读：
+   *   两处共用同一个 latSummary()，口径不会漂。
+   * ▎样本数必须一起印出来：一夜只有 3 句字幕时"均值 6s"什么也说明不了（坑 53）。 */
+  const latSummary = (arr, label) => {
+    if (!arr.length) return null;
+    const avg = arr.reduce((a, b) => a + b, 0) / arr.length;
+    const sorted = [...arr].sort((a, b) => a - b);
+    const p90 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.9))];
+    return `- ${label}：均值 ${(avg / 1000).toFixed(1)}s · P90 ${(p90 / 1000).toFixed(1)}s · `
+      + `最慢 ${(Math.max(...arr) / 1000).toFixed(1)}s（样本 ${arr.length}）`;
+  };
+  const capLats = all.map((e) => Number(e.lat)).filter((v) => Number.isFinite(v) && v > 0);
+  const spkLats = (voiceLats || []).map((e) => e && e.ms).filter((v) => Number.isFinite(v) && v > 0);
+  const latLines = [latSummary(capLats, '说完→上字幕'), latSummary(spkLats, '看到答案→听到开口')]
+    .filter(Boolean);
+  if (latLines.length) {
+    lines.push('');
+    lines.push('## 链路质量（实测）');
+    lines.push(...latLines);
+    if (!spkLats.length) lines.push('- 看到答案→听到开口：本次没有服务端语音播报记录（浏览器朗读几乎即时，不计入）');
+  }
   lines.push('');
   lines.push('## 说话人占比');
   for (const [name, n] of speakers.slice(0, 10)) {
@@ -7243,14 +7271,35 @@ capReportBtn.addEventListener('click', async () => {
   lines.push('');
   lines.push('> 由简易腾讯会议第 31 步本地生成（零 LLM）；要"读懂内容"的版本等 N2 接上 LLM。');
   lines.push('');
-  const blob = new Blob([lines.join('\n')], { type: 'text/markdown' });
+  return { md: lines.join('\n'), speakerCount: speakers.length, durMin };
+}
+
+capReportBtn.addEventListener('click', async () => {
+  // ① 合并全档：先拉服务器归档（没进房/拉失败就只用内存窗口，日报照样能出）
+  let all = cap.log.slice();
+  if (myRoom && typeof fetch === 'function') {
+    try {
+      const res = await fetch(`/api/captions?room=${encodeURIComponent(String(myRoom))}&format=json`, {
+        headers: roomTokenHeader(), // ★ 09-24 C4：日报回读同样要房间内令牌
+      });
+      if (res.ok) all = (await res.json()).concat(cap.log);
+    } catch (err) { /* 服务器不可达：用内存窗口出简版 */ }
+  }
+  if (!all.length) {
+    showToast('还没有字幕记录，出不了日报', 'error');
+    return;
+  }
+  all.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  // ②③ 统计与拼串都在 buildSentryReport 里（抽出去是为了能被测试调用）
+  const rep = buildSentryReport(all, cap.sentry, aiVoiceLats);
+  const blob = new Blob([rep.md], { type: 'text/markdown' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
   a.download = `report-${myRoom || 'local'}-${Date.now()}.md`;
   if (typeof a.click === 'function') a.click();
   URL.revokeObjectURL(url);
-  log(`📋 已生成值守日报（${all.length} 条 · ${speakers.length} 位说话人 · 跨度 ${durMin} 分钟）`);
+  log(`📋 已生成值守日报（${all.length} 条 · ${rep.speakerCount} 位说话人 · 跨度 ${rep.durMin} 分钟）`);
 });
 
 

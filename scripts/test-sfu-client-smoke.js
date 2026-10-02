@@ -863,6 +863,35 @@ const emit = (ev, payload) => {
     () => vm.runInContext(`noteVoiceLatency(${voiceTs + 9999})`, ctx));
   ok('播报延迟：找不到锚点时什么都不报、不崩（不编数）',
     rec.emits.filter((e) => e === 'ai-speech-lat').length === vlatBefore2);
+
+  /* ---- ★ 2026-10-03 第 39 步：两个延迟读数进值守日报 ----
+   * ▎为什么要断这个：日报是"早上拿到手的那份东西"，如果它不含链路质量，
+   *   这一夜到底快不快就只剩"当时屏幕上瞟过一眼"——**证据必须能过夜**。 */
+  ok('字幕定稿把服务器实测的 lat 一起存进本地账本（日报与导出都靠它）',
+    vm.runInContext('cap.log[cap.log.length - 1].lat', ctx) === 2000);
+  ok('播报延迟进入滚动窗口（上限 60 条，长跑不涨）',
+    vm.runInContext('aiVoiceLats.length', ctx) >= 1 &&
+    vm.runInContext('aiVoiceLats[aiVoiceLats.length - 1].ms', ctx) === 2300);
+  /* ▎日报这一节的断言刻意**直接调用那个被抽出来的纯函数**：
+   *   原来整段拼串写在点击回调里，谁都调不到，于是"日报里到底有没有链路质量"
+   *   只能靠人肉点一下看——抽成 buildSentryReport() 才第一次可断言（这也是抽它的理由）。 */
+  const repMd = String(vm.runInContext(`buildSentryReport(
+      [{ ts: 1000, name: '小张', text: '第一句', asr: true, lat: 2400 },
+       { ts: 61000, name: '小李', text: '第二句', asr: true, lat: 5200 },
+       { ts: 121000, name: '小张', text: '没有延迟读数的老条目', asr: true }],
+      { startedAt: 1000, restarts: 2, archived: 7 },
+      [{ ts: 1, ms: 1800 }, { ts: 2, ms: 4400 }]
+    ).md`, ctx));
+  ok('2026-10-03 日报含「链路质量」一节：均值/P90/最慢都算对，且带样本数',
+    /链路质量/.test(repMd)
+    && /说完→上字幕：均值 3\.8s · P90 5\.2s · 最慢 5\.2s（样本 2）/.test(repMd)
+    && /看到答案→听到开口：均值 3\.1s · P90 4\.4s · 最慢 4\.4s（样本 2）/.test(repMd),
+    (repMd.match(/链路质量[\s\S]{0,200}/) || [''])[0]);
+  const repEmpty = String(vm.runInContext(`buildSentryReport(
+      [{ ts: 1000, name: '小张', text: '老服务器没有 lat 字段', asr: true }],
+      {}, []).md`, ctx));
+  ok('2026-10-03 没有延迟数据时不硬凑一节（宁可不写，也不写一个 0.0s 骗人）',
+    !/链路质量/.test(repEmpty) && /说话人占比/.test(repEmpty));
   ok('服务端字幕：单独记账 serverTotal', vm.runInContext('cap.sentry.serverTotal', ctx) >= 1);
   guard('服务端字幕：点关开关', () => capBtnEl.dispatch('click'));
   ok('服务端字幕：关掉只隐藏显示（提示服务器仍在转写）',
