@@ -79,15 +79,14 @@ function start() {
   state.child.on('error', () => { /* spawn 失败交给 exit */ });
 }
 
-async function pythonNameForWorker({ timeoutMs = 15000 } = {}) {
-  const { execFile } = require('child_process');
-  for (const bin of ['python', 'python3']) {
-    const ok = await new Promise((resolve) => {
-      execFile(bin, ['-c', 'import qwen_tts'], { timeout: timeoutMs, windowsHide: true }, (err) => resolve(!err));
-    });
-    if (ok) return bin;
-  }
-  return null;
+/* ★ 2026-10-02 同 asr_qwen_local：`import qwen_tts` 实测 18.4s > 旧的 15s 上限，
+ *   一冷就误判"没装"→ QwenTts.alive 永远 false → 神经音色整条不生效。
+ *   判据统一交给 pyprobe（区分"真没装"与"此刻没答上来"，超时重试一趟长的）。 */
+async function pythonNameForWorker() {
+  const { probePythonModule } = require('./pyprobe');
+  const r = await probePythonModule('qwen_tts');
+  if (!r.bin) state.lastError = r.reason;
+  return r.bin;
 }
 
 async function boot() {
@@ -135,8 +134,10 @@ function kill() {
   state.child = null;
 }
 
-/* 非阻塞预热：开机加载模型（首次合成等它；未就绪时播报链直接落 Edge/浏览器 TTS） */
-async function warm() { try { await boot(); } catch (e) { /* 忽略 */ } }
+/* 非阻塞预热：开机加载模型（未就绪时播报链直接落 Edge/浏览器 TTS）。
+ * ★ 2026-10-02 返回 boot() 结果，调用方据此决定打不打"🔥 已预热"——
+ *   原来恒 undefined，失败也报成功（假绿）。 */
+async function warm() { try { return await boot(); } catch (e) { return false; } }
 
 module.exports = {
   synthesize,

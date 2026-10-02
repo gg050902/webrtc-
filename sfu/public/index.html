@@ -9,7 +9,7 @@
   <link rel="manifest" href="manifest.webmanifest" />
   <meta name="theme-color" content="#14100a" />
   <title>會 · 智能多人视频会议（WebRTC SFU）</title>
-  <link rel="stylesheet" href="style.css?v=20260930" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存（本次为 09-30 设备码入口 + 画质档样式） -->
+  <link rel="stylesheet" href="style.css?v=20261002" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存（本次为第 28 节 首页 hero 化） -->
 </head>
 <body>
   <!-- ★ 09-24（第 33 步）安全上下文提示横幅 —— 只在 http + IP 访问时出现。
@@ -107,43 +107,92 @@
     </div>
   </div>
 
+  <!-- ★ 2026-10-02 首页 hero 化：prejoin 是用户打开页面的**第一屏**，它就是本产品的落地页，
+       所以借鉴定价页的"一屏叙事"（模糊引导语 → 打字机主句 → 胶囊 CTA → 设备卡），
+       但**不照抄它的资源**：那份稿用外链视频做背景、外链字体做标题，
+       与本项目"零依赖 + 可离线 PWA"的红线冲突（断网/内网部署就会露白底），
+       于是背景换成**纯 CSS 氛围层**（漂移光晕 + 宣纸颗粒 + 呼吸金环），
+       字体沿用本地 --font-display（有则用、无则降级衬线，不写任何 JS 探测）；
+       配色仍是本项目的水墨丹青（墨底 / 宣纸字 / 鎏金线 / 朱砂按钮）。
+       ▎分层照抄（z-index 见 style.css 第 28 节的表）：氛围 0 / 内容 1 / 文案容器 10 / 顶栏 20。
+       ▎id 契约：pjEnterBtn / pjFxBtn / pjCamSelect / pjMicSelect / pjMeterBar /
+         pjMuteChk / pjCamChk / preVideo / preVideoHint / pjStatus / .prejoin-card 一个都不改
+         （client.js 与冒烟测试按这些名字找元素）。 -->
   <div id="prejoin" class="prejoin">
-    <div class="prejoin-card">
-      <div class="prejoin-title">
-        <span class="prejoin-logo">會</span>
-        <div>
-          <div class="prejoin-caps">Device Check</div>
-          <div class="prejoin-heading">准备加入会议</div>
-          <div class="prejoin-sub">先检查设备，再进会 —— 摄像头/麦克风只在预览里授权这一次</div>
-        </div>
-      </div>
-      <div class="prejoin-main">
-        <div class="prejoin-video-wrap">
-          <video id="preVideo" autoplay playsinline muted></video>
-          <div id="preVideoHint" class="prejoin-video-hint hidden">
-            摄像头不可用或未授权<br />可直接进入会议（不发布自己的画面）
-          </div>
-        </div>
-        <div class="prejoin-side">
-          <label class="pj-row">摄像头
-            <select id="pjCamSelect" class="dev-select" title="选择摄像头"></select>
-          </label>
-          <label class="pj-row">麦克风
-            <select id="pjMicSelect" class="dev-select" title="选择麦克风"></select>
-          </label>
-          <div class="pj-row">试音
-            <!-- 对麦克风说话，绿条会动：WebAudio AnalyserNode 实时量能量（见第 25 步） -->
-            <div class="pj-meter" title="对麦克风说话，绿条会动"><i id="pjMeterBar"></i></div>
-          </div>
-          <label class="pj-check"><input type="checkbox" id="pjMuteChk" /> 入会时静音麦克风</label>
-          <label class="pj-check"><input type="checkbox" id="pjCamChk" /> 入会时关闭摄像头</label>
-          <!-- ★ F6：预览页也能开滤镜（与会内共用同一块面板；预览里调好，进会后推的就是处理后的画面） -->
-          <button id="pjFxBtn" class="btn pj-fx-btn" title="滤镜/磨皮/虚拟背景（预览即所见即所得）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l1.8 4.7 4.7 1.8-4.7 1.8L12 17l-1.8-4.7-4.7-1.8 4.7-1.8L12 4z"/><path d="M18.5 4v3M20 5.5h-3"/></svg><span>滤镜 / 虚拟背景</span></button>
-          <button id="pjEnterBtn" class="btn primary pj-enter">进入会议 →</button>
-          <div id="pjStatus" class="pj-status">正在打开摄像头…</div>
-        </div>
-      </div>
+    <div class="hero-bg" aria-hidden="true">
+      <span class="hero-glow a"></span><span class="hero-glow b"></span><span class="hero-grain"></span>
     </div>
+
+    <header class="hero-nav">
+      <div class="hero-brand">
+        <span class="hero-seal" aria-hidden="true">會</span>
+        <span class="hero-brand-txt">智能会议<sup class="hero-reg">®</sup></span>
+      </div>
+      <nav class="hero-links" aria-label="首页入口">
+        <a href="#" id="heroLinkDevice">检查设备</a><span class="hero-sep">,&nbsp;</span>
+        <a href="#" id="heroLinkNet">网络自检</a><span class="hero-sep">,&nbsp;</span>
+        <a href="#" id="heroLinkDesk">设备码控电脑</a>
+      </nav>
+    </header>
+
+    <main class="hero">
+      <div class="hero-copy">
+        <!-- ① 模糊引导语：故意糊，让眼睛先落在下面那句清楚的字上（纯装饰，不可选中） -->
+        <div class="hero-blurb" aria-hidden="true">
+          会议室已经开好，AI 小明坐在旁边听着。<br />
+          先看看设备，再决定要不要露脸。
+        </div>
+        <!-- ② 打字机主句：文字由 client.js 第 35 步逐字写入，光标只在打字期间存在 -->
+        <p class="hero-typed"><span id="heroTyped"></span><i id="heroCaret" class="hero-caret" aria-hidden="true"></i></p>
+        <!-- ③ 行动胶囊：与打字机**并行**出现（不等它打完），全部是真实功能入口 -->
+        <div class="hero-pills" id="heroPills">
+          <button id="pjEnterBtn" class="pill solid" type="button">进入会议</button>
+          <button id="pjFxBtn" class="pill" type="button" title="滤镜/磨皮/虚拟背景（预览即所见即所得）">
+            <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l1.8 4.7 4.7 1.8-4.7 1.8L12 17l-1.8-4.7-4.7-1.8 4.7-1.8L12 4z"/><path d="M18.5 4v3M20 5.5h-3"/></svg>
+            <span>滤镜 / 虚拟背景</span>
+          </button>
+          <button id="heroLinkDesk2" class="pill ghost" type="button" title="输入被控端打印的 6 位设备码，直接开远程桌面（不用先进会）">
+            <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="12" rx="1.6"/><path d="M8.5 20h7M12 16.5V20"/></svg>
+            <span>用设备码控电脑</span>
+          </button>
+        </div>
+        <div class="hero-note">摄像头与麦克风只在这里授权一次；不授权也能进会（只听不说）。</div>
+      </div>
+
+      <!-- 设备卡：class 保留 .prejoin-card（ICE 自检结果行会挂进这里，见 client.js initIcePrecheck） -->
+      <section class="prejoin-card hero-device">
+        <div class="prejoin-title">
+          <div>
+            <div class="prejoin-caps">Device Check</div>
+            <div class="prejoin-heading">设备检查</div>
+            <div class="prejoin-sub">画面与声音都只在这一个卡片里预览</div>
+          </div>
+        </div>
+        <div class="prejoin-main">
+          <div class="prejoin-video-wrap">
+            <video id="preVideo" autoplay playsinline muted></video>
+            <div id="preVideoHint" class="prejoin-video-hint hidden">
+              摄像头不可用或未授权<br />可直接进入会议（不发布自己的画面）
+            </div>
+          </div>
+          <div class="prejoin-side">
+            <label class="pj-row">摄像头
+              <select id="pjCamSelect" class="dev-select" title="选择摄像头"></select>
+            </label>
+            <label class="pj-row">麦克风
+              <select id="pjMicSelect" class="dev-select" title="选择麦克风"></select>
+            </label>
+            <div class="pj-row">试音
+              <!-- 对麦克风说话，绿条会动：WebAudio AnalyserNode 实时量能量（见第 25 步） -->
+              <div class="pj-meter" title="对麦克风说话，绿条会动"><i id="pjMeterBar"></i></div>
+            </div>
+            <label class="pj-check"><input type="checkbox" id="pjMuteChk" /> 入会时静音麦克风</label>
+            <label class="pj-check"><input type="checkbox" id="pjCamChk" /> 入会时关闭摄像头</label>
+            <div id="pjStatus" class="pj-status">正在打开摄像头…</div>
+          </div>
+        </div>
+      </section>
+    </main>
   </div>
 
   <!-- ════════ 应用壳：顶栏 / 舞台 / 侧栏 / 日志 ════════ -->

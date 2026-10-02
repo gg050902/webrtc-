@@ -471,7 +471,7 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
 .layer-pick select { max-width: 130px; padding: 3px 8px; font-size: 11px; background: var(--ink-2); border-color: var(--border); border-radius: 8px; color: var(--fg); }
 
 /* 画面格上的两个角按钮（JS 生成）：请求控制（右上）/ 钉选（左上） */
-.remote-ctl-btn, .pin-btn {
+.remote-ctl-btn, .pin-btn, .watch-btn {
   position: absolute;
   top: 8px;
   z-index: 3;
@@ -488,8 +488,59 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
 }
 .remote-ctl-btn { right: 8px; }
 .pin-btn { left: 8px; }
-.video-box:hover .remote-ctl-btn, .video-box:hover .pin-btn { opacity: 1; }
+/* ★ 2026-10-02 「只听不看」：放在钉选下面一行，避免与钉选/请求控制抢同一个位置 */
+.watch-btn { left: 8px; top: 40px; }
+.video-box:hover .remote-ctl-btn, .video-box:hover .pin-btn, .video-box:hover .watch-btn { opacity: 1; }
+/* 暂停中的格子：留一块"我自己选择不看"的暗纱（不影响别人，也不影响这一路的声音） */
+.video-box.paused-view video { opacity: .12; filter: grayscale(1); }
+.video-box.paused-view::after {
+  content: '已暂停画面 · 只听（下行已省下）';
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  z-index: 3; padding: 6px 12px; font-size: 12px; white-space: nowrap;
+  color: var(--fg-dim); background: var(--ink-2);
+  border: 1px solid var(--border); border-radius: 999px;
+  backdrop-filter: blur(4px); pointer-events: none;
+}
+.video-box.paused-view .watch-btn { opacity: 1; background: var(--accent-muted); border-color: var(--accent-border); color: var(--accent); }
 .remote-ctl-btn:hover { border-color: var(--accent-border); color: var(--accent); }
+
+/* ★ 2026-10-02 Piik 取长①：每路远端独立音量（含 >100% 增强）
+   放在格子左下、名牌上方，悬停才露出来——不常驻是为了不抢画面，
+   但一旦暂停/增强生效，控件必须可见（否则用户不知道声音为什么变了）。 */
+.vol-ctl {
+  position: absolute; left: 8px; bottom: 48px; z-index: 3;
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 9px; border-radius: 999px;
+  background: var(--ink-2); border: 1px solid var(--border);
+  backdrop-filter: blur(6px);
+  font-size: 11px; color: var(--fg-dim);
+  opacity: 0; transition: opacity .15s var(--ease);
+}
+.video-box:hover .vol-ctl, .video-box.boosted .vol-ctl { opacity: 1; }
+.vol-ctl .vol-ico { line-height: 1; }
+.vol-ctl input { width: 74px; height: 3px; accent-color: var(--accent); cursor: pointer; }
+.vol-ctl .vol-num { min-width: 32px; text-align: right; font-variant-numeric: tabular-nums; }
+.vol-ctl input.over { accent-color: var(--danger, #e0636f); }
+
+/* ★ 2026-10-02 Piik 取长④：预览页的 ICE 自检结果（一句话 + 三色状态）
+   刻意做成"预告"而不是"拦路"：自检失败也允许进会（同网照样能开），
+   只是把「跨网可能连不上」提前讲清楚，并指到《部署手册.md》。 */
+.ice-probe-row {
+  display: flex; align-items: center; gap: 10px;
+  margin-top: 10px;
+}
+.ice-probe {
+  flex: 1; min-height: 18px;
+  font-size: 12px; line-height: 1.5;
+  color: var(--fg-dim);
+}
+.ice-probe.run { color: var(--fg-dim); }
+.ice-probe.ok { color: var(--ok, #86a876); }
+.ice-probe.warn { color: var(--warn, #d3b877); }
+.ice-probe.bad { color: var(--danger, #e0636f); }
+.ice-probe-btn { flex-shrink: 0; font-size: 12px; padding: 5px 11px; }
+
+
 .pin-btn.on { opacity: 1; background: var(--accent-muted); border-color: var(--accent-border); color: var(--accent); }
 
 /* ────────── 7. 控制坞（底部悬浮）与表情回应 ────────── */
@@ -541,6 +592,21 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
   transition: transform .12s var(--ease), background .12s;
 }
 .react-btn:hover { background: rgba(255, 240, 210, .09); transform: scale(1.18) rotate(-6deg); }
+
+/* ★ 2026-10-02 定向回应的目标提示（回应条里的「→ 小张」小胶囊，点一下取消） */
+.react-to {
+  align-self: center;
+  margin-left: 2px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--accent);
+  background: var(--accent-muted);
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.react-to:hover { color: var(--fg); }
 .react-btn:active { transform: scale(.92); }
 
 /* ────────── 8. 侧栏：成员 + 聊天 ────────── */
@@ -2225,36 +2291,9 @@ body.rd-mode { overflow: hidden; }
   background: var(--accent-muted); border-radius: 999px;
 }
 
-/* ────────── 26. ★ 09-26b 矢量动画头像（丫髻童子）+ 发言字幕条 ──────────
-   静态 PNG 切换太僵硬 → 内联 SVG 矢量小人：呼吸/眨眼/摇头由 CSS 关键帧驱动，
-   五态只切眼形（睁/弯）与嘴形（笑/张/平），瞬时无跳变。 */
-.ai-svg { width: 100%; height: 100%; animation: aiBreathe 4.2s ease-in-out infinite; transform-origin: 50% 70%; }
-.ai-svg.speaking, .ai-svg.st-speak { animation-duration: 1.9s; }
-.ai-svg.st-happy { animation-duration: 2.6s; }
-.ai-svg .head-grp { animation: aiSway 6s ease-in-out infinite; transform-origin: 50% 90%; }
-.ai-svg .eye { animation: aiBlink 4.6s ease-in-out infinite; transform-origin: 50% 50%; }
-.ai-svg .ribbon { animation: aiRibbon 3.4s ease-in-out infinite; transform-origin: 80% 20%; }
-.ai-svg .halo { animation: aiGlow 4.2s ease-in-out infinite; }
-.ai-svg.st-think .head-grp { animation-duration: 9s; }
-.ai-svg.st-speak .halo { animation-duration: 1.9s; }
-@keyframes aiBreathe { 0%, 100% { transform: translateY(0) scale(1); } 50% { transform: translateY(-3.2%) scale(1.012); } }
-@keyframes aiSway { 0%, 100% { transform: rotate(-1.1deg); } 50% { transform: rotate(1.1deg); } }
-@keyframes aiBlink { 0%, 90%, 100% { transform: scaleY(1); } 94% { transform: scaleY(.08); } }
-@keyframes aiRibbon { 0%, 100% { transform: rotate(-5deg); } 50% { transform: rotate(7deg); } }
-@keyframes aiGlow { 0%, 100% { opacity: .28; } 50% { opacity: .55; } }
-/* 五态显隐（切 class 瞬时完成，不重排不跳变） */
-.st-idle   .mouth-smile, .st-happy .mouth-open { display: block; }
-.st-idle   .mouth-open,  .st-idle  .mouth-flat { display: none; }
-.st-listen .mouth-smile, .st-listen .mouth-open { display: none; }
-.st-listen .mouth-flat { display: block; }
-.st-speak  .mouth-smile, .st-think .mouth-smile { display: none; }
-.st-speak  .mouth-open,  .st-happy .mouth-open { display: block; }
-.st-speak  .mouth-flat,  .st-think .mouth-open, .st-think .mouth-flat { display: block; }
-.st-speak  .mouth-smile, .st-think .mouth-smile { display: none; }
-.st-idle   .eye-open, .st-speak .eye-open { display: block; }
-.st-idle   .eye-curve, .st-speak .eye-curve { display: none; }
-.st-listen .eye-open, .st-think .eye-open, .st-happy .eye-open { display: none; }
-.st-listen .eye-curve, .st-think .eye-curve, .st-happy .eye-curve { display: block; }
+/* ────────── 26. AI 格子的成员行小头像 + 发言字幕条 ──────────
+   [2026-10-02] 这一节原来还包含"内联 SVG 矢量小人"的整套关键帧与五态显隐规则，
+   随 JS 侧 aiAvatarSvg()（从未被调用）一起删除；形象/动作现在只有第 27 节一处来源。 */
 /* 成员行小头像里的 SVG 裁剪 */
 .ai-av { display: block; width: 24px; height: 24px; border-radius: 50%; overflow: hidden; flex-shrink: 0; border: 1px solid var(--accent-border); background: var(--bg2); }
 .ai-av .ai-svg { width: 140%; height: 140%; margin: -18% 0 0 -20%; }
@@ -2279,68 +2318,56 @@ body.rd-mode { overflow: hidden; }
 }
 .ai-speech.show { opacity: 1; transform: translateY(0); }
 
-/* ── 09-26c 头像 v3 丝滑层：交叉淡化替代硬切 + 开合嘴 + 思考泡泡 ── */
-.ai-svg .eye-open, .ai-svg .eye-curve, .ai-svg .mouth-smile, .ai-svg .mouth-open, .ai-svg .mouth-flat {
-  transition: opacity .25s ease;
-}
-.ai-svg .eye-open { opacity: 1; }
-.ai-svg .eye-curve { opacity: 0; }
-.ai-svg .mouth-smile { opacity: 1; }
-.ai-svg .mouth-open, .ai-svg .mouth-flat { opacity: 0; }
-.ai-svg.st-listen .eye-open, .ai-svg.st-think .eye-open, .ai-svg.st-happy .eye-open { opacity: 0; }
-.ai-svg.st-listen .eye-curve, .ai-svg.st-think .eye-curve, .ai-svg.st-happy .eye-curve { opacity: 1; }
-.ai-svg.st-idle .mouth-open, .ai-svg.st-idle .mouth-flat { opacity: 0; }
-.ai-svg.st-listen .mouth-smile, .ai-svg.st-listen .mouth-open { opacity: 0; }
-.ai-svg.st-listen .mouth-flat { opacity: 1; }
-.ai-svg.st-speak .mouth-smile { opacity: 0; }
-.ai-svg.st-speak .mouth-open { opacity: 1; animation: aiMouthTalk 0.42s ease-in-out infinite; transform-origin: 100px 131px; }
-.ai-svg.st-speak .mouth-flat { opacity: 0; }
-.ai-svg.st-think .mouth-smile { opacity: 0; }
-.ai-svg.st-think .mouth-flat { opacity: 1; }
-.ai-svg.st-happy .mouth-smile { opacity: 0; }
-.ai-svg.st-happy .mouth-flat { opacity: 0; }
-@keyframes aiMouthTalk { 0%, 100% { transform: scaleY(.35); } 50% { transform: scaleY(1); } }
-.ai-svg .brow { transition: transform .3s ease; transform-origin: 100px 92px; }
-.ai-svg.st-think .brow { transform: translateY(-3px); }
-.ai-svg .think-bubbles { opacity: 0; transition: opacity .4s ease; }
-.ai-svg.st-think .think-bubbles { opacity: 1; animation: aiBubbleFloat 2.4s ease-in-out infinite; }
-.ai-svg.st-think .think-bubbles circle:nth-child(2) { animation-delay: .3s; }
-.ai-svg.st-think .think-bubbles circle:nth-child(3) { animation-delay: .6s; }
-@keyframes aiBubbleFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
-.ai-svg.st-listen .body-grp { transform: translateY(1.5px); transition: transform .4s ease; }
-.ai-svg.st-happy .head-grp { animation: aiHappyBounce 1.6s ease-in-out infinite; }
-@keyframes aiHappyBounce { 0%, 100% { transform: translateY(0) rotate(0); } 40% { transform: translateY(-4px) rotate(-1.6deg); } 70% { transform: translateY(-1px) rotate(1.4deg); } }
-.ai-av .ai-svg, .ai-av-mini { width: 100%; height: 100%; }
+/* ── [2026-10-02 退役] 09-26b/c 的"内联 SVG 矢量小人"整套图层显隐规则已随 JS 侧
+   aiAvatarSvg() 一起删除（那版从未被调用过 = 死代码；要回退看 git log）。
+   现在 AI 形象只有一张干净静帧 + 下面第 27 节的动作系统，一处来源。 ──────────────
 
-/* ── 09-26c 修正:SVG 尺寸链显式化(容器 auto 高会让 100% 失控) ── */
-.ai-face-wrap .ai-svg { width: 78%; height: 88%; }
-.ai-svg svg { width: 100%; height: 100%; display: block; }
-.ai-av .ai-svg svg, .ai-av-mini { display: block; }
-.ai-av .ai-svg { width: 130%; height: 130%; margin: -15% 0 0 -15%; }
-
-/* ────────── 27. ★ 09-26c 头像 v4：精美底图 + 动效系统 ──────────
-   一张好图胜过一切小动作（meihua4 国风头像），"生动"交给动效：
-   呼吸缩放常驻；speaking 声波条跳动+头像轻弹；thinking 暗化+泡泡漂浮；happy 弹跳闪光。 */
+/* ────────── 27. ★ 2026-10-02 AI 头像动作系统（形象与动作彻底分开） ──────────
+ * ▎为什么重写（用户反馈"有重影，而且一直重复一个动作"）：
+ *   ① **重影**：形象素材是 82 帧循环 WebP，帧里带 AI 生成动画的半透明偏移残影
+ *      （抽帧看 f41 头部/肩部那一圈就是）；而 CSS 又对这张"本来就在动"的图
+ *      叠了一层缩放呼吸（旧 aiFaceBreathe）——两套节奏同时演 = 看着发抖、发虚。
+ *      现在素材换成**一张静帧**，动只由 CSS 动，一个元素同一时刻只有一条动画。
+ *   ② **只会一个动作**：循环素材不可能"看场合变招"。现在 idle/listening 期间由
+ *      JS 每 7~14s 随机演一个**一次性**小动作（g-nod/g-tilt/g-peek-l/g-peek-r/
+ *      g-sway/g-breath-deep），演完摘类；speaking/thinking/happy 各有自己的律动，
+ *      且**同一时刻只允许一个在演**（互斥由 client.js 的 armAiGestures 保证）。
+ * ▎transform-origin 定在 50% 92%（肩膀附近）：头像图是"胸像"，绕这里转才像
+ *   转头/点头，绕中心转会像整张图片在飘。 */
 .ai-tile .ai-face {
-  width: 74%;
-  aspect-ratio: 1;
-  border-radius: 50%;
-  object-fit: cover;
-  border: 2px solid var(--accent-border);
-  box-shadow: 0 0 0 6px rgba(216, 179, 106, .08), var(--shadow-1);
-  animation: aiFaceBreathe 4.2s ease-in-out infinite;
-  transition: box-shadow .4s var(--ease), filter .4s var(--ease);
+  animation: aiBreath 5.4s ease-in-out infinite;   /* 常驻：唯一一条无限动画，慢到几乎看不见 */
+  transform-origin: 50% 92%;
 }
-@keyframes aiFaceBreathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.028); } }
-.ai-tile.speaking .ai-face {
-  animation: aiFaceTalk 0.62s ease-in-out infinite;
-  box-shadow: 0 0 0 8px rgba(216, 179, 106, .14), 0 0 26px rgba(216, 179, 106, .25);
+@keyframes aiBreath { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.014); } }
+/* 状态律动（与随机小动作互斥：JS 只在 idle/listening 演小动作） */
+.ai-tile.speaking .ai-face { animation: aiTalkBob 1.15s ease-in-out infinite; }
+@keyframes aiTalkBob { 0%, 100% { transform: scale(1) translateY(0); } 35% { transform: scale(1.016) translateY(-1.5px); } 70% { transform: scale(1.006) translateY(.8px); } }
+.ai-tile.thinking .ai-face { animation: aiThinkLook 3.4s ease-in-out infinite; }
+@keyframes aiThinkLook { 0%, 100% { transform: rotate(0) translateY(0); } 28% { transform: rotate(-2.2deg) translateY(-2px); } 62% { transform: rotate(1.8deg) translateY(-1px); } }
+.ai-tile.happy .ai-face { animation: aiHappyPop 1.15s ease-out 2; }
+@keyframes aiHappyPop { 0% { transform: scale(1); } 30% { transform: scale(1.06) rotate(-2.5deg); } 60% { transform: scale(1.03) rotate(2deg); } 100% { transform: scale(1); } }
+/* 一次性小动作池（演完由 JS 摘类）——每个都是 0.9~2.2s 的短动作，不循环 */
+.ai-tile .ai-face.g-nod        { animation: aiGNod 1.05s ease-in-out 1; }
+.ai-tile .ai-face.g-tilt       { animation: aiGTilt 1.5s ease-in-out 1; }
+.ai-tile .ai-face.g-peek-l     { animation: aiGPeekL 1.25s ease-in-out 1; }
+.ai-tile .ai-face.g-peek-r     { animation: aiGPeekR 1.25s ease-in-out 1; }
+.ai-tile .ai-face.g-sway       { animation: aiGSway 1.8s ease-in-out 1; }
+.ai-tile .ai-face.g-breath-deep{ animation: aiGBreath 2.2s ease-in-out 1; }
+@keyframes aiGNod    { 0%, 100% { transform: translateY(0) rotate(0); } 25% { transform: translateY(2.6px) rotate(.6deg); } 55% { transform: translateY(-1.2px) rotate(-.4deg); } }
+@keyframes aiGTilt   { 0%, 100% { transform: rotate(0); } 40% { transform: rotate(3.4deg); } 75% { transform: rotate(-1.2deg); } }
+@keyframes aiGPeekL  { 0%, 100% { transform: rotate(0) translateX(0); } 45% { transform: rotate(-2.6deg) translateX(-2.5px); } }
+@keyframes aiGPeekR  { 0%, 100% { transform: rotate(0) translateX(0); } 45% { transform: rotate(2.6deg) translateX(2.5px); } }
+@keyframes aiGSway   { 0%, 100% { transform: rotate(0); } 30% { transform: rotate(1.6deg); } 70% { transform: rotate(-1.6deg); } }
+@keyframes aiGBreath { 0%, 100% { transform: scale(1); } 45% { transform: scale(1.035); } }
+/* 圆盘发光只走 box-shadow/transition（不参与 transform，避免与动作抢同一个属性） */
+.ai-tile.speaking .ai-face-wrap {
+  box-shadow: 0 0 0 1px rgba(216, 179, 106, .5), 0 0 0 10px rgba(216, 179, 106, .1), 0 0 34px rgba(216, 179, 106, .3);
 }
-@keyframes aiFaceTalk { 0%, 100% { transform: scale(1.02); } 50% { transform: scale(1.055); } }
-.ai-tile.thinking .ai-face { animation: aiFaceThink 2.6s ease-in-out infinite; filter: saturate(.72) brightness(.86); }
-@keyframes aiFaceThink { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
-.ai-tile.happy .ai-face { animation: aiFaceHappy 1.5s ease-in-out infinite; filter: brightness(1.08); }
-@keyframes aiFaceHappy { 0%, 100% { transform: scale(1.02); } 35% { transform: scale(1.07) rotate(-2deg); } 70% { transform: scale(1.05) rotate(2deg); } }
+/* 无障碍：用户开了"减少动态效果"就全部静止（只留透明度类提示） */
+@media (prefers-reduced-motion: reduce) {
+  .ai-tile .ai-face, .ai-tile.speaking .ai-face, .ai-tile.thinking .ai-face,
+  .ai-tile.happy .ai-face, .ai-tile .ai-face[class*="g-"] { animation: none !important; }
+}
 /* 声波条（speaking 才跳）：7 根竖条错峰弹跳 = 正在说话的"声音可视化" */
 .ai-waves {
   position: absolute;
@@ -2395,10 +2422,14 @@ body.rd-mode { overflow: hidden; }
       正确：容器只给宽度 + aspect-ratio:1 锁死正方形，img 填满即 1:1。 */
 .ai-tile .ai-face-wrap {
   position: absolute;
-  left: 50%; top: 50%;
+  /* ★ 2026-10-02 尺寸改由**高度**驱动：视频格是"扁"的（实测 403×227），
+     旧写法按宽度取 min(76%,320px) → 圆盘 232px 塞进 227px 高的格子，
+     头顶被裁、底部压住名牌（截图实测 圆盘顶部留白 -3px、名牌重叠 -49px）。
+     另外 top 从 50% 抬到 44%，把名牌那 43px 让出来。 */
+  left: 50%; top: 43%;
   transform: translate(-50%, -50%);
-  width: min(76%, 320px);            /* 圆盘直径；上限防止演讲者大格子里过显 */
-  aspect-ratio: 1;                   /* 只约束宽，高由比例锁死正方形 */
+  height: min(66%, 224px);
+  aspect-ratio: 1;                   /* 高定宽，永远是正圆 */
   border-radius: 50%;
   overflow: hidden;
   background:
@@ -2412,9 +2443,11 @@ body.rd-mode { overflow: hidden; }
   display: block;
   width: 100%;
   height: 100%;
-  border-radius: 50%;                /* 与 wrap 双重圆形裁切保险 */
-  object-fit: cover;
-  object-position: center;
+  border-radius: 50%;
+  /* ★ 2026-10-02 cover → contain：静帧是"胸像紧裁"，cover 会把头顶裁掉一半、
+     脸铺满整格，看着像贴脸；contain 让整个人坐在圆盘里，圆盘底色成为背景。 */
+  object-fit: contain;
+  object-position: 50% 58%;
   border: none;
   box-shadow: none;
 }
@@ -2426,5 +2459,152 @@ body.rd-mode { overflow: hidden; }
 }
 .ai-tile.thinking .ai-face-wrap { filter: brightness(.94); }
 .ai-tile.happy .ai-face { filter: saturate(1.06) brightness(1.03); }
-.ai-av { background: #f2ede1; border-radius: 50%; overflow: hidden; }
 .ai-av img { width: 100%; height: 100%; object-fit: cover; object-position: center; display: block; }
+
+/* ══════════════════════════════════════════════════════════════════
+ * 28. 首页 hero（2026-10-02）—— prejoin 从"设备检查卡"升级成"一屏叙事"
+ * ▎借的是落地页的**编排语言**：氛围层 → 品牌行 → 模糊引导语 → 打字机主句 → 胶囊 CTA → 设备卡。
+ * ▎**没有**照抄它的资源：那份稿靠外链视频 + 外链字体，而本项目是零依赖 + 可离线 PWA
+ *   （内网/断网部署时外链就是白屏），所以背景用纯 CSS 光晕 + SVG 噪点，
+ *   字体继续用本地 --font-display（有则用、无则降级衬线，不写任何 JS 探测）。
+ * ▎z-index 分层表（照此，别在别处随手加数值）：
+ *      氛围层 .hero-bg      0
+ *      内容   .hero         1
+ *      文案   .hero-copy   10
+ *      顶栏   .hero-nav    20
+ *   （prejoin 整体仍是 .prejoin 的 100，压住 app 壳；坑 24 的 .hidden 由第 1 行全局 !important 兜底）
+ * ══════════════════════════════════════════════════════════════════ */
+.prejoin {
+  place-items: stretch;
+  padding: 0;
+  overflow: auto;            /* ★ 内容比屏幕高时必须能滚——见下面 .hero 那条教训 */
+  background: var(--bg0);
+}
+/* 氛围层：两团慢速漂移的光 + 一层宣纸颗粒。pointer-events:none —— 装饰绝不能吃点击 */
+.hero-bg { position: absolute; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
+.hero-glow { position: absolute; border-radius: 50%; filter: blur(72px); opacity: .55; }
+.hero-glow.a {
+  width: 56vw; height: 56vw; left: -10vw; top: -16vw;
+  background: radial-gradient(circle, rgba(216, 179, 106, .30), transparent 66%);
+  animation: heroDriftA 52s ease-in-out infinite alternate;
+}
+.hero-glow.b {
+  width: 46vw; height: 46vw; right: -8vw; bottom: -14vw;
+  background: radial-gradient(circle, rgba(185, 58, 38, .22), transparent 66%);
+  animation: heroDriftB 68s ease-in-out infinite alternate;
+}
+/* 颗粒用 data URI 的 feTurbulence（%3C 转义，不出现尖括号与星号斜杠，避开坑 26 家族） */
+.hero-grain {
+  position: absolute; inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.5'/%3E%3C/svg%3E");
+  opacity: .045; mix-blend-mode: overlay;
+}
+@keyframes heroDriftA { from { transform: translate3d(0, 0, 0) scale(1); } to { transform: translate3d(6vw, 4vh, 0) scale(1.12); } }
+@keyframes heroDriftB { from { transform: translate3d(0, 0, 0) scale(1.06); } to { transform: translate3d(-5vw, -5vh, 0) scale(1); } }
+
+/* 顶栏：品牌 + 三个真入口（没有假链接，三个都接了功能，见 client.js 第 35 步） */
+.hero-nav {
+  position: relative; z-index: 20;
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 16px 20px;
+}
+.hero-brand { display: flex; align-items: center; gap: 12px; }
+.hero-seal {
+  display: grid; place-items: center; width: 34px; height: 34px; border-radius: 8px;
+  background: linear-gradient(160deg, #c9462f, #8e2a1c);
+  color: #f6efe2; font-family: var(--font-display); font-size: 19px; line-height: 1;
+  box-shadow: 0 2px 10px rgba(140, 40, 24, .38);
+}
+.hero-brand-txt {
+  font-family: var(--font-display); font-size: 21px; letter-spacing: -.02em; color: var(--fg);
+}
+.hero-reg { font-size: 11px; color: var(--accent); margin-left: 2px; }
+.hero-links { display: flex; flex-wrap: wrap; gap: 0; font-size: 15px; }
+.hero-links a {
+  color: var(--fg); text-decoration: none; opacity: .82; transition: opacity .2s;
+}
+.hero-links a:hover { opacity: .55; text-decoration: underline; text-underline-offset: 2px; }
+.hero-links a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.hero-sep { color: var(--fg-faint); user-select: none; }
+
+/* 主体：桌面两栏（文案 | 设备卡），小屏上下堆叠
+ * ▎这里踩过一次真坑：原先写的是 `align-items:center` + `overflow:hidden` + `min-height:100dvh`，
+ *   内容一旦比屏幕高（小屏、或设备卡里的视频框撑到 756px），居中的结果是把**文案顶出容器上沿**，
+ *   再被 overflow:hidden 裁掉——实测 .hero-copy 的 y = -101，用户看到的就是"标题和打字机凭空消失"。
+ *   判据：**垂直居中的容器 + 裁剪 = 内容必须保证放得下**；放不下就得能滚（.prejoin overflow:auto）。 */
+.hero {
+  position: relative; z-index: 1;
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 520px);
+  align-items: center; gap: 40px;
+  min-height: calc(100dvh - 66px);   /* 顶栏高度之外占满一屏 */
+  padding: 0 40px 40px;
+}
+.hero-copy { position: relative; z-index: 10; max-width: 576px; }
+/* ① 模糊引导语：故意糊，让视线先落在下面那句清楚的字上 */
+.hero-blurb {
+  pointer-events: none; user-select: none; margin-bottom: 20px;
+  font-size: clamp(18px, 4vw, 26px); line-height: 1.3; font-weight: 400;
+  color: var(--fg); filter: blur(4px); opacity: .7;
+}
+/* ② 打字机主句：min-height 预留两行，逐字揭示时整块不跳版 */
+.hero-typed {
+  margin: 0 0 20px; min-height: 54px;
+  font-size: clamp(18px, 4vw, 26px); line-height: 1.35; color: var(--fg);
+}
+.hero-caret {
+  display: inline-block; width: 2px; height: 1.1em; margin-left: 2px;
+  vertical-align: middle; background: var(--accent);
+  animation: heroBlink 1s step-end infinite;
+}
+@keyframes heroBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+/* ③ 胶囊 CTA：与打字机并行出现（.shown 由 JS 在 400ms 加，不等打字结束） */
+.hero-pills {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  opacity: 0; transform: translateY(8px);
+  transition: opacity .4s ease, transform .4s ease;
+}
+.hero-pills.shown { opacity: 1; transform: none; }
+.pill {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  padding: .42em 1.25em; border-radius: 999px; border: 1px solid rgba(236, 229, 216, .16);
+  background: transparent; color: var(--fg); font-size: 15px; line-height: 1.4;
+  cursor: pointer; white-space: nowrap;
+  transition: background-color .2s, color .2s, border-color .2s;
+}
+.pill .i { width: 15px; height: 15px; }
+.pill:hover { background: rgba(236, 229, 216, .10); border-color: var(--border-strong); }
+.pill:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pill.solid { background: var(--fg); color: var(--bg0); border-color: rgba(236, 229, 216, .1); font-weight: 600; }
+.pill.solid:hover { background: var(--violet); color: #f6efe2; border-color: var(--violet); }
+.pill.ghost { border-color: var(--accent-border); color: var(--accent); }
+.pill.ghost:hover { background: var(--accent); color: var(--bg0); }
+.hero-note { margin-top: 14px; font-size: 13px; color: var(--fg-faint); }
+
+/* 设备卡：沿用第 11 节的内部样式，只换外框（不再居中撑满，改成右侧一张卡） */
+.hero-device {
+  width: auto; min-width: 0; padding: 22px 24px; margin: 0;
+  background: var(--glass-strong); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); box-shadow: var(--shadow-2);
+  backdrop-filter: blur(14px) saturate(1.1);
+}
+.hero-device .prejoin-title { margin-bottom: 16px; }
+.hero-device .prejoin-heading { font-size: 18px; }
+
+/* 小屏：一栏到底。三个入口**不折叠成汉堡**——这一屏本身就是全屏遮罩，
+ *   再套一层"菜单遮罩"只是给同一块地方放两张遮罩；改成换行铺开更短路径。
+ *   （参考稿要汉堡是因为它是官网首页、导航项多且页面长；这里只有三项且都在这一屏。） */
+@media (max-width: 900px) {
+  .hero { grid-template-columns: minmax(0, 1fr); gap: 24px; padding: 8px 20px 28px;
+    min-height: 0; align-items: start; align-content: start; }   /* 小屏不强行垂直居中（放不下的会被顶出去） */
+  .hero-nav { padding: 14px 20px; }
+  .hero-brand-txt { font-size: 19px; }
+  .hero-links { font-size: 13px; }
+  .hero-typed { min-height: 0; }
+  .hero-device .prejoin-video-wrap { max-height: 34vh; }          /* 预览框别把一屏吃掉 */
+}
+/* 无障碍：系统开"减弱动态效果"时，光晕不漂、光标不闪、胶囊直接出现（不做"偷偷动一下"） */
+@media (prefers-reduced-motion: reduce) {
+  .hero-glow, .hero-caret { animation: none !important; }
+  .hero-pills { transition: none !important; opacity: 1 !important; transform: none !important; }
+  .hero-links a, .pill { transition: none !important; }
+}

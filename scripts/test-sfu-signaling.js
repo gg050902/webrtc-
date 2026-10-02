@@ -1,4 +1,4 @@
-// SFU 版信令测试：模拟多个客户端连 sfu/server.js（端口默认 3001，可用 TEST_SFU_PORT 覆盖）
+// SFU 版信令测试：模拟多个客户端连 sfu/server.js（★ 2026-10-02 起默认 3011，TEST_SFU_PORT 可覆盖）
 // 验证：房间/密码（复用）+ Router 能力 + Transport 创建/防重 + consume 的错误路径。
 // （produce/consume 的真实媒体需要浏览器摄像头，无法命令行模拟——
 //   这里能证明 mediasoup Worker/Router/Transport 在服务器端真的能建起来）
@@ -12,17 +12,22 @@
 //     否则"怎么跑"这件事会靠口口相传，迟早出错。
 //     顺带把 AI 强制到确定性轨道（AI_FORCE_MOCK=1）：测试只测自己的代码，
 //     不测外部 LLM 的网络速度（真 LLM 的连通性由 test:ai 那个专门轨道负责）。
-const { io } = require('C:/Users/27418/Desktop/webrtc/node_modules/socket.io-client');
+const { io } = require('socket.io-client');
 const { spawn } = require('child_process');
 const nodePath = require('path');
-/* ★ 09-30：端口**可配置**（默认仍是 3001）。
- * ▎为什么必须可配：本脚本会自己起一个 sfu/server.js。若 3001 上已经有别的实例
+/* ★ 09-30：端口**可配置**；★ 2026-10-02 默认改为 3011（见下方新注释）。
+ * ▎为什么必须可配：本脚本会自己起一个 sfu/server.js。若该端口上已有别的实例
  *   （用户自己开的会议服务、或上一次被中断的测试留下的孤儿进程），
  *   脚本只能"拒绝继续"——**这是正确的**（见下方 ensureServer 的说明：
  *   宁可红得清楚也不要绿得可疑），但它把"有别的服务在跑"变成了"你这轮测试跑不了"。
  *   给一个环境变量就能换端口跑，测试就不再被环境卡住。
  *   用法：`TEST_SFU_PORT=3011 npm run test:sfu` */
-const PORT = Number(process.env.TEST_SFU_PORT) || 3001;
+/* ★ 2026-10-02 默认端口从 3001 改成 **3011**：3001 是**用户正在用的那一台**。
+ *   原先的写法逼着人"先关掉 3001 再跑测试"，等于每次回归都要把用户/同事的会议踢下线，
+ *   而更糟的是有人会直接复用 3001 上已有的实例——那就变成坑 57 的假绿。
+ *   判据：**测试自起服务、自占端口，永远不去抢开发者正在用的那个**
+ *   （test:agent/e2e/e2e-media 早就各自用 3012/3013/3016，这里补齐最后两个）。 */
+const PORT = Number(process.env.TEST_SFU_PORT) || 3011;
 const URL = `http://localhost:${PORT}`;
 
 /* ★ 09-24 测试数据隔离（任务 3）：本脚本会真注册账号，绝不能让它们落进
@@ -804,6 +809,58 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   let aiErr = null;
   try { await request(A.s, 'ai-ask', { question: '' }); } catch (e) { aiErr = e.message; }
   ok('09-19 ai-ask 空问题被拒（错误路径正确）', !!aiErr);
+  /* ★ 2026-10-02 第 36 步：AI **操作会议实体**（说"打开白板"就真的全房打开）
+   * ▎为什么值得单独一组断言：这个功能的失败模式是"AI 回了一句漂亮话、什么都没发生"
+   *   （AGENTS 坑 38 那一类），而那种答案在纯文本断言里看起来完全正常。
+   *   所以这里断的是**事件真的到了两个客户端**，不是回复好不好看。
+   * ▎监听器一律在 ai-ask 之前注册、且按 ts 过滤（坑 61 + 坑 44 的同一条纪律）。 */
+  const rcA = []; const rcB = [];
+  /* ★ 断言"全房同步"就得用**真的在同一间房**的那个客户端。
+   *   第一版这里直接拿了上面那个 B —— 但 B 自己 create-room 建的是另一间房（PRO_ROOM），
+   *   于是它永远收不到 A 房间的广播，测试红。代码没错，是**断言站错了房间**（坑 55 同族：
+   *   测某个状态之前，先确认你操作的对象真的在那个状态里）。 */
+  const RC = await client('RC');
+  const rcMembersP = waitEvent(RC.s, 'room-members');
+  RC.s.on('room-control', (p) => rcB.push(p));
+  RC.s.emit('join-room', { roomNumber: ROOM, password: created.password || '' });
+  await Promise.race([rcMembersP, sleep(6000)]);
+  A.s.on('room-control', (p) => rcA.push(p));
+  const rcT0 = Date.now();
+  const rcMsgP = new Promise((resolve) => {
+    const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcT0) { A.s.off('chat-message', h); resolve(m); } };
+    A.s.on('chat-message', h);
+  });
+  await request(A.s, 'ai-ask', { question: '打开白板' });
+  const rcMsg = await Promise.race([rcMsgP, sleep(9000).then(() => null)]);
+  await sleep(400);   // 坑 61：ack 与事件是两趟往返，断言要等一拍
+  ok('2026-10-02 「打开白板」→ 全房间都收到 room-control(board-open)（不是只回一句话）',
+     rcA.length === 1 && rcA[0].action === 'board-open' && rcB.length === 1 && rcB[0].action === 'board-open');
+  ok('2026-10-02 动作型意图的答案明确说"做了"（可验证，不写"你可以点击按钮"）',
+     !!rcMsg && /白板/.test(rcMsg.text) && /打开/.test(rcMsg.text));
+  const rcT1 = Date.now();
+  const rcCloseP = new Promise((resolve) => {
+    const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcT1) { A.s.off('chat-message', h); resolve(m); } };
+    A.s.on('chat-message', h);
+  });
+  rcA.length = 0; rcB.length = 0;
+  await request(A.s, 'ai-ask', { question: '把白板关掉' });
+  await Promise.race([rcCloseP, sleep(9000).then(() => null)]);
+  await sleep(400);
+  ok('2026-10-02 「把白板关掉」识别成 board-close（中文"关"必须排在"开"前面判，否则跨词误命中）',
+     rcA.length === 1 && rcA[0].action === 'board-close');
+  ok('2026-10-02 room-control 广播里不带任何设备/隐私字段（只发"做什么"）',
+     rcA.length > 0 && Object.keys(rcA[0]).sort().join(',') === 'action,byName,ts');
+  const rcT2 = Date.now();
+  const rcCapP = new Promise((resolve) => {
+    const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcT2) { A.s.off('chat-message', h); resolve(m); } };
+    A.s.on('chat-message', h);
+  });
+  rcA.length = 0;
+  await request(A.s, 'ai-ask', { question: '开启实时字幕' });
+  await Promise.race([rcCapP, sleep(9000).then(() => null)]);
+  await sleep(400);
+  ok('2026-10-02 「开启实时字幕」→ captions-on（字幕这条 AI 的"耳朵"也能被语音指令开关）',
+     rcA.length === 1 && rcA[0].action === 'captions-on');
   const aiState2P0 = waitEvent(A.s, 'room-state');
   await request(A.s, 'ai-leave', {});
   const aiState2 = await Promise.race([aiState2P0, sleep(800).then(() => null)]);
@@ -998,6 +1055,18 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   try { await request(F.s, 'set-preferred-layers', { consumerId: 'fake-consumer', spatialLayer: 1 }); }
   catch (e) { layerErr = e.message; }
   ok('D1 对不存在的 Consumer 切层被拒（错误路径正确）', !!layerErr);
+
+  /* --- ★ 2026-10-02 Piik 取长②「只听不看」的服务器侧 ---
+   * ▎这里能测的是**门禁与错误路径**：consumerId 不在自己 socket.consumers 里就必须拒
+   *   （按连接隔离 = 结构上关不掉别人的画面）。正向路径（真暂停后画面停帧）
+   *   在 npm run test:e2e-media 里用两个真浏览器验——信令测试没有真 Consumer 可暂停。 */
+  let pauseErr = null;
+  try { await request(F.s, 'set-consumer-paused', { consumerId: 'someone-elses-consumer', paused: true }); }
+  catch (e) { pauseErr = e.message; }
+  ok('2026-10-02 暂停别人的 Consumer 被拒（按连接隔离，不能影响他人画面）', !!pauseErr && /找不到/.test(pauseErr));
+  // 借 D1 那个假 id 再确认一次：错误应答不会把服务器打死（后续信令照常应答）
+  const aliveAfterPause = await request(F.s, 'get-router-rtp-capabilities', {});
+  ok('2026-10-02 暂停失败后服务器仍正常应答（错误路径不传染）', !!(aliveAfterPause.data && aliveAfterPause.data.rtpCapabilities));
 
   // --- A6：限时授权到点自动撤权（用 900ms 验证整条链路）---
   A.s.emit('remote-release');       // 先结束上一轮控制
@@ -1243,6 +1312,13 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   const cfgNow = await getJson('/config.json');
   ok('09-24 /config.json 声明支持桌面代理（前端据此显示「控制电脑」入口）', cfgNow.remoteDesktop === true);
   ok('09-24 /config.json 下发代理启动命令模板（用户复制即用）', /agent\/index\.js/.test(cfgNow.agentCommand || ''));
+  /* ★ 2026-10-02 引擎可见性：用户问"是没实现还是还在用 whisper"，不该靠翻日志猜。
+   *   asrEnabled 也不能只等价于"装了 whisper"——换引擎后它会谎报 false，
+   *   前端就退回浏览器识别（坑 57「装了≠用上了」的镜像版本）。 */
+  ok('2026-10-02 /config.json 报告当前 ASR 引擎名（qwen-local / whisper / qwen / auto / none）',
+    ['whisper', 'qwen', 'qwen-local', 'auto', 'none'].includes(cfgNow.asrEngine));
+  ok('2026-10-02 asrEnabled 与引擎名口径一致（有引擎就必须 true，不能谎报没耳朵）',
+    cfgNow.asrEnabled === (cfgNow.asrEngine !== 'none'));
 
   /* ① 超员闸 —— 这一条是"补写的守门测试"，因为写它的时候真的抓到了一个 bug：
    *   原来 joinRoom() 满员只 `return`（返回 undefined），调用方却照旧回"进房成功"

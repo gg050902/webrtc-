@@ -46,7 +46,9 @@ def main():
 
     print(json.dumps({"ready": True, "model": args.model}, ensure_ascii=False), flush=True)
 
-    PROMPT = "以下是普通话的会议对话，请用简体中文输出。"
+    # ★ 2026-10-02：提示词由 Node 侧经 ASR_WORKER_PROMPT 下发（单一来源在 sfu/ai/asr.js）。
+    #   原先这里自己写了一份同样的字符串——两处字面量迟早漂移（坑 47）。
+    PROMPT = os.environ.get("ASR_WORKER_PROMPT") or "普通话会议对话，简体中文"
     for line in sys.stdin:
         line = line.strip()
         if not line:

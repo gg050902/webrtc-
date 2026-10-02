@@ -40,6 +40,95 @@ const PY_ENV = Object.freeze({ ...process.env, PYTHONIOENCODING: 'utf-8', PYTHON
  * 注意这里只管"要不要接话"，不含"该怎么答"（那是 brain.js 的职责）。 */
 const WAKE_RE = /小明|小鸣|小名|小铭/;
 
+/* ── 1.5 静音幻觉清洗 + 能量闸（★ 2026-10-02，用户实测"AI 一直收到重复的一句话"的根因）
+ *
+ * ▎现场证据（sfu/captions/cap-746646-20261002.jsonl）：账本里每 2.4~4s 就有一条
+ *   `asr:true` 的字幕，文本一模一样——**「请用简体中文输出。」**
+ *   那不是有人在说话，那是 whisper 的 --initial_prompt 被**当成转写结果回显**了：
+ *   模型遇到纯静音没有内容可写，就顺着提示词往下"续写"，把提示词尾巴吐成一句话。
+ * ▎为什么旧的门槛挡不住：管线里判的是 `size < 40000`（约 1.25s 音频），
+ *   它量的是**时长**不是**能量**——一段 4s 的纯静音有 128KB，照样大摇大摆进了转写。
+ *   （prewarmAsrWorker 就是拿 0.3s 纯静音喂 worker 的，那条路径的结果被丢弃所以没人看见，
+ *    但同一个机制在生产路径上每 4 秒制造一条假字幕。）
+ * ▎后果链：假字幕 → 落进 20s 追问窗口 → 每条都触发一次完整应答（流式气泡 + TTS）
+ *   → "AI 每两三秒重复回答同一句话" + "对话很混乱" + 朗读被自己的假字幕一路 hush 掉
+ *   → "后边它回答没有说话"。所以这一刀是**从源头断流**，比在下游加节流更正确。
+ *
+ * ▎两道防线（都要，缺一不可）：
+ *   ① **能量闸 measureWavLevel()**：转写之前先量这段音频有没有声——没声就直接删段，
+ *      **连模型都不叫**。既治幻觉又省 CPU/降延迟（静音段不再排队的隐藏收益）。
+ *   ② **文本清洗 cleanTranscript()**：真有声音时模型也可能回显提示词/吐经典幻句
+ *      （"字幕by XXX"、"谢谢大家"），这层把它擦干净；擦完什么都不剩 → 返回空串，
+ *      调用方按"这段没人说话"跳过（与本文件"空串=跳过"的既有约定一致）。
+ * ▎为什么空串而不是抛错：转写失败与"没人说话"在业务上等价（这段没有可用信息），
+ *   而抛错会让单段失败拖垮整条转写循环——这条约定从 09-28 就是这样，别改。 */
+
+/* ▎提示词改短的**原因**（不是随手措辞）：原来那句写成祈使句「…请用简体中文输出。」，
+ *   模型续写静音时就照抄这句；换成不含谓语的**中性名词短语**后，即使被回显也一眼可辨、
+ *   且 cleanTranscript 的黑名单正好盯着这几个字。
+ * ▎单一来源（坑 47）：asr_worker.py 原先自己写了一份同样的字符串——两处字面量迟早漂移，
+ *   现在 worker 通过 ASR_WORKER_PROMPT 环境变量取这一份。 */
+const ASR_PROMPT = '普通话会议对话，简体中文';
+
+/* 会被当成"提示词回显/静音幻句"的片段。命中即从文本里擦掉（不是整条丢掉——
+ * 真实句子里偶尔夹一个词被误伤的概率，比整条丢弃导致丢真话低）。 */
+const HALLUCIN_FRAGS = [
+  /请[用使][^，。,]{0,12}(输出|简体|中文)/g,
+  /以下是普通话[^。，,]*/g,
+  /普通话会议对话/g,
+  /简体?中文/g,
+  /^[\s]*(字幕|Subtitles?)(by|：|:)?[\w\s\byyyymmdd./-]{0,30}$/i,
+  /^\s*(谢谢(大家|观看|聆听)?[。！!]?)\s*$/,
+  /^\s*(The end|全文完|完)\s*$/i,
+];
+
+/* 清洗一段转写文本 → 可用的句子；返回 '' 表示"这段等于没人说话"。
+ * 纯函数、无依赖，所以能被 test:asr 直接逐条断言（性能/语义逻辑都要可穷举）。 */
+function cleanTranscript(raw) {
+  let t = String(raw || '').replace(/\s+/g, ' ').trim();
+  if (!t) return '';
+  for (const re of HALLUCIN_FRAGS) t = t.replace(re, '');
+  // 擦掉片段后会留下光秃秃的句首标点（"。明天下午三点…"），一并去掉
+  t = t.replace(/^[\s，,。.、；;：:]+/, '').replace(/[\s，,、；;]+$/, '').trim();
+  // 折叠"同一短句连着复读"（幻觉风暴在语句组装后会长成 A A A 的样子）
+  t = t.replace(/^(.{2,20}?)([，,。.\s]*)\1(?![\w])/, '$1');
+  // 擦干净后只剩标点/单字 → 当作没有内容（唤醒与账本都不需要这种条目）
+  if (t.replace(/[\s，,。.、！!？?：:;；…~\-]/g, '').length < 2) return '';
+  return t;
+}
+
+/* 量一段 16k/单声道/16bit PCM wav 的峰值电平（dBFS）。
+ * ▎为什么在 Node 里自己算而不是问 ffmpeg：这就是 64000 个 sample 的一次遍历，
+ *   亚毫秒级、零进程、零新依赖；而"再起一个 ffmpeg 探测一遍"要给每段多付一次进程钱。
+ * ▎用 peak 不用 rms：安静说话的人 rms 可能低到和房间噪声分不开，peak 能分辨"有没有出声"。
+ * ▎**fail-open 是硬要求**：文件读不到、格式不是我们预期的 PCM16mono，一律返回 null
+ *   （= "判断不了"）→ 调用方照常转写。宁可漏掉一次静音过滤，也绝不能把真话当静音删掉。 */
+function measureWavLevel(file) {
+  let buf;
+  try { buf = fs.readFileSync(file); } catch (e) { return null; }
+  if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return null;
+  let fmt = null;
+  for (let i = 12; i + 8 <= buf.length;) {
+    const id = buf.toString('ascii', i, i + 4);
+    const size = buf.readUInt32LE(i + 4);
+    if (id === 'fmt ') {
+      fmt = { audioFormat: buf.readUInt16LE(i + 8), channels: buf.readUInt16LE(i + 10), bits: buf.readUInt16LE(i + 22) };
+    }
+    if (id === 'data') {
+      if (!fmt || fmt.audioFormat !== 1 || fmt.channels !== 1 || fmt.bits !== 16) return null; // 非预期形态：不猜
+      const end = Math.min(i + 8 + size, buf.length);
+      let peak = 0;
+      for (let p = i + 8; p + 1 < end; p += 2) {
+        const s = Math.abs(buf.readInt16LE(p));
+        if (s > peak) peak = s;
+      }
+      return { peakDb: peak > 0 ? 20 * Math.log10(peak / 32768) : -99, samples: (end - i - 8) / 2 };
+    }
+    i += 8 + size + (size % 2); // chunk 按偶数字节对齐
+  }
+  return null;
+}
+
 /* ── 2. 候选与白名单 ─────────────────────────────────────────── */
 
 // pip 安装位置：--user 装的 whisper.exe 不在服务器 PATH 里，需要显式枚举
@@ -111,16 +200,18 @@ async function probeWhisper({ timeoutMs = 25000 } = {}) {
 }
 
 /* ── 4. 转写一个音频文件 → 文本 ───────────────────────────────
- * ▎参数拼装集中在这里：模型/语言/简体提示词/输出格式/静默进度。
- *   `--initial_prompt` 里点名"用简体中文输出"实测有效（tiny 模型原本偶尔输出繁体）。
- * ▎返回**空串**表示"这段没人说话/识别失败"——调用方按"跳过"处理，不要当异常。 */
+ * ▎参数拼装集中在这里：模型/语言/提示词/输出格式/静默进度。
+ * ▎提示词见 1.5 节：它必须是**不会被回显成整句**的中性短语——旧值那句祈使句
+ *   在静音段被模型照抄成"请用简体中文输出。"，就是本轮"AI 收到重复一句话"的现场。
+ * ▎返回**空串**表示"这段没人说话/识别失败"——调用方按"跳过"处理，不要当异常。
+ *   ★ 2026-10-02 起这里真的会返回空串了：结果统一过 cleanTranscript()。 */
 function buildArgs(runner, wavFile, opts = {}) {
   return [
     ...runner.preArgs,
     wavFile,
     '--model', opts.model || DEFAULT_MODEL,
     '--language', opts.language || 'zh',
-    '--initial_prompt', opts.initialPrompt || '以下是普通话的会议对话，请用简体中文输出。',
+    '--initial_prompt', opts.initialPrompt || ASR_PROMPT,
     '--output_format', 'txt',
     '--output_dir', opts.outDir || path.dirname(wavFile),
     '--verbose', 'False', // 不往 stdout 打印分段（GBK 控制台更稳，也省时间）
@@ -162,7 +253,7 @@ async function transcribeFile(runner, wavFile, opts = {}) {
           let text = '';
           try { text = fs.readFileSync(txt, 'utf8'); } catch (e) { text = ''; }
           try { fs.unlinkSync(txt); } catch (e) { /* 不存在就算了 */ }
-          resolve(String(text).replace(/\s+/g, ' ').trim());
+          resolve(cleanTranscript(text));
         });
     });
   } finally {
@@ -184,15 +275,14 @@ async function transcribeFile(runner, wavFile, opts = {}) {
  *   （transcribeFile），功能不降级；单段超时/异常按空串处理，绝不挂死转写循环。 */
 const { spawn } = require('child_process');
 
-async function pythonNameForWorker({ timeoutMs = 15000 } = {}) {
-  // 只在两个固定字面量里挑：谁真的能 import whisper 用谁（探测本身不引入注入面）
-  for (const bin of ['python', 'python3']) {
-    const ok = await new Promise((resolve) => {
-      execFile(bin, ['-c', 'import whisper'], { timeout: timeoutMs, windowsHide: true, env: PY_ENV }, (err) => resolve(!err));
-    });
-    if (ok) return bin;
-  }
-  return null;
+/* ★ 2026-10-02 探测改走 sfu/ai/pyprobe.js（唯一实现）：
+ *   原来这里也是 `timeout: 15000` + "err 即没装"，与坑 37 同一个错法——
+ *   只是 whisper 的导入比 torch 一族快，才没被踩到。共用一份实现，
+ *   下次改判据（比如再加一趟重试）三处一起生效。 */
+async function pythonNameForWorker() {
+  const { probePythonModule } = require('./pyprobe');
+  const r = await probePythonModule('whisper');
+  return r.bin; // 'python' | 'python3' | null（null = 真不可用，调用方回退 CLI 路径）
 }
 
 function createResidentTranscriber({ model, timeoutMs } = {}) {
@@ -227,7 +317,7 @@ function createResidentTranscriber({ model, timeoutMs } = {}) {
       if (!p) continue;
       state.pending.delete(msg.id);
       clearTimeout(p.timer);
-      p.resolve(String(msg.text || '').replace(/\s+/g, ' ').trim());
+      p.resolve(cleanTranscript(msg.text));
     }
   }
 
@@ -240,7 +330,11 @@ function createResidentTranscriber({ model, timeoutMs } = {}) {
       cwd: __dirname,          // 脚本与本实现同目录（字面量文件名 + 固定 cwd）
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...PY_ENV, ASR_WORKER_MODEL: String(model || DEFAULT_MODEL) },
+      env: {
+        ...PY_ENV,
+        ASR_WORKER_MODEL: String(model || DEFAULT_MODEL),
+        ASR_WORKER_PROMPT: ASR_PROMPT, // ★ 2026-10-02 提示词单一来源（worker 侧不再自己写一份）
+      },
     };
     if (state.usePython3) {
       state.child = spawn('python3', ['asr_worker.py'], childOpts);
@@ -335,6 +429,9 @@ module.exports = {
   shouldWake,
   isFollowUp,
   assertRunner,
+  cleanTranscript,   // ★ 2026-10-02 静音幻觉清洗（纯函数，test:asr 逐条断言）
+  measureWavLevel,   // ★ 2026-10-02 段能量闸（转写前先判断有没有出声）
+  ASR_PROMPT,
   DEFAULT_MODEL,
   DEFAULT_SEGMENT_SEC,
   ASR_CONCURRENCY,

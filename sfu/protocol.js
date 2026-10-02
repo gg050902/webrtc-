@@ -57,7 +57,18 @@ module.exports = {
    * ▎谁来决定层？本 Demo 让**服务器**读 consumer.getStats()（丢包率）自动升降层（权威且统一），
    *   同时允许客户端手动指定（教学演示用）。 */
   SET_PREFERRED_LAYERS: 'set-preferred-layers', // C→S { consumerId, spatialLayer }（null = 交回服务器自动）
+  SET_CONSUMER_PAUSED: 'set-consumer-paused',   // ★ 2026-10-02 C→S { consumerId, paused } → { paused }（「只听不看」：只影响自己这条下行，服务器 pause 后真的不再转发；ABR 在 paused 期间被守卫跳过）
   LAYER_CHANGED: 'layer-changed',               // S→C 定向 { consumerId, producerId, spatialLayer, layerCount, auto, reason }
+
+  /* ── ★ 2026-10-02 第 36 步：房间级实体操作（AI 说"打开白板"就真的打开）────
+   * ▎为什么只有**一条广播**、没有 C→S 的请求事件：动作由 aiBrain 内的规则路由直接执行
+   *   （tools-first，见 AGENTS 坑 38），人类入口就是聊天里的 @ai / 说话唤醒，
+   *   不需要新造一个客户端信令去绕过同一套判定。
+   * ▎白名单（服务器 ROOM_ACTIONS）与客户端 socket.on('room-control') 那张表**必须一一对应**，
+   *   不一致的表现是"AI 说做了、界面什么都没发生"——所以两边各有一条断言钉着。
+   * ▎边界：只允许动房间级共享状态（白板/字幕/视图）。
+   *   动用户设备的一律不走这里（摄像头、屏幕共享、静音别人、发消息），必须各自的授权链路。 */
+  ROOM_CONTROL: 'room-control',                 // S→C 广播 { action, byName, ts }
 
   /* ── ★ A3 升级（2026-09-11）：剪贴板同步（双向，仍受控制关系门禁约束）────
    * ▎为什么单独一个事件、不复用 remote-input？因为剪贴板是**双向**的：

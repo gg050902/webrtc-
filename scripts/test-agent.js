@@ -27,7 +27,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
-const { io } = require('C:/Users/27418/Desktop/webrtc/node_modules/socket.io-client');
+const { io } = require('socket.io-client');
 const { RemoteAgent } = require('../agent/index');
 const { findBrowserBin } = require('../agent/cdp');
 

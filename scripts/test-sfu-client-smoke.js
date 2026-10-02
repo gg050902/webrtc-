@@ -1237,6 +1237,274 @@ const emit = (ev, payload) => {
   ok('09-25 AI 语音会先洗掉 markdown 再念（不念出星号与表格竖线）',
     /function speakableText/.test(clientSrc) && /\\\*\\\*\(\[\^\*\]\*\)\\\*\\\*/.test(clientSrc));
 
+  /* ---- ★ 2026-10-02 "AI 后来不出声"的两条死锁：钉住**接线形状** ----
+   * ▎为什么这里只能断言源码（诚实交代）：冒烟桩里没有 speechSynthesis、也没有 Audio 元素，
+   *   真播放分支走不到——所以行为级覆盖放在 `npm run test:asr-live` 的"语音交付"断言里
+   *   （那条真的检查"声明了 tts:'server' 就必须给出 ai-audio 或 ai-tts-fail"）。
+   *   这里钉的是形状：让位闸必须有例外、回落必须带 force、队列与销账时机必须成立——
+   *   这几条错一条，用户侧症状都是同一个"它答应了却没声音"（且没有任何报错）。 */
+  ok('2026-10-02 让位闸留了例外口（ai-tts-fail 的回落不再被自己挡住）',
+    /function speakAiText\(text, \{ force = false \} = \{\}\)/.test(clientSrc) &&
+    /if \(aiTtsEnabled && !force\) return;/.test(clientSrc));
+  ok('2026-10-02 回落调用真的带 force: true（不带走闸等于白回落）',
+    (clientSrc.match(/speakAiText\(t, \{ force: true \}\)/g) || []).length >= 2);
+  ok('2026-10-02 服务端音频走顺序队列（按句流水线分段到达，不再互相掐）',
+    /const serverTtsQueue = \[\]/.test(clientSrc) && /function playNextServerTts/.test(clientSrc));
+  ok('2026-10-02 销账时机=真的开始播（onplaying），取不到文件有 onerror 回落',
+    /\.onplaying =/.test(clientSrc) && /\.onerror =/.test(clientSrc));
+  ok('2026-10-02 打断(hush)会清空待播队列并释放 busy（不留"永远不播"的新死锁）',
+    /serverTtsQueue\.length = 0;[\s\S]{0,80}serverTtsBusy = false;/.test(clientSrc));
+  /* ---- ★ 2026-10-02 第二次实修："回答的时候不说话"的**另一半**根因 ----
+   * ▎第一半（让位闸挡死回落）已在上面钉住；这一半更隐蔽：hush 之后开的 8 秒静默窗
+   *   把**这次提问的答案**也一起吞了。真实时序 = 「用户说完 → 字幕到达(hush,开窗)
+   *   → 1.5~6s 后答案的音频到达」——答案永远落在自己开的窗里，且 pendingServerTts
+   *   的回落账本被顺手销掉 = 既没有服务端声音、也没有浏览器兜底、还没有任何报错。
+   * ▎修法与坑 47 同源："认人别认时间"——拉黑的是**被打断那一轮答案的 ts**
+   *   （同一轮流水线分段共用 ts），新一轮是新 ts，天然放行；不依赖两端时钟对齐。 */
+  ok('2026-10-02 打断改成按 ts 拉黑"那一轮"（新一轮答案不再被静默窗吞掉）',
+    /const serverTtsDropped = new Set\(\)/.test(clientSrc) &&
+    /serverTtsDropped\.has\(ts\)/.test(clientSrc) &&
+    /serverTtsDropped\.add\(serverTtsPlayingTs\)/.test(clientSrc));
+  ok('2026-10-02 时间窗只作"段没带 ts"时的兜底（不再当主判据）',
+    /Date\.now\(\) < serverTtsIgnoreUntil/.test(clientSrc) &&
+    /\? serverTtsDropped\.has\(ts\)\s*:\s*Date\.now\(\) < serverTtsIgnoreUntil/.test(clientSrc));
+  /* ▎浏览器那一轨同源问题：抢话闸曾用"2.5s 内到过字幕"，后来收到 700ms 仍然误杀——
+   *   因为"字幕刚到"说明的是**1~3 秒前**有人在说话，而答案恰恰总是紧跟在自己的字幕
+   *   后面 1~3 秒到达（每轮必撞闸）。唯一能代表"此刻在说"的信号是麦克风（130ms 级）。
+   *   字幕窗只保留给"根本没有麦克风可量"的场景（拒绝授权/无设备/另一台设备在说话）。 */
+  ok('2026-10-02 抢话闸以麦克风即时信号为主判据（字幕只在无麦克风时兜底）',
+    /const talkingNow = aiHush\.analyser\s*\?\s*\(Date\.now\(\) - lastMicVoiceTs < 600\)\s*:\s*\(Date\.now\(\) - lastUserSpeechTs < 700\)/.test(clientSrc));
+  ok('2026-10-02 看门狗持续量麦克风（不再只在 AI 说话时才量——那样"此刻在说"根本拿不到）',
+    /if \(aiHush\.analyser\) \{[\s\S]{0,600}lastMicVoiceTs = Date\.now\(\);[\s\S]{0,200}if \(window\.speechSynthesis && window\.speechSynthesis\.speaking\)/.test(clientSrc));
+  ok('2026-10-02 服务器 ASR 启动日志说真话（主引擎名 + whisper 只是兜底）',
+    /主引擎 = \$\{primary\}/.test(fs.readFileSync(path.join(__dirname, '..', 'sfu', 'server.js'), 'utf8')));
+  /* ▎浏览器界面上那行"由本机 whisper 识别"是**用户唯一看得见的引擎声明**，
+   *   而它当时是硬编码的——引擎早已切成 qwen-local，界面还在说 whisper。
+   *   用户据此判断"没切换成功"，这一行字比任何后端日志都有说服力（坑 67 的 UI 版）。 */
+  ok('2026-10-02 界面不再硬编码引擎名（状态/提示/日志三处都取 /config.json 的 asrEngine）',
+    /function asrEngineCn\(\)/.test(clientSrc) &&
+    /renderCapStatus\(`🖥️ 服务器转写（\$\{asrEngineCn\(\)\}）`/.test(clientSrc) &&
+    /showToast\(`🖥️ 服务端转写已开启[\s\S]{0,60}\$\{asrEngineCn\(\)\}/.test(clientSrc) &&
+    /log\(`💬 已启用服务端转写[\s\S]{0,80}\$\{asrEngineCn\(\)\}/.test(clientSrc) &&
+    /serverAsrEngine = String\(cfg\.asrEngine/.test(clientSrc));
+  /* ---- ★ 2026-10-02 流式答案"按句上嘴"：朗读不再等整段写完 ----
+   * ▎为什么这是一条真缺口而不是锦上添花：ai-stream 每 12 字就吐一次增量，但增量只进
+   *   气泡不上嘴——一定要等终态 chat-message 才开口。长答案 LLM 要写 3~8 秒，
+   *   用户听到的"它答应了却半天没声"里有一段就是这么攒的（与服务器上 makeSpeakPipeline
+   *   同一个思路，这一刀落在浏览器那一轨）。
+   * ▎断言按"接线"来写（坑 56 的老账：模块写对了、调用方没接）：
+   *   ① delta 分支真的调了 speakStreamPart；② 追加路径绝不 cancel（自己掐自己上一句）；
+   *   ③ 终态只补尾巴且前缀对不上时退回整段（宁重不漏）；④ 队列只有一条泵在跑。 */
+  ok('2026-10-02 流式增量真的接上了按句朗读（不是写了个没人调的函数）',
+    /speakStreamPart\(box, box\.rawAll\)/.test(clientSrc));
+  /* ▎本轮最隐蔽的一处：DOM 增量渲染用的是**攒批后会被清空**的 box.buf（applyStreamBuf
+   *   刷完就 box.buf = ''）。朗读若也读这个缓冲，永远只能看到一帧内的三五个字，
+   *   句末标点根本不可能出现 → 函数写得完全正确、调用点也接上了，**但永远无事发生**。
+   *   判据：账本与攒批缓冲必须是两个变量。 */
+  ok('2026-10-02 朗读读的是不被消费的全文副本（rawAll），不是攒批后会清空的 buf',
+    /box\.rawAll = \(box\.rawAll \|\| ''\) \+ delta;/.test(clientSrc) &&
+    /speakStreamPart\(box, box\.rawAll\)/.test(clientSrc) &&
+    !/speakStreamPart\(box, box\.buf\)/.test(clientSrc));
+  /* ▎泵按"代"作废：cancel 掉的那一句会**迟到地**回调 onerror，若它动到新队列，
+   *   表现就是"第一轮问候语念完之后 AI 再也不出声"——一个只有真机跑得出来的死法。 */
+  ok('2026-10-02 朗读泵有代号，旧泵回调不会动新队列',
+    /let aiSpeakGen = 0/.test(clientSrc) &&
+    /const gen = \+\+aiSpeakGen/.test(clientSrc) &&
+    /if \(gen !== aiSpeakGen\) return;/.test(clientSrc));
+  /* ▎?nosw=1 是"排障开关"，可它自己写成了 `location.reload()`——reload **保留查询串**，
+   *   于是下一次加载又命中同一个条件 → 每 400ms 刷一次页面。**排障工具变成故障源**
+   *   是最糟的一类 bug（用户为了"看看是不是缓存的锅"点开它，然后就再也关不掉了）。 */
+  ok('2026-10-02 一轮答案的第一句"只说最新"（旧寒暄不会把新答案堵在队尾）',
+    /const firstOfThisAnswer = !box\.spokeFirst;/.test(clientSrc) &&
+    /enqueueAiSpeech\(say, \{ replace: firstOfThisAnswer \}\)/.test(clientSrc));
+  /* ▎记账位必须推进：不推进 = 每个增量都把同一句重新入队（症状是"AI 鬼打墙一样重复半句"，
+   *   与本轮用户投诉的"一直收到重复的一句话"字面一样，但根因完全不同）。 */
+  ok('2026-10-02 朗读记账位会推进（spokenChars = cut，不会同一句重念）',
+    /box\.spokenChars = cut;/.test(clientSrc) &&
+    (clientSrc.match(/box\.spokenChars = cut;/g) || []).length >= 2);
+  ok('2026-10-02 ?nosw=1 不再自我循环（跳回去掉 nosw 的地址，其余参数保留）',
+    /location\.replace\(location\.pathname \+ \(keep \? '\?' \+ keep : ''\)/.test(clientSrc) &&
+    !/setTimeout\(\(\) => location\.reload\(\), 400\)/.test(clientSrc));
+  /* ---- ★ 2026-10-02 "一直弹这个"：模态框 + 永不作废的 myRoom = 无限弹窗 ----
+   * ▎用户实测被原生 alert 循环卡住：服务器重启 → 房间（内存结构）没了 →
+   *   D6 自动重连拿旧 myRoom 再 join → room-not-found → alert 阻塞主线程 →
+   *   点确定 → 又重连 → 又弹。两个错叠加：① 用**阻塞式模态**报一个会重复发生的事件；
+   *   ② `myRoom` 从来没有作废路径（进过房就永远自认为在房里）。
+   * ▎断言按"结构上不可能再循环"来写：room-not-found 里必须出现 giveUpRoom（清 myRoom），
+   *   且全文件不再有任何 alert( 调用。 */
+  ok('2026-10-02 房间类提示不再用阻塞式 alert（模态框会把重连状态机冻在中间）',
+    (clientSrc.match(/\balert\s*\(/g) || []).length === 0);
+  ok('2026-10-02 「房间没了」是一次状态迁移（清 myRoom + 回加入页），不是一句提示',
+    /function giveUpRoom\(why\)/.test(clientSrc) &&
+    /if \(myRoom\) \{[\s\S]{0,300}?giveUpRoom\(/.test(clientSrc) &&
+    /myRoom = null;/.test(clientSrc));
+  /* ---- ★ 2026-10-02 首页 hero 化（第 35 步 + style.css 第 28 节）----
+   * ▎这一屏改的是"用户第一眼"，所以断言盯三件最容易坏的事：
+   *   ① **id 契约**：打字机与胶囊是新东西，但 pjEnterBtn/pjFxBtn 这些老 id 一旦被"顺手改名"，
+   *      client.js 与既有断言会一起瞎（本项目前端契约就是 id）；
+   *   ② **零依赖红线**：参考稿靠外链视频 + 外链字体，本项目是离线 PWA——
+   *      所以"页面里不许出现任何外链资源"要有一条测试钉住，不然哪天有人"照抄回来"就破功了；
+   *   ③ **裁剪 + 垂直居中的组合**：实测把文案顶到 y=-101 过（放不进就必须能滚）。 */
+  const heroHtml = fs.readFileSync(path.join(PUB, 'index.html'), 'utf8');
+  const heroCss = fs.readFileSync(path.join(PUB, 'style.css'), 'utf8');
+  ok('2026-10-02 hero 结构在位且老 id 契约未破（pjEnterBtn/pjFxBtn/preVideo… 一个都不能改名）',    /id="heroTyped"/.test(heroHtml) && /id="heroCaret"/.test(heroHtml) && /id="heroPills"/.test(heroHtml) &&
+    ['pjEnterBtn', 'pjFxBtn', 'preVideo', 'pjCamSelect', 'pjMicSelect', 'pjMeterBar', 'pjStatus']
+      .every((id) => heroHtml.includes('id="' + id + '"')));
+  ok('2026-10-02 零依赖红线：首页不引入任何外链资源（字体/视频一律本地或 CSS）',
+    !/(href|src)\s*=\s*["']https?:\/\//i.test(heroHtml) &&
+    !/@import\s+url\(|url\(["']?https?:/i.test(heroCss));
+  ok('2026-10-02 打字机与 CTA 是两条独立时间线（胶囊 400ms 出现，不等打字打完）',
+    /setTimeout\(\(\) => \{ if \(pills\) pills\.classList\.add\('shown'\); \}, 400\)/.test(clientSrc) &&
+    /startDelay = 600/.test(clientSrc));
+  ok('2026-10-02 减弱动效降级：全文直出 + 光标节点不进 DOM（动效不能变成读不到的门槛）',
+    /heroReducedMotion\(\)[\s\S]{0,220}?el\.textContent = text;[\s\S]{0,120}?caret\.remove\(\)/.test(clientSrc) &&
+    /@media \(prefers-reduced-motion: reduce\)[\s\S]{0,400}?\.hero-pills \{ transition: none/.test(heroCss));
+  ok('2026-10-02 hero 分层照表（氛围 0 / 内容 1 / 文案 10 / 顶栏 20），且放不下必须能滚',
+    /\.hero-bg \{[^}]*z-index: 0/.test(heroCss) && /\.hero \{[\s\S]{0,80}?z-index: 1/.test(heroCss) &&
+    /\.hero-copy \{[^}]*z-index: 10/.test(heroCss) && /\.hero-nav \{[\s\S]{0,40}?z-index: 20/.test(heroCss) &&
+    /\.prejoin \{[\s\S]{0,160}?overflow: auto/.test(heroCss));
+  /* ---- ★ 2026-10-02 第 36 步：AI 操作会议实体（跨文件一致性）----
+   * ▎这是本项目反复踩到的**"内层算出来了、外层没带出来"**（坑 56）的新变体：
+   *   服务器 ROOM_ACTIONS 有 6 个动作，客户端 room-control 表如果少写一个分支，
+   *   表现是"AI 说它做了、界面毫无反应"，而**两边各自的测试都会绿**。
+   *   所以这里断的是**两个集合相等**，不是"客户端有处理逻辑"。
+   * ▎另一半是边界守卫：这张表**绝不能**出现动用户设备的动作。 */
+  const srvSrc = fs.readFileSync(path.join(__dirname, '..', 'sfu', 'server.js'), 'utf8');
+  const srvActions = (srvSrc.match(/const ROOM_ACTIONS = \{([\s\S]*?)\n\};/) || [, ''])[1]
+    .split('\n').map((l) => (l.match(/^\s*'([a-z-]+)'\s*:/) || [])[1]).filter(Boolean);
+  const rcBlock = (clientSrc.match(/socket\.on\('room-control'([\s\S]*?)\n\}\);/) || [, ''])[1];
+  const cliActions = (rcBlock.match(/action === '([a-z-]+)'/g) || []).map((s) => s.replace(/.*'([a-z-]+)'.*/, '$1'));
+  ok('2026-10-02 服务器白名单与客户端处理表**一一对应**（少一个分支=AI 说了但没做）',
+     srvActions.length >= 6 &&
+     srvActions.slice().sort().join(',') === cliActions.slice().sort().join(','));
+  ok('2026-10-02 房间级动作表里没有"动用户设备"的事（摄像头/共享/静音别人一律不走这条路）',
+     !/camera|screen|share|mute|kick|record|file|clipboard/i.test(srvActions.join(',')));
+  ok('2026-10-02 动作路由排在 LLM 之前（tools-first：先做事再说话，坑 38）',
+     /const roomAction = detectRoomAction\(q\);[\s\S]{0,600}?intent: 'room-action'[\s\S]{0,400}?classifyIntent/.test(srvSrc));
+  ok('2026-10-02 中文规则把"关"排在"开"前面判（否则「把白板关掉」会命中"打开白板"）',     (() => {
+       const rules = (srvSrc.match(/const ROOM_ACTION_RULES = \[([\s\S]*?)\n\];/) || [, ''])[1];
+       return rules.indexOf('board-close') > -1 && rules.indexOf('board-close') < rules.indexOf('board-open') &&
+              rules.indexOf('captions-off') > -1 && rules.indexOf('captions-off') < rules.indexOf('captions-on');
+     })());
+  /* ---- ★ 2026-10-03 屏幕共享补 simulcast（会议本体的最后一处单层上传）----
+   * ▎摄像头 09-11 就分了三档、服务器 ABR 的守卫是 `layerCount>1`，
+   *   而共享一直是**单层全分辨率**——弱网观众只能"卡成幻灯片或什么都看不见"二选一。
+   *   这是坑 47"同一个概念只能有一个来源"的另一面：分层这件事摄像头有、共享没有，
+   *   两套口径长期漂移。断言按"真的把 encodings 传下去了"来写（坑 56 的接线纪律）。 */
+  ok('2026-10-03 屏幕共享走三层 simulcast（把 encodings 真的传进 produce）',
+    /const SCREEN_SIMULCAST_ENCODINGS = \[/.test(clientSrc) &&
+    /track: screenTrack,\s*encodings: SCREEN_SIMULCAST_ENCODINGS,/.test(clientSrc));
+  ok('2026-10-03 共享分层有单层兜底（协商失败不能把共享整个弄没）',
+    /屏幕分层协商失败[\s\S]{0,200}?sendTransport\.produce\(\{ track: screenTrack/.test(clientSrc));
+  ok('2026-10-03 共享码率档高于摄像头（屏幕是文字线条，压狠了看不清等于没共享）',
+    Number((clientSrc.match(/SCREEN_SIMULCAST_ENCODINGS = \[[\s\S]*?maxBitrate: (\d+), scaleResolutionDownBy: 1/) || [, '0'])[1]) >
+    Number((clientSrc.match(/SIMULCAST_ENCODINGS = \[[\s\S]*?maxBitrate: (\d+), scaleResolutionDownBy: 1/) || [, '0'])[1]));
+  ok('2026-10-02 同一轮的后半句是"追加"（replace:false，绝不 cancel 掉正在念的上一句）',
+    /function enqueueAiSpeech\(say, \{ replace = true \}/.test(clientSrc) &&
+    /if \(replace\) \{[\s\S]{0,600}?window\.speechSynthesis\.cancel\(\);[\s\S]{0,200}?aiSpeakPumping = false;/.test(clientSrc));
+  ok('2026-10-02 终态只补念剩下的尾巴；前缀对不上就整段重念（宁可重复也不漏声）',
+    /startsWith\(spoken\)/.test(clientSrc) &&
+    /slice\(spoken\.length\)/.test(clientSrc) &&
+    /\}\s*else \{\s*speakAiText\(text\);/.test(clientSrc));
+  ok('2026-10-02 朗读队列只有一条泵（流式追加时不会两条链抢同一个队列）',
+    /let aiSpeakPumping = false/.test(clientSrc) && /if \(aiSpeakPumping\) return;\s*aiSpeakPumping = true;/.test(clientSrc));
+  ok('2026-10-02 服务端那一轨在时浏览器不抢（aiTtsEnabled 直接不念，防双声）',
+    /function speakStreamPart\(box, rawBuf\) \{\s*if \(!aiVoiceOn \|\| !SPEECH_OK \|\| aiTtsEnabled\) return;/.test(clientSrc));
+  ok('2026-10-02 服务端语音状态翻转有监听（不再只信进房那一次的快照）',
+    /socket\.on\('ai-tts-state'/.test(clientSrc));
+  ok('2026-10-02 唤醒自动提问有同句去重（Web Speech 重出同一句不再重复提问）',
+    /dupWake/.test(clientSrc) && /lastWakeAskText/.test(clientSrc));
+
+  /* ---- ★ 2026-10-02 AI 头像"重影 + 一直重复一个动作"的重做 ----
+   * ▎为什么这次连 style.css 一起读进来断言：本项目最贵的一次排版事故（坑 26：CSS 注释里
+   *   写了星号斜杠吞掉整站 CSS 变量）**所有 JS 测试都测不到**——CSS 从来没被任何测试读过。
+   *   而头像的"重影"恰好又是同一类跨文件问题：素材自带残影 + CSS 再叠一层缩放节奏，
+   *   两边各演各的。只在 JS 里断言等于没断言，所以这里两边都钉。 */
+  const cssSrc = fs.readFileSync(path.join(PUB, 'style.css'), 'utf8');
+  ok('2026-10-02 形象只有一张静帧（没有任何地方再把循环 WebP 当资源引用）',
+    /const AI_PORTRAIT = /.test(clientSrc) && !/AI_ANIM/.test(clientSrc) &&
+    !/(src|href)\s*=\s*.?["'`][^"'`]*xiaoming-(anim|talk)/.test(clientSrc));
+  ok('2026-10-02 死代码已清（从未被调用的 aiAvatarSvg 不再存在）', !/function aiAvatarSvg/.test(clientSrc));
+  ok('2026-10-02 成员行与视频格共用同一个形象常量（一个概念只有一个来源）',
+    (clientSrc.match(/AI_PORTRAIT/g) || []).length >= 3);
+  ok('2026-10-02 .ai-face 的常驻动画只有一条（两套节奏叠加就是重影）',
+    (cssSrc.match(/\.ai-tile \.ai-face \{[^}]*animation: aiBreath/g) || []).length === 1);
+  ok('2026-10-02 小动作池 ≥5 个且都是一次性动画（infinite 循环正是"机器感"的来源）',
+    /AI_GESTURES = \[/.test(clientSrc) &&
+    (cssSrc.match(/\.ai-face\.g-[a-z-]+\s*\{[^}]*animation: \w+ [\d.]+s [a-z-]+ 1;/g) || []).length >= 5);
+  ok('2026-10-02 说话/思考各有自己的律动（不同状态不同动作）',
+    /\.ai-tile\.speaking \.ai-face \{ animation: aiTalkBob/.test(cssSrc) &&
+    /\.ai-tile\.thinking \.ai-face \{ animation: aiThinkLook/.test(cssSrc));
+  ok('2026-10-02 无障碍：prefers-reduced-motion 下头像动画全部停掉',
+    /@media \(prefers-reduced-motion: reduce\)[\s\S]{0,400}animation: none !important/.test(cssSrc));
+  ok('2026-10-02 调度器只在 idle/listening 演小动作，格子移除时一并停表',
+    /state !== 'idle' && aiAvatar\.state !== 'listening'/.test(clientSrc) &&
+    (clientSrc.match(/clearAiGesture\(\)/g) || []).length >= 2);
+
+  /* ---- ★ 2026-10-02 Piik 取长①：定向回应（只对某个人比表情） ----
+   * ▎数据通道是广播语义，所以"发给某人"只能靠消息带定向头 + 接收方各自过滤
+   *   （与 F5 批注的 to 同一套做法）。这里钉的是三件事：发的时候带 to、
+   *   收的时候过滤、定向状态会过期且发完即清——少一条都会变成"对着空气比心"。 */
+  ok('2026-10-02 定向回应：发送带 to 字段（复用批注那套定向头）',
+    /type: 'react'[\s\S]{0,160}to: t \? t\.id : undefined/.test(clientSrc));
+  ok('2026-10-02 定向回应：接收端过滤掉不是发给自己的（别人不刷屏）',
+    /if \(msg\.to && msg\.to !== socket\.id\) return;/.test(clientSrc));
+  ok('2026-10-02 定向状态会过期（目标离开不会一直定向）+ 发完自动取消',
+    /REACT_TARGET_TTL_MS/.test(clientSrc) && /Date\.now\(\) > reactTarget\.until/.test(clientSrc) &&
+    /setReactTarget\(null\); \/\/ 一次一发/.test(clientSrc));
+  ok('2026-10-02 定向入口在成员行（人 + AI 都有），不是只给一半人',
+    (clientSrc.match(/addReactTargetBtn\(/g) || []).length >= 3);
+
+  /* ---- ★ 2026-10-02 Piik 取长②：只听不看（服务器 pause 才真省下行） ----
+   * ▎关键区别要钉住：前端 display:none **不省流量**（包还在收），必须让服务器 pause。
+   *   所以断言的是"确实发了 set-consumer-paused 且带的是这一格的视频 consumer"。 */
+  ok('2026-10-02 「不看」按钮发 set-consumer-paused（不是只把画面藏起来）',
+    /request\('set-consumer-paused'/.test(clientSrc) && /tile\.videoConsumerId/.test(clientSrc));
+  ok('2026-10-02 按钮只挂在视频路（音频不能被"不看"停掉——只听不看）',
+    /if \(kind === 'video'\) addWatchBtn\(/.test(clientSrc));
+  ok('2026-10-02 一格一个按钮（幂等靠 dataset，重复订阅不叠按钮）',
+    /box\.dataset\.watchBtn/.test(clientSrc));
+  ok('2026-10-02 暂停态有可见遮罩（不是"黑一下什么也没说"）',
+    /\.video-box\.paused-view::after/.test(cssSrc) && /\.watch-btn \{ left: 8px; top: 40px; \}/.test(cssSrc));
+
+  /* ---- ★ 2026-10-02 Piik 取长①：每路独立音量 + 超过 100% 的增强 ----
+   * ▎安全分层是这块设计的全部要点，所以逐条钉：
+   *   0~100% 走 video.volume（不需要用户手势、不可能把会议搞没声）；
+   *   只有 >100% 才挂 WebAudio GainNode，此时**必须**把 <video> 静音，
+   *   否则"元素出声 + 音频图出声"= 双重回声；增强不可用要回落 100% 而不是静音。
+   * ▎还有一条最容易漏的：replaceTrack / 重连会给同一格换一条**新的 MediaStream**，
+   *   而 GainNode 还接在旧流上——旧流已停 + 元素被静音 = "调大音量反而没声音"。
+   *   所以流身份必须判、删格子必须拆图（长跑不泄漏节点）。 */
+  ok('2026-10-02 音量分层：0~100% 用 video.volume，不碰音频图',
+    /if \(v <= 1\) \{ detachTileGain\(video\); video\.volume = v; return v; \}/.test(clientSrc));
+  ok('2026-10-02 增强时把元素静音（否则双重出声）',
+    /video\.muted = true; \/\/ 声音改由音频图负责/.test(clientSrc));
+  ok('2026-10-02 增强不可用 → 回落 100% 而不是静音',
+    (clientSrc.match(/video\.volume = 1;\s*\n?\s*return 1;/g) || []).length >= 2);
+  ok('2026-10-02 流换对象会重挂增益（坑 32 的音频版）',
+    /n\.stream !== video\.srcObject/.test(clientSrc) && /stream: video\.srcObject/.test(clientSrc));
+  ok('2026-10-02 三条删格路径都拆音频图（长跑不泄漏节点）',
+    (clientSrc.match(/detachTileGain\(tile\.video\)/g) || []).length >= 3);
+  ok('2026-10-02 音量偏好按成员持久化（换场还认得谁吵）',
+    /sfu\.tileVol\.v1/.test(clientSrc) && /function rememberVolume/.test(clientSrc) && /function storedVolumes/.test(clientSrc));
+  ok('2026-10-02 音量控件悬停才出现且挡住双击全屏（不抢格子手势）',
+    /\.video-box:hover \.vol-ctl/.test(cssSrc) && /stopPropagation\(\)/.test(clientSrc));
+
+  /* ---- ★ 2026-10-02 Piik 取长④：进房前 ICE 预检 ----
+   * ▎这条补的是"沉默故障"的可见性（坑 36）：跨网连不上时过去只有"转圈 + 黑屏"，
+   *   而 doctor/test:turn 都在服务器上，普通用户不会跑。现在预览页当场给一句人话。 */
+  ok('2026-10-02 ICE 自检用的是服务器下发的同一批 ICE 服务器（不是另配一套）',
+    /iceServersForProbe[\s\S]{0,200}sfuIceServers/.test(clientSrc));
+  ok('2026-10-02 判定优先级 relay > srflx > host > 无（中继最稳，故最先认）',
+    /types\.has\('relay'\) \? 'relay' : types\.has\('srflx'\) \? 'stun' : types\.has\('host'\) \? 'lan' : 'blocked'/.test(clientSrc));
+  ok('2026-10-02 自检不阻塞进会（延迟触发 + 幂等挂载）',
+    /function initIcePrecheck\(\)[\s\S]{0,260}getElementById\('iceProbe'\)\) return/.test(clientSrc) &&
+    /setTimeout\(async/.test(clientSrc));
+  ok('2026-10-02 结论写清诚实边界（SFU 媒体不经 TURN，不自称"保证能连"）',
+    /不经 TURN 转发/.test(clientSrc) && /不代表与会议服务器一定连通/.test(clientSrc));
+  ok('2026-10-02 UDP 被堵时给可执行的下一步（指回部署手册，而不是只报错）',
+    /blocked[\s\S]{0,220}Tailscale/.test(clientSrc));
+
   /* ---- ★ 09-30 远程画面自适应帧率：把**控制律**钉死 ----
    * ▎为什么这类性能逻辑必须单测：它是整个自适应机制里唯一会"调错"的地方，
    *   调错的表现是画面忽快忽慢（比固定帧率更难受），而在真机上极难复现。

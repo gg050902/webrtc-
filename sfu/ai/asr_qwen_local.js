@@ -76,15 +76,15 @@ function start() {
   state.child.on('error', () => { /* spawn 失败交给 exit 分支 */ });
 }
 
-async function pythonNameForWorker({ timeoutMs = 15000 } = {}) {
-  const { execFile } = require('child_process');
-  for (const bin of ['python', 'python3']) {
-    const ok = await new Promise((resolve) => {
-      execFile(bin, ['-c', 'import qwen_asr'], { timeout: timeoutMs, windowsHide: true }, (err) => resolve(!err));
-    });
-    if (ok) return bin;
-  }
-  return null;
+/* ★ 2026-10-02 实测坐实的误判：`import qwen_asr` 冷启动要 **21.7s**（torch 一族），
+ *   而这里原先写死 `timeout: 15000` + "报错即没装" → 机器一冷就被判成"没装 Qwen"，
+ *   本地引擎悄悄不启用（症状：识别还是 whisper、音色还是机械的）。
+ *   判据换成 sfu/ai/pyprobe.js：区分 enoent / 没装 / 太慢，超时再给一趟长预算重试。 */
+async function pythonNameForWorker() {
+  const { probePythonModule } = require('./pyprobe');
+  const r = await probePythonModule('qwen_asr');
+  if (!r.bin) state.lastError = r.reason;
+  return r.bin;
 }
 
 async function boot() {
@@ -129,8 +129,10 @@ function kill() {
   state.child = null;
 }
 
-/* 非阻塞预热：触发 worker 加载但不等待（服务器开机用；未就绪时调用方走 whisper 兜底） */
-async function warm() { try { await boot(); } catch (e) { /* 忽略 */ } }
+/* 非阻塞预热：触发 worker 加载但不等待（服务器开机用；未就绪时调用方走 whisper 兜底）。
+ * ★ 2026-10-02 返回 boot() 的结果——原来恒返回 undefined，调用方 .then() 里无条件打
+ *   "🔥 已预热"，于是**探测失败也报成功**（假绿）。现在由调用方按返回值说实话。 */
+async function warm() { try { return await boot(); } catch (e) { return false; } }
 
 module.exports = {
   transcribe,

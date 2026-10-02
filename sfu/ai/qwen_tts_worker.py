@@ -37,17 +37,28 @@ def main():
         print(json.dumps({"fatal": "import: %s" % e}, ensure_ascii=False), flush=True)
         return 1
 
+    # 精度：默认 **bfloat16**（★ 2026-10-02 实测决定，见 scripts/bench-tts.py 的数）
+    #   本机 16 核 CPU、无 CUDA，同一批文本的实测：
+    #     float32 : 11 字 22.1s / 30 字 49.4s / 87 字 113.6s   （RTF≈6~7）
+    #     bfloat16: 11 字 15.8s / 30 字 32.2s / 87 字  91.3s   （RTF≈4.5~5，省 20~35%）
+    #   ▸ 但要说清：**这仍然不足以支撑实时对话**（合成比播放慢 4~5 倍），
+    #     所以服务端实时播报默认仍走浏览器朗读，本地音色要显式开 aiTtsLocalWait
+    #     ——判据与取舍写在 sfu/server.js 的 localTtsWaitEnabled 注释里。
+    #   ▸ 想回退/对比：QWEN_TTS_DTYPE=float32。
+    dt_name = (os.environ.get("QWEN_TTS_DTYPE") or "bfloat16").strip().lower()
+    dtype = getattr(torch, dt_name, torch.float32)
+
     try:
         model = Qwen3TTSModel.from_pretrained(
             args.model,
-            dtype=torch.float32,
+            dtype=dtype,
             device_map="cpu",
         )
     except Exception as e:
         print(json.dumps({"fatal": "load_model: %s" % e}, ensure_ascii=False), flush=True)
         return 1
 
-    print(json.dumps({"ready": True, "model": args.model}, ensure_ascii=False), flush=True)
+    print(json.dumps({"ready": True, "model": args.model, "dtype": dt_name}, ensure_ascii=False), flush=True)
 
     speaker = os.environ.get("QWEN_TTS_SPEAKER", "Vivian")
     language = os.environ.get("QWEN_TTS_LANGUAGE", "Chinese")

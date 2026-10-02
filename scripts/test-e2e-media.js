@@ -187,6 +187,93 @@ const VIDEO_STATS = `JSON.stringify((() => {
   await shot(A, 0);
   await shot(B, 1);
 
+  /* ⑦ ★ 2026-10-02 Piik 取长②「只听不看」的正向路径
+   * ▎为什么必须放在这条 e2e 里验：信令测试只能测"错 id 被拒"，而这条功能的全部价值在于
+   *   "服务器真的停止转发这一路的包"——那只有真浏览器 + 真媒体流才看得见（假绿防线，坑 57/65）。
+   * ▎判据用 getVideoPlaybackQuality().totalVideoFrames（**已解码帧数**），不用 currentTime：
+   *   直播流的 currentTime 跟着墙钟走，暂停后照样涨，用它判会得出"没生效"的假结论。 */
+  console.log('⑦ 断言：只听不看 = 服务器真的停止转发这一路（解码帧数停增）…');
+  const FRAMES = `(() => { const t=[...document.querySelectorAll('.video-box')].find(v=>v.querySelector('.watch-btn')); return t? String(t.querySelector('video').getVideoPlaybackQuality().totalVideoFrames) : 'none' })()`;
+  const CLICK_WATCH = `(() => { const t=[...document.querySelectorAll('.video-box')].find(v=>v.querySelector('.watch-btn')); if(!t) return 0; t.querySelector('.watch-btn').click(); return 1 })()`;
+  const f1 = Number(await B.evaluate(FRAMES));
+  await sleep(1500);
+  const f2 = Number(await B.evaluate(FRAMES));
+  chk(f2 > f1, `暂停前帧数在增长（${f1} → ${f2}，证明这一路确实在流）`);
+
+  await B.evaluate(CLICK_WATCH);
+  const paused = await waitJs(B, `document.querySelector('.video-box.paused-view') ? 1 : 0`, 8000, '格子进入暂停态');
+  chk(!!paused, '点「不看」后进入暂停态（服务器 ack paused=true）');
+  await sleep(1200);            // 把浏览器已缓冲的那点帧放完
+  const p1 = Number(await B.evaluate(FRAMES));
+  await sleep(2200);
+  const p2 = Number(await B.evaluate(FRAMES));
+  chk(p2 <= p1 + 2, `暂停后解码帧不再增长（${p1} → ${p2}；允许 ≤2 帧是排空已缓冲的）`);
+
+  await B.evaluate(CLICK_WATCH);
+  const resumed = await waitJs(B, `document.querySelector('.video-box.paused-view') ? 0 : 1`, 8000, '恢复接收');
+  chk(!!resumed, '再点一次恢复（暂停态摘掉）');
+  await sleep(1000);
+  const r1 = Number(await B.evaluate(FRAMES));
+  await sleep(1500);
+  const r2 = Number(await B.evaluate(FRAMES));
+  chk(r2 > r1, `恢复后帧数重新增长（${r1} → ${r2}，链路完好回来）`);
+
+  /* ⑧ ★ 2026-10-02 Piik 取长①：每路独立音量（0~100% 走元素、>100% 走 WebAudio 增强）
+   * ▎要防的失败模式很具体：增强时忘了把元素静音 = 双重回声；增强不可用还硬切 = 一路没声。 */
+  console.log('⑧ 断言：每路独立音量控件可用（分层不弄丢声音）…');
+  const hasVol = await waitJs(B, `document.querySelector('.video-box .vol-ctl input[type=range]') ? 1 : 0`, 6000, '音量滑杆存在');
+  chk(!!hasVol, '远端格子上有独立音量滑杆');
+  const volState = await B.evaluate(`(() => {
+    const box=[...document.querySelectorAll('.video-box')].find(v=>v.querySelector('.vol-ctl input'));
+    if(!box) return 'none';
+    const sl=box.querySelector('.vol-ctl input'); const v=box.querySelector('video');
+    sl.value='0.4'; sl.dispatchEvent(new Event('input',{bubbles:true}));
+    const half=[v.volume, v.muted];
+    sl.value='1.8'; sl.dispatchEvent(new Event('input',{bubbles:true}));
+    const boost=[v.volume, v.muted];
+    sl.value='1'; sl.dispatchEvent(new Event('input',{bubbles:true}));
+    return JSON.stringify({ half, boost, back: [v.volume, v.muted] });
+  })()`);
+  try {
+    const vs = JSON.parse(volState);
+    chk(Math.abs(vs.half[0] - 0.4) < 0.06 && vs.half[1] === false, `40% 走元素音量（volume=${vs.half[0]}，未借音频图）`);
+    chk(vs.boost[1] === true && vs.boost[0] === 1, `180% 走 WebAudio 增强（元素静音、由音频图出声）`);
+    chk(vs.back[1] === false, `调回 100% 后元素取消静音（音频图已拆，不会一路没声）`);
+  } catch (e) { chk(false, `音量状态读取失败：${volState}`); }
+
+  /* ⑨ ★ 2026-10-02 Piik 取长④：预览页 ICE 自检真的给出了结论（不是永远转圈） */
+  console.log('⑨ 断言：预览页 ICE 自检有结论…');
+  const probe = await waitJs(A, `(document.getElementById('iceProbe')||{}).textContent || ''`, 14000, 'ICE 自检结论');
+  chk(/网络自检/.test(String(probe)), `ICE 自检结论：${probe}`);
+  /* ⑩ ★ 2026-10-03 把 D1 整条"分层 + 选层"链在真浏览器里钉死
+   * ▎为什么这条值得加：信令回归只能验"set-preferred-layers 的错误路径"，
+   *   冒烟只能验"源码形状对"——而**分层到底协商成功没有、降层到底有没有让画面变小**，
+   *   只有真浏览器 + 真媒体流看得见（坑 57/65 那条纪律：断言"变了"之前先证明"原来在动"）。
+   * ▎判据用 `video.videoWidth`：降层 = 服务器改转发哪一路 = 解码分辨率真的变小。
+   *   这是"画面确实降级了"最硬的证据，比读码率省去了采样窗口。 */
+  console.log('⑩ 断言：simulcast 真分层 + 锁最低层真的让画面变小…');
+  const layerCounts = await waitJs(A,
+    `(() => { const v = [...layerState.values()].map(s => s.layerCount); return v.length ? Math.max.apply(null, v) : 0 })()`,
+    15000, 'A 侧收到的 layer-changed');
+  chk(Number(layerCounts) >= 2, `A 侧订阅到的画面有 ${layerCounts} 层（服务器 layer-changed 已送达，选层器才会出现）`);
+  const VW = `(() => { const t=[...document.querySelectorAll('.video-box')].find(v=>v.querySelector('.layer-pick')); return t? String(t.querySelector('video').videoWidth) : 'none' })()`;
+  const wBefore = Number(await A.evaluate(VW));
+  chk(wBefore > 0, `降层前画面在流（videoWidth=${wBefore}，先证明输入真的进去了）`);
+  await A.evaluate(`(() => {
+    const t=[...document.querySelectorAll('.video-box')].find(v=>v.querySelector('.layer-pick'));
+    const sel=t.querySelector('.layer-pick select'); sel.value='0';
+    sel.dispatchEvent(new Event('change',{bubbles:true})); return 1 })()`);
+  let wAfter = wBefore;
+  for (let i = 0; i < 12; i++) { await sleep(1000); wAfter = Number(await A.evaluate(VW)) || wAfter; if (wAfter < wBefore) break; }
+  chk(wAfter < wBefore, `锁到第 1 层后画面分辨率真的变小（${wBefore} → ${wAfter}px，这就是弱网自动降层的同一条执行路径）`);
+  await A.evaluate(`(() => {
+    const t=[...document.querySelectorAll('.video-box')].find(v=>v.querySelector('.layer-pick'));
+    const sel=t.querySelector('.layer-pick select'); sel.value='auto';
+    sel.dispatchEvent(new Event('change',{bubbles:true})); return 1 })()`);
+  await sleep(4000);   // 交回自动后服务器下一轮 tick（2s）会升回去，给两拍
+  const wBack = Number(await A.evaluate(VW)) || 0;
+  chk(wBack >= wAfter, `交回服务器自动选层后画面没被锁死在低层（videoWidth=${wBack}）`);
+
   console.log(`\n结果：${checks - issues}/${checks} 通过，${issues} 失败（截图目录 ${OUT}）`);
   const fail = issues > 0;
   for (const b of browsers) { try { b.kill(); } catch (e) { /* 忽略 */ } }

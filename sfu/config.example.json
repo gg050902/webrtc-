@@ -56,6 +56,14 @@
   //   不可达自动回落浏览器 speechSynthesis（AI_TTS=0 可强制关闭）。
   //   aiTtsVoice —— 音色名（默认 zh-CN-XiaoxiaoNeural 晓晓；可换 zh-CN-YunxiNeural 云希等）。
   "aiTtsVoice": "zh-CN-XiaoxiaoNeural",
+  // ★ 2026-10-02 本地 Qwen3-TTS（自持音色）要不要用于**实时播报**。默认 false：
+  //   本机 CPU 实测合成一句要 12~44s（答案 3s 就上屏、声音 47s 才到），
+  //   对话里"慢半拍的好声音"不如"马上能听到的普通声音"，所以默认让浏览器朗读出声。
+  //   true = 让本地神经音色抢这条链（配 Edge 不可达时想用自持音色/做录音产物才开）。
+  "aiTtsLocalWait": false,
+  // ★ 2026-10-02 慢引擎下的**播报字数预算**：超过就只以文字显示，不再硬念
+  //   （CPU 神经音色 RTF>1，长答案念到一半用户早就不听了）。默认 48 字。
+  "aiTtsMaxChars": 48,
   // ★ 09-24 C4 房间内令牌（room token）：会议内容接口（/api/captions、/api/minutes、/minutes/*）
   //   的门禁开关。默认 true（安全默认值）：进房时给每个成员（含游客）发一张只对本房间有效的
   //   签名令牌，读内容要带它。设成 false 则退回旧行为（这些接口开放）——仅供本地调试/教学对比，

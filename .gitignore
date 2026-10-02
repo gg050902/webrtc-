@@ -45,3 +45,17 @@ sfu/shots/
 #   加这条是因为我用 `git add -A` 时把 _probe-desk.js 一起提交了——
 #   `add -A` 会把"我以为早删了"的临时文件也带上，所以用规则挡住它。
 scripts/_*
+
+# ★ 2026-10-02：本地大模型权重（4.1GB，ModelScope/HF 下载产物，用命令可再生）
+#   为什么要挡：目录里自带的 .gitattributes 把 *.safetensors 声明成 LFS，
+#   一次 `git add -A` 就把 25 个模型文件带进了索引——权重在磁盘上存了两份
+#   （models/ + .git/lfs/objects 各 4.1G），而且别人 clone 时若没装 git-lfs，
+#   拿到的只是 135 字节的指针文件（模型直接不可用）。下载命令写进 README，不入库。
+models/
+
+# Agent 会话数据（与 .mimosa/.reasonix 同类：本机产物，含绝对路径，不入库）
+.workbuddy/
+
+# Python 字节码缓存（worker 脚本跑一次就会生成，本机产物）
+__pycache__/
+*.pyc

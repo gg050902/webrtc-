@@ -47,6 +47,17 @@ function makeSpeechWav(dir) {
   return wav;
 }
 
+// 拼一个 16k/单声道/16bit 的 PCM wav（44 字节头 + 样本）：能量闸的测试素材，零依赖不联网
+function writeWav(file, samples) {
+  const head = Buffer.alloc(44);
+  head.write('RIFF', 0); head.writeUInt32LE(36 + samples.length * 2, 4); head.write('WAVE', 8);
+  head.write('fmt ', 12); head.writeUInt32LE(16, 16); head.writeUInt16LE(1, 20); head.writeUInt16LE(1, 22);
+  head.writeUInt32LE(16000, 24); head.writeUInt32LE(32000, 28);
+  head.writeUInt16LE(2, 32); head.writeUInt16LE(16, 34);
+  head.write('data', 36); head.writeUInt32LE(samples.length * 2, 40);
+  fs.writeFileSync(file, Buffer.concat([head, Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength)]));
+}
+
 (async () => {
   console.log('\n=== ① 探测：whisper 必须可用（本次事故的回归断言）===');
   const runner = await Asr.probeWhisper();
@@ -111,11 +122,48 @@ function makeSpeechWav(dir) {
     skipped('常驻 worker 自检', runner ? '缺少测试语音' : 'whisper 未安装');
   }
 
+  /* === ③.6 静音幻觉清洗 + 能量闸（★ 2026-10-02 回归）===
+   * ▎现场证据（sfu/captions/cap-746646-20261002.jsonl）：账本里每 2.4~4s 一条一模一样的
+   *   「请用简体中文输出。」——那不是有人说话，是 whisper 在**纯静音段**把 --initial_prompt
+   *   续写成了句子。每条假字幕都落进 20s 追问窗口 → AI 每两三秒重复回答一次（用户报的
+   *   "一直收到重复的一句话/对话很混乱/后来不出声"全是这一条链上的下游症状）。
+   * ▎这一段全是**纯函数断言**：不要真模型、不要 GPU、跑得快且永远可复现（同 ③ 的思路）。
+   *   上一轮事故正是因为"没有任何测试盯着探测口径"；这一轮同理——**没人断言过的清洗
+   *   等于没有清洗**。 */
+  console.log('\n=== ③.6 静音幻觉清洗 + 能量闸 ===');
+  ok('丢掉提示词回显「请用简体中文输出。」', Asr.cleanTranscript('请用简体中文输出。') === '');
+  ok('丢掉复读风暴（同一句连说三遍 → 空串）',
+    Asr.cleanTranscript('请用简体中文输出。 请用简体中文输出。 请用简体中文输出。') === '');
+  ok('提示词原文整条也被丢（不留光秃秃的标点）', Asr.cleanTranscript(`${Asr.ASR_PROMPT}。`) === '');
+  ok('丢掉经典幻句「字幕by XXX」与「谢谢大家」',
+    Asr.cleanTranscript('字幕by Peter') === '' && Asr.cleanTranscript('谢谢大家！') === '');
+  ok('真话原样保留（含唤醒词那句不许被误伤）',
+    Asr.cleanTranscript('小明，帮我记一下明天下午三点的评审会。') === '小明，帮我记一下明天下午三点的评审会。');
+  ok('混合情形只擦幻句、留下真句',
+    Asr.cleanTranscript('请用简体中文输出。明天下午三点开评审会。') === '明天下午三点开评审会。');
+  ok('只剩一个字的噪音也判"没有内容"', Asr.cleanTranscript('嗯。') === '');
+  // 能量闸：造两个 wav（纯静音 / 有声音）——静音必须判"没出声"，有声绝不能误删
+  const silWav = path.join(dir, 'gate-silence.wav');
+  const vozWav = path.join(dir, 'gate-voice.wav');
+  writeWav(silWav, new Int16Array(16000));
+  const tone = new Int16Array(16000);
+  for (let i = 0; i < tone.length; i++) tone[i] = Math.round(8000 * Math.sin(2 * Math.PI * 220 * i / 16000));
+  writeWav(vozWav, tone);
+  const sil = Asr.measureWavLevel(silWav);
+  const voz = Asr.measureWavLevel(vozWav);
+  ok('能量闸：纯静音峰值 ≤ -90 dBFS（会被跳过，连模型都不叫）', !!sil && sil.peakDb <= -90);
+  ok('能量闸：正常音量语音峰值 > -45 dBFS（绝不被当静音删掉）', !!voz && voz.peakDb > -45);
+  ok('能量闸：文件读不到 → 返回 null（fail-open：判断不了就照常转写）',
+    Asr.measureWavLevel(path.join(dir, 'nope-not-here.wav')) === null);
+
   console.log('\n=== ④ 在线自检：/config.json 的 asrEnabled ===');
   try {
     const res = await fetch('http://127.0.0.1:3001/config.json', { signal: AbortSignal.timeout(3000) });
     const cfg = await res.json();
     ok('运行中的服务器报告 asrEnabled=true（装了 whisper 就必须为真）', cfg.asrEnabled === true);
+    // ★ 2026-10-02：引擎名也要看得见（用户问"是没实现还是还在用 whisper"，不该靠猜）
+    ok('运行中的服务器报告当前 ASR 引擎（asrEngine 字段）',
+      ['whisper', 'qwen', 'qwen-local', 'auto', 'none'].includes(cfg.asrEngine));
   } catch (e) {
     skipped('在线 /config.json 自检', '3001 上没有运行中的服务器（先 npm run start:sfu）');
   }

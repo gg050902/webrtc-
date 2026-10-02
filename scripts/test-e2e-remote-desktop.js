@@ -222,6 +222,24 @@ async function waitJs(cdp, expr, timeout = 20000, label = '') {
   await sleep(800);
   console.log('   ✅ 已在画面上派发真实鼠标事件（若被控端页面有响应即证明链路通）');
 
+  /* ★ 2026-10-03 把"手感"变成一个读数：**我点下去 → 画面动了** 多少毫秒。
+   * ▎为什么值得进回归：远程桌面过去的指标是 RTT 和帧率，那两个都是"链路"的，
+   *   而用户抱怨的"发肉"发生在 输入→代理执行→重画→抓屏→编码→回传→解码 整条链上，
+   *   RTT 再低也盖不住抓屏+编码那一段。量错指标就会调错地方（坑 58）。
+   * ▎断言取"宽松上限"而不是精确值：这台机器在跑测试时本来就忙，
+   *   我们要钉的是"这个读数存在且量级合理"，不是"必须小于某个魔数"。 */
+  await cdp._send(cdp.pageWs, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: Math.round(rc.x) + 40, y: Math.round(rc.y) + 30, button: 'none', buttons: 0 });
+  await cdp._send(cdp.pageWs, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: Math.round(rc.x) + 40, y: Math.round(rc.y) + 30, button: 'left', buttons: 1, clickCount: 1 });
+  await cdp._send(cdp.pageWs, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: Math.round(rc.x) + 40, y: Math.round(rc.y) + 30, button: 'left', buttons: 0, clickCount: 1 });
+  const latTxt = await waitJs(cdp,
+    `(/响应 (\\d+)ms/.exec(document.getElementById('rdState').textContent || '') || [])[1] || ''`,
+    12000, '响应延迟读数');
+  const latMs = Number(latTxt);
+  /* ▎上限为什么收到 800ms（实测 153ms）：这条断言现在同时是**"输入回声帧"还在不在**的哨兵——
+   *   没有回声帧时这个读数会退回 2000ms+（CDP 只在画面变化时出帧，点了不改像素就一直不出帧），
+   *   所以 3000ms 的宽松上限等于没断。800ms 既容得下 CI 机器抖动，又一定抓得住退化。 */
+  chk(latMs > 0 && latMs < 800, `端到端手感延迟 ${latMs}ms（点下去 → 画面动；回声帧机制不在的话这里会是 2000ms+）`);
+
   console.log('⑥ 通过地址栏远程导航到 example.com…');
   await cdp.evaluate(`(() => { const u = document.getElementById('rdUrl'); u.value = 'https://example.com'; u.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); })()`);
   await sleep(4000);

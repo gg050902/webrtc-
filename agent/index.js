@@ -169,6 +169,7 @@ class RemoteAgent {
     this.streaming = false;
     this.controllerId = null;
     this._lastFrameAt = 0;
+    this._echoTimer = null;      // ★ 2026-10-03 输入回声帧的待触发定时器（见 scheduleEcho）
     this._frameGap = Math.round(1000 / cfg.fps);
     this._frameCount = 0;
     this._frameBytes = 0;
@@ -439,6 +440,11 @@ class RemoteAgent {
     if (!this.streaming) return;
     this.streaming = false;
     this.controllerId = null;
+    /* ★ 2026-10-03 撤权/断线时把待发的"回声帧"一起停掉——
+     *   否则会出现：控制权已经收回，120ms 后那个定时器还是抓了一帧推给旧控制端。
+     *   （scheduleEcho 回调里有 streaming 复查，但**能不叫这一枪就别叫**：
+     *    撤权之后还去抓屏 = 多一次无谓的隐私面，也白花一次编码。） */
+    if (this._echoTimer) { clearTimeout(this._echoTimer); this._echoTimer = null; }
     clearInterval(this._statTimer);
     this.cdp.stopScreencast().catch(() => {});
   }
@@ -461,12 +467,37 @@ class RemoteAgent {
     if (!this.streaming || !this.controllerId) return;
     const now = Date.now();
     if (now - this._lastFrameAt < this._frameGap) return;   // 超频：丢这一帧
-    const buf = Buffer.from(b64, 'base64');
+    const buf = Buffer.isBuffer(b64) ? b64 : Buffer.from(b64, 'base64');
     if (buf.length > 900 * 1024) return;                    // 异常大帧直接丢（保护服务器）
     this._lastFrameAt = now;
     this._frameCount++;
     this._frameBytes += buf.length;
     this.sock.volatile.emit('remote-frame', { to: this.controllerId, frame: buf });
+  }
+
+  /* ★ 2026-10-03 **输入回声帧**：注入输入后，如果抓屏没自己出帧，就手动补一帧。
+   * ▎为什么非做不可（e2e 实测把这件事摊开的）：控制台的"点下去→画面动"量到 **2287ms**，
+   *   而链路其实没那么慢——根因是 CDP 的 screencast 是**变化驱动**的：
+   *   画面像素没变就一帧都不发。于是"点了空白处 / 点了个没有视觉反馈的控件 /
+   *   鼠标只是移动"这些情况下，控制端**一直收不到画面**，直到别处恰好有个变化。
+   *   用户的体感就是"我点了它半天才动"——**这不是带宽慢，是"没人报信"**。
+   * ▎做法：注入输入后 120ms 复查一次，若这期间抓屏没出过帧，就主动 captureScreenshot 补一帧。
+   * ▎代价照实说：多一次编码。所以三重限流：① 已有回声定时器就合并（一次突发只补一次）；
+   *   ② 抓屏已经出帧就不补（`_lastFrameAt >= sentAt`）；③ 仍然走 sendFrame 的帧间隔闸门。
+   *   静止不动的画面下不会产生任何额外开销——没有输入就没有回声。 */
+  scheduleEcho() {
+    if (!this.streaming || !this.controllerId) return;
+    if (this._echoTimer) return;                 // 突发输入合并成一次补帧
+    const sentAt = Date.now();
+    this._echoTimer = setTimeout(() => {
+      this._echoTimer = null;
+      if (!this.streaming || !this.cdp || !this.cdp.isAlive()) return;
+      if (this._lastFrameAt >= sentAt) return;   // 抓屏已经报过信了，不用补
+      this.cdp.screenshot({ format: 'jpeg', quality: this.cfg.quality })
+        .then((buf) => { this.sendFrame(buf); })
+        .catch(() => { /* 补帧失败不影响主链路 */ });
+    }, 120);
+    if (this._echoTimer.unref) this._echoTimer.unref();   // 别让一个补帧定时器吊住进程退出
   }
 
   /* ---------------- 输入注入：把一条消息作用到真实浏览器 ----------------
@@ -565,6 +596,10 @@ class RemoteAgent {
       // 一条坏消息不该炸掉整条输入流
       if (msg.kind !== 'mousemove') this.log(`   ⚠️ 注入失败（${msg.kind}）：${e.message}`);
     }
+    /* ★ 2026-10-03 输入之后安排一次"回声帧"（详见 scheduleEcho 的注释）。
+     *   放在 catch 之后：注入**失败**时更要补一帧——否则控制端看到的是"点了没反应"，
+     *   而真相是"点了没成功、画面也没告诉你"。 */
+    this.scheduleEcho();
   }
 
   /* 回传"当前页面信息"，让控制端的地址栏能显示真实 URL/标题（像真的浏览器一样） */

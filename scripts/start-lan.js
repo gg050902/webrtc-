@@ -64,7 +64,25 @@ async function main() {
     console.log(`  旧配置已备份 → ${path.basename(bak)}`);
   }
 
-  const config = {
+  /* ★ 2026-10-02 **合并式生成**，不再整份覆写（用户配置被吃掉的真事故）：
+   * ▎原来这里是一个从零拼出来的对象 + writeFileSync——adminUsername / asrEngine / asrModel /
+   *   aiChatWindowSec / aiTtsVoice … 只要不在下面这张表里，跑一次 start:lan 就**静默消失**。
+   *   实际后果实测过：10-01 把 asrEngine 配成 qwen-local，之后一次 start:lan 把它抹掉，
+   *   服务器悄悄退回 whisper，用户侧表现为"AI 说话还是那个机械音/识别还是慢"，
+   *   而且没有任何报错——这类"配置被工具吃掉"是最难查的一类故障。
+   * ▎规则：本脚本只负责它**真正懂**的那几项（网络与 HTTPS），其余字段原样保留。
+   *   旧配置仍然备份（.bak-<时间戳>），所以即便合并结果不满意也能手工还原。 */
+  let prev = {};
+  if (fs.existsSync(CONFIG)) {
+    try {
+      prev = require(path.join(ROOT, 'sfu', 'jsonc.js')).parseJsonc(
+        fs.readFileSync(CONFIG, 'utf8')) || {};
+    } catch (e) {
+      console.log(`  ⚠️ 旧 config.json 解析失败（${e.message}）——本次只能整份重建（已备份，可手工还原）`);
+      prev = {};
+    }
+  }
+  const generated = {
     port: 3001,
     maxMembers: 8,
     listenIp: '0.0.0.0',            // 监听所有网卡：别的电脑才连得进来
@@ -82,8 +100,13 @@ async function main() {
     ],
     https: { enabled: true, port: 3443, autoSelfSigned: true },
   };
+  // 只有"本次真的探到了 IP"才覆盖，否则保留用户手写的值（例如 Tailscale IP）
+  if (!picked) delete generated.announcedIp;
+  const config = Object.assign({}, prev, generated);
   fs.writeFileSync(CONFIG, JSON.stringify(config, null, 2) + '\n');
-  console.log('  ✔ 已生成 sfu/config.json（0.0.0.0 + announcedIp + HTTPS 自签 + openrelay TURN）');
+  const kept = Object.keys(prev).filter((k) => !(k in generated));
+  console.log(`  ✔ 已生成 sfu/config.json（0.0.0.0 + announcedIp + HTTPS 自签 + openrelay TURN）` +
+    (kept.length ? `，并保留原有手工字段：${kept.join('、')}` : ''));
 
   const lan = picked || '127.0.0.1';
   console.log('──────────────────────────────────────────────────────');

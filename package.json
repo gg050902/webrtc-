@@ -37,6 +37,8 @@
     "test:ai-brain": "node scripts/test-ai-brain.js",
     "verify:ai": "node scripts/verify-ai-live.js",
     "verify:board": "node scripts/verify-board-live.js",
+    "verify:voice": "node scripts/verify-voice-latency.js",
+    "bench:tts": "python scripts/bench-tts.py",
     "ai:chat": "node scripts/chat.js",
     "ai:summarize": "node scripts/summarize.js",
     "ai:agent": "node scripts/agent.js",

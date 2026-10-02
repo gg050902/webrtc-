@@ -43,114 +43,43 @@ const PRESET_AVATARS = [
   { key: 'av-07', name: '黛紫' }, { key: 'av-08', name: '石青' }, { key: 'av-09', name: '墨竹' },
 ];
 const AI_STATES = ['idle', 'listening', 'thinking', 'speaking', 'happy'];
-const aiAvatar = { state: 'idle', el: null, rowEl: null, tile: null };
+const aiAvatar = { state: 'idle', el: null, rowEl: null, tile: null, gestureTimer: 0, gesture: '', gestureDone: null };
 
-const aiStateUrl = (st) => `/avatars/ai/${AI_STATES.includes(st) ? st : 'idle'}-128.png`;
-/* ★ 09-27 Q版3D双动画：idle（呼吸/眨眼，palindrome 严格无缝循环）+ talk（嘴部开合说话）。
- *  speaking 状态换 talk 图、其余状态回 idle；进页面即预加载 talk，首次切换不白闪。 */
-const AI_ANIM = {
-  idle: '/avatars/ai/xiaoming-anim.webp?v=3d',
-  idleSm: '/avatars/ai/xiaoming-anim-sm.webp?v=3d',
-  talk: '/avatars/ai/xiaoming-talk.webp?v=3d',
-  talkSm: '/avatars/ai/xiaoming-talk-sm.webp?v=3d',
-};
-try { [new Image(), new Image()].forEach((im, i) => { im.src = i ? AI_ANIM.talkSm : AI_ANIM.talk; }); } catch (e) { /* 无头环境无 Image（坑 29 家族：顶层 DOM API 防御式调用） */ }
+/* ★ 2026-10-02 头像动画重做（用户反馈"有重影，而且一直重复一个动作"）
+ * ▎重影的真相：旧版形象是 82 帧的循环 WebP（xiaoming-anim.webp）。把它的帧抽出来看
+ *   （ffmpeg -i xiaoming-anim.webp f%02d.png），第 41 帧头部与肩部就有一圈**半透明偏移残影**
+ *   ——那是 AI 生成动画时交叉淡化烘进帧里的痕迹，图片自带。而我们的 CSS 又在这张"本来就在动"
+ *   的图上再叠一层缩放呼吸（aiFaceBreathe），两套节奏叠加 → 用户看到的"重影 + 发抖"。
+ * ▎"一直重复一个动作"的真相：循环 WebP 天生只会循环，它不可能"看场合做不同的事"。
+ * ▎所以这次把**形象**与**动作**彻底分开：
+ *   ① 形象 = 一张干净静帧（取自循环的起始帧，无残影）；成员行与视频格共用同一张
+ *      （一个概念只能有一个来源，坑 47——旧版行用 -sm、格用大图、还按状态换 src，三份）；
+ *   ② 动作 = 纯 CSS 关键帧 + JS 调度器：常驻只有一条极慢呼吸，而且挂在**容器**上；
+ *      状态动作与小动作挂在**图片本身**上——两个元素各演各的一条动画，结构上不可能再打架；
+ *   ③ 空闲/聆听时每 7~14 秒随机挑一个**一次性**小动作（点头/侧头/左看/右看/轻晃/深呼吸），
+ *      演完立刻摘类；说话时是随字幕节奏的轻弹，思考时"抬头想"，开心时一次弹跳——
+ *      同一时刻永远只有一个动作在演，而且它不是同一段循环。 */
+const AI_PORTRAIT = '/avatars/ai/xiaoming-idle.png?v=20261002';
 let myAvatar = null; // 我的预设头像 key（登录/恢复后带回）
 let serverAsrEnabled = false; // ★ 09-27d：服务端 ASR 是否开启（/config.json 下发）
+/* ★ 2026-10-02 界面必须说实话：这里原先在日志和 toast 里**硬编码"whisper"**，
+ *   而引擎早就可插拔（whisper / qwen-local / qwen 云）。用户照着界面上那行字
+ *   得出的结论就是"根本没切过去，还在用 whisper"（本轮用户原话）。
+ *   一个写在 UI 里的过期字符串，比没有字符串更糟——它会让人去装已经装好的东西。 */
+let serverAsrEngine = 'none';  // whisper | qwen-local | qwen | none（/config.json 下发）
+const ASR_ENGINE_CN = { whisper: '本机 whisper', 'qwen-local': '本机 Qwen3-ASR', qwen: 'Qwen3-ASR（云端）' };
+function asrEngineCn() { return ASR_ENGINE_CN[serverAsrEngine] || '服务器转写'; }
 
 /* ★ 09-26b 唤醒词：开会时商量提到「小明」，它就接话——
  *   字幕成稿（emitCaption）里检测到名字 + AI 在场 → 自动把整句话作为提问发给 ai-ask。
  *   改名字只需改这里（+server 的 bot 显示名）。 */
 const AI_NICKNAME = '小明';
+let lastWakeAskText = ''; // ★ 2026-10-02 唤醒自动提问的去重状态（见 emitCaption）
+let lastWakeAskTs = 0;
 
-/* ★ 09-26b 矢量动画头像 v2（素材：apple-avatar/gufeng/handdraw 丫髥童子）——
- *   静态 PNG 切换太僵硬，换成内联 SVG：呼吸浮动/眨眼/摇头由 CSS 关键帧驱动，
- *   五态靠眼形（睁/弯）与嘴形（笑/张/平）的显隐切换，瞬时无跳变。 */
-/* [09-26c 弃用保留] 矢量小人版本,如需回退 git log 可寻 */
-function aiAvatarSvg(st, cls) {
-  /* ★ 09-26c 头像 v3 深度美化（用户反馈"还是不好看"）：
-   *  ① 造型精修：皮肤径向渐变+柔边阴影滤镜、双眼皮+双高光眼、眉毛、发丝高光、
-   *     交领双层次、腮红改柔边渐变——消除"火柴人"感；
-   *  ② 丝滑：眼形/嘴形不再 display 硬切，全部 opacity 交叉淡化（transition .25s）；
-   *  ③ 状态细粒度：thinking 有漂浮思考泡泡+瞳孔看斜上；speaking 嘴部开合动画；
-   *     idle 偶发眨眼+轻微点头；listening 身体微前倾。 */
-  const ST = { idle: 'st-idle', listening: 'st-listen', thinking: 'st-think', speaking: 'st-speak', happy: 'st-happy' }[st] || 'st-idle';
-  return `<div class="ai-svg ${cls || ''} ${ST}"><svg viewBox="0 0 200 210" width="100%" height="100%" xmlns="http://www.w3.org/2000/svg">
-    <defs>
-      <radialGradient id="a-halo" cx="50%" cy="44%" r="55%">
-        <stop offset="0%" stop-color="#d8e8df" stop-opacity=".9"/><stop offset="100%" stop-color="#d8e8df" stop-opacity="0"/>
-      </radialGradient>
-      <radialGradient id="a-skin" cx="46%" cy="36%" r="72%">
-        <stop offset="0%" stop-color="#fdf1e0"/><stop offset="62%" stop-color="#f7e4cb"/><stop offset="100%" stop-color="#ecd2b2"/>
-      </radialGradient>
-      <linearGradient id="a-hair" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#4a3b2c"/><stop offset="45%" stop-color="#33291e"/><stop offset="100%" stop-color="#201912"/>
-      </linearGradient>
-      <linearGradient id="a-robe" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#679a90"/><stop offset="100%" stop-color="#4c7a71"/>
-      </linearGradient>
-      <filter id="a-soft" x="-30%" y="-30%" width="160%" height="160%">
-        <feGaussianBlur stdDeviation="2.2"/>
-      </filter>
-      <filter id="a-blur1" x="-40%" y="-40%" width="180%" height="180%">
-        <feGaussianBlur stdDeviation="1.1"/>
-      </filter>
-    </defs>
-    <ellipse class="halo" cx="100" cy="100" rx="94" ry="94" fill="url(#a-halo)"/>
-    <g class="body-grp">
-      <!-- 衣领两层次：外袍 + 交领 -->
-      <path d="M58 168 q42 26 84 0 l7 44 h-98 Z" fill="url(#a-robe)"/>
-      <path d="M74 166 q26 20 52 0 l4 18 q-30 14 -60 0 Z" fill="#e8dcc6"/>
-      <path d="M100 172 v20 M88 178 l-6 12 M112 178 l6 12" stroke="#c9b88f" stroke-width="2.6" stroke-linecap="round"/>
-      <!-- 思考泡泡（仅 st-think 显示） -->
-      <g class="think-bubbles">
-        <circle cx="158" cy="52" r="5" fill="#d8cdb8" opacity=".85"/>
-        <circle cx="172" cy="38" r="7.5" fill="#d8cdb8" opacity=".7"/>
-        <circle cx="188" cy="22" r="10" fill="#d8cdb8" opacity=".55"/>
-      </g>
-      <!-- 头（后层柔影 + 脸） -->
-      <ellipse cx="102" cy="110" rx="55" ry="59" fill="#c9a97f" opacity=".35" filter="url(#a-soft)"/>
-      <ellipse cx="100" cy="106" rx="54" ry="58" fill="url(#a-skin)"/>
-      <!-- 耳朵 -->
-      <ellipse cx="45" cy="110" rx="7" ry="11" fill="url(#a-skin)"/>
-      <ellipse cx="155" cy="110" rx="7" ry="11" fill="url(#a-skin)"/>
-      <!-- 头发：主体 + 鬓角 + 发丝高光 + 丫髻 -->
-      <path d="M46 104 q4 -48 54 -48 q50 0 54 48 q-12 -28 -54 -28 q-42 0 -54 28 Z" fill="url(#a-hair)"/>
-      <path d="M44 100 q-8 24 1 38 q-16 -13 -13 -38 Z" fill="url(#a-hair)"/>
-      <path d="M156 100 q8 24 -1 38 q16 -13 13 -38 Z" fill="url(#a-hair)"/>
-      <path d="M60 84 q22 -18 42 -16 M140 84 q-20 -17 -38 -16" stroke="#6b5a41" stroke-width="2" fill="none" opacity=".7" stroke-linecap="round"/>
-      <circle cx="100" cy="50" r="11" fill="url(#a-hair)"/>
-      <path d="M92 44 q8 -8 16 0" stroke="#6b5a41" stroke-width="2" fill="none" opacity=".8" stroke-linecap="round"/>
-      <rect x="96" y="56" width="8" height="6" rx="2" fill="#b4594c"/>
-      <!-- 眉毛（thinking 时挑起） -->
-      <path class="brow" d="M69 92 q10 -6 20 -2" stroke="#3b2f24" stroke-width="2.6" fill="none" stroke-linecap="round"/>
-      <path class="brow" d="M111 90 q10 -4 20 2" stroke="#3b2f24" stroke-width="2.6" fill="none" stroke-linecap="round"/>
-      <!-- 腮红（柔边渐变） -->
-      <ellipse cx="68" cy="119" rx="10" ry="6" fill="#eda79c" opacity=".45" filter="url(#a-blur1)"/>
-      <ellipse cx="132" cy="119" rx="10" ry="6" fill="#eda79c" opacity=".45" filter="url(#a-blur1)"/>
-      <!-- 眼睛：睁眼（双眼皮+双高光；thinking 时瞳孔看斜上） -->
-      <g class="eye-open">
-        <path d="M69 100 q11 -5 22 0" stroke="#3b2f24" stroke-width="1.6" fill="none" opacity=".55" stroke-linecap="round"/>
-        <path d="M109 100 q11 -5 22 0" stroke="#3b2f24" stroke-width="1.6" fill="none" opacity=".55" stroke-linecap="round"/>
-        <g class="eye"><ellipse cx="80" cy="108" rx="7.6" ry="9.6" fill="#241c14"/>
-          <circle cx="82.6" cy="104.2" r="2.7" fill="#fff"/><circle cx="77.8" cy="111" r="1.3" fill="#fff" opacity=".75"/></g>
-        <g class="eye"><ellipse cx="120" cy="108" rx="7.6" ry="9.6" fill="#241c14"/>
-          <circle cx="122.6" cy="104.2" r="2.7" fill="#fff"/><circle cx="117.8" cy="111" r="1.3" fill="#fff" opacity=".75"/></g>
-      </g>
-      <!-- 眼睛：弯眼（倾听/思考/愉悦） -->
-      <g class="eye-curve">
-        <path d="M70 108 q10 -10 20 0" stroke="#241c14" stroke-width="4.6" fill="none" stroke-linecap="round"/>
-        <path d="M110 108 q10 -10 20 0" stroke="#241c14" stroke-width="4.6" fill="none" stroke-linecap="round"/>
-      </g>
-      <!-- 鼻子（一点即止） -->
-      <path d="M100 116 q2.5 3 0 5" stroke="#c9a97f" stroke-width="2" fill="none" stroke-linecap="round"/>
-      <!-- 嘴：三种（交叉淡化） -->
-      <path class="mouth-smile" d="M89 128 q11 10 22 0" stroke="#b4594c" stroke-width="3.4" fill="none" stroke-linecap="round"/>
-      <ellipse class="mouth-open" cx="100" cy="131" rx="8.5" ry="7"/>
-      <path class="mouth-flat" d="M91 130 h18" stroke="#b4594c" stroke-width="3.4" fill="none" stroke-linecap="round"/>
-    </g>
-  </svg></div>`;
-}
+/* [2026-10-02 退役] 09-26b/c 的 aiAvatarSvg()（内联 SVG 矢量小人）从未被调用过，
+ *   随其 CSS 一并删除；形象现在只有 AI_PORTRAIT 一张静帧 + 第 27 节动作系统。
+ *   需要回退：git log -- 找到 09-26c 版本。 */
 
 /* ★ 09-19e 去 AI 味·图标系统：彩色 emoji 换单色线性 SVG（stroke=currentColor 随按钮状态变色）——
  *   真产品的按钮都是单色图标+文字，彩色 emoji 堆在控件上是最大的「模板感」来源。
@@ -175,6 +104,7 @@ const ICONS = {
   shield: svgIcon('<path d="M12 3.5l7 2.5v5.2c0 4.6-3 7.9-7 9.3-4-1.4-7-4.7-7-9.3V6l7-2.5z"/>'), // ★ G6-②：平台管理员
   clip: svgIcon('<path d="M8.5 12.5l5.5-5.5a3 3 0 0 1 4.2 4.2l-7.5 7.5a5 5 0 0 1-7.1-7.1L11 4.2"/>'),
   door: svgIcon('<rect x="13" y="4" width="6" height="16" rx="1"/><path d="M3 12h7M7.5 8.5L11 12l-3.5 3.5"/>'),
+  smile: svgIcon('<circle cx="12" cy="12" r="8.5"/><path d="M9 10h.01M15 10h.01M8.5 14.5a4.5 4.5 0 0 0 7 0"/>'), // ★ 定向回应（Piik 式"只对某个人"）
   cursor: svgIcon('<path d="M5 3.5l7 16.5 2.1-6.9L21 11 5 3.5z"/>'),
 };
 /* 动态改文本的按钮统一走这里：icon+span 结构，与 index.html 静态按钮同构 */
@@ -510,10 +440,42 @@ joinRoomBtn.addEventListener('click', tryJoinRoom);
 roomInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') tryJoinRoom(); });
 roomPasswordInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') tryJoinRoom(); });
 
+/* ★ 2026-10-02 「房间没了」要**就地退回加入页**，而不是弹模态框。
+ *   起因是用户实测反馈"一直弹这个"：服务器重启后房间是内存结构、号已回收，
+ *   而 D6 自动重连会拿旧 myRoom 再 join-room → room-not-found → **原生模态框阻塞主线程** →
+ *   点掉确定 → socket 又重连 → 再 join → 再弹……**无限循环**。
+ *   ▎两个独立错误叠在一起：
+ *   ① 原生模态框（alert）是**阻塞主线程**的，它把重连状态机冻在中间，
+ *      用户只能一遍遍点确定（而且它长不出"这次不再试了"的记忆）；
+ *   ② `myRoom` 从来没有"作废"这条路——进过房就永远自认为在房里，
+ *      于是徽标还挂着旧房号、重连还去敲已经不存在的那扇门。
+ *   正解：把"这个房间没有了"当成一个**状态迁移**（清 myRoom + 回加入页 + 拆媒体），
+ *   提示交给页内的 toast（可叠加、可自动消失、不冻线程）。 */
+function giveUpRoom(why) {
+  const gone = myRoom;
+  myRoom = null;
+  myRoomPassword = null;
+  myRoomToken = null;
+  reconnecting = false;
+  try { resetMediaState(); } catch (e) { /* 媒体本来就没起来过 */ }
+  roomBadge.classList.add('hidden');
+  roomPanel.classList.remove('hidden');
+  [leaveBtn, handBtn, boardBtn, fxBtn, capBtn, aiBtn, aiOpBtn].forEach((b) => { if (b) b.disabled = true; });
+  resetRoomButtons();
+  log(`🚪 房间 ${gone || '(无)'} 已经不在了：${why} —— 已退回加入页，不会再自动去敲这扇门`);
+}
+
 socket.on('room-not-found', ({ roomNumber }) => {
   log(`❌ 房间 ${roomNumber || '(空)'} 不存在：可能输错了，或对方已结束会议`);
+  if (myRoom) {
+    // 重连重回旧房失败：这是状态迁移，必须停止后续自动重试
+    giveUpRoom('服务器那边这个号已经不存在（多半是服务重启或最后一人离开后房间被回收）');
+    showToast(`房间 ${roomNumber || ''} 已不存在——请核对房间号，或直接创建一个新房间`, 'error');
+    return;
+  }
   resetRoomButtons();
-  alert(`房间 ${roomNumber || ''} 不存在，请核对房间号，或直接创建一个新房间`);
+  if (roomInput) { roomInput.value = ''; roomInput.focus(); }
+  showToast(`房间 ${roomNumber || ''} 不存在，请核对房间号（或点「创建房间」开一个新的）`, 'error');
 });
 
 socket.on('room-wrong-password', ({ roomNumber }) => {
@@ -523,13 +485,13 @@ socket.on('room-wrong-password', ({ roomNumber }) => {
     roomInput.value = roomNumber;
     roomPasswordInput.focus();
   }
-  alert(`房间 ${roomNumber || ''} 需要密码，请输入正确密码后再加入`);
+  showToast(`房间 ${roomNumber || ''} 需要密码，请输入正确密码后再加入`, 'error');
 });
 
 socket.on('room-full', ({ max }) => {
   log(`❌ 房间已满（最多 ${max} 人），请稍后再试`);
   resetRoomButtons();
-  alert(`房间已满（最多 ${max} 人）`);
+  showToast(`房间已满（最多 ${max} 人），请稍后再试`, 'error');
 });
 
 /* ──────────────────────────────────────────────────────────────
@@ -682,6 +644,7 @@ async function initSFU() {
     const cfg = await fetch('/config.json').then((r) => r.json());
     if (Array.isArray(cfg.iceServers)) sfuIceServers = cfg.iceServers;
     serverAsrEnabled = !!cfg.asrEnabled; // ★ 09-27d：服务端转写可用性（Web Speech 失败时的降级依据）
+    serverAsrEngine = String(cfg.asrEngine || 'none'); // ★ 2026-10-02 界面要报"真在用的那个引擎"
     aiTtsEnabled = !!cfg.aiTtsEnabled; // ★ 09-30c：服务端神经语音可用（AI 回答走服务器 MP3，本地 TTS 让位）
     sfuVideoSvc = !!cfg.videoSvc; // ★ D+3：true = 摄像头改用 VP9 SVC 单路分层上传
     // ★ 09-24 AI 模式：服务器只给 true/false（不给 key），前端据此显示「LLM / Mock」状态灯。
@@ -745,6 +708,19 @@ const SIMULCAST_ENCODINGS = [
   { rid: 'q', maxBitrate: 150000, scaleResolutionDownBy: 4 }, // 低：约 320×180
   { rid: 'h', maxBitrate: 500000, scaleResolutionDownBy: 2 }, // 中：约 640×360
   { rid: 'f', maxBitrate: 1500000, scaleResolutionDownBy: 1 }, // 高：原始分辨率（上限 1.5Mbps）
+];
+
+/* ★ 2026-10-03 屏幕共享的分层：码率档整体比摄像头高一截。
+ * ▎为什么不能共用同一张表：共享的内容是**文字与线条**——1080p 幻灯片压到 500kbps
+ *   就是一团马赛克，观众看不清字等于没共享；而摄像头是人脸+背景，低码率也能看。
+ * ▎代价照实说：simulcast 上行 = 三档之和（约 4.2Mbps），共享方最吃上行带宽；
+ *   换来的是"每个观众按自己的下行带宽拿合适的一层"，而不是全员一起卡死。
+ *   （SVC 模式 config.videoSvc=true 时摄像头走单路分层，共享这里仍是 simulcast——
+ *    屏幕内容的空间层差异大，独立三路更稳。） */
+const SCREEN_SIMULCAST_ENCODINGS = [
+  { rid: 'q', maxBitrate: 250000, scaleResolutionDownBy: 4 },  // 低：缩到 1/4 边长，够看清版式
+  { rid: 'h', maxBitrate: 1200000, scaleResolutionDownBy: 2 }, // 中：约 960×540，日常够用
+  { rid: 'f', maxBitrate: 2800000, scaleResolutionDownBy: 1 }, // 高：原始分辨率，文字锐利
 ];
 
 async function publishTracks() {
@@ -870,6 +846,141 @@ function addPinBtn(box, remoteId) {
   box.appendChild(btn);
 }
 
+/* ★ 2026-10-02 Piik 取长①：每路远端**独立音量**，并且可以超过 100%（audio boost）
+ * ▎为什么值得做：真实会议里"那个人声音太小/太大"是最高频的抱怨，而全局音量解决不了它
+ *   （调大了另一个人就炸）。Piik 给每个观众一份"只管我自己听到什么"的控件，就是这个思路。
+ * ▎**安全分层**（这条设计是刻意的，别合并成一条路径）：
+ *     · 0 ~ 100%  → 直接用 video.volume。零新机制、不需要用户手势、不可能把会议搞成静音；
+ *     · > 100%    → 才挂 WebAudio 的 GainNode（HTMLMediaElement 的 volume 上限就是 1.0，
+ *                   要过 unity 只能走音频图）。这时必须把 <video> 静音，否则"元素出声 +
+ *                   图出声"= 双重回声。
+ *   ▸ 增强失败（没有 AudioContext / 被自动播放策略挡住 / 这一格还没有流）就**退回 100%**
+ *     并说明原因——绝不让"想调大点"变成"突然没声音了"。
+ *   ▸ AudioContext 只在第一次需要增强时才建（不抢页面其它用途：预览试音、D5 混音器）。 */
+const tileGain = new Map();   // video 元素 → { src, gain }
+let playbackCtx = null;
+function getPlaybackCtx() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return null;
+  if (!playbackCtx) playbackCtx = new AC();
+  if (playbackCtx.state === 'suspended') { try { playbackCtx.resume().catch(() => {}); } catch (e) { /* 忽略 */ } }
+  return playbackCtx && playbackCtx.state !== 'suspended' ? playbackCtx : null;
+}
+function detachTileGain(video) {
+  const n = tileGain.get(video);
+  if (n) { try { n.src.disconnect(); n.gain.disconnect(); } catch (e) { /* 已断 */ } tileGain.delete(video); }
+  video.muted = false;
+}
+/* 返回真正生效的音量（可能小于请求值——增强不可用时回落 1.0），调用方据此回写滑杆 */
+function applyTileVolume(video, want) {
+  const v = Math.max(0, Math.min(2, Number(want) || 0));
+  if (v <= 1) { detachTileGain(video); video.volume = v; return v; }
+  const ctx = getPlaybackCtx();
+  if (!ctx || !video.srcObject) { video.volume = 1; return 1; } // 增强不可用：满音量但不炸
+  let n = tileGain.get(video);
+  /* ★ 流换了对象就必须重挂：replaceTrack / D6 重连 / 关摄像头再开，都会给这一格一条
+   *   **新的 MediaStream**，而 GainNode 上游还接着旧流——旧流已停 = 这一格彻底没声，
+   *   而元素此时是被我们静音的（防双重出声），于是"调大音量"反而变成"突然静音"。
+   *   这是本项目反复强调的那类缺陷（坑 32 的音频版：锚点变了，挂在旧锚点上的东西要重建）。 */
+  if (n && n.stream !== video.srcObject) { detachTileGain(video); n = null; }
+  if (!n) {
+    try {
+      const src = ctx.createMediaStreamSource(video.srcObject);
+      const gain = ctx.createGain();
+      gain.gain.value = v;
+      src.connect(gain);
+      gain.connect(ctx.destination);
+      n = { src, gain, stream: video.srcObject }; // 记下挂的是哪条流（上面那段注释判的就是它）
+      tileGain.set(video, n);
+      video.muted = true; // 声音改由音频图负责（不静音就是双重出声）
+    } catch (e) {
+      detachTileGain(video);
+      video.volume = 1;
+      return 1;
+    }
+  }
+  n.gain.gain.value = v;
+  video.volume = 1;
+  return v;
+}
+const VOL_STORE_KEY = 'sfu.tileVol.v1'; // 按成员 id 记（谁吵谁安静，换场会还认得）
+function storedVolumes() {
+  try { return JSON.parse(localStorage.getItem(VOL_STORE_KEY) || '{}') || {}; } catch (e) { return {}; }
+}
+function rememberVolume(id, v) {
+  try { const m = storedVolumes(); m[id] = Math.round(v * 100) / 100; localStorage.setItem(VOL_STORE_KEY, JSON.stringify(m)); } catch (e) { /* 隐私模式写不进就算了 */ }
+}
+function addVolumeCtl(box, tile, remoteId) {
+  if (box.dataset.volCtl) {
+    // 已有控件（重复订阅/重连后同一格再挂一次）：把滑杆值重新作用一遍，
+    // 让 applyTileVolume 内部的"流换对象就重挂"逻辑跟上（否则增强会悄悄失效）。
+    const sl = box.querySelector('.vol-ctl input');
+    if (sl) applyTileVolume(tile.video, Number(sl.value));
+    return;
+  }
+  box.dataset.volCtl = '1';
+  const wrap = document.createElement('div');
+  wrap.className = 'vol-ctl';
+  const icon = document.createElement('span');
+  icon.className = 'vol-ico';
+  const slider = document.createElement('input');
+  slider.type = 'range';
+  slider.min = '0'; slider.max = '2'; slider.step = '0.05';
+  const saved = storedVolumes()[remoteId];
+  slider.value = String(saved == null ? 1 : saved);
+  const label = document.createElement('span');
+  label.className = 'vol-num';
+  const paint = (v) => {
+    label.textContent = Math.round(v * 100) + '%';
+    icon.textContent = v === 0 ? '🔇' : v > 1 ? '📢' : '🔊';
+    slider.classList.toggle('over', v > 1);
+  };
+  const apply = () => {
+    const eff = applyTileVolume(tile.video, Number(slider.value));
+    if (eff !== Number(slider.value)) slider.value = String(eff); // 增强不可用 → 滑杆自己回到 100%
+    rememberVolume(remoteId, eff);
+    paint(eff);
+    if (eff < Number(slider.value)) showToast('这台设备暂时不支持超过 100% 的增强，已停在 100%', 'info');
+  };
+  slider.addEventListener('input', apply);
+  slider.addEventListener('click', (e) => e.stopPropagation()); // 别触发格子的双击全屏
+  wrap.appendChild(icon); wrap.appendChild(slider); wrap.appendChild(label);
+  box.appendChild(wrap);
+  paint(Number(slider.value));
+  if (saved != null) apply(); // 重连/重新订阅后把偏好补回去（流换了对象，增益必须重挂）
+}
+/* ★ 2026-10-02 Piik 取长②：每格一个「不看」按钮 = 让服务器 pause 这路的**视频** Consumer
+ * ▎语义是"只听不看"：画面停掉，**声音留着**（会议里你不能因为不想看某人就把他静音）。
+ * ▎为什么不是前端 display:none 就完事：那样 mediasoup 还在往你这里发这路的包，
+ *   下行带宽一分没省；只有服务器 pause 才真的不发（服务器侧 set-consumer-paused 事件）。
+ * ▎与 ABR/省流的分工：暂停期间选层监控被服务器侧守卫跳过（坑 21/62 同一条纪律——
+ *   一个执行器不能有两个控制回路），恢复后 ABR 才重新接手。 */
+function addWatchBtn(box, tile) {
+  if (box.dataset.watchBtn) return; // 幂等：一格一个（dataset 标记，同 addPinBtn 的做法）
+  box.dataset.watchBtn = '1';
+  const btn = document.createElement('button');
+  btn.className = 'watch-btn';
+  btn.textContent = '⏸ 不看';
+  btn.title = '只听不看：让服务器停止转发这一路的画面（真省下行带宽），声音保留；再点恢复';
+  let paused = false;
+  btn.addEventListener('click', async () => {
+    if (!tile.videoConsumerId) { showToast('这一格还没有视频可暂停', 'info'); return; }
+    btn.disabled = true;
+    try {
+      const resp = await request('set-consumer-paused', { consumerId: tile.videoConsumerId, paused: !paused });
+      paused = !!(resp && resp.data && resp.data.paused);
+      box.classList.toggle('paused-view', paused);
+      btn.textContent = paused ? '▶ 看' : '⏸ 不看';
+      log(paused ? '⏸ 已暂停这一路画面（服务器停止转发，下行省下来）' : '▶ 恢复接收这一路画面');
+    } catch (e) {
+      showToast(`画面暂停失败：${e.message}`, 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  box.appendChild(btn);
+}
+
 // 把订阅到的一路媒体"放上画面"
 function attachRemoteMedia(from, source, kind, consumer, key) {
   const track = consumer.track;
@@ -884,6 +995,8 @@ function attachRemoteMedia(from, source, kind, consumer, key) {
       addCtlBtn(tile.box, from);
       // ★ F1：主画面格左上角挂「钉选」按钮
       addPinBtn(tile.box, from);
+      // ★ 2026-10-02 Piik 取长①：这一路的独立音量（含 >100% 增强）挂在主画面格上
+      addVolumeCtl(tile.box, tile, from);
       main = { video: tile.video, stream: new MediaStream(), box: tile.box };
       peerMains.set(from, main);
     } else {
@@ -914,6 +1027,21 @@ function attachRemoteMedia(from, source, kind, consumer, key) {
     tile.source = source;
     if (kind === 'video') tile.videoConsumerId = consumer.id;
     if (source === 'screen') tile.screenConsumerId = consumer.id;
+    if (kind === 'video') addWatchBtn(tile.box, tile); // ★ 2026-10-02 「只听不看」按钮（视频路才有意义）
+    /* ★ 2026-10-03 补渲染"选层器"：服务器的 layer-changed(initial) 是在 consume 的
+     *   **ack 之前** emit 的（坑 61 那条时序），而格子要等 ack 回来才登记进 consumerTiles——
+     *   于是那条通知到达时 `tile` 还不存在，ensureLayerPicker 直接 return，
+     *   **选层器从来没被创建出来**（真浏览器 e2e 第一次断言 videoWidth 就抓到了：
+     *   层数明明有 3 层、layerState 里查得到，DOM 里却一个 .layer-pick 都没有）。
+     *   修法顺着"一个概念只有一个来源"：layerState 才是权威账本，
+     *   格子一出现就照账本补一次渲染，而不是去调服务器的 emit 时序。 */
+    if (kind === 'video') {
+      const st = layerState.get(consumer.id);
+      if (st && st.layerCount > 1) {
+        ensureLayerPicker(tile, consumer.id, st.layerCount);
+        updateLayerPicker(tile, st);
+      }
+    }
   }
 
   peersSeen.add(from);
@@ -1064,6 +1192,7 @@ function resetMediaState() {
   myProducers.clear();
   for (const [key, tile] of tiles) {
     if (tile.video.srcObject) tile.video.srcObject.getTracks().forEach((t) => t.stop());
+    detachTileGain(tile.video); // ★ 2026-10-02 音量增强走的音频图也要拆（否则每轮重连漏一批节点）
     tile.box.remove();
     tiles.delete(key);
   }
@@ -1144,6 +1273,7 @@ function removeTilesOfProducer(producerId) {
     if (key.endsWith(`::${producerId}`)) {
       const tile = tiles.get(key);
       if (tile.video.srcObject) tile.video.srcObject.getTracks().forEach((t) => t.stop());
+      detachTileGain(tile.video); // ★ 2026-10-02 同上：拆音频图再删格子
       tile.box.remove();
       tiles.delete(key);
       // ★ 远程协助：删的若是"某人的屏幕格"，同步清记录（key 格式 = "对方id::producerId"）
@@ -1165,6 +1295,7 @@ socket.on('peer-left', ({ id }) => {
   for (const key of [...tiles.keys()]) {
     if (key.startsWith(`${id}::`)) {
       const tile = tiles.get(key);
+      detachTileGain(tile.video); // ★ 2026-10-02 同上
       tile.box.remove();
       tiles.delete(key);
     }
@@ -1203,11 +1334,28 @@ shareBtn.addEventListener('click', async () => {
       });
       const screenTrack = screenStream.getVideoTracks()[0];
       screenTrack.onended = () => stopSharing(); // 用户点系统"停止共享"
-
-      const screenProducer = await sendTransport.produce({
-        track: screenTrack,
-        appData: { source: 'screen' },
-      });
+      /* ★ 2026-10-03 屏幕共享也上 simulcast（会议本体这一路的真缺口）：
+       *   原来共享是**单层全分辨率**上传，于是弱网观众只能二选一——
+       *   要么卡成幻灯片，要么什么都看不见；而服务器明明已经有 D1 的自动选层
+       *   （它的守卫是 `kind==='video' && layerCount>1`，**层数>1 就自动生效，服务器零改动**）。
+       *   摄像头当年就分了三档，共享漏了——这是"同一个概念两处口径"的老账（坑 47）。
+       * ▎码率档比摄像头高：屏幕上是**文字和线条**，压太狠就糊成一片，看不清 PPT 等于没共享。
+       * ▎contentHint='detail' 是给编码器的语义提示（文字细节优先于帧率），
+       *   Chrome 会据此降低帧率、保住清晰度——共享静态幻灯片时这正好是我们想要的。 */
+      try { screenTrack.contentHint = 'detail'; } catch (e) { /* 老浏览器没这个属性 */ }
+      let screenProducer;
+      try {
+        screenProducer = await sendTransport.produce({
+          track: screenTrack,
+          encodings: SCREEN_SIMULCAST_ENCODINGS,
+          appData: { source: 'screen' },
+        });
+        log(`📤 已上传屏幕（${SCREEN_SIMULCAST_ENCODINGS.length} 层 simulcast，弱网观众会自动降层）`);
+      } catch (err) {
+        // 兜底：个别环境/编码器不支持共享分层 → 退回单层，功能不能因此没了
+        log(`⚠️ 屏幕分层协商失败（${err.message}），退回单层上传`);
+        screenProducer = await sendTransport.produce({ track: screenTrack, appData: { source: 'screen' } });
+      }
       myProducers.set(screenProducer.id, screenProducer);
 
       /* ★ 2026-10-01（借鉴 Piik）：共享音频真的推上会——浏览器勾了"分享标签页音频"时
@@ -1364,8 +1512,21 @@ socket.on('chat-message', ({ from, text, ts, msgId, name, ai, streamId, tts }) =
   if (from === 'ai-bot') {
     /* ★ 2026-10-01 服务端语音标记：服务器带了 tts:'server' = 它会送音频（Qwen 本地/Edge），
      *   本地 TTS 让位（防双声）；若服务器合成失败会补发 ai-tts-fail {ts} → 再回落浏览器朗读。 */
-    if (tts === 'server') pendingServerTts.set(ts, text);
-    else speakAiText(text);
+    if (tts === 'server' && !playedServerTts.has(ts)) pendingServerTts.set(ts, text);
+    else if (tts === 'server') { /* 流水线抢跑：这段音频已经播过了，不再挂回落账 */ }
+    else {
+      /* ★ 2026-10-02 流式答案已经按句念过一部分 → 这里只补剩下的尾巴。
+       *   判据用"前缀真的对得上"而不是长度：对不上（服务器改了措辞/带了标记）
+       *   就退回整段重念——**宁可重复一句，也不能漏掉后半段没声音**。 */
+      const spoken = streamId ? streamSpokenRaw.get(streamId) : '';
+      if (streamId) streamSpokenRaw.delete(streamId);
+      if (spoken && String(text).startsWith(spoken)) {
+        const rest = String(text).slice(spoken.length);
+        if (rest.trim()) enqueueAiSpeech(speakableText(rest), { replace: false });
+      } else {
+        speakAiText(text);
+      }
+    }
     maybeHintAiVoice(); // ★ 09-28：语音没开时提示一次"可以听它说话"（对话闭环的手感所在）
   }
   // ★ 09-24：带 streamId 的是流式回答的"终态"——增量已经在同一个气泡里渲染过了，
@@ -1395,6 +1556,10 @@ function updateAiModeUi() {
 const aiStreamNodes = new Map();   // streamId -> 正在打字中的气泡 DOM
 const aiStreamDone = new Set();    // 已靠增量渲染完成的 streamId（终态消息据此去重）
 const streamTraces = new Map();    // ★ 09-24e streamId -> 待补的"检索过程"文字（done 帧到达时插入气泡）
+/* ★ 2026-10-02 streamId -> 本轮已经用浏览器念出去的原文前缀。
+   流式答案的字是一句一句念的，终态那条 chat-message 若再整段朗读就成了双声；
+   拿这个前缀一比，只补念剩下的尾巴（前缀对不上则退回整段——宁重不漏）。 */
+const streamSpokenRaw = new Map();
 const streamHits = new Map();      // ★ 09-25 streamId -> 待补的"证据原话"列表（同上）
 
 /* ★ 09-30：流式增量的**按帧批量刷新**（详见 ai-stream delta 分支的注释）。
@@ -1452,6 +1617,12 @@ socket.on('ai-stream', ({ id, delta, done, mock, trace, hitList }) => {
     aiStreamNodes.set(id, box);
   }
   if (delta) {
+    /* ★ 2026-10-02 流式答案的按句朗读要一份**不被消费的全文副本**（rawAll）。
+     *   下面那个 box.buf 是给 DOM 攒批用的，applyStreamBuf 刷完就把它清空了
+     *   ——拿它找"整句"永远只能看到一帧内的三五个字，句子内根本不可能出现句末标点，
+     *   于是这条朗读通路会静默地一事无成（症状：改了个看起来完全正确的函数，
+     *   但它读的是别人正在消费的那个缓冲区）。 **攒批的缓冲与记账的账本分开。** */
+    box.rawAll = (box.rawAll || '') + delta;
     /* ★ 09-30 丝滑度修复：增量**按帧批量刷**，不再每来一个字就写一次 DOM。
      *   ▎为什么（这是"AI 打字卡"的主因，不是模型慢）：
      *     改造前每个 delta 都执行
@@ -1466,9 +1637,16 @@ socket.on('ai-stream', ({ id, delta, done, mock, trace, hitList }) => {
      *     浏览器只需在帧末算一次布局，而不是每写一个 token 算一次。 */
     box.buf = (box.buf || '') + delta;
     scheduleStreamFlush(id, box);
+    /* ★ 2026-10-02 按句上嘴：流里一出现完整的一句就立刻念，不等整段写完。
+       （文字仍在 rAF 里攒批刷，两处各管各的节奏，互不拖累。） */
+    speakStreamPart(box, box.rawAll);
   }
   if (done) {
     flushStreamNow(id, box);   // ★ 09-30：先把握在缓冲里的字刷出去，否则末尾会少一截
+    /* 记下"这一轮已经用浏览器念到哪儿了"，终态 chat-message 只补念剩下的尾巴，
+       不再整段重念（那是双声；不记则是"念了两遍同一句"）。 */
+    if (box.spokenRaw) streamSpokenRaw.set(id, box.spokenRaw);
+    while (streamSpokenRaw.size > 40) streamSpokenRaw.delete(streamSpokenRaw.keys().next().value);
     box.node.classList.remove('streaming');
     const mode = mock ? 'Mock' : 'LLM';
     box.nameEl.innerHTML += `<span class="msg-ai-mode${mock ? ' mock' : ''}" title="这条答案由${mock ? '本地规则（未接 LLM）' : 'DeepSeek 模型'}生成">${mode}</span>`;
@@ -3011,17 +3189,36 @@ function maybeHintAiVoice() {
   showToast('🔈 想直接"听"小明说话？点控制坞的「AI 语音」开关即可（浏览器语音合成，零依赖）');
 }
 
-function speakAiText(text) {
+function speakAiText(text, { force = false } = {}) {
   if (!aiVoiceOn || !SPEECH_OK) return;
   /* ★ 09-30c 双轨闸：服务端神经语音可用时，AI 的声音走服务器 MP3（ai-audio 事件），
    *   本地 speechSynthesis 整体让位——避免"同一条答案两个声音先后读"的灾难。
-   *   服务端合成失败时那次回答就没有语音（文字照常进气泡），下一轮自动再试。 */
-  if (aiTtsEnabled) return;
+   * ★ 2026-10-02 实修（用户实测"后边它回答没有说话"的第一条真死锁）：
+   *   这道闸原先**无条件**生效，把 ai-tts-fail 的回落路径也一起挡死了。链路是这样断的：
+   *     服务器声明 tts:'server'（"这条答案我会送音频"）→ 客户端让位不念
+   *     → 服务器合成失败，补发 ai-tts-fail 让客户端"回落浏览器朗读"
+   *     → 客户端调用 speakAiText → 又被这同一道 `aiTtsEnabled` 闸 return
+   *     → **MP3 没来、浏览器也不念，而且永久如此**（aiTtsEnabled 只在进房那次读
+   *        /config.json 就再也不刷新，Edge 端点可达性是会漂的）。
+   *   加 force 参数：只有"确认服务端这条已经失败"的回落调用能绕过让位闸。 */
+  if (aiTtsEnabled && !force) return;
   const say = speakableText(text);
   if (!say) return;
-  /* ★ 09-30 抢话修复②：回答送达时用户**还在说话**（2.5s 内刚有字幕）→ 这轮不念。
-   *   文字照样进聊天气泡，丢的只是朗读——人跟人对话，对方话没说完就插话是失礼。 */
-  if (Date.now() - lastUserSpeechTs < 2500) return;
+  /* ★ 09-30 → 2026-10-02 抢话闸的判据换掉：原来用"2.5s 内到过字幕"，
+   *   但字幕比真话晚 1~3 秒才到（分段+转写），于是"用户刚说完、AI 刚答完"这个
+   *   最常见的时刻整轮落在闸内 → **AI 永远不开口**（用户："我要的是不乱说话，不是不说话"）。
+   *   ▎再修一次（同一天）：连 700ms 的字幕兜底也不能常开。理由很简单——
+   *   **"字幕刚到"说明的是"1~3 秒前有人在说话"，不是"此刻有人在说话"**；
+   *   而答案恰恰总是紧跟在自己的字幕后面 1~3 秒到达，等于每轮都撞进闸里。
+   *   真正需要的"此刻在说"信号只有麦克风（即时、130ms 就能确认）。
+   *   字幕那条只保留给"根本没有麦克风可量"的场景（aiHush.analyser 为空：
+   *   拒绝授权/无设备/同房间另一台设备在说话），此时它是唯一的证据来源。
+   *   ▸ 礼仪并没有丢：用户真在说话时，麦克风闸当场拦；字幕迟到时，
+   *     asr-caption 处理器里的 hushAiSpeech() 会把已经念出来的掐断——两条都还在。 */
+  const talkingNow = aiHush.analyser
+    ? (Date.now() - lastMicVoiceTs < 600)
+    : (Date.now() - lastUserSpeechTs < 700);
+  if (talkingNow) return;
       try {
       /* ★ 09-26e 语音去 AI 味——三层优化：
        *  ① 音色策略：自然神经音色优先（Online (Natural) / Premium / 常见自然音色名）——
@@ -3029,74 +3226,274 @@ function speakAiText(text) {
        *  ② 分句队列：按句末标点切段排队朗读，句间自然停顿、语调重新起势，
        *     接近真人节奏；新回答到来 cancel+清队列，“只说最新”语义不变；
        *  ③ 参数：rate 1.02（自然音色语速快，过快吞字）、pitch 1.05 略亮。 */
-      window.speechSynthesis.cancel();
-      aiSpeakQueue.length = 0;
-      const pickVoice = () => {
-        try {
-          const vs = window.speechSynthesis.getVoices() || [];
-          const zh = vs.filter((v) => /zh[-_]?CN|Chinese|中文|普通话/i.test(v.lang + ' ' + v.name));
-          const prefs = [
-            /(Online.*Natural|Natural.*Online)/i,
-            /Xiaoxiao|Xiaoyi|云希|云野|晓晓|晓伊/i,
-            /Premium|Enhanced/i,
-            /Huihui|Yaoyao|Kangkang/i,
-          ];
-          for (const re of prefs) {
-            const hit = zh.find((v) => re.test(v.name));
-            if (hit) return hit;
-          }
-          return zh[0] || null;
-        } catch (e) { return null; }
-      };
-      const voice = pickVoice();
-      const sentences = say.split(/(?<=[。！？!?..])/).reduce((acc, seg) => {
-        if (!seg) return acc;
-        if (acc.length && (acc[acc.length - 1] + seg).length < 6) acc[acc.length - 1] += seg;
-        else acc.push(seg);
-        return acc;
-      }, []);
-      aiSpeakQueue.push(...sentences.filter((x) => x.trim()));
-      const speakNext = () => {
-        if (!aiSpeakQueue.length) return;
-        const part = aiSpeakQueue.shift();
-        if (Date.now() > aiSpeakDeadline) { aiSpeakQueue.length = 0; return; }
-        const u = new SpeechSynthesisUtterance(part);
-        u.lang = 'zh-CN';
-        u.rate = 1.02;
-        u.pitch = 1.05;
-        if (voice) u.voice = voice;
-        u.onend = () => setTimeout(speakNext, 120); // 句间自然停顿
-        window.speechSynthesis.speak(u);
-      };
-      aiSpeakDeadline = Date.now() + Math.max(20000, say.length * 400);
-      speakNext();
+      enqueueAiSpeech(say, { replace: true });
     } catch (e) { /* 播报失败绝不影响会议功能 */ }
+}
+
+/* ★ 2026-10-02 把"切句 + 排队 + 逐句念"从 speakAiText 里抽出来，因为来了第二个用户：
+ *   **流式答案的朗读不该等整段写完**。ai-stream 每 12 字就吐一次增量，
+ *   原先这些增量只进气泡不上嘴，一定要等终态 chat-message 才开口——
+ *   一句长答案 LLM 要写 3~8 秒，用户听到的"它答应了却半天没声"就是这么攒出来的。
+ *   现在：流里一出现"完整的一句"就立刻念这一句，LLM 写第 2、3 句的时间被第 1 句的
+ *   朗读盖住（服务器上那套 makeSpeakPipeline 是同一个思路，搬到浏览器这一轨）。
+ * ▎replace=true：新一轮答案（清队列、掐掉正在念的）；false：同一轮的后半句，
+ *   **接在队列尾巴后面**（绝不能 cancel，否则自己把自己的上一句掐了）。 */
+function enqueueAiSpeech(say, { replace = true } = {}) {
+  const sentences = String(say || '').split(/(?<=[。！？!?；;])/).reduce((acc, seg) => {
+    if (!seg) return acc;
+    if (acc.length && (acc[acc.length - 1] + seg).length < 6) acc[acc.length - 1] += seg;
+    else acc.push(seg);
+    return acc;
+  }, []).filter((x) => x.trim());
+  if (!sentences.length) return;
+  if (replace) {
+    /* ★ 2026-10-02 关键一处：cancel() 只能让"再也听不见"，**不能让"再也不念"**——
+     *   已经交给 speechSynthesis 的那句会走 onerror(canceled) 而不是 onend；
+     *   若先 push 新句子再 cancel，那条错误回调会把**刚排好的新队列整个倒空**
+     *   （症状：第一轮问候语念完之后，AI 就再也不会出声了）。
+     *   顺序必须是：cancel → 清队列/断泵 → 再 push。泵断链后下一次
+     *   startAiSpeakPump 会重新起一条，不去等那条注定不再来的 onend。 */
+    window.speechSynthesis.cancel();
+    aiSpeakQueue.length = 0;
+    aiSpeakPumping = false;
+    aiSpeakDeadline = Date.now() + Math.max(20000, say.length * 400);
+  } else {
+    /* 追加时只把"超时保险丝"往后接，不动正在念的那句 */
+    aiSpeakDeadline = Math.max(aiSpeakDeadline, Date.now() + 8000 + say.length * 400);
+  }
+  aiSpeakQueue.push(...sentences);
+  startAiSpeakPump();
+}
+
+/* 泵按"代"作废：新一轮答案 cancel+重排后，旧泵闭包的回调（尤其 onerror）
+   还可能迟到到达，让它看一眼代号为不对就静默退出，而不是去动新队列/新标志。 */
+let aiSpeakGen = 0;
+function startAiSpeakPump() {
+  if (aiSpeakPumping) return;
+  aiSpeakPumping = true;
+  const gen = ++aiSpeakGen;
+  const voice = pickAiVoice();
+  const speakNext = () => {
+    if (gen !== aiSpeakGen) return;              // 老泵：已被取代，什么都别动
+    if (!aiSpeakQueue.length) { aiSpeakPumping = false; return; }
+    const part = aiSpeakQueue.shift();
+    if (Date.now() > aiSpeakDeadline) { aiSpeakQueue.length = 0; aiSpeakPumping = false; return; }
+    const u = new SpeechSynthesisUtterance(part);
+    u.lang = 'zh-CN';
+    u.rate = 1.02;
+    u.pitch = 1.05;
+    if (voice) u.voice = voice;
+    u.onend = () => setTimeout(speakNext, 120); // 句间自然停顿
+    u.onerror = () => setTimeout(speakNext, 120); // 被 cancel 也会走这儿：靠代号判断该不该继续
+    window.speechSynthesis.speak(u);
+  };
+  speakNext();
+}
+
+/* 自然神经音色优先（挑一次就够：音色表在页面生命周期内基本不变） */
+let aiSpeakVoice;
+function pickAiVoice() {
+  if (aiSpeakVoice !== undefined) return aiSpeakVoice;
+  try {
+    const vs = window.speechSynthesis.getVoices() || [];
+    const zh = vs.filter((v) => /zh[-_]?CN|Chinese|中文|普通话/i.test(v.lang + ' ' + v.name));
+    const prefs = [
+      /(Online.*Natural|Natural.*Online)/i,
+      /Xiaoxiao|Xiaoyi|云希|云野|晓晓|晓伊/i,
+      /Premium|Enhanced/i,
+      /Huihui|Yaoyao|Kangkang/i,
+    ];
+    for (const re of prefs) {
+      const hit = zh.find((v) => re.test(v.name));
+      if (hit) { aiSpeakVoice = hit; return hit; }
+    }
+    aiSpeakVoice = zh[0] || null;
+  } catch (e) { aiSpeakVoice = null; }
+  return aiSpeakVoice;
+}
+
+/* ★ 2026-10-02 流式答案的"按句追念"：气泡里刚出现的那一句立刻上嘴。
+ *   box.spokenChars 记账"已经交出去念到哪儿了"，只在**真的排进队列之后**才推进
+ *   （若被抢话闸拦下，位置不动，终态那条会补念——宁多念一次也不漏）。 */
+function speakStreamPart(box, rawBuf) {
+  if (!aiVoiceOn || !SPEECH_OK || aiTtsEnabled) return;   // 服务端那一轨在，就不该双声
+  let cut = 0;
+  for (let i = 0; i < rawBuf.length; i++) {
+    const c = rawBuf[i];
+    if (c === '。' || c === '！' || c === '？' || c === '!' || c === '?' || c === '；' || c === ';') cut = i + 1;
+  }
+  const from = box.spokenChars || 0;
+  if (cut - from < 6) return;                              // 太短的碎句不单独念（听着像结巴）
+  const firstOfThisAnswer = !box.spokeFirst;
+  if (firstOfThisAnswer) {
+    const talkingNow = aiHush.analyser
+      ? (Date.now() - lastMicVoiceTs < 600)
+      : (Date.now() - lastUserSpeechTs < 700);
+    if (talkingNow) return;                                // 用户还在说 → 这一轮不抢话
+  }
+  const say = speakableText(rawBuf.slice(from, cut));
+  if (!say) { box.spokenChars = cut; return; }
+  /* ★ 2026-10-02 **一轮答案的第一句要"只说最新"**（replace:true），后面的句子才是追加。
+   *   这条是真浏览器实测逼出来的：AI 入会那条自我介绍有四五行，它把朗读队列占满，
+   *   我提问的答案只能排在它后面——**文字 2.6s 就上屏、声音 8.1s 才轮到**
+   *   （用户说的"它半天不出声"里，有一种不是 bug 的慢，就是这种排队）。
+   *   语义上也站得住：答案开始往外流 = 用户刚问了话，此刻还排在队里的旧寒暄就是过期内容。
+   *   另：spokeFirst 只在**真的排进队列之后**才置位——若第一句被抢话闸拦下，
+   *   下一句仍按"本轮第一句"处理（否则会出现"整轮都在往后追加、却从没人清过旧队列"）。 */
+  enqueueAiSpeech(say, { replace: firstOfThisAnswer });
+  box.spokeFirst = true;
+  box.spokenChars = cut;   // ★ 必须推进：不推进就等于每来一个增量都把同一句重新念一遍
+  if (!box.spokenRaw) box.spokenRaw = '';
+  box.spokenRaw += rawBuf.slice(from, cut);
 }
 let aiSpeakQueue = [];   // 分句朗读队列
 let aiSpeakDeadline = 0; // 本轮朗读截止时刻（超时保护）
-let lastUserSpeechTs = 0; // ★ 09-30：最近一次"有人在说话"的时刻（字幕信号驱动）
+let aiSpeakPumping = false; // ★ 2026-10-02 泵只跑一个（流式追加时防两条链抢同一队列）
+let lastUserSpeechTs = 0; // ★ 09-30：最近一次字幕到达的时刻（滞后信号，只作兜底）
+let lastMicVoiceTs = 0;   // ★ 2026-10-02：最近一次麦克风真出声的时刻（即时信号，看门狗维护）
 let aiTtsEnabled = false; // ★ 09-30c：服务端神经语音可用（/config.json 下发）
 let serverTtsEl = null;   // 播放服务端 MP3 的 <audio>（复用，hush 时暂停它）
 const pendingServerTts = new Map(); // ★ 2026-10-01：ts → 文本（服务端语音待送达/失败的回落账本）
+/* ★ 2026-10-02 语音流水线带来一个新的时序：第一句的音频可能**比 chat-message 先到**
+ * （LLM 刚吐完第一句就去合成了）。这时 pendingServerTts 里还没有这条 ts，等气泡到达时
+ * 再塞进去就成了一条"永远不会被销掉"的账——万一之后来了 ai-tts-fail，会把已经念过的
+ * 答案再念一遍。所以记下"这些 ts 真的播过"，气泡到达时不再为它们挂回落账。 */
+const playedServerTts = new Set();
 
 /* ★ 09-30c 服务端神经语音：服务器合成 MP3 后广播 ai-audio，这里负责播。
- * ▎为什么客户端不做合成：音色在服务器端统一（晓晓），用户机器装什么音色不再重要；
- *   浏览器只当"扬声器"——一个 <audio> 元素，零额外依赖。 */
-socket.on('ai-audio', ({ url, ts } = {}) => {
-  if (!aiVoiceOn || !url || !SPEECH_OK) return;
+ * ▎为什么客户端不做合成：音色在服务器端统一（晓晓），用户机器装了什么音色不再重要；
+ *   浏览器只当"扬声器"——一个 <audio> 元素，零额外依赖。
+ * ★ 2026-10-02 改成**顺序播放队列**（修掉两条"后来不出声"的死锁）：
+ *   ① 原实现每次收到 ai-audio 就 `pendingServerTts.delete(ts)`（**在 play() 之前**），
+ *      然后 `play().catch(() => {})` 把失败吞掉——于是"音频 404 / 被自动播放策略拒绝"
+ *      这一类情况既没声音、回落账本又已经被销掉 = 这条答案**永久无声**；
+ *   ② 服务器现在按句流水线分段发（一段合成完立刻发一段），last-wins 的单 <audio>
+ *      会把前一段掐掉 → 必须排队，否则用户永远只听到最后一句的尾巴。
+ *   ▸ 销账时机改成"真的开始播了"（onplaying）；onerror 才走浏览器朗读兜底。
+ *   ▸ hush（用户开口打断）会连队列一起清——被打断的答案不该在后面又自己响起来。 */
+const serverTtsQueue = [];
+let serverTtsBusy = false;
+/* ★ 2026-10-02 打断要"认人"，不能"认时间"——本文件里第二个静音死锁就出在这儿：
+ *   原先 hush 之后开一个 8 秒静默窗，窗内到达的段一律丢弃。但语音对话的真实时序是
+ *   「用户说完 → 字幕到达（hush，开窗）→ 1.5~6s 后**这条问题的答案**合成完送到」，
+ *   答案永远落在自己开的窗里 → 被丢弃，且顺手把 pendingServerTts 的回落账本也销了
+ *   = 这一轮**既没有服务端声音、也没有浏览器兜底**（用户实测："回答的时候不说话"）。
+ *   正解：记下"被打断的那一轮答案"的 ts，只丢**它**的后续段（同一轮流水线分段共用 ts），
+ *   新一轮答案是新的 ts，天然放行。不用时间窗 = 不依赖两端时钟对齐。 */
+const serverTtsDropped = new Set(); // 被打断那一轮的 ts 集合（同 ts 的后到段一律不念）
+let serverTtsPlayingTs;             // 当前正在播的段属于哪一轮答案
+let serverTtsIgnoreUntil = 0;       // 兜底：段没带 ts 时才退回时间窗判据
+function playNextServerTts() {
+  if (serverTtsBusy) return;
+  const item = serverTtsQueue.shift();
+  if (!item) return;
+  if (!serverTtsEl) serverTtsEl = new Audio();
+  serverTtsBusy = true;
+  serverTtsPlayingTs = typeof item.ts === 'number' ? item.ts : undefined;
+  serverTtsEl.onplaying = () => {
+    aiTtsFailStreak = 0; // 播出来了 = 这条链是通的，失败计数归零
+    if (typeof item.ts === 'number') {
+      pendingServerTts.delete(item.ts);
+      playedServerTts.add(item.ts);                  // 这条答案已经出声了
+      if (playedServerTts.size > 60) playedServerTts.delete(playedServerTts.values().next().value);
+    }
+  };
+  serverTtsEl.onended = () => { serverTtsBusy = false; serverTtsPlayingTs = undefined; playNextServerTts(); };
+  serverTtsEl.onerror = () => {
+    serverTtsBusy = false;
+    serverTtsPlayingTs = undefined;
+    const t = typeof item.ts === 'number' ? pendingServerTts.get(item.ts) : undefined;
+    if (t) {
+      pendingServerTts.delete(item.ts);
+      speakAiText(t, { force: true }); // 音频文件取不到（货架已清/网络断）→ 自己念
+    }
+    playNextServerTts();
+  };
   try {
-    hushAiSpeech(); // 先掐掉可能正在播的浏览器 TTS（同一时刻只该有一个"AI 的声音"）
-    if (!serverTtsEl) serverTtsEl = new Audio();
-    serverTtsEl.src = url;
-    serverTtsEl.play().catch(() => { /* 自动播放策略拦截时静默（用户有交互后即可） */ });
-    if (typeof ts === 'number') pendingServerTts.delete(ts); // 已送达：无需回落
+    serverTtsEl.src = item.url;
+    serverTtsEl.play().catch(() => {
+      /* 自动播放策略拦截：浏览器朗读同样需要用户手势，这里**不回落**（否则用户一点
+       * 就两个声音叠上来）。只把这一项从队列里放过去。 */
+      serverTtsBusy = false;
+      serverTtsPlayingTs = undefined;
+      if (typeof item.ts === 'number') pendingServerTts.delete(item.ts);
+      playNextServerTts();
+    });
+  } catch (e) {
+    serverTtsBusy = false;
+    serverTtsPlayingTs = undefined;
+  }
+}
+socket.on('ai-audio', ({ url, ts, total } = {}) => {
+  if (!aiVoiceOn || !url || !SPEECH_OK) return;
+  /* ★ 2026-10-02 只丢"被打断的那一轮"，不丢"刚答完的这一轮"（判据见 serverTtsDropped 注释）。
+   *   段没带 ts（老服务器/异常）时才退回 8 秒时间窗。 */
+  const interrupted = (typeof ts === 'number')
+    ? serverTtsDropped.has(ts)
+    : Date.now() < serverTtsIgnoreUntil;
+  if (interrupted) {
+    if (typeof ts === 'number') pendingServerTts.delete(ts);
+    return;
+  }
+  try {
+    /* 注意参数：这里**不能**把服务端音频自己掐了——服务器按句流水线是一段一段发过来的，
+     * 前一段正常播完就该接着播下一段。原先这里裸调 hushAiSpeech()，本意是"关掉正在念的
+     * 浏览器 TTS（防双声）"，加上"清服务端队列"之后就会变成**自己把自己的下一段丢掉**。
+     * 所以服务端音频的抢占只针对浏览器那一轨（serverToo=false）。 */
+    hushAiSpeech({ serverToo: false });
+    serverTtsQueue.push({ url, ts, total });
+    if (serverTtsQueue.length > 6) serverTtsQueue.splice(0, serverTtsQueue.length - 6); // 防堆积
+    playNextServerTts();
   } catch (e) { /* 播放失败不影响会议 */ }
 });
 
-/* ★ 2026-10-01 服务端语音合成失败 → 回落浏览器朗读同一条回答（声音永不缺席） */
+/* ★ 2026-10-02 第 36 步：服务器下发的**房间级视图指令**（AI 说"打开白板"就靠它落地）。
+ * ▎边界要说清楚（这条纪律比功能本身重要）：
+ *   这里只允许动"房间级共享状态"——白板开合、字幕开合、视图切换。
+ *   **凡是动用户设备的事都不在这张表里**（开摄像头、共享屏幕、发消息、静音别人），
+ *   那些必须走各自的授权链路，与 C1 AI 操作员"授权绝不豁免"是同一条纪律。
+ *   所以服务器那侧的白名单（ROOM_ACTIONS）和这张表必须一致——不一致就是漏洞。 */
+socket.on('room-control', ({ action, byName } = {}) => {
+  const who = byName || 'AI 助理';
+  let done = '';
+  if (action === 'board-open' && !boardOn) { setBoardOpen(true); done = '已打开实时白板'; }
+  else if (action === 'board-close' && boardOn) { setBoardOpen(false); done = '已关闭白板'; }
+  else if (action === 'captions-on' && !cap.on) { toggleCaptions(); done = '已开启实时字幕'; }
+  else if (action === 'captions-off' && cap.on) { toggleCaptions(); done = '已关闭实时字幕'; }
+  else if (action === 'view-grid') { if (setViewMode('gallery')) done = '已切到宫格视图'; }
+  else if (action === 'view-speaker') { if (setViewMode('speaker')) done = '已切到演讲者视图'; }
+  if (done) showToast(`🤖 ${who}：${done}（全房间同步）`, 'info');
+});
+
+/* ★ 2026-10-02 服务端语音状态翻转要跟着走（配合服务器那条"定期重探"）：
+ *   进房时读到的 aiTtsEnabled 是一次性快照，而端点可达性会漂（Edge 403 是常态）。
+ *   服务器重探后广播这条，页面当场改让位闸——不然就回到"两边都不出声"那个死局。 */
+socket.on('ai-tts-state', ({ enabled } = {}) => {
+  /* 本地静音期内（连续失败自愈）不理会服务器"我又可用了"——等静音期自己过，
+   * 避免"失败→切浏览器→服务器又说行→又切回去"来回抖动。 */
+  const next = !!enabled && Date.now() >= aiTtsLocalMuteUntil;
+  if (next === aiTtsEnabled) return;
+  aiTtsEnabled = next;
+  aiTtsFailStreak = 0;
+  log(next ? '🔊 服务端神经语音已就绪，AI 用服务器音色说话'
+           : '🔈 服务端语音不可用，AI 回答改由浏览器朗读');
+});
+
+/* ★ 2026-10-02 连续失败自愈：回落闸 force 只能救"这一次"，但如果服务端探测说"我可用"
+ *   而实际每次都失败，用户会经历"每句都要等服务器判死刑才出声"的延迟。
+ *   连吃两次失败就本地临时停用服务端语音 5 分钟（服务器重探成功后会广播恢复）。 */
+let aiTtsFailStreak = 0;
+let aiTtsLocalMuteUntil = 0;
 socket.on('ai-tts-fail', ({ ts } = {}) => {
   const t = pendingServerTts.get(ts);
-  if (t) { pendingServerTts.delete(ts); speakAiText(t); }
+  aiTtsFailStreak += 1;
+  if (aiTtsFailStreak >= 2) {
+    aiTtsEnabled = false;
+    aiTtsLocalMuteUntil = Date.now() + 5 * 60000;
+    aiTtsFailStreak = 0;
+    log('🔈 服务端语音连续失败，这段时间改由浏览器朗读（服务器重探成功后自动切回）');
+  }
+  if (t) { pendingServerTts.delete(ts); speakAiText(t, { force: true }); }
 });
 
 /* ★ 09-30 抢话修复①：用户一开口，AI 立即闭嘴。
@@ -3105,17 +3502,34 @@ socket.on('ai-tts-fail', ({ ts } = {}) => {
  *   人类对话的礼仪是：对方开口，我就让。
  * ▎触发点：新字幕到达（服务端 asr-caption / 本地识别结果都算"有人在说话"）。
  *   用字幕当 VAD，不引入任何新依赖、不加复杂度。 */
-function hushAiSpeech() {
+function hushAiSpeech({ serverToo = true } = {}) {
   if (!SPEECH_OK) return;
   try {
     if (aiSpeakQueue.length || window.speechSynthesis.speaking || window.speechSynthesis.pending) {
       aiSpeakQueue.length = 0;
       window.speechSynthesis.cancel();
     }
+    /* serverToo=false 用于"服务端音频自己到达时只关浏览器那一轨"——
+     * 按句流水线是一段一段发过来的，若这里连自己的队列一起清掉，就等于自己丢自己的下一段。 */
+    if (!serverToo) return;
     // ★ 09-30c：服务端 MP3 也在"AI 的声音"管辖内——用户开口，它同样得停
     if (serverTtsEl && !serverTtsEl.paused) {
       try { serverTtsEl.pause(); } catch (e) { /* 忽略 */ }
     }
+    /* ★ 2026-10-02 打断要连**队列**一起清，并释放 busy 标志：
+     *   pause() 之后 onended 永远不会来（被暂停的音频不结束），于是 serverTtsBusy
+     *   一直挂着 true → 下一条答案的音频进队后再也不会被播出 = 新的死锁。
+     *   语义上也该如此：用户打断了 AI，它这段答案剩下的句子就不该在后面自己响起来。
+     * ▸ 怎么认出"这段答案剩下的句子"：正在播的 + 队列里排着的 ts 全部拉黑
+     *   （按句流水线的一段一段共用同一个 ts），后到的同 ts 段自然被 ai-audio 丢掉。
+     *   **不能**用时间窗——那会把"这次提问的答案"也一起吞掉（见 serverTtsDropped 注释）。 */
+    if (typeof serverTtsPlayingTs === 'number') serverTtsDropped.add(serverTtsPlayingTs);
+    for (const q of serverTtsQueue) { if (typeof q.ts === 'number') serverTtsDropped.add(q.ts); }
+    while (serverTtsDropped.size > 20) serverTtsDropped.delete(serverTtsDropped.values().next().value);
+    serverTtsQueue.length = 0;
+    serverTtsBusy = false;
+    serverTtsPlayingTs = undefined;
+    serverTtsIgnoreUntil = Date.now() + 8000;   // 只作"段没带 ts"时的兜底判据
   } catch (e) { /* 播报失败绝不影响会议功能 */ }
 }
 
@@ -3174,15 +3588,25 @@ function startAiHushWatcher() {
         // 设备热切换：轨道换了 → 静默重绑；没麦克风的阶段 analyser 为 null，空转
         const cur = localStream && localStream.getAudioTracks()[0];
         if (cur !== aiHush.track) bindAiHush(cur);
-        if (aiHush.analyser && window.speechSynthesis && window.speechSynthesis.speaking) {
+        /* ★ 2026-10-02 采样不再以"AI 正在说话"为前提。
+         *   旧写法只在 speechSynthesis.speaking 时量麦克风——于是"用户现在是否在说话"
+         *   这个信息在 AI 沉默时根本拿不到，只能退回去用"字幕到达时间"猜，
+         *   而字幕比真话晚 1~3 秒（分段+转写），拿它当"正在说话"就会把
+         *   **刚答完的那一轮朗读整轮吃掉**（用户实测："回答的时候不说话"）。
+         *   现在：只要 AI 语音开着就持续量麦克风，得到"此刻是否在说话"的即时信号；
+         *   掐断（hush）仍然只在 AI 真的在念时才做（AI 没念时没什么可掐的）。 */
+        if (aiHush.analyser) {
           aiHush.analyser.getFloatTimeDomainData(aiHush.buf);
           let peak = 0;
           for (let i = 0; i < aiHush.buf.length; i++) { const v = Math.abs(aiHush.buf[i]); if (v > peak) peak = v; }
           aiHush.hits = peak > AI_HUSH_THRESHOLD ? aiHush.hits + 1 : 0;
           if (aiHush.hits >= AI_HUSH_FRAMES) {
             aiHush.hits = 0;
-            lastUserSpeechTs = Date.now();
-            hushAiSpeech();
+            lastMicVoiceTs = Date.now();   // "此刻有人在说话"的即时证据
+            if (window.speechSynthesis && window.speechSynthesis.speaking) {
+              lastUserSpeechTs = Date.now();
+              hushAiSpeech();
+            }
           }
         } else {
           aiHush.hits = 0;
@@ -3264,6 +3688,26 @@ function claimTodo(ts, btn) {
   }
 }
 
+/* ★ 2026-10-02 成员行上的「只对 TA 回应」按钮（Piik 式定向反应）
+ * ▎为什么放在成员行而不是视频格上：视频格会被双击全屏/钉选/批注层抢事件，
+ *   而成员行本来就是"关于这个人的一切操作"的入口（录制、发文件、移出都在这）。
+ * ▎交互：点一下 = 定向到 TA（回应条出现「→ 小张」），在回应条上选表情即发；
+ *   再点一次同一个按钮 = 取消；发完自动取消（一次一发，避免手滑连着定向给错人）。 */
+function addReactTargetBtn(host, id, name) {
+  const b = document.createElement('button');
+  b.className = 'mini m-ai-react';
+  b.innerHTML = ICONS.smile;
+  b.title = `只对 ${name || 'TA'} 回应一个表情（再点一次取消）`;
+  b.addEventListener('click', () => {
+    const t = liveReactTarget();
+    if (t && t.id === id) { setReactTarget(null); showToast('已取消定向回应', 'info'); return; }
+    setReactTarget(id, name);
+    showToast(`接下来点的表情只发给 ${name || 'TA'}`, 'info');
+  });
+  host.appendChild(b);
+  return b;
+}
+
 function renderMembers(members) {
   memberNumEl.textContent = members.length;
   const me = members.find((m) => m.id === socket.id);
@@ -3288,9 +3732,9 @@ function renderMembers(members) {
       row.classList.add('ai-bot-row');
       const note = botHearingNote();   // 由最近一次快照/字幕事件维护的活状态
       row.classList.add('has-av');
-      /* 小头像初始 src 跟随当前状态（成员列表重建发生在 speaking 中时不会回跳 idle） */
-      const rowAvSrc = aiAvatar.state === 'speaking' ? AI_ANIM.talkSm : AI_ANIM.idleSm;
-      row.innerHTML = `<span class="ai-av"><img src="${rowAvSrc}" alt=""></span>`
+      /* ★ 2026-10-02 行内小图与视频格**共用同一张静帧**（旧版这里按 speaking 在两张
+       *   循环 WebP 间换 src，素材自带残影 → 重影；且一个概念三份来源） */
+      row.innerHTML = `<span class="ai-av"><img src="${AI_PORTRAIT}" alt=""></span>`
         + `<span class="m-id">${ICONS.bot} ${escapeHtml(m.name || 'AI 小明')}`
         + `<span class="m-bot-note" title="AI 助理的实时状态">${escapeHtml(note)}</span></span>`;
       aiAvatar.rowEl = row.querySelector('.ai-av'); // ★ 09-26：状态机刷新时换五态图
@@ -3304,6 +3748,8 @@ function renderMembers(members) {
         log(`🤖 在聊天框里输入你的问题（已自动带上 @ai 前缀）；开会时提到「${AI_NICKNAME}」它会自动接话`);
       });
       row.appendChild(askBtn);
+      // ★ 2026-10-02 对 AI 也能定向回应（"它答得好，我只对它比个 👍"）
+      addReactTargetBtn(row, m.id, m.name || 'AI 小明');
       memberListEl.appendChild(row);
       continue;
     }
@@ -3422,6 +3868,8 @@ function renderMembers(members) {
       fileBtn.title = '发文件给 TA';
       fileBtn.addEventListener('click', () => pickFileFor(m.id));
       badges.appendChild(fileBtn);
+      // ★ 2026-10-02 定向回应（Piik 式）：只对这个人比一个表情，别人不刷屏
+      if (!isMe) addReactTargetBtn(badges, m.id, m.name);
 
       // ★ D4：房主/平台管理员可以移出成员（服务器 roleOf 再校验一次权限，前端只是入口）
       if (me && (me.owner || me.role === 'admin')) {
@@ -4362,16 +4810,19 @@ function applyLayout() {
   lastLayoutSig = sig;
 }
 
-viewGalleryBtn.addEventListener('click', () => {
-  layoutMode = 'gallery';
+/* ★ 2026-10-02 第 36 步：切视图也抽成函数（同一屏的第二个触发源 = AI/远端指令）。
+ *   mode: 'gallery' 宫格 | 'speaker' 演讲者。非法值直接忽略，不猜。 */
+function setViewMode(mode) {
+  if (mode !== 'gallery' && mode !== 'speaker') return false;
+  if (layoutMode === mode) return true;
+  layoutMode = mode;
   applyLayout();
-  log('▦ 已切到宫格视图');
-});
-viewSpeakerBtn.addEventListener('click', () => {
-  layoutMode = 'speaker';
-  applyLayout();
-  log('▢ 已切到演讲者视图（大画面跟随共享者/说话人）');
-});
+  log(mode === 'gallery' ? '▦ 已切到宫格视图' : '▢ 已切到演讲者视图（大画面跟随共享者/说话人）');
+  return true;
+}
+
+viewGalleryBtn.addEventListener('click', () => setViewMode('gallery'));
+viewSpeakerBtn.addEventListener('click', () => setViewMode('speaker'));
 
 // 钉选：演讲者视图的大画面固定给这个人（他开共享就显示他的屏幕）；再点一次取消
 function togglePin(id) {
@@ -4444,7 +4895,37 @@ function applyNetDots() {
  *     沉淀成"复盘报表"（服务器 talk-stats 广播），可视化价值最高的一件。
  * ────────────────────────────────────────────────────────────── */
 
-// ① 表情回应：回应骑在聊天同一条 SCTP 广播频道上（mediasoup 自动转发给所有订阅者）
+/* ① 表情回应：骑在聊天同一条 SCTP 广播频道上（mediasoup 自动转发给所有订阅者）。
+ *
+ * ★ 2026-10-02 加**定向回应**（学 Piik 的"点某个人的沙发，只对 ta 比一个"）：
+ * ▎为什么在应用层加 `to` 而不是新开一条通道：mediasoup 的 DataChannel 是**广播**语义
+ *   （服务器不知道"这条只给谁"），所以"发给某人"只能靠消息里带定向头、接收方各自过滤——
+ *   这正是 F5 屏幕批注已经验证过的同一套做法（annot 消息的 to 字段），复用而不是另造一套。
+ * ▎定向 ≠ 隐私：消息仍然到了所有人手里，只是别人不显示。这是教学版必须说清的边界
+ *   （真要私密得走端到端加密，不在本轮范围）。
+ * ▎为什么 20 秒自动过期：目标人可能随时离开/关页，定向状态不清就会"对着空气比心"。 */
+let reactTarget = null; // { id, name, until }
+const REACT_TARGET_TTL_MS = 20000;
+const reactChip = document.createElement('span');
+reactChip.className = 'react-to hidden';
+try { reactBar.appendChild(reactChip); } catch (e) { /* 桩里没有容器就算了 */ }
+
+function setReactTarget(id, name) {
+  reactTarget = id ? { id, name: name || 'TA', until: Date.now() + REACT_TARGET_TTL_MS } : null;
+  renderReactChip();
+}
+function liveReactTarget() {
+  if (reactTarget && Date.now() > reactTarget.until) reactTarget = null; // 过期自动收回
+  return reactTarget;
+}
+function renderReactChip() {
+  const t = liveReactTarget();
+  reactChip.classList.toggle('hidden', !t);
+  reactChip.textContent = t ? `→ ${t.name}` : '';
+  reactChip.title = t ? '本次回应只发给 TA（再点一次回应条外的 ✕ 取消）' : '';
+}
+reactChip.addEventListener('click', () => setReactTarget(null)); // 点一下就取消定向
+
 for (const btn of reactBar.querySelectorAll('.react-btn')) {
   btn.addEventListener('click', () => sendReact(btn.dataset.emoji));
 }
@@ -4454,10 +4935,18 @@ function sendReact(emoji) {
     showToast('数据通道未就绪，回应没发出去', 'info');
     return;
   }
+  const t = liveReactTarget();
+  renderReactChip(); // 顺手把可能已到期的定向状态同步到界面
   chatDataProducer.send(JSON.stringify({
-    type: 'react', emoji, msgId: `${socket.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    type: 'react', emoji,
+    to: t ? t.id : undefined, // 定向头：接收端各自过滤（广播语义下的应用层私聊）
+    msgId: `${socket.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
   }));
   spawnFlyingEmoji(emoji); // mediasoup 不会把消息回给发送者，自己的先飞起来
+  if (t) {
+    showToast(`已回应 ${t.name}：${emoji}`, 'info');
+    setReactTarget(null); // 一次一发，不常驻定向（防误发）
+  }
 }
 
 // 表情飞屏：从屏幕底部随机位置飘上去，动画结束自动删（纯 CSS 动画，见 style.css）
@@ -4832,26 +5321,16 @@ function setAiState(st, speechText, phase) {
    *   阶段文案只对 thinking 生效——其它状态（聆听/发言/完成）没有阶段概念，
    *   硬套会说出"正在翻会议记录"却其实在发言这种假话。 */
   const thinkLabel = (st === 'thinking' && phase && AI_PHASE_LABEL[phase]) || null;
-  /* ★ 09-27 说话动画切换：speaking 换"嘴部开合" talk 图，其余状态回呼吸 idle 图。
-   *  两张都是透明 WebP 循环动画，直接换 src（已预加载，无白闪）。 */
-  const talk = st === 'speaking';
-  if (aiAvatar.rowEl) {
-    const rowIm = aiAvatar.rowEl.querySelector('img');
-    if (rowIm) rowIm.src = talk ? AI_ANIM.talkSm : AI_ANIM.idleSm;
-  }
-  if (aiTileEl) {
-    const face = aiTileEl.querySelector('.ai-face');
-    if (face) face.src = talk ? AI_ANIM.talk : AI_ANIM.idle;
-  }
-  /* ★ 09-26c 头像 v4（用户反馈 SVG 小人还是不够美）：
-   *  底图换成 meihua4 的精美国风头像（一张好图胜过一切小动作），生动感交给
-   *  **动效系统**——呼吸缩放/speaking 声波条跳动/thinking 暗化+泡泡漂浮/happy 弹跳。
-   *  状态全部由格子 class 驱动 CSS，切换只动 class（丝滑过渡由 transition 承担）。 */
-  if (aiAvatar.rowEl) aiAvatar.rowEl.classList.toggle('speaking', st === 'speaking');
+  /* ★ 2026-10-02 状态一律走 class 驱动 CSS，**不再换图片 src**：
+   *   旧版这里按 speaking 在 talk/idle 两张循环 WebP 之间切 src——那既是"重影"的一半
+   *   （两张都是自带残影的动画），也是"只会一个动作"的根源（循环素材不可能看场合变招）。
+   *   现在形象只有一张静帧，动作全交给下面的 CSS 状态类 + 随机小动作调度器。 */
+  const talking = st === 'speaking';
+  if (aiAvatar.rowEl) aiAvatar.rowEl.classList.toggle('speaking', talking);
   if (aiTileEl) {
     const label = aiTileEl.querySelector('.ai-status');
     if (label) label.textContent = thinkLabel || AI_STATE_LABEL[st];
-    aiTileEl.classList.toggle('speaking', st === 'speaking');
+    aiTileEl.classList.toggle('speaking', talking);
     aiTileEl.classList.toggle('thinking', st === 'thinking');
     aiTileEl.classList.toggle('happy', st === 'happy');
     /* ★ 09-26b 发言字幕逐字化（用户反馈"AI 字幕太僵硬"）：
@@ -4879,8 +5358,52 @@ function setAiState(st, speechText, phase) {
       setTimeout(() => { if (bar && !bar.classList.contains('show')) bar.textContent = ''; }, 400);
     }
   }
+  armAiGestures(); // ★ 2026-10-02 状态一变就重新安排"下一次小动作"（说话/思考期间不演）
 }
 let aiSpeechTimer = 0;
+
+/* ──────────────────────────────────────────────────────────────
+ * ★ 2026-10-02 AI 头像"小动作"调度器（用户点名：不要一直重复一个动作，不同时候做不同动作）
+ * ▎为什么用 JS 调度而不是 CSS 一条 infinite 动画：infinite 就是"永远同一段循环"，
+ *   那正是用户嫌的机器感。偶发、不可预测的**一次性**动作才像活物——
+ *   所以这里排一个 7~14 秒的随机定时器，到点从动作池里挑**一个**演，演完摘类再排下一次。
+ * ▎为什么只在 idle / listening 演：speaking 时身体该随说话律动、thinking 时该"抬头想"，
+ *   再叠一个随机点头就成了抽搐（同一元素同一时刻只允许一条动画，见 style.css 第 27 节）。
+ * ▎防"永久占位"：animationend 与超时保险丝都会走同一个 finish，但 finish 只生效一次——
+ *   否则动画被打断（切状态/切布局）时类没摘掉，之后就再也不会做小动作了。
+ * ────────────────────────────────────────────────────────────── */
+const AI_GESTURES = ['g-nod', 'g-tilt', 'g-peek-l', 'g-peek-r', 'g-sway', 'g-breath-deep'];
+function clearAiGesture() {
+  clearTimeout(aiAvatar.gestureTimer);
+  aiAvatar.gestureTimer = 0;
+  const f = aiTileEl && aiTileEl.querySelector('.ai-face');
+  if (f && aiAvatar.gesture) f.classList.remove(aiAvatar.gesture);
+  aiAvatar.gesture = '';
+  aiAvatar.gestureDone = null;
+}
+function armAiGestures() {
+  clearAiGesture();
+  if (aiAvatar.state !== 'idle' && aiAvatar.state !== 'listening') return; // 说话/思考有自己的律动
+  const wait = 7000 + Math.floor(Math.random() * 7000); // 7~14s：太密=抽搐，太疏=看不出活着
+  aiAvatar.gestureTimer = setTimeout(() => {
+    if (aiAvatar.state !== 'idle' && aiAvatar.state !== 'listening') { armAiGestures(); return; }
+    const f = aiTileEl && aiTileEl.querySelector('.ai-face');
+    if (!f) return;
+    const g = AI_GESTURES[Math.floor(Math.random() * AI_GESTURES.length)];
+    aiAvatar.gesture = g;
+    f.classList.add(g);
+    const finish = () => {
+      if (aiAvatar.gestureDone !== finish) return; // 只让第一次触发生效
+      f.classList.remove(g);
+      aiAvatar.gesture = '';
+      aiAvatar.gestureDone = null;
+      armAiGestures();                            // 演完接着排下一个
+    };
+    aiAvatar.gestureDone = finish;
+    f.addEventListener('animationend', finish, { once: true });
+    setTimeout(finish, 3000);                     // 保险丝（animation 被外部覆盖时不卡死）
+  }, wait);
+}
 
 function syncAiTile(present) {
   const grid = document.getElementById('videoGrid');
@@ -4890,13 +5413,14 @@ function syncAiTile(present) {
     aiTileEl.className = 'video-box ai-tile';
     const waves = '<div class="ai-waves">' + '<i></i>'.repeat(7) + '</div>';
     aiTileEl.innerHTML =
-      '<div class="ai-face-wrap"><img class="ai-face" src="' + AI_ANIM.idle + '" alt="AI 小明"></div>' +
+      '<div class="ai-face-wrap"><img class="ai-face" src="' + AI_PORTRAIT + '" alt="AI 小明"></div>' +
       waves +
       '<div class="ai-speech" aria-live="polite"></div>' +
       '<div class="video-label">AI 小明<span class="ai-status">聆听中…</span></div>';
     grid.appendChild(aiTileEl);
     applyLayout();
   } else if (!present && aiTileEl) {
+    clearAiGesture(); // ★ 2026-10-02 格子没了要连定时器一起停（否则定时器还在给已移除的节点加类）
     aiTileEl.remove();
     aiTileEl = null;
     applyLayout();
@@ -4914,12 +5438,18 @@ aiBtn.addEventListener('click', () => {
   log(on ? '🤖 正在送走 AI 助理…' : '🤖 正在邀请 AI 助理入会…');
 });
 
-boardBtn.addEventListener('click', () => {
-  boardOn = !boardOn;
+boardBtn.addEventListener('click', () => setBoardOpen(!boardOn));
+
+/* ★ 2026-10-02 第 36 步：白板开合抽成一个函数——因为现在有了**第二个触发源**
+ *   （AI 助理说"打开白板"要替全房间打开）。内联在监听器里写死的话，
+ *   第二个来源就只能把那段代码抄一遍，抄完就开始漂（本项目这类账已踩三次）。 */
+function setBoardOpen(on) {
+  if (boardOn === on) return;
+  boardOn = on;
   boardOverlay.classList.toggle('hidden', !boardOn);
   if (boardOn) fitBoardCanvas();
   boardBtn.classList.toggle('active', boardOn);
-});
+}
 
 // 白板画布的画笔输入三件套（坐标相对画布归一化）
 boardCanvas.addEventListener('pointerdown', (e) => {
@@ -5237,7 +5767,16 @@ function handleDataMessage(from, message) {
 
     if (msg.type === 'react') {
       // ★ 09-13 F4：表情回应飞屏（发送者不回环，发的人本地已经飞过）
-      if (typeof msg.emoji === 'string' && msg.emoji.length <= 8) spawnFlyingEmoji(msg.emoji);
+      if (typeof msg.emoji !== 'string' || msg.emoji.length > 8) return;
+      /* ★ 2026-10-02 定向回应（学 Piik 的"只对某个人比"）：带 to 且不是发给我的 → 不刷屏。
+       *   再说一遍边界：mediasoup 数据通道是**广播**的，这条消息所有人都收到了，
+       *   只是别人不显示——省的是"注意力"，不是"隐私"（要隐私得端到端加密）。 */
+      if (msg.to && msg.to !== socket.id) return;
+      spawnFlyingEmoji(msg.emoji);
+      if (msg.to === socket.id) {
+        const src = lastMembers.find((x) => x.id === from);
+        showToast(`${(src && src.name) || shortId(from)} 对你比了 ${msg.emoji}`, 'info');
+      }
       return;
     }
     // ★ 09-17 实时字幕（第 29 步）：骑在同一条 'chat' 频道上的第三种消息。
@@ -5795,7 +6334,11 @@ function ensureAsrConfig() {
       .then((cfg) => {
         if (cfg) {
           serverAsrEnabled = !!cfg.asrEnabled;
-          aiTtsEnabled = !!cfg.aiTtsEnabled; // ★ 09-30c：服务端神经语音（双轨闸，见 speakAiText）
+          /* ★ 2026-10-02：这份配置只在进房时取一次（asrCfgPromise 缓存），所以
+           *   aiTtsEnabled 不能只看它——否则服务器后来漂了页面永远不知道。
+           *   现在：这里给初值，之后由服务器广播的 ai-tts-state 增量更新；
+           *   本地静音期（连续失败自愈）内不接受"可用"，避免来回抖。 */
+          aiTtsEnabled = !!cfg.aiTtsEnabled && Date.now() >= aiTtsLocalMuteUntil;
           if (Array.isArray(cfg.iceServers)) sfuIceServers = cfg.iceServers;
           if (typeof cfg.videoSvc === 'boolean') sfuVideoSvc = cfg.videoSvc;
           if (typeof cfg.aiEnabled === 'boolean') { sfuAiEnabled = cfg.aiEnabled; updateAiModeUi(); }
@@ -5829,14 +6372,14 @@ function enableServerCaptionMode() {
   cap.neterr = 0;
   if (!cap.sentry.startedAt) cap.sentry.startedAt = Date.now();
   setIconBtn(capBtn, ICONS.cc, '服务端字幕');
-  renderCapStatus('🖥️ 服务器转写（whisper）', 'live');
+  renderCapStatus(`🖥️ 服务器转写（${asrEngineCn()}）`, 'live');
   reportMyState({ caption: true });
-  log('💬 已启用服务端转写：你的麦克风音频经 SFU 送到服务器，由本机 whisper 识别后上字幕（不走浏览器云端）');
+  log(`💬 已启用服务端转写：你的麦克风音频经 SFU 送到服务器，由${asrEngineCn()}识别后上字幕（不走浏览器云端）`);
   if (!lastMembers.some((m) => m.isBot)) {
     socket.emit('ai-join'); // 任何成员都可邀请（服务器侧有守卫；仅服务端转写需要它在场）
     log('🤖 已自动邀请 AI 小明入会——它是服务端转写的"耳朵"（送走 AI 即停止转写）');
   }
-  showToast('🖥️ 服务端转写已开启：正常说话即可上字幕（本机 whisper，不依赖浏览器识别）');
+  showToast(`🖥️ 服务端转写已开启：正常说话即可上字幕（${asrEngineCn()}，不依赖浏览器识别）`);
 }
 
 async function toggleCaptions() {
@@ -5969,6 +6512,7 @@ function startCaptionRec() {
         cap.asrChecked = true;
         fetch('/config.json').then((r) => r.json()).then((c) => {
           serverAsrEnabled = !!c.asrEnabled;
+          serverAsrEngine = String(c.asrEngine || serverAsrEngine || 'none'); // ★ 2026-10-02 重拉配置也要跟着刷新引擎名
           if (serverAsrEnabled && cap.on) {
             renderCapStatus('🖥️ 服务器转写模式', 'live');
             showToast('已切换：服务器转写（AI 小明在场时说话即上字幕）');
@@ -6023,10 +6567,19 @@ function emitCaption(text) {
   if (capHistoryPanel && !capHistoryPanel.classList.contains('hidden')) appendCapHistoryRow(entry);
   /* ★ 09-26b 唤醒词：成稿里提到「小明」且 AI 在场 → 自动接话（整句作为提问）。
    *   为什么放客户端：字幕在每端本地识别，谁嘴里说出"小明"谁触发——服务端
-   *   听不到字（它只有音频管线没有转写），这是当前架构下最自然的挂点。 */
+   *   听不到字（它只有音频管线没有转写），这是当前架构下最自然的挂点。
+   * ▎★ 2026-10-02 加**同句去重**（用户实测"AI 一直收到重复的一句话"的客户端这一半）：
+   *   Web Speech 会把同一句话 repeated 出多次 isFinal（尤其"你好小明"这种短句），
+   *   原先这里**零去重、零冷却**——一句"小明…"能连着发出好几条 ai-ask，
+   *   每条都换回一个回答，看着就是 AI 在自言自语。8 秒内同一句只发一次。 */
   if (AI_NICKNAME && text.includes(AI_NICKNAME) && lastMembers.some((m) => m.isBot)) {
-    socket.emit('ai-ask', { question: text });
-    log(`🤖 ${AI_NICKNAME} 听到你叫它了，正在组织回答…`);
+    const nowTs = Date.now();
+    const dupWake = lastWakeAskText === text && nowTs - lastWakeAskTs < 8000;
+    if (!dupWake) {
+      lastWakeAskText = text; lastWakeAskTs = nowTs;
+      socket.emit('ai-ask', { question: text });
+      log(`🤖 ${AI_NICKNAME} 听到你叫它了，正在组织回答…`);
+    }
   }
   if (!chatDataProducer || chatDataProducer.closed) return; // SCTP 不在（没进房/重连中）→ 只显示本地
   try {
@@ -6660,7 +7213,13 @@ if ('serviceWorker' in navigator && (window.isSecureContext !== false)) {
           await Promise.all(keys.map((k) => caches.delete(k)));
         }
         log(`🧹 已注销 ${regs.length} 个 Service Worker 并清空缓存，正在重载…`);
-        setTimeout(() => location.reload(), 400);
+        /* ★ 2026-10-02 修掉这个逃生舱自己的 bug：`location.reload()` **保留查询串**，
+         *   于是重载后 `/[?&]nosw=1/` 又命中 → 再注销 → 再 reload = **每 400ms 刷一次页面**
+         *   （"排障开关"本身变成一个死循环，比没这个开关更糟）。
+         *   正解：跳回**去掉 nosw 的同一个地址**，其余参数（尤其 ?room= 邀请链接）原样保留。 */
+        const keep = location.search
+          .split(/[?&]/).filter((kv) => kv && !/^nosw(=1)?$/.test(kv)).join('&');
+        setTimeout(() => location.replace(location.pathname + (keep ? '?' + keep : '') + location.hash), 400);
       } catch (err) {
         log(`⚠️ 注销 Service Worker 失败：${err.message}`);
       }
@@ -6746,12 +7305,31 @@ let rdQualityAt = 0;             // 上次调参时间
 const RD_QUALITY_MIN_GAP = 4000; // 最小调参间隔（防震荡）
 const RD_FPS_MIN = 6;
 const RD_FPS_MAX = 24;
+/* ★ 2026-10-03 端到端手感延迟：**我点下去 → 画面动了** 多少毫秒。
+ * ▎为什么单独量这个数：以前控制台只显示 RTT 和帧率，那两个都是"链路"的指标，
+ *   而用户抱怨的是"点着发肉"——那是 输入→代理执行→重画→抓屏→编码→回传→解码 一整条，
+ *   RTT 再低也盖不住里面"抓屏 + 编码"那一段。**量错指标就会调错地方**（坑 58 同族）。
+ * ▎做法：发输入时记一个时刻，下一帧到达时配对相减（EMA 平滑，避免单帧抖动骗人）。
+ *   只在输入后 3 秒内配对——静止画面几秒后才飘来的一帧不算"我点出来的响应"。 */
+let rdInputSentAt = 0;
+let rdInputMs = 0;
+const RD_INPUT_PAIR_WINDOW_MS = 3000;
+/** 纯函数：把一次新测量并进 EMA（α=0.35：既跟得上变化，又不被单帧尖峰带跑）。 */
+function rdInputEma(prev, sample) {
+  if (!(sample > 0)) return prev;
+  return prev > 0 ? Math.round(prev * 0.65 + sample * 0.35) : Math.round(sample);
+}
 
 function rdNoteFrame() {
   const now = Date.now();
   if (rdLastFrameAt) {
     rdIntervals.push(now - rdLastFrameAt);
     if (rdIntervals.length > 30) rdIntervals.shift();   // 只留最近 30 帧
+  }
+  /* 输入→画面的配对测量（见上面 rdInputSentAt 的注释）。
+   * 不清零 rdInputSentAt：一次拖拽会连发几十个输入，每个都该和它之后的第一帧配对。 */
+  if (rdInputSentAt && now - rdInputSentAt < RD_INPUT_PAIR_WINDOW_MS) {
+    rdInputMs = rdInputEma(rdInputMs, now - rdInputSentAt);
   }
   rdLastFrameAt = now;
   rdAdaptQuality();
@@ -6856,9 +7434,14 @@ async function rdPumpFrames() {
   }
   /* 状态文案要回答"画面在不在动"，而不是报一个帧数 ——
    * 用户看到"已收 2 帧"只会疑惑（2 帧算好还是不好？）。帧数放进 title 给想深究的人。
-   * ★ 09-30d（借鉴 billd-desk）：状态行带上会话时长——"控制了多久"是远程会话的基本事实。*/
-  setRdState('✅ 实时画面' + rdDurationText());
-  if (rdStateEl) rdStateEl.title = `已接收 ${rdFrames} 帧 JPEG 画面（来自对方电脑的真实屏幕）`;
+   * ★ 09-30d（借鉴 billd-desk）：状态行带上会话时长——"控制了多久"是远程会话的基本事实。
+   * ★ 2026-10-03：状态行再带上**手感延迟**（我点下去→画面动了 多少 ms）。
+   *   这是远程桌面唯一真正决定"好不好用"的数字，RTT 低不等于它低（中间还有抓屏+编码）。 */
+  setRdState('✅ 实时画面' + rdDurationText() + (rdInputMs ? ` · 响应 ${rdInputMs}ms` : ''));
+  if (rdStateEl) {
+    rdStateEl.title = `已接收 ${rdFrames} 帧 JPEG 画面（来自对方电脑的真实屏幕）` +
+      (rdInputMs ? `\n响应延迟 = 发出输入 → 收到对应画面（最近 ${rdInputMs}ms，EMA 平滑）` : '');
+  }
 }
 
 /* ★ 09-30d：会话时长文案（首帧起计；每帧刷新时顺带更新，无需额外定时器） */
@@ -6870,6 +7453,9 @@ function rdDurationText() {
 
 function rdSend(event) {
   if (!rdHostId) return false;
+  /* ★ 2026-10-03 记下"最近一次把输入发出去"的时刻，用来量**端到端手感延迟**
+   *   （我点下去 → 画面真的动了，多少毫秒）。见 rdNoteFrame 里的配对逻辑。 */
+  rdInputSentAt = Date.now();
   socket.emit('remote-input', { to: rdHostId, event });
   return true;
 }
@@ -7477,6 +8063,209 @@ startLocalMedia();
 initInsecureNotice();
 // ★ 09-25：侧栏分段（成员/看板/聊天）——脚本在 body 末尾，DOM 已就绪，可直接挂事件
 initSideTabs();
+initIcePrecheck();        // ★ 第 34 步：预览页 ICE 自检（把「UDP 被堵」提前说成人话）
+/* ★ 2026-10-02 教训一条（写在这儿免得下次再踩）：**顶层调用必须写在它用到的 const 之后**。
+ *   initHero() 原先紧跟在第 34 步那行后面，而它要读的 `const HERO_TEXT` 声明在下面——
+ *   TDZ 抛错本身不响，**真正贵的是它会把本文件后面所有顶层语句一起砍掉**
+ *   （表现：页面看起来是好的，因为大部分初始化在更前面就做完了，
+ *    但后面新加的 init 一个都没跑，且控制台什么都不报）。
+ *   所以这里只留注释，真正的 initHero() 调用放在函数定义之后。 */
+
+/* ──────────────────────────────────────────────────────────────
+ * 第 35 步：★ 2026-10-02 首页 hero 化（prejoin 从"设备检查卡"变成"一屏叙事"）
+ *
+ * ▎为什么值得动这一屏：prejoin 是用户打开页面的**第一眼**，也就是本产品的落地页。
+ *   原来它只有一张"检查设备"的卡，功能在但没有人味——用户不知道 AI 助理在场、
+ *   不知道摄像头只在这里授权一次、也不知道可以先测网络。
+ * ▎借鉴的是**编排语言**（模糊引导语 → 打字机主句 → 胶囊 CTA → 严格分层），
+ *   不是它的资源：参考稿用外链视频当背景、外链字体当标题，
+ *   而本项目是零依赖 + 可离线 PWA（内网/断网一部署，外链就是白屏），
+ *   所以背景改成纯 CSS 光晕 + SVG 噪点（见 style.css 第 28 节），字体继续用本地衬线栈。
+ * ▎三条纪律：
+ *   ① **不写假链接**——顶栏三项全部接真功能（滚到设备卡 / 跑 ICE 自检 / 开设备码面板）；
+ *   ② **打字机与 CTA 是两条独立时间线**（胶囊 400ms 出现，绝不等打字打完），
+ *      否则慢的人看到的就是"页面卡住没按钮"；
+ *   ③ **prefers-reduced-motion 直接出全文、不出现光标**——
+ *      动效是装饰，不能变成一部分人读不到内容的门槛。
+ * ────────────────────────────────────────────────────────────── */
+const HERO_TEXT = '我是 AI 小明，这场会的记录员。先看看摄像头和麦克风，准备好了再进来。';
+
+function heroReducedMotion() {
+  try { return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) { return false; }
+}
+
+/** 打字机：speed/startDelay 做成参数（默认 38ms/600ms），教学时想调快调慢不用改逻辑 */
+function typeHeroLine(el, caret, text, speed = 38, startDelay = 600) {
+  if (!el) return;
+  if (heroReducedMotion()) {          // 降级：全文直出，光标节点根本不进 DOM
+    el.textContent = text;
+    if (caret && caret.parentNode) caret.remove();
+    return;
+  }
+  el.textContent = '';
+  let i = 0;
+  setTimeout(() => {
+    const tick = () => {
+      i += 1;
+      el.textContent = text.slice(0, i);
+      if (i >= text.length) {
+        // 打完了把光标**节点移除**（不是隐藏）——留着它就一直闪，抢视线
+        if (caret && caret.parentNode) caret.remove();
+        return;
+      }
+      setTimeout(tick, speed);
+    };
+    tick();
+  }, startDelay);
+}
+
+function initHero() {
+  const typed = $('heroTyped');
+  const caret = $('heroCaret');
+  const pills = $('heroPills');
+  if (!typed && !pills) return;         // 老页面结构（没有 hero）时整体静默跳过
+  typeHeroLine(typed, caret, HERO_TEXT);
+  // ★ 与打字机并行：400ms 就让按钮出现，不等字打完（否则读屏/慢网络下像页面卡死）
+  setTimeout(() => { if (pills) pills.classList.add('shown'); }, 400);
+
+  /* 顶栏三个入口——每一个都必须真的有事可做 */
+  const on = (id, fn) => {
+    const el = $(id);
+    if (el && el.addEventListener) el.addEventListener('click', (e) => { e.preventDefault(); fn(); });
+  };
+  on('heroLinkDevice', () => {
+    const card = document.querySelector('.hero-device');
+    if (card && card.scrollIntoView) card.scrollIntoView({ behavior: heroReducedMotion() ? 'auto' : 'smooth', block: 'center' });
+    const sel = $('pjCamSelect');
+    if (sel && sel.focus) try { sel.focus({ preventScroll: true }); } catch (err) { sel.focus(); }
+  });
+  on('heroLinkNet', () => {
+    // 复用第 34 步那颗按钮，不另写一份探测逻辑（一个概念只有一个来源）
+    const btn = document.querySelector('.ice-probe-btn');
+    if (btn) btn.click();
+    else showToast('网络自检还没就绪，稍等一下再点', 'info');
+  });
+  const openDesk = () => {
+    if (authOverlay) authOverlay.classList.add('hidden');
+    if (deskOverlay) deskOverlay.classList.remove('hidden');
+    setTimeout(() => { try { deskCodeEl && deskCodeEl.focus(); } catch (e) { /* 桩里没这个元素 */ } }, 50);
+  };
+  on('heroLinkDesk', openDesk);
+  on('heroLinkDesk2', openDesk);
+}
+initHero();   // ★ 第 35 步：调用点必须在 const/函数定义之后（见上面那条 TDZ 教训）
+/* ──────────────────────────────────────────────────────────────
+ * 第 34 步：★ 2026-10-02 Piik 取长④ —— 进房前 ICE 预检（把「沉默故障」说成人话）
+ *
+ * ▎为什么这条值得做：本项目最难缠的一类故障是坑 36 那种——什么都没报错，只是黑屏。
+ *   跨网连不上时用户看到的就是「转圈 + 没画面」，而真正的原因往往是
+ *   「这条网络把 UDP 全封了 / 没有可用 TURN」。我们已经有 doctor 与 test:turn，
+ *   但那两个都在**服务器命令行**上，普通用户不会跑；Piik 的做法是把「能不能连」
+ *   放进连接前的自检里，当场给一句人话（它的 ADR 里也明说 UDP 被全封时会显式失败）。
+ * ▎做法（零依赖）：开一条一次性的 RTCPeerConnection，用服务器下发的**同一批** ICE 服务器，
+ *   建一个数据通道只为触发 ICE 收集，5~6 秒内看它拿到哪些候选类型：
+ *     relay → TURN 到位（跨网最稳）；srflx → STUN 打洞可用；
+ *     只有 host → 同网可用、跨网还得靠 TURN；一个都没有 → UDP 很可能被阻断。
+ * ▎诚实边界（写进 title 也写进日志，不夸口）：这测的是「本机到 ICE 服务器的连通性」，
+ *   不等于「和会议服务器一定通」；而且 mediasoup 的媒体走 UDP、**不经 TURN 转发**
+ *   （《部署手册.md》里那条边界），所以结论只用于提前预警 + 指路。
+ * ────────────────────────────────────────────────────────────── */
+const ICE_PROBE_VERDICT = {
+  relay: { cls: 'ok', text: '中继可用（拿到 relay 候选，跨网最稳）' },
+  stun: { cls: 'ok', text: '打洞可用（拿到公网 srflx 候选）' },
+  lan: { cls: 'warn', text: '只有内网候选：同网能连，跨网需要 TURN' },
+  blocked: { cls: 'bad', text: '没拿到任何候选：这条网络很可能封了 UDP' },
+  na: { cls: 'warn', text: '本浏览器不支持 ICE 探测（已跳过）' },
+};
+let iceProbe = null; // { cls, text, verdict, at }
+let iceProbeRunning = false;
+
+function iceServersForProbe() {
+  const list = (Array.isArray(sfuIceServers) && sfuIceServers.length)
+    ? sfuIceServers : [{ urls: 'stun:stun.l.google.com:19302' }];
+  return list.filter((x) => x && typeof x.urls === 'string');
+}
+
+function renderIceProbe() {
+  const box = document.getElementById('iceProbe');
+  if (!box) return;
+  if (!iceProbe) { box.className = 'ice-probe'; box.textContent = ''; return; }
+  box.className = `ice-probe ${iceProbe.cls}`;
+  box.textContent = `📡 网络自检：${iceProbe.text}`;
+  box.title = '结论只表示「本机到 ICE 服务器的连通性」，不代表与会议服务器一定连通'
+    + '（SFU 媒体走 UDP、不经 TURN 转发，详见《部署手册.md》）';
+}
+
+async function runIceProbe() {
+  if (iceProbeRunning) return iceProbe;
+  if (!window.RTCPeerConnection) {
+    iceProbe = Object.assign({ verdict: 'na', at: Date.now() }, ICE_PROBE_VERDICT.na);
+    renderIceProbe();
+    return iceProbe;
+  }
+  iceProbeRunning = true;
+  const types = new Set();
+  let pc = null;
+  try {
+    pc = new window.RTCPeerConnection({ iceServers: iceServersForProbe() });
+    pc.createDataChannel('ice-probe'); // 只为触发 ICE 收集，不需要真的连通任何人
+    pc.onicecandidate = (e) => {
+      const c = e && e.candidate && e.candidate.candidate;
+      if (!c) return;
+      if (/ typ relay/.test(c)) types.add('relay');
+      else if (/ typ srflx/.test(c)) types.add('srflx');
+      else if (/ typ host/.test(c)) types.add('host');
+    };
+    await pc.setLocalDescription(await pc.createOffer());
+    const deadline = Date.now() + 6000;
+    // 拿到 relay 就提前收工（relay 通常最慢，等满 6 秒没意义）
+    while (Date.now() < deadline && !types.has('relay')) await new Promise((r) => setTimeout(r, 250));
+    const verdict = types.has('relay') ? 'relay' : types.has('srflx') ? 'stun' : types.has('host') ? 'lan' : 'blocked';
+    iceProbe = Object.assign({ verdict, at: Date.now() }, ICE_PROBE_VERDICT[verdict]);
+    log(`📡 ICE 自检：${iceProbe.text}`);
+    if (verdict === 'blocked') {
+      showToast('这条网络可能封了 UDP：同网可以开会；跨网请换网络，或按《部署手册.md》用 Tailscale / 云主机', 'error', 9000);
+    }
+  } catch (err) {
+    iceProbe = Object.assign({ verdict: 'na', at: Date.now() }, ICE_PROBE_VERDICT.na, { text: `自检失败：${err.message}` });
+  } finally {
+    try { if (pc) pc.close(); } catch (e) { /* 忽略 */ }
+    iceProbeRunning = false;
+    renderIceProbe();
+  }
+  return iceProbe;
+}
+
+function initIcePrecheck() {
+  const card = document.querySelector('.prejoin-card');
+  if (!card || document.getElementById('iceProbe')) return;
+  const row = document.createElement('div');
+  row.className = 'ice-probe-row';
+  const btn = document.createElement('button');
+  btn.className = 'btn ghost ice-probe-btn';
+  btn.textContent = '📡 测网络';
+  btn.title = '开一条一次性 ICE 探测（约 6 秒），看这条网络能不能打洞、有没有中继可用';
+  btn.addEventListener('click', () => {
+    iceProbe = null;
+    renderIceProbe();
+    const box = document.getElementById('iceProbe');
+    if (box) { box.className = 'ice-probe run'; box.textContent = '📡 网络自检中…'; }
+    runIceProbe();
+  });
+  const out = document.createElement('div');
+  out.id = 'iceProbe';
+  out.className = 'ice-probe';
+  row.appendChild(btn);
+  row.appendChild(out);
+  card.appendChild(row);
+  // 进预览页自动测一次：先等配置落地（否则用不到服务器下发的 TURN，结论会偏悲观），
+  // 且整段都不阻塞——用户该点「进入会议」照样能点，自检只是给个预告。
+  setTimeout(async () => {
+    try { if (typeof ensureAsrConfig === 'function') await ensureAsrConfig(); } catch (e) { /* 拿不到配置就用默认 STUN */ }
+    runIceProbe();
+  }, 1200);
+}
+
 initAiChips();          // 快捷问法按钮（点一下 = 手打 "@ai …"）
 initBoardActions();     // 看板头的「📝 出纪要」
 initAiVoice();          // ★ 09-25 AI 语音播报开关（默认关，用户可开）
