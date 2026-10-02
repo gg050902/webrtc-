@@ -395,6 +395,44 @@ const VIDEO_STATS = `JSON.stringify((() => {
     `⏱ 延迟读数在小屏仍然看得见、也没被挤出条外（宽 ${capBarMobile.innerW}px）`);
   chk(capBarMobile.textW > 60,
     `加了读数之后**正文还有地方**（实测 ${capBarMobile.textW}px；被挤没就是回归）`);
+
+  /* ★ 2026-10-03 小屏溢出**系统性**扫一遍（不是一次修一个）
+   * ▎动机就是上面那条：字幕条溢出 223px 这件事存在了很久，直到我"把宽度量出来"才现形。
+   *   同一个错误思路在别处大概率也有——所以这次不只修一个元素，而是给**每一排横向控件**
+   *   都设一条"不许溢出可视区"的断言，让以后任何一次加按钮都必须过这道闸。
+   * ▎判据用"元素的 right 是否超过视口"而不是 scrollWidth：前者能定位到具体是哪个控件越界，
+   *   报错时直接把选择器与名字打出来，不用人再去开 DevTools 找。 */
+  console.log('⑫ 断言：390px 会中界面各处横向不越界（控制坞 / 顶栏 / 成员行 / 反应条）…');
+  await A._send(A.pageWs, 'Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
+  await sleep(1200);   // 等媒体查询重排 + 一帧 rAF
+  const overflow = JSON.parse(await A.evaluate(`(() => {
+    const vw = innerWidth;
+    const bad = [];
+    /* 只查"会中真正常驻"的横向排布容器；.hidden 的组件不参与（它们 display:none，
+     * getBoundingClientRect 全是 0，会假报"没溢出"也容易假报，直接跳过最省心） */
+    const groups = ['.controls', '.topbar', '.react-bar', '.side-panel .side-head', '.room-hero'];
+    for (const sel of groups) {
+      document.querySelectorAll(sel).forEach((box) => {
+        if (box.offsetParent === null) return;              // 不可见就跳过
+        for (const c of box.children) {
+          if (c.offsetParent === null) continue;
+          const r = c.getBoundingClientRect();
+          if (r.width > 0 && (r.right > vw + 1 || r.left < -1)) {
+            bad.push({ sel, cls: String(c.className || c.tagName).slice(0, 30), right: Math.round(r.right) });
+          }
+        }
+      });
+    }
+    return JSON.stringify({
+      vw, docOverflow: document.documentElement.scrollWidth - vw, bad: bad.slice(0, 8),
+      docBad: bad.length,
+    });
+  })()`));
+  chk(overflow.docOverflow <= 1,
+    `整页没有横向滚动条（documentElement 超出 ${overflow.docOverflow}px）`);
+  chk(overflow.docBad === 0,
+    `常驻控件没有一个越出 390px 视口${overflow.bad.length ? `（越界样本：${JSON.stringify(overflow.bad)}）` : ''}`);
+  await A._send(A.pageWs, 'Emulation.clearDeviceMetricsOverride', {});
   await shot(A, 0);
 
   console.log(`\n结果：${checks - issues}/${checks} 通过，${issues} 失败（截图目录 ${OUT}）`);
