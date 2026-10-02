@@ -168,6 +168,28 @@ function writeWav(file, samples) {
     skipped('在线 /config.json 自检', '3001 上没有运行中的服务器（先 npm run start:sfu）');
   }
 
+  console.log('\n=== ④b ★ 2026-10-03 分段碎片判据 isFragmentOf（同一句被切两半不该答两次）===');
+  {
+    const norm = (s) => String(s).replace(/[\s，,。.、！!？?；;：:“”"'‘’]/g, '');
+    /* 真实取证数据：test:asr-live 在 qwen-local 下把一句话切成了这三条 */
+    const A = norm('小明，帮我记一下明天下午三点的评审。');
+    const tail = norm('小明。');
+    const B = norm('帮我记一下明天下午三点的评审会。');
+    ok('尾音碎片（只余下唤醒词）由既有"包含"规则处理，本判据不越权（短文本不下结论）',
+      Asr.isFragmentOf(A, tail) === false && A.includes(tail));
+    ok('写法漂移的同一句（三↔3 + 尾字截断）判为碎片 → 字幕不重复入账',
+      Asr.isFragmentOf(A, B) === true);
+    /* 反例三则：判据若太宽，会把"真人接着问的第二句"当成碎片吞掉——那比重复应答更糟 */
+    ok('放过：信息更全的新问句（打招呼之后提出真问题）',
+      Asr.isFragmentOf(norm('小明。'), norm('小明，把今天的纪要生成一下发我')) === false);
+    ok('放过：完全无关的下一句',
+      Asr.isFragmentOf(A, norm('服务器的带宽压测跑过了吗')) === false);
+    ok('放过：太短的文本不下结论（bigram 太少没有统计意义，同坑 53）',
+      Asr.isFragmentOf(A, norm('好')) === false && Asr.isFragmentOf('', A) === false);
+    ok('放过：只有两三个 bigram 的句子不判碎片',
+      Asr.isFragmentOf(norm('今天天气很好'), norm('天气')) === false);
+  }
+
   console.log('\n=== ⑤ 配置模板：example 带注释也要能解析（复制即用）===');
   try {
     const { parseJsonc } = require('../sfu/jsonc');

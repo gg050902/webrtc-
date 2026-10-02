@@ -2450,15 +2450,25 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
         const prev = room.lastAsrUtterance;
         if (n && prev && now - prev.ts < ASR_DUP_MS
           && (n === prev.norm || (prev.norm.length >= 2 && prev.norm.includes(n))
-            || (n.includes(prev.norm) && n.length <= prev.norm.length + 6))) {
+            || (n.includes(prev.norm) && n.length <= prev.norm.length + 6)
+            /* ★ 2026-10-03 第四条：分段边界切出来的**碎片**。上面三条都要求"互相包含"，
+             *   而同一句被切成「…下午三点的评审。」与「…下午3点的评审会。」时，
+             *   三↔3 的写法漂移 + 尾字截断让两者互不包含，于是同一句话进账本两次、
+             *   AI 也应答两次（test:asr-live 在 qwen-local 下实测 3 条字幕 / 3 次应答）。
+             *   判据本身是纯函数 Asr.isFragmentOf（可单测，见 test:asr 的 ④b 组）。
+             *   ▸ 必须**同一个人**才算碎片：两个人先后说同样的话是两件事，
+             *     把后一个人的字幕吞掉就是在改会议记录（prev.from 正是为此而记的）。 */
+            || (prev.from === memberId && Asr.isFragmentOf(prev.norm, n))) ) {
           if (process.env.ASR_DEBUG) console.log(`[asr-dup] ${speakerName} 重复句丢弃：${text.slice(0, 30)}`);
           logEvent('debug', 'asr-dup-dropped', { roomNumber, member: memberId, chars: n.length });
+          bump(COLLAB.throttled, 'dup');
           return;
         }
         const aiAns = room.aiLastAnswer;
         if (n && n.length >= 4 && aiAns && now - aiAns.ts < 45000 && aiAns.norm.includes(n)) {
           if (process.env.ASR_DEBUG) console.log(`[asr-echo] ${speakerName} 收到的是 AI 自己的回声：${text.slice(0, 30)}`);
           logEvent('debug', 'asr-ai-echo-dropped', { roomNumber, member: memberId, chars: n.length });
+          bump(COLLAB.throttled, 'echo');   // ★ 2026-10-03 补齐口径：三类闸（dup/echo/interval）都要能在 /metrics 数出来
           return;
         }
         room.lastAsrUtterance = { norm: n, ts: now, from: memberId };
@@ -6069,6 +6079,10 @@ async function runAsrSelfTest() {
   const execFileP = (bin, args, opts) => new Promise((resolve, reject) => {
     require('child_process').execFile(bin, args, opts, (err, stdout, stderr) => (err ? reject(err) : resolve(stdout)));
   });
+  /* ★ 2026-10-03 自测的清理动作提到 try **外面**：原来只在 PASS 路径末尾删临时目录与字幕文件，
+   *   而 `must()` 一抛就跳过了清理 → **失败一次就下一轮必红**（脏账本被当成"本轮产出的字幕"数进去）。
+   *   测试自己留下的痕迹必须无论成败都收走，否则回归结果依赖"上一次跑没跑干净"。 */
+  let cleanupSelfTest = null;
   try {
     // ① 等 ffmpeg 与 whisper 探测收敛（两个都是启动期异步探测）
     for (let i = 0; !FFMPEG_OK && i < 30; i++) await sleep(100);
@@ -6190,6 +6204,18 @@ async function runAsrSelfTest() {
       fs.writeFileSync(merged, Buffer.concat([head, body]));
     })();
     console.log(`🧪 [TEST_ASR] 测试音频已拼接：说 ${(speechPcm.length / 32000).toFixed(1)}s + 停 6s + 再说 + 停 3s`);
+    /* ★ 2026-10-03 自测隔离（一条"假红"查出来的）：字幕账本按 <房间>-<UTC日期> 一天一个文件、
+     *   append-only，而这条自测固定用房间 999999 —— 于是**上一次跑剩下的条目会被这一次读进去**。
+     *   实测后果：本轮只产出 2 条字幕，断言却数出 4 条（前一次失败运行留下的 2 条也算进来），
+     *   `allAsr.length <= 2` 因此在第二次运行起必然红。收尾的 rmSync 只在 PASS 路径执行，
+     *   失败运行根本不清理 → 越跑越脏。
+     *   ▸ 修法两条，缺一不可：① **开场先清场**（用本次运行自己的文件，与历史彻底断开）；
+     *     ② 读取时再按 `ts >= 本次起点` 过滤 —— 万一有并发写入者（同一分钟另一次运行），
+     *       时间戳过滤仍然成立（同坑 44：按 ts 过滤比按顺序可靠）。 */
+    const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const capFile = path.join(CAPTIONS_DIR, `cap-999999-${day}.jsonl`);
+    const runStartTs = Date.now();
+    try { fs.rmSync(capFile, { force: true }); } catch (e) { /* 本来就没有 */ }
     // ⑥ ffmpeg 把这条音频推进来（payloadType/SSRC 与上面约定一致）
     const sender = require('child_process').spawn(FFMPEG_BIN, [
       '-loglevel', 'error',
@@ -6201,8 +6227,6 @@ async function runAsrSelfTest() {
     sender.stderr.on('data', (d) => console.log(`🧪 [源] ${d.toString().trim()}`));
     await sleep(2000);
     // ⑦ 轮询字幕账本：等 asr:true 且含语义关键词的条目（转写 5s 段 + worker 应在 60s 内出结果）
-    const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const capFile = path.join(CAPTIONS_DIR, `cap-999999-${day}.jsonl`);
     const deadline = Date.now() + 90000;
     let hit = null;
     while (Date.now() < deadline && !hit) {
@@ -6211,7 +6235,7 @@ async function runAsrSelfTest() {
         for (const line of lines) {
           try {
             const e = JSON.parse(line);
-            if (e.asr === true && /小明|评审|三点|三點|下午/.test(e.text || '')) { hit = e; break; }
+            if (e.asr === true && Number(e.ts) >= runStartTs && /小明|评审|三点|三點|下午/.test(e.text || '')) { hit = e; break; }
           } catch (e) { /* 坏行跳过 */ }
         }
       } catch (e) { /* 文件还没出现 */ }
@@ -6235,7 +6259,8 @@ async function runAsrSelfTest() {
       try {
         return fs.readFileSync(capFile, 'utf8').split('\n').filter(Boolean)
           .map((l) => { try { return JSON.parse(l); } catch (e) { return null; } })
-          .filter((e) => e && e.asr === true);
+          /* ★ 2026-10-03 只算**本次运行**写的条目（上一段注释解释了为什么必须加这道过滤） */
+          .filter((e) => e && e.asr === true && Number(e.ts) >= runStartTs);
       } catch (e) { return []; }
     };
     await sleep(12000); // 让流的后半段（6s 静音 + 第二次发声 + 3s 静音）走完转写与成句
@@ -6307,8 +6332,13 @@ async function runAsrSelfTest() {
     producer.close();
     await sleep(500);
     rooms.delete(selfRoom.roomNumber);
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* 忽略 */ }
-    try { fs.rmSync(capFile, { force: true }); } catch (e) { /* 忽略 */ }
+    /* 收尾登记（不是立刻执行）：断言若在它之前抛错，catch 里同样会跑一遍 */
+    cleanupSelfTest = () => {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* 忽略 */ }
+      try { fs.rmSync(capFile, { force: true }); } catch (e) { /* 忽略 */ }
+    };
+    cleanupSelfTest();
+    cleanupSelfTest = null;
     if (!hit) throw new Error('90s 内字幕账本未出现 asr 转写（管线某段断了，看上方聆听/转写日志）');
     console.log(`🧪 [TEST_ASR] PASS —— 转写并入库：「${hit.text}」（说话人 ${hit.name}）`);
     if (!aiReplied) throw new Error('AI 未应答（耳朵听到了但嘴没动：唤醒词→aiBrain→chat-message 断链）');
@@ -6318,6 +6348,7 @@ async function runAsrSelfTest() {
     if (process.env.TEST_ASR_EXIT === '1') { await gracefulShutdown('selftest-end'); return; }
   } catch (err) {
     console.error(`🧪 [TEST_ASR] FAIL —— ${err.message}`);
+    if (cleanupSelfTest) cleanupSelfTest();  // ★ 2026-10-03 失败也要收走自己的痕迹（否则污染下一轮）
     if (process.env.TEST_ASR_EXIT === '1') process.exit(1);
   }
 }

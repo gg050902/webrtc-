@@ -420,6 +420,39 @@ function isFollowUp(windowUntilTs, now = Date.now()) {
   return !!windowUntilTs && now < windowUntilTs;
 }
 
+/* ── 5b. ★ 2026-10-03 「这是上一句的碎片」判据（纯函数，test:asr 逐条断言） ──
+ * ▎要解决的真问题：4s 分段窗口会把**一句人说出口的话**切成两个 wav 分别转写，
+ *   于是同一句话在账本里出现两条、AI 也应答两次（`test:asr-live` 在 qwen-local
+ *   引擎下实测到 3 条字幕 / 3 次应答，用户侧观感就是"它又在重复接话"）。
+ * ▎为什么原来的"归一化包含"判据拦不住：分段边界会带来**写法漂移**——
+ *   「…下午三点的评审。」与「…下午3点的评审会。」既不相等、也不互相包含
+ *   （三↔3 的写法差 + 尾字被截断），而它们确实是同一句。
+ * ▎判据（三个条件同时成立才算碎片，缺一会误杀真人追问）：
+ *   ① **方向性**：算"新句被旧句覆盖的比例"，不是对称相似度。
+ *      反向的例子必须放过：先说「小明」（打招呼）、紧跟着说「小明，把纪要生成一下」——
+ *      后者包含前者，但它是一句**新的、信息更全**的话，绝不能被当成碎片丢掉。
+ *   ② **有新信息就放行**：新句里没被旧句覆盖的 bigram 数量 > 4 就算"说了新东西"。
+ *   ③ **只比长度够的句子**：单字/双字的归一化文本（「小」「嗯」）bigram 太少，
+ *      比例在统计上没有意义，不下结论（同坑 53：样本太小就别拿占比判够不够格）。
+ * ▎窗口与"同一说话人"由调用方把关（见 server 的 finalizeUtterance）：
+ *   两个人先后说同样的话是两件事，不能把后一个人的字幕吞掉。 */
+function bigramSet(s) {
+  const t = String(s || '');
+  const out = new Set();
+  for (let i = 0; i < t.length - 1; i++) out.add(t.slice(i, i + 2));
+  if (!out.size && t.length === 1) out.add(t); // 单字句退化成 unigram，避免空集判不出
+  return out;
+}
+function isFragmentOf(prevNorm, norm) {
+  const a = bigramSet(prevNorm);
+  const b = bigramSet(norm);
+  if (a.size < 3 || b.size < 3) return false;     // ③ 太短不下结论
+  let covered = 0;
+  for (const g of b) if (a.has(g)) covered += 1;
+  const novel = b.size - covered;
+  return covered / b.size >= 0.6 && novel <= 4;   // ① 方向 + ② 新信息门槛
+}
+
 module.exports = {
   probeWhisper,
   transcribeFile,
@@ -430,6 +463,8 @@ module.exports = {
   isFollowUp,
   assertRunner,
   cleanTranscript,   // ★ 2026-10-02 静音幻觉清洗（纯函数，test:asr 逐条断言）
+  isFragmentOf,      // ★ 2026-10-03 分段碎片的"同一句话"判据（方向性 bigram 覆盖）
+  bigramSet,
   measureWavLevel,   // ★ 2026-10-02 段能量闸（转写前先判断有没有出声）
   ASR_PROMPT,
   DEFAULT_MODEL,
