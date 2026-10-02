@@ -2467,18 +2467,21 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
         const text = u.text.slice(0, 500);
         const n = normAsrText(text);
         const now = Date.now();
-        const prev = room.lastAsrUtterance;
-        if (n && prev && now - prev.ts < ASR_DUP_MS
-          && (n === prev.norm || (prev.norm.length >= 2 && prev.norm.includes(n))
-            || (n.includes(prev.norm) && n.length <= prev.norm.length + 6)
-            /* ★ 2026-10-03 第四条：分段边界切出来的**碎片**。上面三条都要求"互相包含"，
-             *   而同一句被切成「…下午三点的评审。」与「…下午3点的评审会。」时，
-             *   三↔3 的写法漂移 + 尾字截断让两者互不包含，于是同一句话进账本两次、
-             *   AI 也应答两次（test:asr-live 在 qwen-local 下实测 3 条字幕 / 3 次应答）。
-             *   判据本身是纯函数 Asr.isFragmentOf（可单测，见 test:asr 的 ④b 组）。
-             *   ▸ 必须**同一个人**才算碎片：两个人先后说同样的话是两件事，
-             *     把后一个人的字幕吞掉就是在改会议记录（prev.from 正是为此而记的）。 */
-            || (prev.from === memberId && Asr.isFragmentOf(prev.norm, n))) ) {
+        /* ★ 2026-10-03 锚点改成**每人一条**（存在成员对象上），不再是"全房间最后一句"。
+         * ▎原实现的缺陷：`room.lastAsrUtterance` 是房间级单槽，于是
+         *   ① 小张说一句、小李插一句、小张的后半句到达时对比的是**小李**那句 → 碎片漏判，
+         *     同一句话在账本里出现两遍（正是本轮要消灭的症状，只是换个触发条件：多人会议）；
+         *   ② 反过来还可能**误吞**：两个人先后说了相似的话，后一个人被当成"碎片"丢弃——
+         *     那是在改会议记录。
+         *   ▸ 存成员对象上而不是另开一个 Map：人走即散（disconnect 已经会清成员），
+         *     不需要额外的清理路径，也不会漏（同坑 20"定时器要清"那类隐患的根治办法是**根本不另立状态**）。
+         *   ▸ "必须同一个人"从此是**结构保证**的，不再依赖 prev.from 比对（坑 47：
+         *     能用结构消除的判据，就不要靠每次记得检查）。 */
+        const sm = [...room.members].find((m) => m && m.id === memberId) || null;
+        const prev = sm ? sm.lastAsrUtterance : null;
+        /* 四条文本判据抽成了纯函数 Asr.isDupOrFragment（test:asr ④b 组逐条断言）。
+         *   原来它是这里的一串内联布尔——**总闸却没人测得到**，正是坑 57 那一类。 */
+        if (n && prev && now - prev.ts < ASR_DUP_MS && Asr.isDupOrFragment(prev.norm, n)) {
           if (process.env.ASR_DEBUG) console.log(`[asr-dup] ${speakerName} 重复句丢弃：${text.slice(0, 30)}`);
           logEvent('debug', 'asr-dup-dropped', { roomNumber, member: memberId, chars: n.length });
           bump(COLLAB.throttled, 'dup');
@@ -2491,7 +2494,7 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
           bump(COLLAB.throttled, 'echo');   // ★ 2026-10-03 补齐口径：三类闸（dup/echo/interval）都要能在 /metrics 数出来
           return;
         }
-        room.lastAsrUtterance = { norm: n, ts: now, from: memberId };
+        if (sm) sm.lastAsrUtterance = { norm: n, ts: now };   // ★ 每人一条，人走即散
         /* ★ 2026-10-03 延迟读数**先算后入库**：把它一并写进字幕账本，
          *   这样早上那份值守日报能直接证明"这一夜的字幕有多快"，
          *   而不是只有一个"当时在 /metrics 里看过"的口头保证。

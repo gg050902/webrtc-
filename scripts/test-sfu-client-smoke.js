@@ -869,9 +869,14 @@ const emit = (ev, payload) => {
    *   这一夜到底快不快就只剩"当时屏幕上瞟过一眼"——**证据必须能过夜**。 */
   ok('字幕定稿把服务器实测的 lat 一起存进本地账本（日报与导出都靠它）',
     vm.runInContext('cap.log[cap.log.length - 1].lat', ctx) === 2000);
+  /* ▸ 这里刻意用**区间**而不是 ===2300：ms = Date.now() - (Date.now()-2300)，
+   *   两次取时之间只要跨过 1ms 就变成 2301 —— 上一版写成精确相等，
+   *   于是一条正确的实现会因为**机器的抖动**偶发判红。
+   *   判据：**凡是由时间推导出来的期望值，断言就必须带容差**（同坑 28 的帧率教训）。 */
+  const vLast = Number(vm.runInContext('aiVoiceLats[aiVoiceLats.length - 1].ms', ctx));
   ok('播报延迟进入滚动窗口（上限 60 条，长跑不涨）',
-    vm.runInContext('aiVoiceLats.length', ctx) >= 1 &&
-    vm.runInContext('aiVoiceLats[aiVoiceLats.length - 1].ms', ctx) === 2300);
+    vm.runInContext('aiVoiceLats.length', ctx) >= 1 && vLast >= 2300 && vLast < 2600,
+    `实测 ${vLast}ms`);
   /* ▎日报这一节的断言刻意**直接调用那个被抽出来的纯函数**：
    *   原来整段拼串写在点击回调里，谁都调不到，于是"日报里到底有没有链路质量"
    *   只能靠人肉点一下看——抽成 buildSentryReport() 才第一次可断言（这也是抽它的理由）。 */

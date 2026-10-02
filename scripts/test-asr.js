@@ -188,6 +188,17 @@ function writeWav(file, samples) {
       Asr.isFragmentOf(A, norm('好')) === false && Asr.isFragmentOf('', A) === false);
     ok('放过：只有两三个 bigram 的句子不判碎片',
       Asr.isFragmentOf(norm('今天天气很好'), norm('天气')) === false);
+    /* 总闸 isDupOrFragment：四条判据合一。这条必须单独测——
+     *   它原来是 server 里一串内联布尔，**刷屏总闸却没人测得到**（坑 57 那一类）。 */
+    ok('总闸①：归一化相等判重复', Asr.isDupOrFragment(A, A) === true);
+    ok('总闸②：尾音碎片（子串）判重复', Asr.isDupOrFragment(A, norm('小明。')) === true);
+    ok('总闸③：只差标点/语气词的子串判重复',
+      Asr.isDupOrFragment(norm('帮我记一下评审会'), norm('帮我记一下评审会。好的')) === true);
+    ok('总闸④：写法漂移的碎片判重复（三↔3 + 尾字截断，互不包含）',
+      Asr.isDupOrFragment(A, B) === true);
+    ok('总闸：无关句子放行', Asr.isDupOrFragment(A, norm('服务器的带宽压测跑过了吗')) === false);
+    ok('总闸：任一边为空不判（空串不能被当成"与上一句重复"）',
+      Asr.isDupOrFragment('', A) === false && Asr.isDupOrFragment(A, '') === false);
   }
 
   console.log('\n=== ⑤ 配置模板：example 带注释也要能解析（复制即用）===');

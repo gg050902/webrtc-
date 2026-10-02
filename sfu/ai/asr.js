@@ -453,6 +453,25 @@ function isFragmentOf(prevNorm, norm) {
   return covered / b.size >= 0.6 && novel <= 4;   // ① 方向 + ② 新信息门槛
 }
 
+/* ★ 2026-10-03 「这两句是不是同一句」的总判据（纯函数，test:asr 逐条断言）。
+ * ▎为什么要抽出来：这四条原本是 server 里一段内联布尔表达式，**谁都测不到它**，
+ *   而它正是"字幕刷屏 / AI 重复接话"的总闸——坑 57 说过：
+ *   凡是"某能力装了就该生效"的地方，都要有一条"它必须成立"的回归。
+ * ▎注意这里**只比文本**："同不同一个人"不该由字符串判据关心——
+ *   server 把锚点存在**成员对象**上（每人一条），跨人误吞在结构上就不可能发生。
+ *   能用结构消除的判据，就不要靠每次记得检查（坑 47）。
+ * ▎四条：① 归一化相等；② 新句是旧句子串（尾音碎片）；
+ *   ③ 旧句是新句子串且新句只多 ≤6 字（差个标点/语气词）；④ 写法漂移的碎片。 */
+function isDupOrFragment(prevNorm, norm) {
+  const a = String(prevNorm || '');
+  const b = String(norm || '');
+  if (!a || !b) return false;
+  return b === a
+    || (a.length >= 2 && a.includes(b))
+    || (b.includes(a) && b.length <= a.length + 6)
+    || isFragmentOf(a, b);
+}
+
 module.exports = {
   probeWhisper,
   transcribeFile,
@@ -464,6 +483,7 @@ module.exports = {
   assertRunner,
   cleanTranscript,   // ★ 2026-10-02 静音幻觉清洗（纯函数，test:asr 逐条断言）
   isFragmentOf,      // ★ 2026-10-03 分段碎片的"同一句话"判据（方向性 bigram 覆盖）
+  isDupOrFragment,   // ★ 2026-10-03 重复句总闸（四条判据合一，server 只调用不内联）
   bigramSet,
   measureWavLevel,   // ★ 2026-10-02 段能量闸（转写前先判断有没有出声）
   ASR_PROMPT,
