@@ -7306,7 +7306,7 @@ function buildSentryReport(all, sentry, voiceLats) {
     lines.push('');
     lines.push('## 链路质量（实测）');
     lines.push(...latLines);
-    if (!spkLats.length) lines.push('- 看到答案→听到开口：本次没有服务端语音播报记录（浏览器朗读几乎即时，不计入）');
+    if (!spkLats.length) lines.push('- 看到答案→听到开口：本次没有朗读记录（AI 语音未开，或一轮都没真的发音）');
   }
   lines.push('');
   lines.push('## 说话人占比');
