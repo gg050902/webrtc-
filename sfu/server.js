@@ -2524,33 +2524,54 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
         } catch (e) { return null; }
       };
 
+      /* ★ 2026-10-03 「转写串行」这一刀（由第 37 步的实测数字指出来，不是猜的）：
+       *   实测 wait 4.0s / trans 1.2s，而 wait 里大头是**上一段还在转写**——
+       *   recordLoop 一路 `await handleSegment(...)`，于是尾巴那句必须等头一句转完才开始，
+       *   一句话的总延迟变成了各段之和而不是最慢那一段。
+       *   ▸ 为什么现在敢并发：`Asr` 侧本来就有全局信号量 ASR_CONCURRENCY（默认 2），
+       *     而这条管线一次只用一路——等于把已经付了的并发能力扔掉了。
+       *   ▸ doneSet 在 handleSegment **入口同步占位**（在任何 await 之前），
+       *     所以同一个段不可能被两次并发转写；这点是先读过代码才动手的（坑 43）。
+       *   ▸ 上限刻意收在 2：再多就会让同一句话的碎片更乱序，而收益边际递减。 */
+      let segInFlight = 0;
+      const inFlightPaths = new Set();  // ★ 正在被转写读的那个文件，清理时绝不能碰
+      const SEG_MAX = Math.max(1, Math.min(2, Number(process.env.ASR_PIPE_CONCURRENCY) || 2));
+      const launchSegment = (full, baseName) => {
+        segInFlight += 1;
+        inFlightPaths.add(full);
+        handleSegment(full, baseName)
+          .catch((e) => { if (process.env.ASR_DEBUG) console.log('[asr-seg-err]', e && e.message); })
+          .finally(() => { segInFlight -= 1; inFlightPaths.delete(full); });
+      };
+
       const recordLoop = async () => {
         await new Promise((r) => setTimeout(r, 300)); // 等首段产生
         while (alive && rooms.get(roomNumber)) {
           // ★ 语句组装：静音间隙超过 UTTERANCE_GAP_MS → 成句（入账本+上字幕+唤醒判定）。
           //   ⚠️ 必须在转写之前查——说完话后不再有新段，放 continue 之后成句就永远不会执行
           //   （实测：账本空、AI 永不应答的假失败根因）。
+          /* ★ 2026-10-03 加 `segInFlight === 0` 守卫：**有转写在途就不许成句**。
+           *   否则会出现"尾巴还在模型里，头半句已经成句并唤醒了"→ 尾巴再成一句、
+           *   再唤醒一次 = 上一轮刚修好的"重复接话"从另一个入口漏回来。
+           *   并发度越高这个窗口越常见，所以这条守卫是本次改动的**前置条件**，不是优化。 */
           try {
             const now = Date.now();
-            for (const [mid, u] of [...utterances]) {
-              if (now - u.lastAt > UTTERANCE_GAP_MS) await finalizeUtterance(mid);
+            if (segInFlight === 0) {
+              for (const [mid, u] of [...utterances]) {
+                if (now - u.lastAt > UTTERANCE_GAP_MS) await finalizeUtterance(mid);
+              }
             }
           } catch (e) { /* 成句失败不拖垮循环 */ }
           /* ══ ★ 2026-10-03 静音抢跑**挪到常规转写之前**（实测延迟从 6.97s 里的 wait=4.2s 来）══
            * ▎原来的顺序是 pick → (没封口段就 continue) → 抢跑。而"刚说完话"这一刻恰恰
            *   **没有新封口的段**（说话的那 4s 窗还在写），于是 continue 直接跳过抢跑代码——
            *   抢跑只在"凑巧有封口段"时才执行，等于每隔一个分段边界才有机会一次（4s 一等）。
-           *   实测拆分正好对上：wait 4.2s（调度在等边界）vs trans 1.2s（模型根本不慢）。
-           *   ▎**瓶颈不是模型，是我们的事件循环把最该抢跑的时刻跳过了。**
            *   改成每轮都先判抢跑，再处理封口段；两者都没活干才睡 300ms。
-           * ▎诚实记录：改完在同一 fixture 上复测，总延迟没有立刻下降（wait 4.0s vs 4.2s）。
-           *   原因是这里的 wait 主要被**上一段还在串行转写**占着（首轮 qwen-local 单段 6.7s），
-           *   不是等分段边界。顺序仍然是对的（原来那条路径在"刚说完话"时根本走不到），
-           *   但它值不回"立刻变快"这个说法——所以把数字写在这儿，别让它变成一条口头优化。
-           *   ▎下一刀的靶子也因此清楚了：**转写串行**（loop 里 await handleSegment），
-           *     不是模型速度；ASR_CONCURRENCY 允许 2 路，而这里一次只用一路。
-           * ▎语义不变的部分：doneSet 占位防双跑、快照 copy 合法截断、ASR_FLUSH=0 逃生舱。 */
-          if (process.env.ASR_FLUSH !== '0' && alive && lastVoiceTs && Date.now() - lastVoiceTs > FLUSH_MS) {
+           * ▎诚实记录（第一次改完）：只调顺序时总延迟没降（wait 4.0s vs 4.2s），
+           *   因为 wait 被"上一段还在串行转写"占着——那正是下面这段并发要解决的。
+           *   ▸ 语义不变的部分：doneSet 占位防双跑、快照 copy 合法截断、ASR_FLUSH=0 逃生舱。 */
+          if (process.env.ASR_FLUSH !== '0' && alive && lastVoiceTs && Date.now() - lastVoiceTs > FLUSH_MS
+            && segInFlight < SEG_MAX) {
             try {
               const all = fs.readdirSync(segDir).filter((f) => f.startsWith('seg-') && f.endsWith('.wav')).sort();
               const newest = all[all.length - 1];
@@ -2562,22 +2583,38 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
                   fs.copyFileSync(full, copy);
                   flushedBase = newest;
                   doneSet.add(newest); // 占位：封口后常规轮询与收尾都会跳过
-                  try { await handleSegment(copy, newest); } catch (e) { /* 抢跑失败走常规路径 */ }
+                  launchSegment(copy, newest);   // ★ 不等它——让下一段并行开始
                 }
               }
             } catch (e) { /* 抢跑失败不影响常规转写 */ }
           }
+          if (segInFlight >= SEG_MAX) { await new Promise((r) => setTimeout(r, 200)); continue; }
           const pick = await pickReadySegment();
           if (!pick) { await new Promise((r) => setTimeout(r, 300)); continue; }
-          try { await handleSegment(pick.full, pick.baseName); } catch (e) { /* 单段失败不拖垮循环 */ }
+          launchSegment(pick.full, pick.baseName);
           // 清理已被跳过/处理完的旧段（Windows 上文件仍被 ffmpeg 写着时删不掉，下轮再试）
+          /* ★ 2026-10-03 并发化必须同时加的那道保护：串行版里 handleSegment 已经跑完
+           *   （文件也被它自己删了）才走到这里；并发版则是"发出去就继续转"，
+           *   于是这个清理会**把正在被模型读取的那个段删掉** → 转写全部拿到空/坏文件 →
+           *   账本 0 条。实测就是 0 条，被"正向对照"那条断言当场判红（坑 65 第三次立功）。
+           *   ▸ 通用判据：**把 await 改成 fire-and-forget 时，要顺着这条链找出所有
+           *     "默认它已经做完"的下游动作**——清理、删除、关文件、发通知都算。 */
           try {
             for (const f of fs.readdirSync(segDir)) {
-              if (doneSet.has(f)) { try { fs.unlinkSync(path.join(segDir, f)); } catch (e) { /* 占用中 */ } }
+              if (!doneSet.has(f)) continue;
+              const p = path.join(segDir, f);
+              if (inFlightPaths.has(p)) continue;      // 还在转写里的段绝不能删
+              try { fs.unlinkSync(p); } catch (e) { /* 占用中 */ }
             }
           } catch (e) { /* 目录清理竞态 */ }
         }
         // 收尾：把最后一段（ffmpeg 已停、不再增长）也转出来——别丢最后半句话
+        /* ★ 2026-10-03 并发化带来的第二步：先**等在途的转写跑完**再收尾。
+         *   不 drain 的话，"最后半句"还在模型里、这里就已经把累积语句成句了 →
+         *   尾巴落进下一条新语句（= 刚修好的"同一句拆两句、AI 答两遍"从退出路径漏回来）。
+         *   最多等 20s（一段转写实测 1~7s），超时就带着已有文本收尾——不能无限等，
+         *   否则一次卡住的推理会把管线的退出挂死。 */
+        for (let i = 0; segInFlight > 0 && i < 100; i++) await new Promise((r) => setTimeout(r, 200));
         try {
           const rest = fs.readdirSync(segDir).filter((f) => f.startsWith('seg-') && f.endsWith('.wav') && !doneSet.has(f)).sort();
           for (const f of rest) {
