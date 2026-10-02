@@ -1364,6 +1364,19 @@ npm run ai:agent       # AI 脚本：手写 ReAct 工具循环（--goal "…" --
 npm run test:record    # D+2 服务器侧录制端到端自测（需已装 ffmpeg；产物落 sfu/recordings/）★ 连跑 3 次 PASS
 npm run test:turn      # ICE 可达性实测（对 config 每个 STUN/TURN 手搓 STUN Binding，3s 超时）
 npm run soak          # C3-N1 服务器耐久自测（默认 7 小时过夜；--minutes 2 压缩自测；结束对账"一条不丢"）
+                      #   ★ 2026-10-03 报告多一行「字幕延迟」（取自服务器 collab.capLat）；
+                      #   没推真音频时如实写"本次未采到"，不判 FAIL（假红也伤人）
+npm run test:watch   # ★ 2026-10-03 watch 的退化诊断回归（纯函数 + 合成输入穷举）★ 32/32
+                      #   判据：控制律/告警逻辑错了不会让任何功能变红，只会天天误报或永远不响
+npm run test:asr     # 服务端 ASR 单测（探测/能量闸/清洗/碎片判据 isFragmentOf/配置模板）★ 36/36
+npm run test:asr-live # ★ 语音闭环端到端（TTS→RTP→真管线→转写→应答），**带正向前置对照**；
+                      #   ★ 2026-10-03 开场清场 + 按 ts 过滤 + 失败也清理（此前会被上一次运行污染）
+                      #   TEST_ASR_WAIT_WARM=1 可等主引擎就位再测；专用端口 3017
+npm run test:e2e-media # ★ 真浏览器多人音视频回归（假摄像头双页进同一房）★ 38/38
+                      #   覆盖：在流画面 videoWidth>0 / 只听不看 / 每路音量 / 3 层 simulcast 降层 /
+                      #   hero 手机形态 / 字幕与播报延迟读数 / 390px 全控件不越界；专用端口 3016
+npm run bench:tts    # ★ 本地 Qwen3-TTS 参数档基准（float32/bf16 × 流式/非流式，量 RTF）
+                      #   结论已回填《性能测试报告.md》5.3：RTF 6.1~7.4，非流式无收益 → 不改加载参数
 npm run bench          # E4 压力基准（4/8/16 路，约 1 分钟，独立 Worker，不用起 3001）
 npm run agent          # ★ 09-24b 启动被控端桌面代理；★ 09-30 两种用法：
                        #   不带 --room = 设备码模式（推荐，启动即打印 6 位设备码，可加
