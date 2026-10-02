@@ -274,6 +274,42 @@ const VIDEO_STATS = `JSON.stringify((() => {
   const wBack = Number(await A.evaluate(VW)) || 0;
   chk(wBack >= wAfter, `交回服务器自动选层后画面没被锁死在低层（videoWidth=${wBack}）`);
 
+  /* ⑩b ★ 2026-10-03 字幕延迟读数在**真浏览器**里的样式与接线
+   * ▎为什么冒烟过了还要再来一遍：冒烟吃的是假 DOM，它验不出 CSS。
+   *   本项目栽过坑 26（注释里出现"星号斜杠"这个序列，把注释提前闭合，
+   *   于是全站 CSS 变量整块被吞）和坑 24（组件自带 display 压过 .hidden）——
+   *   两类缺陷在假 DOM 里都是"绿的"，用户看到的却是"元素根本不出现"或"关不掉"。
+   *   ▸ 顺带一条现场自供：写这段注释时我就又踩了一次坑 26，被 node --check 当场抓住。
+   *     所以这里刻意不提那个序列，改用中文描述——**规则连注释自己都要遵守**。
+   * ▎这里只驱动客户端那一半（renderCapLatency 是纯显示函数），
+   *   不需要真音频——服务器那一半由 test:asr-live 负责（它断言 latMs 真带出来了）。 */
+  console.log('⑩b 断言：字幕延迟读数（真浏览器 CSS 生效 + 不被 .hidden 压住）…');
+  const capLatUi = JSON.parse(await A.evaluate(`(() => {
+    const el = document.getElementById('capLat');
+    if (!el) return JSON.stringify({ noEl: true });
+    const before = { display: getComputedStyle(el).display };
+    const fn = typeof window.renderCapLatency === 'function' ? window.renderCapLatency : null;
+    if (!fn) return JSON.stringify({ fnMissing: true, before });
+    fn(2400, { wait: 1200, trans: 1200 });
+    const cs = getComputedStyle(el);
+    const after = { text: el.textContent, cls: el.className, display: cs.display,
+      color: cs.color, title: String(el.title || '').replace(/\\n/g, ' · ').slice(0, 150) };
+    fn(0);                       // 脏值：应保持上一次的读数
+    return JSON.stringify({ before, after, kept: el.textContent });
+  })()`));
+  chk(!capLatUi.noEl, `页面里存在 #capLat 元素（index.html 新增那一行真的被托管出来了）`);
+  chk(!capLatUi.fnMissing, `client.js 的 renderCapLatency 在全局可见（经典脚本；不存在=接线断了）`);
+  chk(capLatUi.before && capLatUi.before.display === 'none',
+    `初始 hidden 真的生效（display=${capLatUi.before && capLatUi.before.display}；坑 24"关不掉"的哨兵）`);
+  chk(capLatUi.after && capLatUi.after.display !== 'none'
+    && capLatUi.after.text === '⏱ 2.4s' && /cap-lat ok/.test(capLatUi.after.cls),
+    `调用后读数现身：「${capLatUi.after && capLatUi.after.text}」 class=「${capLatUi.after && capLatUi.after.cls}」 display=${capLatUi.after && capLatUi.after.display}`);
+  chk(capLatUi.after && /^rgb\(/.test(capLatUi.after.color || ''),
+    `三色样式真的应用上了（color=${capLatUi.after && capLatUi.after.color}；CSS 变量被吞时这里是初值）`);
+  chk(capLatUi.after && /等待 1\.2s/.test(capLatUi.after.title) && /转写 1\.2s/.test(capLatUi.after.title),
+    `悬浮提示摊开拆分：${capLatUi.after && capLatUi.after.title}`);
+  chk(capLatUi.kept === '⏱ 2.4s', `脏值 latMs=0 不覆盖读数（保持「${capLatUi.kept}」，不编数）`);
+
   /* ⑪ ★ 2026-10-03 首页 hero 的手机形态（390×844）
    * ▎为什么放到这条 e2e 里：hero 是本轮新加的、又是"用户第一眼"，
    *   而它最容易坏的地方恰恰是**小屏放不放得下**——
