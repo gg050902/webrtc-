@@ -1334,6 +1334,15 @@ const emit = (ev, payload) => {
    *   且全文件不再有任何 alert( 调用。 */
   ok('2026-10-02 房间类提示不再用阻塞式 alert（模态框会把重连状态机冻在中间）',
     (clientSrc.match(/\balert\s*\(/g) || []).length === 0);
+  /* ▎为什么把 Mesh 对照版一起测：这是本项目自己写下的纪律（坑 57）——
+   *   "同项目同一个坑只修一半 = 半迁移 = 等于没修"。
+   *   弹窗循环那次只修了 sfu/，根目录 Mesh 版仍是旧行为；
+   *   断言只盯主版本，就会让对照版长期带着同一个 bug 漂移。 */
+  const meshSrc = fs.readFileSync(path.join(__dirname, '..', 'public', 'client.js'), 'utf8');
+  ok('2026-10-03 Mesh 对照版同步：两版都不许有阻塞式 alert（半迁移=没迁移）',
+    (meshSrc.match(/\balert\s*\(/g) || []).length === 0 &&
+    /function giveUpRoom\(why\)/.test(meshSrc) &&
+    /if \(myRoom\) \{[\s\S]{0,300}?giveUpRoom\(/.test(meshSrc));
   ok('2026-10-02 「房间没了」是一次状态迁移（清 myRoom + 回加入页），不是一句提示',
     /function giveUpRoom\(why\)/.test(clientSrc) &&
     /if \(myRoom\) \{[\s\S]{0,300}?giveUpRoom\(/.test(clientSrc) &&
