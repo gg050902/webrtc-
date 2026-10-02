@@ -1625,6 +1625,19 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
 
   /* 字幕条/诊断卡上移避开换行的控制坞（控制坞变两层后大约 88~110px 高） */
   .caption-bar { bottom: 128px; max-width: 94%; padding: 8px 12px; gap: 8px; font-size: 13px; }
+  /* ★ 2026-10-03 手机上字幕条改成"正文独占一行 + 控件落到第二行"。
+   * ▎为什么要改：这一行原本就不换行，而里面塞了 历史 / 状态徽标 / ⏱读数 / 正文 /
+   *   手动输入 / 发送 / 记录 七样，除正文外全是 flex-shrink:0 ——
+   *   真浏览器实测 390px 下 **溢出 223px、正文被挤到 0px**（也就是手机上根本看不到字幕，
+   *   只看到一排按钮）。这个缺陷在本轮之前就在，是本轮新加的那枚 ⏱ 把它量出来的：
+   *   写断言的人以为在测新元素，结果测出的是老问题（这正是自动化断言的价值）。
+   * ▎为什么用 wrap 而不是"小屏藏掉几个按钮"：藏东西是在替用户决定他不要什么，
+   *   而换行只是把同一排控件排成两行——功能一个不少，只是高度多一行。
+   * ▸ order:-1 让正文成为第一行：手机上**字幕本身**才是主角，控件靠后。 */
+  .caption-bar { flex-wrap: wrap; row-gap: 6px; }
+  .caption-bar .caption-text { flex: 1 1 100%; order: -1; min-width: 0; }
+  .caption-bar .cap-status, .caption-bar .cap-lat { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46%; }
+  .cap-manual { min-width: 90px; flex: 1 1 auto; }
   .cap-diag { bottom: 186px; width: 94%; }
   .cap-history { width: 94%; }
 

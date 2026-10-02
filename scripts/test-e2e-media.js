@@ -367,6 +367,34 @@ const VIDEO_STATS = `JSON.stringify((() => {
   chk(heroMobile.typed && heroMobile.typed.y >= 0 && heroMobile.typedText.length > 4,
     `打字机主句可见且在出字（y=${heroMobile.typed && heroMobile.typed.y}，"${String(heroMobile.typedText).slice(0, 10)}…"）`);
   chk(heroMobile.pills && heroMobile.pills.y >= 0, `胶囊 CTA 可见（y=${heroMobile.pills && heroMobile.pills.y}）`);
+
+  /* ★ 2026-10-03 字幕条在 390px 下装得下"新加的那枚读数"吗
+   * ▎为什么专门量这个：字幕条是一行**不换行的 flex**（历史 / 状态徽标 / ⏱读数 / 正文 /
+   *   手动输入 / 发送 / 记录），而本轮往里面塞了一个 flex-shrink:0 的 ⏱ 徽标。
+   *   桌面上多 52px 无所谓，390px 那一行本来就挤——**加一个不可缩的元素就可能把正文挤没**。
+   *   这类"我只加了一个小东西"的回归，只有把宽度量出来才会红。 */
+  const capBarMobile = JSON.parse(await B.evaluate(`(() => {
+    const bar = document.getElementById('captionBar');
+    bar.classList.remove('hidden');
+    document.getElementById('captionText').textContent = '这是手机上看字幕时的一整句话，用来占位测宽度';
+    renderCapLatency(2400, { wait: 1200, trans: 1200 });
+    const lat = document.getElementById('capLat');
+    const txt = document.getElementById('captionText');
+    const br = bar.getBoundingClientRect(), lr = lat.getBoundingClientRect(), tr = txt.getBoundingClientRect();
+    return JSON.stringify({
+      innerW: innerWidth,
+      barOverflow: bar.scrollWidth - bar.clientWidth,
+      latVisible: getComputedStyle(lat).display !== 'none' && lr.width > 0,
+      latInside: lr.right <= br.right + 1 && lr.left >= br.left - 1,
+      textW: Math.round(tr.width),
+    });
+  })()`));
+  chk(capBarMobile.barOverflow <= 1,
+    `手机 390px：字幕条内部没有横向溢出（溢出 ${capBarMobile.barOverflow}px）`);
+  chk(capBarMobile.latVisible && capBarMobile.latInside,
+    `⏱ 延迟读数在小屏仍然看得见、也没被挤出条外（宽 ${capBarMobile.innerW}px）`);
+  chk(capBarMobile.textW > 60,
+    `加了读数之后**正文还有地方**（实测 ${capBarMobile.textW}px；被挤没就是回归）`);
   await shot(A, 0);
 
   console.log(`\n结果：${checks - issues}/${checks} 通过，${issues} 失败（截图目录 ${OUT}）`);
