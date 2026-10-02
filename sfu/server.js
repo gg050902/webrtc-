@@ -79,6 +79,19 @@ function serverAsrEngineLabel() {
   return WHISPER ? 'whisper' : 'none';
 }
 function serverAsrAvailable() { return serverAsrEngineLabel() !== 'none'; }
+/* ★ 2026-10-03 「主引擎现在接得住活吗」——与 serverAsrEngineLabel() 配对的那个**状态**问题。
+ * ▎为什么单独要一个：label 讲的是"配置说用谁"，而本地 worker 冷启动要 ~55s。
+ *   这段时间字幕由 whisper 兜底**是正确行为**，但 watch.js 只看"这一轮是谁转写的"
+ *   就会在每次开机时误报"主引擎退回"。判断退化必须区分两种"在兜底"：
+ *   **主引擎还没起来**（正常，等）与 **主引擎起来了却不用**（真故障，报）。
+ * ▸ qwen（云）没有常驻进程，配了 key 就算就位。 */
+function asrPrimaryReady() {
+  const label = serverAsrEngineLabel();
+  if (label === 'qwen-local') { const w = getQwenLocalAsr(); return !!(w && w.alive); }
+  if (label === 'qwen') return !!QwenAsr.readKey();
+  if (label === 'whisper') return !!getResidentAsr(CONFIG.asrModel || Asr.DEFAULT_MODEL);
+  return false;
+}
 /* ★ 2026-10-01 Qwen3 本地引擎（模型下载到 models/ 后 CPU 推理，免 key 免 GPU）：
  * ▎ASR：asr_qwen_local.js（常驻 worker，同 whisper worker 协议）；
  * ▎TTS：tts_qwen.js（同款常驻协议）——引擎链 = Qwen 本地（活着就优先）→ Edge（探测）
@@ -112,11 +125,32 @@ function getResidentAsr(model) {
  *   喂给 worker 转写一次：模型加载完，之后每段只付纯转写时间。
  * ▎静音 wav 是纯内存拼的 44 字节头 + 零样本——不依赖 ffmpeg，转写结果是空串，
  *   正好走完"加载→推理→返回"全链路，但不产生任何字幕副作用。 */
+/* ★ 2026-10-03 兜底引擎"先预热、主引擎就位后释放"（改掉一条静默失效的优化）。
+ * ▎问题：09-30e 为"第一次识别特别慢"加了 whisper 常驻 worker 开机预热；09-30c 之后
+ *   引擎切成 qwen-local，那次预热被**改成了"跳过"**（理由：两套模型同时驻留白占内存）。
+ *   结果实测被抓：Qwen worker 冷启动要 ~55s，而它没就绪期间 handleSegment 会**现场起**
+ *   whisper——那一趟是带模型加载的（`test:asr-live` 首段 15.0s，第二、三段才回到 2.5s/1.7s）。
+ *   也就是说**开机后第一分钟的每一句字幕都要白等 15s**，而那正是当年要消灭的东西。
+ * ▎新策略：内存与首句延迟不必二选一——**兜底先预热，主引擎就绪后再 kill 掉它**。
+ *   翻倍内存只存在于"两个都在"的重叠窗口（≈Qwen 的加载时间），首句延迟回到 ~2.5s 档。
+ *   ▸ 释放后若 Qwen 又挂了，handleSegment 会重新现场起 whisper（冷一次，属罕见路径）；
+ *   ▸ ASR_PREWARM_WHISPER=1 表示"就是要让兜底常驻"（排障/对比数据），此时不释放。 */
+let fallbackAsrReleased = false;
+function releaseFallbackAsr() {
+  if (process.env.ASR_PREWARM_WHISPER === '1') return;
+  fallbackAsrReleased = true;
+  if (!asrWorker || asrWorker.dead) return;
+  try { asrWorker.kill(); } catch (e) { /* 已经退了就不用管 */ }
+  asrWorker = null; // 置空 = 下次真需要时按需重建（而不是复用一个已死的单例）
+  console.log('🧹 主引擎已就位 → 释放 whisper 兜底 worker 的模型内存（Qwen 不可用时仍会自动重起）');
+}
+
 async function prewarmAsrWorker() {
   try {
     // ★ 先等 whisper 探测收敛（启动回调时探测还是异步进行中——早检查会静默空跑，已实测踩中）
     for (let i = 0; !WHISPER && i < 100; i++) await new Promise((r) => setTimeout(r, 100));
     if (!WHISPER || process.env.ASR_WORKER === '0') return;
+    if (fallbackAsrReleased) return; // 主引擎已经就位，这趟预热不必再跑（省一次模型加载）
     const w = getResidentAsr(CONFIG.asrModel || Asr.DEFAULT_MODEL);
     if (!w) return;
     const os = require('os');
@@ -932,12 +966,14 @@ async function snapshotRooms() {
      *   两边读的是**同一个 COLLAB 对象**——不另算一份，免得两个地方说法不同（坑 47）。 */
     collab: {
       asrEngine: serverAsrEngineLabel(),
+      asrReady: asrPrimaryReady(),   // ★ 2026-10-03 主引擎此刻是否接得住活（预热期=false，别把正确行为当故障）
       asr: COLLAB.asr,
       answers: COLLAB.answers,
       throttled: COLLAB.throttled,
       roomControl: COLLAB.roomControl,
       roomApplied: COLLAB.roomApplied,
       board: COLLAB.board,
+      capLat: COLLAB.capLat,   // ★ 2026-10-03 字幕延迟：{n, sum, max, last}（面板与 /metrics 同源，不另算一份）
     },
     rooms: list,
   };
@@ -961,11 +997,26 @@ const COLLAB = {
   roomControl: {},    // action -> n（服务器发出的房间动作）
   roomApplied: {},    // action -> n（客户端回执"我真的执行了"）—— 与上面的差 = 说了没做
   board: { stroke: 0, undo: 0, clear: 0, rejected: 0 },
+  /* ★ 2026-10-03 字幕端到端延迟（"说完"→"定稿字幕广播出去"）。
+   *   ▎为什么要量这一条而不是只量转写耗时：用户抱怨的"字幕很慢"其实包含三段
+   *     ——静音判定的等待、模型转写、以及分段窗口本身的长度；而 `sfu_ai_asr_seconds_total`
+   *     只覆盖中间那一段。只看转写会得出"2s 不算慢啊"的错误结论，
+   *     因为真正决定体感的是**从人停止发声到字幕出现**的总长（同坑 58：先量对指标）。
+   *   ▎口径：lastVoiceTs 是"最后一个判定为有声的 RMS 窗到达时刻"，
+   *     窗口本身 0.5s（astats reset=8000 @16kHz），所以这个起点天然偏晚 ≤0.5s，
+   *     量出来的延迟是**下限**——宁可保守，也不要在界面上虚报"比实际更快"。 */
+  capLat: { n: 0, sum: 0, max: 0, last: 0 },
 };
 function bump(obj, key) { obj[key] = (obj[key] || 0) + 1; }
 function bumpAsr(via, ms) {
   const s = COLLAB.asr[via] || (COLLAB.asr[via] = { n: 0, sec: 0 });
   s.n += 1; s.sec += (ms || 0) / 1000;
+}
+function bumpCapLat(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return;   // 0/NaN = 这一句没有可靠的有声起点，不污染统计
+  const c = COLLAB.capLat;
+  c.n += 1; c.sum += ms; c.last = Math.round(ms);
+  if (ms > c.max) c.max = Math.round(ms);
 }
 
 const PROCESS_START = Date.now();
@@ -1010,6 +1061,10 @@ function buildMetrics(snap) {
   L.push(`sfu_ai_tts_enabled ${aiTtsState.enabled ? 1 : 0}`);
   help('sfu_ai_asr_engine_qwen', 'gauge', '1 when the Qwen3-ASR (DashScope) engine is active for new transcriptions');
   L.push(`sfu_ai_asr_engine_qwen ${(asrEngineMode() !== 'whisper' && QwenAsr.readKey()) ? 1 : 0}`);
+  /* ★ 2026-10-03 主引擎是否已就位：让"兜底在干活"这条告警能分清"还没起来"与"起来却不用"。
+   *   少了这一行，watch 只能在开机预热期误报（误报的代价是以后没人看告警）。 */
+  help('sfu_ai_asr_primary_ready', 'gauge', '1 when the configured primary ASR engine can take work now (local worker loaded / cloud key present)');
+  L.push(`sfu_ai_asr_primary_ready ${asrPrimaryReady() ? 1 : 0}`);
   /* ★ 2026-10-03 语音链路与协作动作的累计计数（口径见上面 COLLAB 的注释） */
   help('sfu_ai_asr_segments_total', 'counter', 'Transcribed audio segments, by engine that actually did it');
   for (const [via, s] of Object.entries(COLLAB.asr)) {
@@ -1019,6 +1074,18 @@ function buildMetrics(snap) {
   for (const [via, s] of Object.entries(COLLAB.asr)) {
     L.push(`sfu_ai_asr_seconds_total{engine="${via}"} ${s.sec.toFixed(1)}`);
   }
+  /* ★ 2026-10-03 字幕端到端延迟（说完→定稿字幕）。三个数各有分工：
+   *   avg 看整体体感、max 看最坏一句话（"是不是偶尔卡很久"）、last 让 watch.js
+   *   能在**不重启**的前提下发现"延迟刚刚变差了"。
+   *   ▎为什么不用 histogram bucket：零依赖手拼 Prometheus，直方图要 5 条线还得配
+   *   分位函数；三个 gauge 已足够回答"要不要继续降延迟"这一个决策问题。 */
+  const cl = COLLAB.capLat;
+  help('sfu_ai_asr_caption_count_total', 'counter', 'Finalized captions that carry a measurable end-of-speech latency');
+  L.push(`sfu_ai_asr_caption_count_total ${cl.n}`);
+  help('sfu_ai_asr_caption_latency_ms', 'gauge', 'End-of-speech -> caption latency in ms (avg / max / last)');
+  L.push(`sfu_ai_asr_caption_latency_ms{kind="avg"} ${cl.n ? Math.round(cl.sum / cl.n) : 0}`);
+  L.push(`sfu_ai_asr_caption_latency_ms{kind="max"} ${cl.max}`);
+  L.push(`sfu_ai_asr_caption_latency_ms{kind="last"} ${cl.last}`);
   help('sfu_ai_answers_total', 'counter', 'How many times the AI assistant actually replied');
   L.push(`sfu_ai_answers_total ${COLLAB.answers}`);
   help('sfu_ai_answer_throttled_total', 'counter', 'Replies suppressed by a gate (dup/echo/inflight/interval)');
@@ -2335,11 +2402,24 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
          *   被能量闸/清洗挡掉的段不计——否则"退化到 CLI"会被一堆被丢弃的静音段
          *   在指标里伪装成"引擎很忙"，那正是我们要能一眼看出的事。 */
         bumpAsr(via, Date.now() - t0);
-        console.log(`🤖 [ASR/${via}] ${speakerName}（转写 ${((Date.now() - t0) / 1000).toFixed(1)}s）：${text.slice(0, 50)}`);
+        const transMs = Date.now() - t0;
+        console.log(`🤖 [ASR/${via}] ${speakerName}（转写 ${(transMs / 1000).toFixed(1)}s）：${text.slice(0, 50)}`);
         // 累积进当前语句 + 字幕条显示"累积中的句子"（interim：不进历史、不触发唤醒）
         const u = utterances.get(memberId) || { text: '', lastAt: 0 };
         u.text = `${u.text} ${text}`.trim().slice(0, 800);
         u.lastAt = Date.now();
+        /* ★ 2026-10-03 把延迟**拆开**记账：光有一个总秒数没法指导优化——
+         *   "4s 才出字幕"到底是模型慢，还是我们的静音判定/分段窗口在等？
+         *   两者的处方完全相反（前者换引擎/降模型，后者调 asrSegmentSec 与 FLUSH_MS）。
+         *   ▸ waitMs = 说完 → 这次转写**开始**之间的空档（静音判定 + 轮询/快照调度）；
+         *   ▸ transMs = 这段音频真正喂给模型的时间。
+         *   ▸ 只记末段：一句话可能跨多个分段，而"说完"发生在最后一段——
+         *     用末段的拆分去解释总延迟才成立（用首段会把等待算成不存在的量）。
+         *   ▸ 后到的段覆盖前一段的记录，所以 u.stage 始终是"最后一段"的账。 */
+        u.stage = {
+          wait: lastVoiceTs && t0 >= lastVoiceTs ? t0 - lastVoiceTs : 0,
+          trans: transMs,
+        };
         utterances.set(memberId, u);
         io.to(roomNumber).emit('asr-caption', { name: speakerName, text: u.text.slice(0, 200), interim: true });
         logEvent('info', 'asr-segment', { roomNumber, member: memberId, chars: text.length });
@@ -2385,7 +2465,18 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
         ingestCaptions(roomNumber, [{
           ts: now, from: memberId, name: speakerName, text, asr: true,
         }]);
-        io.to(roomNumber).emit('asr-caption', { name: speakerName, text: text.slice(0, 200) });
+        /* ★ 2026-10-03 带出"说完→上字幕"的实测延迟（口径见 COLLAB.capLat 注释）。
+         *   上限 120s：lastVoiceTs 只在 RMS 高于阈值时刷新，若某段音频之后人就再没出声，
+         *   陈旧时间戳会把延迟虚报成几分钟——那种值对"要不要再降延迟"毫无参考价值，
+         *   宁可报 0（前端不显示）。 */
+        const latMs = lastVoiceTs && now > lastVoiceTs && now - lastVoiceTs < 120000
+          ? now - lastVoiceTs : 0;
+        bumpCapLat(latMs);
+        io.to(roomNumber).emit('asr-caption', {
+          name: speakerName, text: text.slice(0, 200), latMs,
+          /* 拆分（末段口径）：界面悬浮提示与 /metrics 都靠它回答"慢在哪一段" */
+          stage: u.stage || null,
+        });
         await asrWakeAndAnswer(roomNumber, memberId, text, speakerName);
       };
 
@@ -5822,17 +5913,14 @@ io.on('connection', (socket) => {
           return;
         }
         console.log('🔥 Qwen3-ASR 本地 worker 已预热（语音片段将用 qwen-local 转写）');
+        releaseFallbackAsr(); // ★ 2026-10-03 主引擎上线，兜底那套模型就该让位（见 releaseFallbackAsr 注释）
       }).catch(() => {});
     }
-    /* ★ 2026-10-02 引擎分工：qwen-local 显式启用时**不再预热 whisper 常驻 worker**——
-     *   两套模型同时驻留 = 白占 1.5G 内存 + 抢 CPU（"延迟很大"的隐性来源之一）。
-     *   ▸ 这不是砍兜底：Qwen worker 挂了/没就绪时，handleSegment 仍会现场起 whisper（冷启动一次）。
-     *   ▸ ASR_PREWARM_WHISPER=1 可强制双预热（排障时想看 whisper 对比数据就用它）。 */
-    if (asrEngineMode() === 'qwen-local' && process.env.QWEN_ASR_MODEL && process.env.ASR_PREWARM_WHISPER !== '1') {
-      console.log('🎙 引擎=qwen-local：跳过 whisper 预热（省内存；Qwen 不可用时仍自动回落）');
-    } else {
-      prewarmAsrWorker(); // ★ 09-30e：常驻 ASR worker 开机预热（第一句语音不再等 13s 模型加载）
-    }
+    /* ★ 2026-10-03 改回"无论主引擎是谁都预热 whisper"，并让它在主引擎就绪后自动释放。
+     *   原先这里在 qwen-local 下直接跳过预热，省下的是常驻内存、付出的是**开机第一分钟
+     *   每句字幕多等 15s**（实测：首段 15.0s / 后续 2.5s）——那笔账当年算反了。
+     *   ▸ ASR_PREWARM_WHISPER=1 = 强制让兜底常驻（排障、跑对比数据时用）。 */
+    prewarmAsrWorker(); // ★ 09-30e 开机预热 + ★ 2026-10-03 首句不再等模型加载
     setInterval(() => Tts.sweepAudio(), 60000).unref(); // 过期 MP3 清扫（30 分钟寿命）
     if (httpsServer) {
       httpsServer.listen(tlsCfg.port || 3443, () => {
@@ -6048,6 +6136,11 @@ async function runAsrSelfTest() {
     const ttsFails = [];
     probe.on('ai-audio', (a) => aiAudios.push({ at: Date.now(), seq: a && a.seq, total: a && a.total, url: String((a && a.url) || '').slice(0, 24) }));
     probe.on('ai-tts-fail', () => ttsFails.push(Date.now()));
+    /* ★ 2026-10-03 字幕延迟读数也要有端到端证据：界面上那个"⏱ X.Xs"来自 asr-caption 的
+     *   latMs 字段，而"字段有没有真的带上"这件事，冒烟只能验客户端、信令验不到管线
+     *   ——只有这条自测跑的是真转写路径。断言写在下面 PASS 之前（坑 56 的指标版）。 */
+    const captions = [];
+    probe.on('asr-caption', (c) => captions.push({ at: Date.now(), latMs: c && c.latMs, interim: !!(c && c.interim), text: String((c && c.text) || '').slice(0, 30) }));
     await new Promise((resolve, reject) => {
       probe.on('connect', resolve);
       probe.on('connect_error', () => reject(new Error('自测客户端连接失败')));
@@ -6181,6 +6274,21 @@ async function runAsrSelfTest() {
       || !botReplies.some((m) => m.tts === 'server'),
       `AI 声明了服务端语音（tts:'server'）却既没发 ai-audio 也没发 ai-tts-fail —— 前端会两头都不出声`);
     const answerAt = botReplies.length ? (botReplies[0].ts || 0) : 0;
+    /* ★ 2026-10-03 字幕延迟读数的端到端证据：定稿那条 asr-caption 必须带上可信的 latMs。
+     *   ▎为什么在这里验而不是在信令回归里验：信令测试跑不到真转写管线，冒烟测试跑不到服务器
+     *     ——"字段有没有真的算出来并带上"这条接线只有自测能证（坑 56 的指标版）。
+     *   ▎判"可信"用物理区间 [0.3s, 30s] 而不是具体秒数：下界是"RMS 窗 0.5s + 静音判定 1.2s"
+     *     之下必然算错了起点，上界是"这条链路显然坏了"；把实测秒数写死进回归，
+     *     换模型/换机器就必然红——那是测环境，不是测代码。 */
+    const finals = captions.filter((c) => !c.interim);
+    must(finals.length >= 1,
+      `账本里有 ${allAsr.length} 条字幕，客户端却没收到任何定稿 asr-caption —— 字幕广播断在管线之后`);
+    const withLat = finals.filter((c) => Number.isFinite(c.latMs) && c.latMs >= 300 && c.latMs <= 30000);
+    must(withLat.length >= 1,
+      `定稿字幕都没带上可信的 latMs（拿到 ${JSON.stringify(finals.map((c) => c.latMs))}）` +
+      ' —— 界面那个「⏱ X.Xs」延迟读数会永远空着，而没有任何一处会报错');
+    console.log(`🧪 [TEST_ASR] 字幕延迟实测：定稿 ${finals.length} 条 · 说完→上字幕 `
+      + withLat.map((c) => `${(c.latMs / 1000).toFixed(1)}s`).join(' / '));
     console.log(`🧪 [TEST_ASR] 语音交付：音频 ${aiAudios.length} 段 / 失败通知 ${ttsFails.length} 次` +
       (aiAudios.length
         ? `（分段数=${aiAudios[0].total}，答案上屏→听到首段 ${((aiAudios[0].at - answerAt) / 1000).toFixed(1)}s` +

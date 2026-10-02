@@ -1298,6 +1298,28 @@ input, select, textarea { accent-color: var(--accent-emphasis); }
 .cap-status.live { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
 .cap-status.bad  { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
 
+/* ★ 2026-10-03 字幕延迟读数（.cap-lat）：服务器实测「说完 → 字幕上屏」的秒数。
+ * ▎为什么要单做一个元素而不是塞进 .cap-status 的文案：状态徽标讲的是"耳朵在不在工作"
+ *   （布尔语义），延迟讲的是"耳朵有多快"（数值语义）——两者挤在一行里，
+ *   数字一变长文案就抖动，而且三色含义会互相污染。分开之后各自只表达一件事。
+ * ▎配色沿用"三色即三档判断"的项目惯例（同 .net-0/1/2）：正常/偏慢/很差一眼分清，
+ *   不需要读数字。三色阈值与 client.js 的 renderCapLatency 里那两处 3000/6000 同源。 */
+.cap-lat {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;   /* 数字等宽：延迟读数跳动时宽度不抖 */
+  padding: 3px 9px;
+  border-radius: 999px;
+  color: var(--fg-muted);
+  background: color-mix(in srgb, var(--bg2) 70%, transparent);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+  transition: color .15s, border-color .15s;
+}
+.cap-lat.ok   { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 38%, transparent); }
+.cap-lat.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+.cap-lat.bad  { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+
 .cap-manual {
   flex: 1;
   min-width: 120px;

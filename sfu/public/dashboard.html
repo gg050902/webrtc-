@@ -185,6 +185,15 @@ function render(data) {
     ? 'color:#d3b877' : 'color:#9ecf7a';
   const throttled = Object.values(cb.throttled || {}).reduce((a, n) => a + n, 0);
   const boardRejected = (cb.board && cb.board.rejected) || 0;
+  /* ★ 2026-10-03 字幕端到端延迟（说完→字幕定稿）。
+   * ▎为什么单列一格而不并进"转写引擎"那格：引擎那格讲的是"谁在转写、单次多久"，
+   *   而体感延迟 = 静音判定等待 + 分段窗口 + 转写，**转写只占其中一段**（这正是
+   *   本轮的教训：量错指标就会得出"2s 不慢啊"的错误结论）。两个语义必须两格。
+   * ▸ avg 用 sum ÷ n 现算，服务器只存原始量，不在两处各算一份口径（同 COLLAB 注释）。 */
+  const cl = cb.capLat || {};
+  const capAvg = cl.n ? (cl.sum / cl.n / 1000).toFixed(1) : '--';
+  const capColor = !cl.n ? 'color:#8a8070' : (cl.sum / cl.n <= 3000 ? 'color:#9ecf7a'
+    : (cl.sum / cl.n <= 6000 ? 'color:#d3b877' : 'color:#e0636f'));
   document.getElementById('overview').innerHTML = `
     <div class="stat"><div class="num">${data.rooms.length}</div><div class="lbl">房间数</div></div>
     <div class="stat"><div class="num">${totalMembers}</div><div class="lbl">参会人数</div></div>
@@ -193,6 +202,7 @@ function render(data) {
     <div class="stat"><div class="num">${data.worker.pid ?? '--'}</div><div class="lbl">mediasoup Worker PID</div></div>
     <div class="stat"><div class="num" style="${data.recordingCount ? '' : 'color:#8a8070'}">⏺ ${data.recordingCount}</div><div class="lbl">服务器录制中（D+2）</div></div>
     <div class="stat"><div class="num" style="font-size:20px">${cb.asrEngine || '--'}</div><div class="lbl">转写引擎 · ${asrTxt} <span style="${asrColor}">●</span></div></div>
+    <div class="stat"><div class="num" style="${capColor}">${capAvg}s</div><div class="lbl">说完→上字幕（均值 · 最慢 ${(cl.max / 1000 || 0).toFixed(1)}s · ${cl.n || 0} 句）</div></div>
     <div class="stat"><div class="num">${cb.answers || 0}<span style="font-size:14px;color:#8a8070"> / 拦 ${throttled}</span></div><div class="lbl">AI 应答次数（被闸拦下）</div></div>
     <div class="stat"><div class="num">${Object.values(cb.roomControl || {}).reduce((a, n) => a + n, 0)}</div><div class="lbl">房间动作（AI 操作实体）</div></div>
     <div class="stat"><div class="num" style="${boardRejected ? 'color:#e0636f' : ''}">${(cb.board && cb.board.stroke) || 0}<span style="font-size:14px;color:#8a8070"> / 拒 ${boardRejected}</span></div><div class="lbl">白板归档笔数（被拒）</div></div>`;

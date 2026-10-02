@@ -230,6 +230,11 @@ const capStatus = $('capStatus');
 const capDiagBox = $('capDiagBox');
 const capDiagList = $('capDiagList');
 const capDiagCloseBtn = $('capDiagCloseBtn');
+/* ★ 2026-10-03 字幕延迟读数（第 37 步）：服务器实测"说完→字幕定稿"的秒数显示在这里。
+ *   ▎为什么要把它做进界面：延迟这件事**看不见就不可能降**——之前每次问"字幕慢不慢"，
+ *   我只能凭分段秒数和模型耗时的算术给一个估算，而估算永远不会告诉我"今天变慢了"。
+ *   现在每次定稿都带一个真数字，界面、/metrics、watch.js 三处吃同一个来源。 */
+const capLat = $('capLat');
 
 /* ★ G4 移动端/PWA（第 32 步，2026-09-23）新增元素
  *   sideBtn   = 顶栏"成员/聊天"抽屉开关（≤980px 才显示，桌面侧栏常驻）
@@ -1477,7 +1482,7 @@ roomBadge.addEventListener('click', async () => {
  *   这是工程上常见的"双发去重"做法（面试讲点：at-least-once + 幂等接收）。
  * ────────────────────────────────────────────────────────────── */
 socket.on('ai-state', ({ state, text }) => setAiState(state, text)); // ★ 09-26b：text 供逐字字幕
-socket.on('asr-caption', ({ name, text, interim } = {}) => {
+socket.on('asr-caption', ({ name, text, interim, latMs, stage } = {}) => {
   /* ★ 09-27c：服务端 ASR 转写上字幕条（实时字幕体验统一；不刷聊天区）
    * ★ 09-28：三处强化——
    *   ① 只在"字幕开着"时显示（用户关掉字幕就不打扰；服务端仍在转写、仍在喂 AI）；
@@ -1491,6 +1496,7 @@ socket.on('asr-caption', ({ name, text, interim } = {}) => {
   if (!interim) {
     capPushLog(entry);
     if (capHistoryPanel && !capHistoryPanel.classList.contains('hidden')) appendCapHistoryRow(entry);
+    renderCapLatency(latMs, stage); // ★ 2026-10-03 定稿才带延迟读数（半句的"延迟"没有意义）
   }
   bumpBotHeard();
   /* ★ 09-30 抢话修复③：真人在说话 → 记时间戳 + AI 立即闭嘴。
@@ -6325,6 +6331,39 @@ function renderCapStatus(text, level = '') {
   if (!capStatus) return;
   capStatus.textContent = text;
   capStatus.className = `cap-status ${level}`;
+}
+/* ★ 2026-10-03 第 37 步：字幕延迟读数。
+ * ▎数据来源是服务器（它才知道"这个人最后一次有声"是几点），本函数只负责显示与
+ *   本地滚动统计——**不在浏览器重算延迟**，否则两处口径不同，界面上就会出现
+ *   "徽标 2s、面板 4s" 这种自相矛盾（本项目为这类"一个概念两个来源"栽过很多次）。
+ * ▎窗口只留最近 8 句：长跑几小时的会议里，早期网络状况不该拉平现在的读数。
+ * @param latMs 说完→字幕定稿的总延迟（0/缺 = 服务器判为不可靠，不显示）
+ * @param stage {wait, trans} 末段拆分：等待=静音判定+调度，转写=模型耗时。
+ *              这一拆才是可操作信息——"慢在等待"要调 asrSegmentSec/FLUSH_MS，
+ *              "慢在转写"要换引擎或模型，只看总数两种情况长得一模一样。 */
+const capLatWindow = [];
+function renderCapLatency(latMs, stage) {
+  if (!capLat) return;
+  const ms = Number(latMs);
+  if (!Number.isFinite(ms) || ms <= 0 || ms > 120000) return; // 服务器判为不可靠 → 保持上一次读数，不编数
+  capLatWindow.push({ ms, wait: Number(stage && stage.wait) || 0, trans: Number(stage && stage.trans) || 0 });
+  if (capLatWindow.length > 8) capLatWindow.shift();
+  const sec = (ms / 1000).toFixed(1);
+  const avg = capLatWindow.reduce((a, b) => a + b.ms, 0) / capLatWindow.length;
+  const avgWait = capLatWindow.reduce((a, b) => a + b.wait, 0) / capLatWindow.length;
+  const avgTrans = capLatWindow.reduce((a, b) => a + b.trans, 0) / capLatWindow.length;
+  const slow = Math.max(...capLatWindow.map((x) => x.ms));
+  capLat.textContent = `⏱ ${sec}s`;
+  /* 三色：≤3s 正常（分段窗口+静音判定+转写的物理下限附近）/ ≤6s 偏慢 / 更慢就醒目提示。
+   * ▸ 用覆盖式 className 赋值：一条语句同时"去掉 hidden（让读数现身）+ 上三色类"，
+   *   不用 classList.toggle 的返回值（坑 35：假 DOM 的 toggle 不返回布尔，两端语义会反）。 */
+  capLat.className = 'cap-lat' + (ms <= 3000 ? ' ok' : ms <= 6000 ? ' warn' : ' bad');
+  const f = (v) => (v / 1000).toFixed(1);
+  capLat.title = `说完一句话 → 字幕定稿上屏：本句 ${sec}s`
+    + (stage ? `（末段拆分：等待 ${f(stage.wait)}s + 转写 ${f(stage.trans)}s）` : '')
+    + `\n最近 ${capLatWindow.length} 句：均值 ${f(avg)}s、最慢 ${f(slow)}s`
+    + `\n均值里 等待 ${f(avgWait)}s / 转写 ${f(avgTrans)}s —— 等待长就调分段与静音判定，转写长就换引擎`
+    + '\n（服务器实测，不含浏览器渲染）';
 }
 function renderCapDiag() {
   if (!capDiagList) return;

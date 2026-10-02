@@ -802,6 +802,41 @@ const emit = (ev, payload) => {
     vm.runInContext('cap.log[cap.log.length - 1].text', ctx) === '服务器转写的一句话' &&
     vm.runInContext('cap.log[cap.log.length - 1].asr', ctx) === true);
   ok('服务端字幕：不回传 SCTP（服务器已落盘，避免重复入库）', rec.sctpSends.length === sctpBeforeAsr);
+
+  /* ---- ★ 2026-10-03 第 37 步：字幕延迟读数（"说完→上字幕"实测显示） ----
+   * ▎断言重点不是"数字对不对"（那是服务器的事），而是**客户端绝不编数**：
+   *   没有 latMs、脏 latMs、半句 interim 三种情况下读数必须保持不动。
+   *   一个会自己瞎填的读数比没有读数更糟——它会让人据此判断"延迟还可以"。 */
+  const capLatEl = documentStub.getElementById('capLat');
+  ok('延迟读数：服务器没带 latMs 时不编数（元素文案仍未被写过）', !String(capLatEl.textContent).includes('⏱'));
+  guard('延迟读数：定稿带 2400ms', () => emit('asr-caption', { name: '小张', text: '第二句', latMs: 2400 }));
+  ok('延迟读数：定稿带 latMs → 显示 ⏱ 2.4s 且上三色（≤3s 为 ok）',
+    capLatEl.textContent === '⏱ 2.4s' && /\bcap-lat ok\b/.test(capLatEl.className));
+  guard('延迟读数：半句 interim 也带 latMs', () => emit('asr-caption', { name: '小张', text: '半句', interim: true, latMs: 500 }));
+  ok('延迟读数：半句(interim)不刷新——只有定稿才是"说完"', capLatEl.textContent === '⏱ 2.4s');
+  guard('延迟读数：偏慢 4500ms', () => emit('asr-caption', { name: '小张', text: '第三句', latMs: 4500 }));
+  ok('延迟读数：3~6s 判 warn（偏慢要看得见）', /\bcap-lat warn\b/.test(capLatEl.className));
+  guard('延迟读数：很差 9000ms', () => emit('asr-caption', { name: '小张', text: '第四句', latMs: 9000 }));
+  ok('延迟读数：>6s 判 bad（胭脂红，与项目三色惯例一致）', /\bcap-lat bad\b/.test(capLatEl.className));
+  const capLatBeforeDirty = capLatEl.textContent;
+  guard('延迟读数：脏值 0 / 非数字 / 超 120s', () => {
+    emit('asr-caption', { name: '小张', text: '第五句', latMs: 0 });
+    emit('asr-caption', { name: '小张', text: '第六句', latMs: 'abc' });
+    emit('asr-caption', { name: '小张', text: '第七句', latMs: 999999 });
+  });
+  ok('延迟读数：三种脏值一律不刷新（服务器判为不可靠就不显示，别拿假数字糊弄人）',
+    capLatEl.textContent === capLatBeforeDirty);
+  ok('延迟读数：悬浮提示给出均值与最慢值（本地窗口只用于显示，权威统计在 /metrics）',
+    capLatEl.title.includes('均值') && capLatEl.title.includes('最慢'));
+  /* ★ 拆分读数：只有总数就没法指导优化——"4s"到底是模型慢还是在等静音，处方完全相反。 */
+  guard('延迟拆分：带 stage 的定稿', () => emit('asr-caption', {
+    name: '小张', text: '第八句', latMs: 4200, stage: { wait: 1500, trans: 2700 },
+  }));
+  ok('延迟拆分：悬浮提示摊开"等待 + 转写"两段（慢在哪一段要能一眼看出）',
+    capLatEl.title.includes('等待 1.5s') && capLatEl.title.includes('转写 2.7s'));
+  guard('延迟拆分：老服务器不带 stage', () => emit('asr-caption', { name: '小张', text: '第九句', latMs: 2000 }));
+  ok('延迟拆分：没有 stage 时不编拆分（只显示总数，功能不降级也不虚报）',
+    capLatEl.textContent === '⏱ 2.0s' && !capLatEl.title.includes('末段拆分'));
   ok('服务端字幕：单独记账 serverTotal', vm.runInContext('cap.sentry.serverTotal', ctx) >= 1);
   guard('服务端字幕：点关开关', () => capBtnEl.dispatch('click'));
   ok('服务端字幕：关掉只隐藏显示（提示服务器仍在转写）',

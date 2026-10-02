@@ -761,6 +761,27 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
      met.text.includes('sfu_ai_asr_segments_total') && met.text.includes('sfu_ai_asr_seconds_total')
      && met.text.includes('sfu_ai_answers_total') && met.text.includes('sfu_room_control_total')
      && met.text.includes('sfu_board_records_total'));
+  /* ★ 2026-10-03 字幕端到端延迟三行（avg/max/last）+ 样本数 counter。
+   *   ▎为什么断"三个 kind 都在"而不是只断 base：watch.js 用正则按 kind 取值，
+   *     少发一行不会让任何功能变红，只会让那条告警**永远不响**——
+   *     这正是坑 56"内层算出来了、外层没带出来"的指标版。 */
+  ok('2026-10-03 /metrics 含字幕延迟三读数（avg/max/last）与样本计数',
+     met.text.includes('sfu_ai_asr_caption_count_total')
+     && /sfu_ai_asr_caption_latency_ms\{kind="avg"\} \d+/.test(met.text)
+     && /sfu_ai_asr_caption_latency_ms\{kind="max"\} \d+/.test(met.text)
+     && /sfu_ai_asr_caption_latency_ms\{kind="last"\} \d+/.test(met.text));
+  /* ▎这里自带一个取行助手，不复用下面 900 多行的 numOf：那个是**块级 const**，
+   *   在本行还没声明 → TDZ 直接 ReferenceError（坑 69 的同族：位置错了它不报语义错，只炸运行顺序）。 */
+  const numOfCap = (txt, key) => {
+    const m = new RegExp(key.replace(/[{}]/g, '\\$&') + ' (\\d+)').exec(txt);
+    return m ? Number(m[1]) : -1;
+  };
+  const snapCap = JSON.parse((await httpReq('GET', `http://localhost:${PORT}/api/rooms`)).text);
+  ok('2026-10-03 /api/rooms 的 collab.capLat 与 /metrics 同源（一个概念只有一个来源）',
+     !!snapCap.collab && !!snapCap.collab.capLat
+     && typeof snapCap.collab.capLat.max === 'number'
+     && snapCap.collab.capLat.n === numOfCap(met.text, 'sfu_ai_asr_caption_count_total')
+     && snapCap.collab.capLat.max === numOfCap(met.text, 'sfu_ai_asr_caption_latency_ms{kind="max"}'));
   // ★ 09-24 AI 用量可观测：调用次数/错误数/tokens/估算花费在同一份 metrics 面上
   ok('09-24 /metrics 含 AI 用量指标（调用/错误/tokens/花费 四组齐备）',
      met.text.includes('sfu_ai_llm_enabled') && met.text.includes('sfu_ai_llm_calls_total')

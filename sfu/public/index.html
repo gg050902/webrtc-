@@ -9,7 +9,7 @@
   <link rel="manifest" href="manifest.webmanifest" />
   <meta name="theme-color" content="#14100a" />
   <title>會 · 智能多人视频会议（WebRTC SFU）</title>
-  <link rel="stylesheet" href="style.css?v=20261002" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存（本次为第 28 节 首页 hero 化） -->
+  <link rel="stylesheet" href="style.css?v=20261003" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存（本次新增字幕延迟读数 .cap-lat） -->
 </head>
 <body>
   <!-- ★ 09-24（第 33 步）安全上下文提示横幅 —— 只在 http + IP 访问时出现。
@@ -270,6 +270,9 @@
         <button id="capHistoryBtn" class="btn mini" title="回看字幕历史（最近 100 条）">⌃ 历史</button>
         <!-- ★ 09-17c 自检徽标：把"为什么没字幕"摊开给用户看（安全上下文/权限/识别服务三段） -->
         <span id="capStatus" class="cap-status" title="字幕自检：点击查看详细诊断">💬 未开启</span>
+        <!-- ★ 2026-10-03 字幕延迟读数：服务器实测「说完→字幕上屏」多少秒（看不见就降不了）。
+             定稿字幕才刷新，半句不刷；hover 看近若干句的均值与最慢值。 -->
+        <span id="capLat" class="cap-lat hidden" title="说完→字幕上屏的实测延迟">⏱ --</span>
         <span id="captionText" class="caption-text"></span>
         <!-- ★ 09-17c 手动字幕兜底：浏览器云端识别不可用时，也能用打字的方式把内容发成字幕 -->
         <input id="capManualInput" class="cap-manual" maxlength="120"

@@ -17,16 +17,27 @@ function ok(cond, msg) {
   else { issues++; console.log(`  ❌ FAIL  ${msg}`); }
 }
 
-const m = (segs, rejected = 0, issued = 0, applied = 0) => {
+const m = (segs, rejected = 0, issued = 0, applied = 0, capLat = null, primaryReady = undefined) => {
   const lines = [];
   for (const [eng, n] of Object.entries(segs)) lines.push(`sfu_ai_asr_segments_total{engine="${eng}"} ${n}`);
   lines.push(`sfu_board_records_total{op="rejected"} ${rejected}`);
   if (issued) lines.push(`sfu_room_control_total{action="board-open"} ${issued}`);
   if (applied) lines.push(`sfu_room_control_applied_total{action="board-open"} ${applied}`);
+  /* ★ 2026-10-03 字幕延迟三项 gauge：capLat = {n, avg, max} 或 null（null = 这一句都没量到过） */
+  if (capLat) {
+    lines.push(`sfu_ai_asr_caption_count_total ${capLat.n}`);
+    lines.push(`sfu_ai_asr_caption_latency_ms{kind="avg"} ${capLat.avg}`);
+    lines.push(`sfu_ai_asr_caption_latency_ms{kind="max"} ${capLat.max}`);
+    lines.push(`sfu_ai_asr_caption_latency_ms{kind="last"} ${capLat.max}`);
+  }
+  /* primaryReady：只有 true/false 才发这一行；undefined = 模拟**老服务器根本没有这行**。
+   * ▎为什么要专门测这第三种：诊断如果把"读不到这行"当成 0（没就位），
+   *   兜底告警在老服务器上就永远不响——"读不到"和"读到 0"是两件事。 */
+  if (primaryReady !== undefined) lines.push(`sfu_ai_asr_primary_ready ${primaryReady ? 1 : 0}`);
   return lines.join('\n');
 };
 const run = (metrics, collab, prev, state) => diagnoseVoiceAndCollab(metrics, collab, prev, state);
-const fresh = () => ({ counters: {}, fallbackRounds: 0, gapRounds: 0 });
+const fresh = () => ({ counters: {}, fallbackRounds: 0, gapRounds: 0, capSlowRounds: 0, bootWaitRounds: 0 });
 const has = (out, key) => out.some((a) => a.key === key);
 
 console.log('\n--- watch：语音与协作退化诊断（纯函数，合成输入）---');
@@ -48,6 +59,38 @@ console.log('\n--- watch：语音与协作退化诊断（纯函数，合成输�
   ok(!has(o1, 'asr-engine-fallback'), '第 1 轮兜底不报（预热期误报防线）');
   ok(has(o2, 'asr-engine-fallback'), '第 2 轮仍在兜底 → 报"主引擎退回"');
   ok(!has(o3, 'asr-engine-fallback'), '第 3 轮不重复刷同一条（只在恰好第 2 轮报）');
+}
+
+/* ②b ★ 2026-10-03 预热期 vs 真退化：本地 worker 冷启动要 ~55s，10s 一轮的 watch
+ *     连两轮就落在这个窗口里 → 老判据每次开机都可能误报。现在按 primary_ready 分诊。 */
+{
+  const st = fresh();
+  process.env.WATCH_ASR_BOOT_ROUNDS = '4';   // 把"耐心上限"调小，让这条判据可在几轮内测完（默认 12 轮≈2 分钟）
+  const fb = m({ '常驻': 2 }, 0, 0, 0, null, false); // 兜底在干活 + 主引擎还没起来
+  const round1 = run(fb, { asrEngine: 'qwen-local' }, st.counters, st);
+  const round2 = run(m({ '常驻': 4 }, 0, 0, 0, null, false), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(!has(round1, 'asr-engine-fallback') && !has(round2, 'asr-engine-fallback'),
+    '主引擎未就绪期间的兜底 → 不报"退回"（预热是正确行为，报了就是天天误报）');
+  const mid = run(m({ '常驻': 6 }, 0, 0, 0, null, false), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(!has(mid, 'asr-engine-stuck'), '刚好第 3 轮仍算预热期（边界：报得太早等于没分诊）');
+  const late = run(m({ '常驻': 8 }, 0, 0, 0, null, false), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(has(late, 'asr-engine-stuck'), '超过耐心上限仍在兜底 → 改报"主引擎起不来"（这才是真故障）');
+  ok(!has(late, 'asr-engine-fallback'), '同一条兜底不会两条告警都报（诊断口径必须唯一）');
+  const recovered = run(m({ '常驻': 9, 'qwen-local': 1 }, 0, 0, 0, null, true), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(has(recovered, 'asr-engine-ok'), '预热期结束后主引擎接手 → 也报一条恢复（值班要知道那条"起不来"过去了）');
+  delete process.env.WATCH_ASR_BOOT_ROUNDS;
+}
+{
+  const st = fresh();
+  const o1 = run(m({ '常驻': 2 }, 0, 0, 0, null, true), { asrEngine: 'qwen-local' }, st.counters, st);
+  const o2 = run(m({ '常驻': 4 }, 0, 0, 0, null, true), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(!has(o1, 'asr-engine-fallback') && has(o2, 'asr-engine-fallback'),
+    '主引擎**已就绪**却让兜底干活 → 仍按两轮判据报"退回"（分诊不能把真故障也放过）');
+  const st3 = fresh();
+  const noLine = run(m({ '常驻': 2 }, 0, 0, 0, null, undefined), { asrEngine: 'qwen-local' }, st3.counters, st3);
+  const noLine2 = run(m({ '常驻': 4 }, 0, 0, 0, null, undefined), { asrEngine: 'qwen-local' }, st3.counters, st3);
+  ok(!has(noLine, 'asr-engine-fallback') && has(noLine2, 'asr-engine-fallback'),
+    '老服务器根本没有 primary_ready 这行 → 退回旧判据（"读不到"≠"读到 0"，否则告警永远不响）');
 }
 
 /* ③ 恢复：主引擎回来时要给一条"恢复了"，否则值班的人不知道前面那条已经过去了 */
@@ -81,7 +124,35 @@ console.log('\n--- watch：语音与协作退化诊断（纯函数，合成输�
   ok(!has(ok2, 'room-control-gap'), '发出=回执时不报（正常客户端都执行了）');
 }
 
-/* ⑥ 边界：metrics 拿不到 / collab 缺失都不能炸（值守脚本自己崩掉是最糟的结局） */
+/* ⑥ ★ 2026-10-03 字幕端到端延迟退化：三条判据各钉一条，缺一条都会让告警失去价值 */
+{
+  const st = fresh();
+  const slow = { n: 5, avg: 9000, max: 12000 };
+  const o1 = run(m({ 'qwen-local': 1 }, 0, 0, 0, slow), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(!has(o1, 'caption-slow'), '延迟超阈值第 1 轮不报（等第二轮确认，抖动不报警）');
+  const o2 = run(m({ 'qwen-local': 2 }, 0, 0, 0, slow), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(has(o2, 'caption-slow'), '连续两轮均值超 6s → 报字幕延迟退化');
+  ok(/最慢 12\.0s/.test(o2.find((a) => a.key === 'caption-slow').text), '告警文案里带最慢值（值班要能一眼判断严重程度）');
+  const back = run(m({ 'qwen-local': 3 }, 0, 0, 0, { n: 6, avg: 2000, max: 12000 }), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(has(back, 'caption-ok'), '延迟回落 → 报恢复（否则值班不知道那条过去了）');
+}
+{
+  /* 样本不足时**绝不**下结论：只有 1~2 句字幕的会议里，均值会被一句长句完全带跑（坑 53 同源） */
+  const st = fresh();
+  const o1 = run(m({}, 0, 0, 0, { n: 2, avg: 30000, max: 30000 }), { asrEngine: 'qwen-local' }, st.counters, st);
+  const o2 = run(m({}, 0, 0, 0, { n: 2, avg: 30000, max: 30000 }), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(!has(o1, 'caption-slow') && !has(o2, 'caption-slow'), '样本 <3 句时即使 avg 爆表也不报（统计噪声不是链路退化）');
+}
+{
+  const st = fresh();
+  const o1 = run(m({}, 0, 0, 0, { n: 20, avg: 2400, max: 5000 }), { asrEngine: 'qwen-local' }, st.counters, st);
+  const o2 = run(m({}, 0, 0, 0, { n: 40, avg: 2400, max: 5000 }), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(o1.length === 0 && o2.length === 0, '延迟在阈值内 → 一条不发（阈值不是拿来天天报的）');
+  const none = run(m({}, 0, 0, 0, null), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(none.length === 0, 'metrics 里没有延迟行（还没出过字幕）→ 不报错也不崩');
+}
+
+/* ⑦ 边界：metrics 拿不到 / collab 缺失都不能炸（值守脚本自己崩掉是最糟的结局） */
 {
   const st = fresh();
   ok(run('', null, st.counters, st).length === 0, 'metrics 为空 → 返回空数组不抛错');

@@ -261,6 +261,33 @@ module.exports = {
   AI_MINUTES: 'ai-minutes', // C→S { type:'segment'|'final', since? } 应答 { file, path, mock }
   AI_OP: 'ai-op',         // C→S { goal } 应答 { started, goal }（后续走既有远程协助五信令）
 
+  /* ══ ★ 2026-10-03 补齐：语音链路**下行**广播（原来总表只写了 C→S 请求，把"服务器主动推"漏了）══
+   * ▎为什么值得单独列：这几条是整条语音闭环的出口，而它们**没有 ack、没有兜底重发**——
+   *   漏写一条，后来人只会照着请求侧改，客户端监听挂错/挂漏都不会报错（静默失效）。
+   * ▎共同口径：**广播 = 尽力而为**（丢了不补，因为下一条很快就来）；
+   *   需要"绝不能丢"的状态（授权、房间快照）才走 room-state / 带 ack 的请求-应答。 */
+  ASR_CAPTION: 'asr-caption', // S→C 广播 { name, text, interim?, latMs?, stage? }
+  //   interim=true  → 一句话**累积中的半句**：只刷字幕条，不进历史、不触发唤醒；
+  //   无 interim    → 定稿：进字幕账本 + 参与 AI 唤醒/追问判定。
+  //   ★ latMs（2026-10-03 新增）= 服务器实测「这个人说完 → 这句定稿广播出去」的毫秒数。
+  //     起点是最后一个判定为有声的 RMS 窗（窗长 0.5s，所以这个数是**下限**，不虚报更快）；
+  //     0 / 缺失 = 服务器认为这一句的起点不可靠（例如陈旧时间戳），前端**保持上一次读数**，
+  //     绝不自己编一个 —— 会瞎填的读数比没有读数更糟。
+  //   ★ stage = { wait, trans }（末段口径的拆分）：
+  //     wait = 说完 → 这次转写**开始**（静音判定 + 调度），trans = 模型耗时。
+  //     ▸ 为什么要拆：只有一个总数时"4s"可能是模型慢、也可能是我们在等，
+  //       而处方完全相反（前者换引擎/降模型，后者调 asrSegmentSec 与 FLUSH_MS）。
+  //     ▸ 为什么只记末段：一句话可能跨多个分段，而"说完"发生在最后一段。
+  //   ▸ 权威统计在 /metrics（sfu_ai_asr_caption_latency_ms{kind="avg|max|last"}），
+  //     前端那个 ⏱ 徽标只做本地 8 句滚动窗口 —— **一个概念只有一个来源**。
+  AI_STATE: 'ai-state',   // S→C 广播 { state:'idle|listening|thinking|speaking|happy', text? }（speaking 帧带全文给逐字字幕）
+  AI_AUDIO: 'ai-audio',   // S→C 广播 { url, ts, seq, total }（服务端神经语音分片；顺序播放、onplaying 才销回落账）
+  AI_TTS_FAIL: 'ai-tts-fail', // S→C 广播 { ts }（声明了 tts:'server' 却没给出音频 → 前端回落浏览器朗读；两者都不发=无头静音，已被 test:asr-live 断言禁止）
+  AI_TTS_STATE: 'ai-tts-state', // S→C 广播 { enabled, engine }（能力开关会漂：端点可达性随网络出口变化，翻转必须重新下发）
+  BOARD_STATE: 'board-state', // S→单个成员 { strokes:[...] }（晚到的人/刷新后补画白板账本；实时仍走 SCTP 'board' 频道）
+  BOARD_RECORD: 'board-record', // C→S { op:'end'|'undo'|'clear', stroke? }（只上报"整笔"，实时通道不留给持久化——见 client 注释）
+  REMOTE_QUALITY: 'remote-quality', // 控制端→S→被控端 { fps }：闭环自适应的建议值（被控端只调本地限流间隔，下一帧生效，不重启抓屏）
+
   /* ══ ★ 09-24 真 OS 级远程桌面（被控端 = 本机 agent 程序，不是网页）══
    * ▎为什么"真远程桌面"必须有一个本地程序？（面试讲点）
    *   浏览器的安全模型决定了**网页没有权限**移动真实光标、敲真实键盘、截别的程序窗口——

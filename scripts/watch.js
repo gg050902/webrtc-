@@ -22,7 +22,7 @@ const argOf = (name, dft) => {
 const BASE = argOf('--url', 'http://localhost:3001');
 const INTERVAL = Math.max(5, parseInt(argOf('--interval', '10'), 10)) * 1000;
 const MAX_RSS = parseInt(argOf('--max-rss', '512'), 10) * 1048576;
-const voiceState = { asrMiss: 0, tts: null, counters: {}, fallbackRounds: 0, gapRounds: 0 }; // ★ 09-30f：语音链路翻转检测的上一轮状态；counters 是 10-03 退化诊断的计数基准
+const voiceState = { asrMiss: 0, tts: null, counters: {}, fallbackRounds: 0, gapRounds: 0, capSlowRounds: 0 }; // ★ 09-30f：语音链路翻转诊断的上一轮状态；counters = 计数基准；*Rounds = 各条"连续两轮才算"的退化判据
 const WEBHOOK = process.env.WATCH_WEBHOOK_URL || null;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;   // ★ 09-24 G8：接口门禁后必须带 token
 const AUTH_HEADERS = ADMIN_TOKEN ? { Authorization: `Bearer ${ADMIN_TOKEN}` } : {};
@@ -74,13 +74,33 @@ function diagnoseVoiceAndCollab(metricsText, collab, prev, state) {
     (metricsText.match(new RegExp(base + '\\{[^}]+\\}', 'g')) || [])
       .map((s) => /="([^"]*)"/.exec(s)).filter(Boolean).map((m) => m[1]),
   )];
+  /* 带 label 的 gauge 取值（kind="avg" 这一类）：counterOf 的 `key 数字` 形态匹配不到它们。 */
+  const gaugeOf = (base, kind) => {
+    const m = new RegExp(base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      + '\\{kind="' + kind + '"\\} (\\d+)').exec(metricsText);
+    return m ? Number(m[1]) : 0;
+  };
+  /* 布尔开关取值：**区分"这行不存在"与"这行是 0"**。
+   * ▎反例就是这条规则自己：若把"老服务器没有 primary_ready 这一行"当成 0（=没就位），
+   *   兜底告警就会在老服务器上**永远不响**——那正是我们一路在防的"静默失效"。 */
+  const flagOf = (key) => {
+    const m = new RegExp(key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ' (\\d+)').exec(metricsText);
+    return m ? Number(m[1]) === 1 : null;
+  };
 
   /* ① 引擎退化：配置说"用 qwen-local"，而这一轮真出字幕的段**全都来自兜底引擎**。
    *    要求连续 2 轮才报——启动预热期本地 worker 没就绪，走兜底是**正确行为**，
-   *    一有变化就报等于天天误报（误报的代价是以后没人看告警）。 */
+   *    一有变化就报等于天天误报（误报的代价是以后没人看告警）。
+   * ★ 2026-10-03 补上"预热期"的正面判据：本地 worker 冷启动要 ~55s，而 10s 一轮的
+   *   watch 连两轮就落在窗口里 → 每次开机都可能误报。现在按 primary_ready 分成两种病：
+   *     · 主引擎**还没起来**却一直在兜底 = 预热期，先耐心等（超过 N 轮才报"起不来"）；
+   *     · 主引擎**已经起来**却还让兜底干活 = 真退化，按原来的两轮判据报。
+   *   ▸ 老服务器不带这一行（flagOf=null）→ 退回原行为，绝不因为"读不到"就闭嘴。 */
   const expected = collab && collab.asrEngine;
   const EXPECTED_KEYS = { 'qwen-local': ['qwen-local'], qwen: ['qwen'], whisper: ['常驻', 'CLI'] };
   const want = EXPECTED_KEYS[expected] || [];
+  const primaryReady = flagOf('sfu_ai_asr_primary_ready');
+  const BOOT_PATIENCE_ROUNDS = Math.max(2, Number(process.env.WATCH_ASR_BOOT_ROUNDS) || 12);
   if (want.length) {
     let mine = 0; let other = 0;
     for (const eng of labelsOf('sfu_ai_asr_segments_total')) {
@@ -88,13 +108,24 @@ function diagnoseVoiceAndCollab(metricsText, collab, prev, state) {
       if (want.indexOf(eng) >= 0) mine += d; else other += d;
     }
     if (mine === 0 && other > 0) {
-      state.fallbackRounds += 1;
-      if (state.fallbackRounds === 2) {
-        out.push({ key: 'asr-engine-fallback', text: `配置的主引擎是 ${expected}，但连续两轮的字幕都由兜底引擎转写（慢 3~5 倍）——查本地 Qwen worker 是否没起来（sfu/logs 或启动日志那行 🔥/⚠️）` });
+      if (primaryReady === false) {
+        state.bootWaitRounds = (state.bootWaitRounds || 0) + 1;
+        if (state.bootWaitRounds === BOOT_PATIENCE_ROUNDS) {
+          out.push({ key: 'asr-engine-stuck', text: `主引擎 ${expected} 的 worker 到第 ${state.bootWaitRounds} 轮仍未就绪，字幕一直由兜底承担（慢 3~5 倍）`
+            + ` —— 这不是预热而是起不来：查启动日志那行 🔥/⚠️、models/ 目录是否存在、以及 python 是否能 import qwen_asr` });
+        }
+      } else {
+        state.bootWaitRounds = 0;
+        state.fallbackRounds += 1;
+        if (state.fallbackRounds === 2) {
+          out.push({ key: 'asr-engine-fallback', text: `配置的主引擎是 ${expected}（它就位了却没用），连续两轮字幕都由兜底引擎转写（慢 3~5 倍）——查 worker 是否被并发闸卡住` });
+        }
       }
     } else {
       if (state.fallbackRounds >= 2) out.push({ key: 'asr-engine-ok', text: `主引擎 ${expected} 已回到转写一线（兜底轮数 ${state.fallbackRounds} 结束）` });
+      if ((state.bootWaitRounds || 0) >= BOOT_PATIENCE_ROUNDS) out.push({ key: 'asr-engine-ok', text: `主引擎 ${expected} 已就绪并开始承担转写` });
       state.fallbackRounds = 0;
+      state.bootWaitRounds = 0;
     }
   }
   /* ② 白板归档被拒：客户端在送脏数据（非法颜色/坐标），或版本与服务器不同步。
@@ -112,6 +143,24 @@ function diagnoseVoiceAndCollab(metricsText, collab, prev, state) {
     if (state.gapRounds === 2) out.push({ key: 'room-control-gap', text: `房间动作发出了 ${issued} 条却没有任何客户端回执 —— 客户端的 room-control 处理表可能漏了分支（AI 说了但没做）` });
   } else {
     state.gapRounds = 0;
+  }
+  /* ④ ★ 2026-10-03 字幕延迟变差：avg 超阈值且**样本够**才判。
+   *    ▎为什么门槛里要写 n>=3：只出过 1~2 句字幕时，均值会被一句长句完全带跑，
+   *      那是统计噪声不是链路退化（同坑 53 的判据——样本太小就不要拿比例/均值下结论）。
+   *    ▎为什么还要连续 2 轮：一次网络抖动或模型冷启动会抬一轮，报出来只会让人学会忽略告警。
+   *    ▸ 阈值可用 WATCH_CAP_LAT_WARN_MS 调；默认 6000ms ≈ "静音判定 + 分段 + 转写"叠满的实测上沿。 */
+  const capN = counterOf('sfu_ai_asr_caption_count_total');   // 无 label 的 counter，走 counterOf
+  const capAvg = gaugeOf('sfu_ai_asr_caption_latency_ms', 'avg');
+  const capWarnMs = Number(process.env.WATCH_CAP_LAT_WARN_MS) || 6000;
+  if (capN >= 3 && capAvg > capWarnMs) {
+    state.capSlowRounds = (state.capSlowRounds || 0) + 1;
+    if (state.capSlowRounds === 2) {
+      out.push({ key: 'caption-slow', text: `字幕延迟均值 ${(capAvg / 1000).toFixed(1)}s（最慢 ${(gaugeOf('sfu_ai_asr_caption_latency_ms', 'max') / 1000).toFixed(1)}s，样本 ${capN} 句），超过 ${capWarnMs / 1000}s 阈值`
+        + ` —— 查：①引擎是否退回兜底（看上面 asr-engine-fallback）②asrSegmentSec 是否被配大 ③CPU 是否被本地模型占满` });
+    }
+  } else {
+    if ((state.capSlowRounds || 0) >= 2) out.push({ key: 'caption-ok', text: `字幕延迟恢复正常（均值 ${(capAvg / 1000).toFixed(1)}s）` });
+    state.capSlowRounds = 0;
   }
   return out;
 }
