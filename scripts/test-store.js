@@ -158,7 +158,7 @@ function importedBackups() {
    * ▎为什么这里要 import sfu/password 而不在测试里再抄一遍 scrypt：
    *   本测试的职责是"验证 store 存的东西能被**密码方案**验过"，所以必须用**那一份**
    *   真方案。抄一遍就只能证明"我抄对了"，证明不了产品用对。 */
-  const { hashPassword, newSalt, verifyPassword } = require('../sfu/password');
+  const { hashPassword, newSalt, verifyPassword, hashPasswordLegacy, hashAlgoOf, needsUpgrade } = require('../sfu/password');
 
   // 改密：换盐 + 换哈希 → 旧密码必须失效，新密码必须通过
   const u1Before = store.getUser('u1');
@@ -169,6 +169,33 @@ function importedBackups() {
   ok('setPassword 后旧密码失效', !verifyPassword('pw-u1', u1After.salt, u1After.hash));
   ok('setPassword 后新密码能验过', verifyPassword('brand-new-pw', u1After.salt, u1After.hash));
   ok('setPassword 对不存在的账号返回 false', store.setPassword('nobody-xyz', newSalt(), 'dead') === false);
+
+  /* ═══════ ★ 09-30 口令哈希 V2 + 平滑重哈希（password.js 的代际机制）═══════
+   * ▎守的是"参数升档不炸老账号"：存量 V1 哈希照常能验，新哈希一律 V2，
+   *   服务器登录成功后的"换盐 + V2 重算"写回路径用 setPassword 真跑一遍。 */
+  console.log('\n── 口令哈希 V2 / 平滑重哈希 ──');
+  const saltV1 = newSalt();
+  const v1Hash = hashPasswordLegacy('Old#Pass1', saltV1);
+  ok('V1 哈希长度 = 64 字符（32 字节）', v1Hash.length === 64);
+  ok('hashAlgoOf 识别 V1 / V2 / 损坏',
+     hashAlgoOf(v1Hash) === 'v1' && hashAlgoOf(hashPassword('x', 'y')) === 'v2' && hashAlgoOf('zz') === 'unknown');
+  ok('needsUpgrade：V1 需要升级 / V2 不需要',
+     needsUpgrade(v1Hash) === true && needsUpgrade(hashPassword('x', 'y')) === false);
+  ok('verifyPassword 用 V1 参数验存量账号（老密码照常能登）',
+     verifyPassword('Old#Pass1', saltV1, v1Hash) === true && verifyPassword('Wrong#Pass', saltV1, v1Hash) === false);
+  const saltUp = newSalt();
+  const v2Hash = hashPassword('Old#Pass1', saltUp);
+  ok('平滑重哈希后 verifyPassword 走 V2 参数（换盐不破坏登录）',
+     verifyPassword('Old#Pass1', saltUp, v2Hash) === true && verifyPassword('Old#Pass1', saltV1, v2Hash) === false);
+  ok('store.setPassword 能写回升级结果（128 字符 + 可验）', (() => {
+    const u = `reh_${Math.random().toString(36).slice(2, 8)}`;
+    const s1 = newSalt();
+    store.createUser({ username: u, salt: s1, hash: hashPasswordLegacy('Up#Pass2', s1), displayName: '待升级' });
+    const s2 = newSalt();
+    store.setPassword(u, s2, hashPassword('Up#Pass2', s2));
+    const row = store.getUser(u);
+    return row.hash.length === 128 && verifyPassword('Up#Pass2', row.salt, row.hash);
+  })());
 
   /* 口令方案同源：迁移搬过来的老账号，必须仍能用**原来的明文密码**验过。
    * 这条同时锁两件事：① 迁移没有重新哈希；② sfu/password.js 与 store 里存的东西对得上。 */

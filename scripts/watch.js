@@ -22,6 +22,7 @@ const argOf = (name, dft) => {
 const BASE = argOf('--url', 'http://localhost:3001');
 const INTERVAL = Math.max(5, parseInt(argOf('--interval', '10'), 10)) * 1000;
 const MAX_RSS = parseInt(argOf('--max-rss', '512'), 10) * 1048576;
+const voiceState = { asrMiss: 0, tts: null }; // ★ 09-30f：语音链路翻转检测的上一轮状态
 const WEBHOOK = process.env.WATCH_WEBHOOK_URL || null;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;   // ★ 09-24 G8：接口门禁后必须带 token
 const AUTH_HEADERS = ADMIN_TOKEN ? { Authorization: `Bearer ${ADMIN_TOKEN}` } : {};
@@ -89,21 +90,52 @@ async function tick() {
   }
 
   // ④ 指标层面的进程内存（/metrics 是 G7-① 的成果，这里顺手消费）
+  let metricsText = null;
   try {
     const res = await fetch(`${BASE}/metrics`, { headers: AUTH_HEADERS });
     if (res.status !== 401) { // 401 已在上面①处统一提示，这里不重复刷屏
-      const met = await res.text();
-      const rss = met.match(/sfu_process_resident_memory_bytes (\d+)/);
+      metricsText = await res.text();
+      const rss = metricsText.match(/sfu_process_resident_memory_bytes (\d+)/);
       if (rss && Number(rss[1]) > MAX_RSS) {
         alert('rss', `服务器进程内存 ${(Number(rss[1]) / 1048576).toFixed(0)}MB 超过阈值 ${(MAX_RSS / 1048576).toFixed(0)}MB`);
       }
     }
   } catch (e) { /* metrics 拉不到单独不算告警（api 已覆盖） */ }
+
+  /* ★ 09-30f 语音链路告警（P4）：AI 的"耳朵/嘴巴"悄悄坏掉是长跑值守最阴的故障——
+   *   转写照常出文件但 worker 死了会退 CLI（字幕变慢 N 倍），没人会主动发现。
+   *   这里用 /metrics 的两个 gauge 做状态翻转检测：
+   *   · asr worker 0 → 连续 N 轮(默认 2，跳过预热期)才告警（启动加载期误报）；
+   *   · tts 翻转（true↔false）→ 即时提醒（端点可达性随出口网络漂移，值得知道）。 */
+  if (metricsText) {
+    const gauge = (name) => {
+      const m = metricsText.match(new RegExp(`${name} (\\d)`));
+      return m ? Number(m[1]) : null;
+    };
+    const worker = gauge('sfu_ai_asr_worker_enabled');
+    const tts = gauge('sfu_ai_tts_enabled');
+    const n = Number(process.env.WATCH_ASR_WORKER_MISS) || 2;
+    if (worker === 0) {
+      voiceState.asrMiss += 1;
+      if (voiceState.asrMiss === n) {
+        alert('asr-worker', `ASR 常驻 worker 掉线（连续 ${voiceState.asrMiss} 轮）——已退回 CLI 逐段转写，字幕延迟变大约 3~5 倍（查 sfu/logs 是否 python 崩溃）`);
+      }
+    } else if (worker === 1) {
+      if (voiceState.asrMiss >= n) alert('asr-worker-ok', 'ASR 常驻 worker 已恢复（转写速度回到常驻档）');
+      voiceState.asrMiss = 0;
+    }
+    if (tts !== null && voiceState.tts !== null && tts !== voiceState.tts) {
+      alert(`tts-${tts}`, tts
+        ? '服务端神经语音（Edge TTS）变为可用——AI 语音已升级为服务器音色'
+        : '服务端神经语音不可达——AI 语音已回落浏览器 TTS（本机音色）');
+    }
+    if (tts !== null) voiceState.tts = tts;
+  }
 }
 
 console.log(`👀 watch 启动：每 ${INTERVAL / 1000}s 轮询 ${BASE}` +
   (WEBHOOK ? '，webhook 已配置' : '，webhook 未配置（设 WATCH_WEBHOOK_URL 启用）') +
-  '。告警规则：服务拉不到 / 健康分<' + SCORE_MIN + ' / 宽限期<10s / rss 超限。Ctrl+C 退出。');
+  '。告警规则：服务拉不到 / 健康分<' + SCORE_MIN + ' / 宽限期<10s / rss 超限 / ASR worker 掉线 / 神经语音翻转。Ctrl+C 退出。');
 if (!ADMIN_TOKEN) {
   console.log('⚠️  未设置 ADMIN_TOKEN —— /api/rooms 与 /metrics 现在需要管理员身份，会一直 401。');
   console.log('   用法：ADMIN_TOKEN=<token> npm run watch');

@@ -144,9 +144,15 @@ const BTN_NAME = ['left', 'middle', 'right', 'left'];    // 帧里的 btn: 0=左
 /* ★ 09-30 借鉴 billd 的"画质档"：把散落的 quality/fps/尺寸收成三档预设，
  *   控制端可实时切（走 remote-input 的 {kind:'quality'} 新语义），弱网时自动降档。
  *   取值依据：CDP screencast 是 JPEG 逐帧，公网带宽是第一瓶颈——
- *     流畅档压到 5fps/q30（滚动/看视频不卡），高清档 20fps/q80（局域网看细节）。 */
+ *     流畅档压到 6fps/q30（滚动/看视频不卡），高清档 20fps/q80（局域网看细节）。
+ * ▎档位 fps 的**下限取 6**，和控制端自适应的硬下限 RD_FPS_MIN 对齐：
+ *   档位定"中枢"、闭环自适应只在中枢附近 ±2 微调（见 sfu/public/client.js 同段注释）。
+ *   若这里填 5，客户端会立刻建议回 6fps —— 两个来源互相拉扯，
+ *   表现为"选了流畅但帧率没真降下去"（同一个概念只能有一个来源，AGENTS 坑 47）。
+ * ▎与 remote-quality 那条**硬钳制 2~24** 的区别：那条防"乱传参数把对端拖垮"，
+ *   这里定"正常该用多少"；两层分工不同，别合并。 */
 const QUALITY_PRESETS = {
-  smooth:   { quality: 30, fps: 5,  maxWidth: 1280, maxHeight: 800 },
+  smooth:   { quality: 30, fps: 6,  maxWidth: 1280, maxHeight: 800 },
   standard: { quality: 55, fps: 12, maxWidth: 1600, maxHeight: 1000 },
   hd:       { quality: 80, fps: 20, maxWidth: 1920, maxHeight: 1200 },
 };
@@ -338,6 +344,18 @@ class RemoteAgent {
       if (msg) this.applyInput(msg);
     });
 
+    /* ★ 09-30d（借鉴 billd-desk）：剪贴板双向同步——被控端方向。
+     *   控制端把本机剪贴板推来（'ctl2host'）→ 写进对方**网页**剪贴板。
+     *   （对方"系统剪贴板"是 OS 资源，CDP 够不着——诚实边界：工作区是浏览器，
+     *     "复制网页资料 / 粘贴到网页输入框"的主场景全部覆盖。） */
+    sock.on('clipboard-sync', ({ text, dir } = {}) => {
+      if (dir !== 'ctl2host' || typeof text !== 'string' || !text) return;
+      if (!this.cdp || !this.cdp.isAlive()) return;
+      this.cdp.evaluate(`navigator.clipboard.writeText(${JSON.stringify(text)}).then(() => 1).catch(() => 0)`)
+        .then((okw) => this.log(okw ? `📋 收到控制端剪贴板（${text.length} 字）→ 已写入网页剪贴板` : '⚠️ 剪贴板写入失败（页面无焦点）'))
+        .catch(() => {});
+    });
+
     sock.on('room-not-found', () => this.log('❌ 房间不存在：先在浏览器里把房间建好，再启动代理'));
     sock.on('room-wrong-password', () => this.log('❌ 房间密码不对'));
     sock.on('room-full', ({ max } = {}) => this.log(`❌ 房间满了（上限 ${max} 人）`));
@@ -512,6 +530,18 @@ class RemoteAgent {
           if (['maximized', 'normal', 'minimized', 'fullscreen'].includes(msg.state)) {
             await this.cdp.setWindowState(msg.state);
             this.emitMeta();
+          }
+          break;
+
+        case 'clipboard-read':
+          // ★ 09-30d：控制端主动"拉"——读对方网页剪贴板送回（服务器门禁照走 clipboard-sync）
+          if (!this.controllerId) break;
+          {
+            const t = await this.cdp.evaluate('navigator.clipboard.readText().then((t) => String(t)).catch(() => "")');
+            if (t) {
+              this.sock.emit('clipboard-sync', { to: this.controllerId, text: String(t).slice(0, 100000), dir: 'host2ctl' });
+              this.log(`📋 已把网页剪贴板送回控制端（${String(t).length} 字）`);
+            }
           }
           break;
 

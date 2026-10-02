@@ -281,6 +281,7 @@ const fxCloseBtn = $('fxCloseBtn');
 
 /* ★ 实时字幕（第 29 步）新增元素 */
 const capBtn = $('capBtn');           // 控制坞字幕开关
+const pipBtn = $('pipBtn');           // ★ 2026-10-01 画中画（借鉴 Piik）：主画面浮窗化
 const captionBar = $('captionBar');   // 舞台底部字幕条
 const captionText = $('captionText'); // 字幕文本（名字 + 内容）
 const capExportBtn = $('capExportBtn'); // 字幕记录导出
@@ -461,6 +462,7 @@ function enterRoom(roomNumber) {
   // ★ 09-25 AI 语音：也在这里放开（updateAiVoiceUi 内部会再判浏览器是否支持 speechSynthesis）
   updateAiVoiceUi();
   lowBwBtn.disabled = false;  // ★ 第 32 步：省流开关（订阅了别人画面才有意义，进房后放开）
+  pipBtn.disabled = false;    // ★ 2026-10-01 画中画（借鉴 Piik）：进房后可把主画面浮窗化
   log(`🏠 已进入房间「${roomNumber}」。把房间号或右上角链接发给别人即可邀请`);
 }
 
@@ -680,6 +682,7 @@ async function initSFU() {
     const cfg = await fetch('/config.json').then((r) => r.json());
     if (Array.isArray(cfg.iceServers)) sfuIceServers = cfg.iceServers;
     serverAsrEnabled = !!cfg.asrEnabled; // ★ 09-27d：服务端转写可用性（Web Speech 失败时的降级依据）
+    aiTtsEnabled = !!cfg.aiTtsEnabled; // ★ 09-30c：服务端神经语音可用（AI 回答走服务器 MP3，本地 TTS 让位）
     sfuVideoSvc = !!cfg.videoSvc; // ★ D+3：true = 摄像头改用 VP9 SVC 单路分层上传
     // ★ 09-24 AI 模式：服务器只给 true/false（不给 key），前端据此显示「LLM / Mock」状态灯。
     //   为什么值得显示：用户要能一眼分清"AI 真在思考"还是"在走本地模板"——
@@ -1194,7 +1197,9 @@ shareBtn.addEventListener('click', async () => {
     if (!sharingScreen) {
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
         video: true,
-        audio: false,
+        /* ★ 2026-10-01（借鉴 Piik）：共享带音频——勾选标签页时把网页声音一起送进会议
+         *   （看视频/放 PPT 配乐的场景）。浏览器不勾音频时这条静默为无声轨，无害。 */
+        audio: true,
       });
       const screenTrack = screenStream.getVideoTracks()[0];
       screenTrack.onended = () => stopSharing(); // 用户点系统"停止共享"
@@ -1204,6 +1209,18 @@ shareBtn.addEventListener('click', async () => {
         appData: { source: 'screen' },
       });
       myProducers.set(screenProducer.id, screenProducer);
+
+      /* ★ 2026-10-01（借鉴 Piik）：共享音频真的推上会——浏览器勾了"分享标签页音频"时
+       *   screenStream 里有音轨，作为第二路 audio producer 发出去（appData.source=
+       *   'screen-audio'，停止共享时随循环一起关）。没勾就是没有音轨，静默跳过。 */
+      const screenAudioTrack = screenStream.getAudioTracks()[0];
+      if (screenAudioTrack) {
+        try {
+          const ap = await sendTransport.produce({ track: screenAudioTrack, appData: { source: 'screen-audio' } });
+          myProducers.set(ap.id, ap);
+          log('🔊 标签页音频已随共享送入会议');
+        } catch (e) { /* 音频轨 produce 失败不影响画面共享 */ }
+      }
 
       sharingScreen = true;
       setIconBtn(shareBtn, ICONS.screen, '停止共享');
@@ -1312,17 +1329,21 @@ roomBadge.addEventListener('click', async () => {
  *   这是工程上常见的"双发去重"做法（面试讲点：at-least-once + 幂等接收）。
  * ────────────────────────────────────────────────────────────── */
 socket.on('ai-state', ({ state, text }) => setAiState(state, text)); // ★ 09-26b：text 供逐字字幕
-socket.on('asr-caption', ({ name, text }) => {
+socket.on('asr-caption', ({ name, text, interim } = {}) => {
   /* ★ 09-27c：服务端 ASR 转写上字幕条（实时字幕体验统一；不刷聊天区）
    * ★ 09-28：三处强化——
    *   ① 只在"字幕开着"时显示（用户关掉字幕就不打扰；服务端仍在转写、仍在喂 AI）；
    *   ② 进本地字幕历史（标记 asr:true → 不再回传服务器，避免与服务器自己的落盘重复）；
-   *   ③ bumpBotHeard()：服务端转写是 AI"的确在听"的更强证据，兼顾听觉指示器。 */
+   *   ③ bumpBotHeard()：服务端转写是 AI"的确在听"的更强证据，兼顾听觉指示器。
+   * ★ 2026-10-01 语句组装：interim=true 是"累积中的半句"——只刷字幕条（实时感），
+   *   **不进历史**；成句后的定稿（无 interim）才进历史（Otter 分段不被碎片污染）。 */
   if (!cap.on) return;
-  const entry = { ts: Date.now(), from: 'asr', name: name || '转写', text: text || '', asr: true };
-  capPushLog(entry);
-  showCaptionBar(entry.name, entry.text, false);
-  if (capHistoryPanel && !capHistoryPanel.classList.contains('hidden')) appendCapHistoryRow(entry);
+  const entry = { ts: Date.now(), from: 'asr', name: name || '转写', text: text || '', asr: true, interim: !!interim };
+  showCaptionBar(entry.name, entry.text, true);
+  if (!interim) {
+    capPushLog(entry);
+    if (capHistoryPanel && !capHistoryPanel.classList.contains('hidden')) appendCapHistoryRow(entry);
+  }
   bumpBotHeard();
   /* ★ 09-30 抢话修复③：真人在说话 → 记时间戳 + AI 立即闭嘴。
    *   排除 AI 自己（外放时服务端可能把 AI 的 TTS 回声也转写出来——那是"AI 在说"，
@@ -1333,7 +1354,7 @@ socket.on('asr-caption', ({ name, text }) => {
   }
 });
 
-socket.on('chat-message', ({ from, text, ts, msgId, name, ai, streamId }) => {
+socket.on('chat-message', ({ from, text, ts, msgId, name, ai, streamId, tts }) => {
   // ★ D+1：同一条消息可能从 SCTP 和信令各到一次，msgId 相同的只显示第一条
   if (msgId && seenChatIds.has(msgId)) return;
   if (msgId) markSeenChatId(msgId);
@@ -1341,7 +1362,10 @@ socket.on('chat-message', ({ from, text, ts, msgId, name, ai, streamId }) => {
    *   丢掉（增量已渲染过），若把播报放在 appendChat 里，流式答案就永远不会被念出来。
    *   这类"顺序错了功能静默失效"的坑，只能靠把它写在注释里记住。 */
   if (from === 'ai-bot') {
-    speakAiText(text);
+    /* ★ 2026-10-01 服务端语音标记：服务器带了 tts:'server' = 它会送音频（Qwen 本地/Edge），
+     *   本地 TTS 让位（防双声）；若服务器合成失败会补发 ai-tts-fail {ts} → 再回落浏览器朗读。 */
+    if (tts === 'server') pendingServerTts.set(ts, text);
+    else speakAiText(text);
     maybeHintAiVoice(); // ★ 09-28：语音没开时提示一次"可以听它说话"（对话闭环的手感所在）
   }
   // ★ 09-24：带 streamId 的是流式回答的"终态"——增量已经在同一个气泡里渲染过了，
@@ -2989,6 +3013,10 @@ function maybeHintAiVoice() {
 
 function speakAiText(text) {
   if (!aiVoiceOn || !SPEECH_OK) return;
+  /* ★ 09-30c 双轨闸：服务端神经语音可用时，AI 的声音走服务器 MP3（ai-audio 事件），
+   *   本地 speechSynthesis 整体让位——避免"同一条答案两个声音先后读"的灾难。
+   *   服务端合成失败时那次回答就没有语音（文字照常进气泡），下一轮自动再试。 */
+  if (aiTtsEnabled) return;
   const say = speakableText(text);
   if (!say) return;
   /* ★ 09-30 抢话修复②：回答送达时用户**还在说话**（2.5s 内刚有字幕）→ 这轮不念。
@@ -3047,6 +3075,29 @@ function speakAiText(text) {
 let aiSpeakQueue = [];   // 分句朗读队列
 let aiSpeakDeadline = 0; // 本轮朗读截止时刻（超时保护）
 let lastUserSpeechTs = 0; // ★ 09-30：最近一次"有人在说话"的时刻（字幕信号驱动）
+let aiTtsEnabled = false; // ★ 09-30c：服务端神经语音可用（/config.json 下发）
+let serverTtsEl = null;   // 播放服务端 MP3 的 <audio>（复用，hush 时暂停它）
+const pendingServerTts = new Map(); // ★ 2026-10-01：ts → 文本（服务端语音待送达/失败的回落账本）
+
+/* ★ 09-30c 服务端神经语音：服务器合成 MP3 后广播 ai-audio，这里负责播。
+ * ▎为什么客户端不做合成：音色在服务器端统一（晓晓），用户机器装什么音色不再重要；
+ *   浏览器只当"扬声器"——一个 <audio> 元素，零额外依赖。 */
+socket.on('ai-audio', ({ url, ts } = {}) => {
+  if (!aiVoiceOn || !url || !SPEECH_OK) return;
+  try {
+    hushAiSpeech(); // 先掐掉可能正在播的浏览器 TTS（同一时刻只该有一个"AI 的声音"）
+    if (!serverTtsEl) serverTtsEl = new Audio();
+    serverTtsEl.src = url;
+    serverTtsEl.play().catch(() => { /* 自动播放策略拦截时静默（用户有交互后即可） */ });
+    if (typeof ts === 'number') pendingServerTts.delete(ts); // 已送达：无需回落
+  } catch (e) { /* 播放失败不影响会议 */ }
+});
+
+/* ★ 2026-10-01 服务端语音合成失败 → 回落浏览器朗读同一条回答（声音永不缺席） */
+socket.on('ai-tts-fail', ({ ts } = {}) => {
+  const t = pendingServerTts.get(ts);
+  if (t) { pendingServerTts.delete(ts); speakAiText(t); }
+});
 
 /* ★ 09-30 抢话修复①：用户一开口，AI 立即闭嘴。
  * ▎抢话的体验根源：AI 回答用浏览器 TTS 朗读（默认开），而人说完唤醒词往往还在
@@ -3060,6 +3111,10 @@ function hushAiSpeech() {
     if (aiSpeakQueue.length || window.speechSynthesis.speaking || window.speechSynthesis.pending) {
       aiSpeakQueue.length = 0;
       window.speechSynthesis.cancel();
+    }
+    // ★ 09-30c：服务端 MP3 也在"AI 的声音"管辖内——用户开口，它同样得停
+    if (serverTtsEl && !serverTtsEl.paused) {
+      try { serverTtsEl.pause(); } catch (e) { /* 忽略 */ }
     }
   } catch (e) { /* 播报失败绝不影响会议功能 */ }
 }
@@ -5740,6 +5795,7 @@ function ensureAsrConfig() {
       .then((cfg) => {
         if (cfg) {
           serverAsrEnabled = !!cfg.asrEnabled;
+          aiTtsEnabled = !!cfg.aiTtsEnabled; // ★ 09-30c：服务端神经语音（双轨闸，见 speakAiText）
           if (Array.isArray(cfg.iceServers)) sfuIceServers = cfg.iceServers;
           if (typeof cfg.videoSvc === 'boolean') sfuVideoSvc = cfg.videoSvc;
           if (typeof cfg.aiEnabled === 'boolean') { sfuAiEnabled = cfg.aiEnabled; updateAiModeUi(); }
@@ -6108,6 +6164,30 @@ capExportBtn.addEventListener('click', async () => {
 });
 
 capBtn.addEventListener('click', toggleCaptions);
+
+/* ★ 2026-10-01 画中画（借鉴 Piik 的"灵活观看方式"）：
+ * ▎行为：把**当前大画面**（演讲者视图的 tile-main / 共享画面 / 宫格里第一个远端画面）
+ *   弹出成系统级画中画小窗——切到别的窗口也能盯着演讲者或共享内容（ PiP 由
+ *   requestPictureInPicture 提供，零依赖；不支持的环境提示后忽略）。
+ * ▎离房/换主画面：PiP 窗随元素移除自动关闭，无需额外状态机。 */
+pipBtn.addEventListener('click', async () => {
+  try {
+    if (!document.pictureInPictureElement) {
+      const main = document.querySelector('.tile-main video')
+        || document.querySelector('.video-box video');
+      if (!main || typeof main.requestPictureInPicture !== 'function') {
+        showToast('当前浏览器/画面不支持画中画', 'error');
+        return;
+      }
+      await main.requestPictureInPicture();
+      log('🖼️ 画中画已开启（可拖到任意窗口之上，关掉小窗即退出）');
+    } else {
+      await document.exitPictureInPicture();
+    }
+  } catch (e) {
+    showToast(`画中画失败：${e.name}`, 'error');
+  }
+});
 
 /* ---- ★ 09-25「🗂 汇总」：跨段归并（把按小时切开的纪要合成一份总纪要）----
  * ▎为什么和「📝 纪要」并排放在同一个工具条里：它们是同一件事的**不同粒度**
@@ -6633,6 +6713,7 @@ try { rdCtx = rdCanvasEl && rdCanvasEl.getContext ? rdCanvasEl.getContext('2d') 
 const agentPeers = new Map();   // agentId → { name, info }（renderMembers 时重建）
 let rdHostId = null;            // 我正在控制的桌面代理 id（null = 没在控制）
 let rdFrames = 0;
+let rdStartTs = 0;              // ★ 09-30d：首帧时间（会话时长显示）
 let rdDrawing = false;
 let rdPendingAb = null;         // 只留最新一帧：画面实时性 > 完整性（堆积只会看到"过去"）
 
@@ -6745,6 +6826,7 @@ function rdFit() {
 async function rdDrawFrame(ab) {
   rdFrames++;
   if (typeof rdFrameCounter === 'number') rdFrameCounter++;   // ★ 09-30 供自适应画质统计（每 3s 归零重算实测帧率）
+  if (!rdStartTs) rdStartTs = Date.now();                     // ★ 09-30d：首帧起计会话时长（billd-desk 同款状态显示）
   if (rdHintEl && rdFrames === 1) rdHintEl.classList.add('hidden');
   try {
     if (typeof createImageBitmap === 'function' && typeof Blob === 'function') {
@@ -6773,9 +6855,17 @@ async function rdPumpFrames() {
     rdDrawing = false;
   }
   /* 状态文案要回答"画面在不在动"，而不是报一个帧数 ——
-   * 用户看到"已收 2 帧"只会疑惑（2 帧算好还是不好？）。帧数放进 title 给想深究的人。*/
-  setRdState('✅ 实时画面');
+   * 用户看到"已收 2 帧"只会疑惑（2 帧算好还是不好？）。帧数放进 title 给想深究的人。
+   * ★ 09-30d（借鉴 billd-desk）：状态行带上会话时长——"控制了多久"是远程会话的基本事实。*/
+  setRdState('✅ 实时画面' + rdDurationText());
   if (rdStateEl) rdStateEl.title = `已接收 ${rdFrames} 帧 JPEG 画面（来自对方电脑的真实屏幕）`;
+}
+
+/* ★ 09-30d：会话时长文案（首帧起计；每帧刷新时顺带更新，无需额外定时器） */
+function rdDurationText() {
+  if (!rdStartTs) return '';
+  const s = Math.floor((Date.now() - rdStartTs) / 1000);
+  return ` · ${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 }
 
 function rdSend(event) {
@@ -6807,6 +6897,7 @@ function openRemoteDesk(hostId, info) {
   rdIntervals.length = 0;
   rdTargetFps = 12;
   rdQualityAt = Date.now();   // 起步给一个"冷静期"，别一上来就调参
+  rdStartTs = 0;              // ★ 09-30d：会话时长从新会话首帧起算
   if (rdConsoleEl) rdConsoleEl.classList.remove('hidden');
   if (document.body && document.body.classList) document.body.classList.add('rd-mode');
   if (rdHintEl && rdHintEl.classList) { rdHintEl.classList.remove('hidden'); rdHintEl.textContent = '正在等对方电脑的第一帧画面…'; }
@@ -7017,7 +7108,39 @@ const rdBtn = (id, fn) => { const el = $(id); if (el && el.addEventListener) el.
 rdBtn('rdBack', () => rdSend({ kind: 'back' }));
 rdBtn('rdReload', () => rdSend({ kind: 'refresh' }));
 rdBtn('rdMax', () => { rdSend({ kind: 'window', state: 'maximized' }); showToast('⛶ 已请求最大化对方窗口', 'info'); });
+/* ★ 09-30d（借鉴 billd-desk）：控制台全屏——远程会话的画面空间永远不嫌多。
+ *   全屏的是 rdConsole 本身（含工具条），切换后 rdFit 重适配画面尺寸。 */
+rdBtn('rdFull', () => {
+  try {
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else if (rdConsoleEl && rdConsoleEl.requestFullscreen) {
+      rdConsoleEl.requestFullscreen();
+    }
+    setTimeout(() => { try { rdFit(); } catch (e) { /* 桩无尺寸 */ } }, 300);
+  } catch (e) { /* 无 Fullscreen API 的环境忽略 */ }
+});
 rdBtn('rdRelease', () => closeRemoteDesk(true));
+/* ★ 09-30d（借鉴 billd-desk）：剪贴板双向——
+ *   推：读本机剪贴板 → clipboard-sync(ctl2host) → agent 写进对方网页剪贴板；
+ *   拉：remote-input {kind:'clipboard-read'} → agent 读对方网页剪贴板 → clipboard-sync
+ *   (host2ctl) 回来 → 复用既有 host2ctl 监听写进我的剪贴板（不重复造轮子）。
+ *   服务器剪贴板门禁（控制对白名单）照常生效——能力来自授权，不是来自通道。 */
+rdBtn('rdClipPush', async () => {
+  if (!rdHostId) return;
+  try {
+    const t = await navigator.clipboard.readText();
+    if (!t) { showToast('📋 你的剪贴板是空的（或浏览器未授权读取）', 'info'); return; }
+    socket.emit('clipboard-sync', { to: rdHostId, text: String(t).slice(0, 100000), dir: 'ctl2host' });
+    showToast(`📋 已推送 ${t.length} 字到对方电脑的网页剪贴板`, 'info');
+  } catch (e) {
+    showToast('❌ 读取本机剪贴板失败：请点一下页面再试', 'error');
+  }
+});
+rdBtn('rdClipPull', () => {
+  if (!rdHostId) return;
+  if (rdSend({ kind: 'clipboard-read' })) showToast('📥 正在拉取对方网页的剪贴板…', 'info');
+});
 
 /* =====================================================================================
  * ★ 09-30 借鉴 billd-desk —— 两块增强远程控制体验：
@@ -7092,8 +7215,14 @@ socket.on('desk-granted', ({ hostId, hostName } = {}) => {
 });
 
 // ---- ② 画质档 + 弱网自适应 ----
+/* ▎和上面那套"闭环 fps 自适应"（rdAdaptQuality → remote-quality）怎么共存？（坑 47：一个概念只留一个来源）
+ *   两条控制线如果各调各的帧率，用户选了「高清」也会被自适应悄悄拖回 12fps——
+ *   所以这里明确分工，**帧率只有一个目标值来源**：
+ *     · **档位 = 策略层**：决定 JPEG 画质 + 分辨率上限 + **目标帧率中枢**（切档即改写 rdTargetFps）；
+ *     · · **自适应 = 执行层**：只在中枢附近 ±2 微调（6~24 硬钳制），不另起炉灶定目标。
+ *   smooth 特意取 6fps（= RD_FPS_MIN 硬下限），否则自动微调会立刻把"流畅"顶回 6，两个来源打架。 */
 const RD_PRESETS = {
-  smooth:   { fps: 5,  label: '流畅' },
+  smooth:   { fps: 6,  label: '流畅' },
   standard: { fps: 12, label: '标准' },
   hd:       { fps: 20, label: '高清' },
 };
@@ -7105,6 +7234,11 @@ let rdFrameCounter = 0;      // 3s 窗口内收到的帧数（rdPumpFrames 里�
 function setRdPreset(preset, byAuto) {
   if (!RD_PRESETS[preset]) return;
   rdPreset = preset;
+  /* 切档 = 换"中枢"：把自适应的目标帧率与采样窗口一起重设，
+   *   否则旧的 rdTargetFps/旧样本会继续按上一档拉扯对端（表现为"切了档没反应"）。 */
+  rdTargetFps = RD_PRESETS[preset].fps;
+  rdIntervals.length = 0;
+  rdLastFrameAt = 0;
   rdSend({ kind: 'quality', preset });
   // 高亮当前档按钮（自动模式下高亮"自动"）
   const map = { rdQSmooth: 'smooth', rdQStd: 'standard', rdQHD: 'hd' };

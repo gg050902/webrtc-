@@ -435,6 +435,229 @@
 >   入口"；**回归（本次实测）**：信令 **154/154** + 冒烟 **159/159**；真机：喊小明
 >   →thinking→speaking 逐字打出 RAG 诚实回答（检索不到明说，不编造）。
 
+> **★ 2026-10-02d 语音链路根因修复（用户报"AI 一直收到重复的一句话 / 对话很混乱 / 延迟很大 /
+> 后边它回答没有说话 / 刚刚都听不到声音"，五症同源）+ 仓库搬到 D 盘后的卫生收尾**——
+> ① **根因**：whisper 在**纯静音段**把 `--initial_prompt` 续写成句子，账本每 2.4~4s 出现一条
+>   一模一样的「请用简体中文输出。」（证据 `sfu/captions/cap-746646-20261002.jsonl`）；旧门槛
+>   `size<40000` 量的是**时长**不是**能量**，4s 静音 128KB 照进转写 → 假字幕落进 20s 追问窗口
+>   → 每条触发一次完整应答（风暴+账本污染）→ 又把 `lastUserSpeechTs` 刷新 → 朗读闸永久关闭。
+>   **修法四件**：`Asr.measureWavLevel()` 能量闸（Node 里读 PCM 算峰值 dBFS，<-45dB 删段**连模型都不叫**）
+>   + `Asr.cleanTranscript()` 语义清洗（提示词回显/「字幕by」/「谢谢大家」/纯标点→空串），
+>   提示词改中性短语并**单一来源**（`Asr.ASR_PROMPT`，worker 经 `ASR_WORKER_PROMPT` 取用）
+>   + 成句处**重复句闸 + AI 回声闸**（归一化包含判据，`ASR_DUP_MS` 15s / 回声 45s）
+>   + 应答侧**在途锁 + 最小间隔 + 窗口只在实际接话时顺延**；客户端唤醒自动提问加 8s 同句去重。
+> ② **"后来不出声"两条真死锁**（坑 66）：`speakAiText` 的让位闸把 `ai-tts-fail` 的回落也挡死
+>   （`force` 例外口修好）+ `aiTtsEnabled` 进房读一次终身缓存（服务器**定期重探**补上真定时器、
+>   翻转广播 `ai-tts-state`、客户端连败 2 次本地自愈）；`ai-audio` 改**顺序队列**、
+>   销账时机改成"真的开始播"（onplaying）、onerror 才回落浏览器朗读、hush 连队列一起清。
+> ③ **★ Qwen 双引擎"写了但从来没生效"的真相**（用户问"是没实现还是还在用 whisper"）：
+>   `sfu/server.js` 找模型目录用的是 `path.join(__dirname,'models')` 而 server.js 在 sfu/ 下 →
+>   它找 `<根>/sfu/models`（不存在）→ `QWEN_*_MODEL` 永不设 → 两个 `warm()` 一次都没被调用
+>   （启动日志从来没有那两行 🔥）。路径改为按项目根解析后**双 worker 正常预热**；
+>   `config.json` 切 `asrEngine:"qwen-local"`（whisper 自动兜底）、`announcedIp` 修成本机真实 WLAN IP；
+>   `/config.json` 新增 `asrEngine` 字段且 `asrEnabled` 不再等价于"装了 whisper"（否则换引擎会谎报
+>   没耳朵、前端退回浏览器识别）；`start:lan` 改为**合并式生成**保留手工字段
+>   （配置被工具静默吃掉就是 qwen-local 丢失的直接原因）。
+> ④ **延迟（实测数字，别凭感觉优化）**：探针量到 **Qwen3-TTS 本地 CPU 合成一句要 44s**
+>   （答案 3.0s 就上屏、声音 47.0s 才到）——这就是"我跟它说话延迟很大、后边它回答没有说话"的
+>   第二个独立成因。据此改策略：**实时播报默认走浏览器朗读（即时）**，本地神经音色改成
+>   显式开关 `config.aiTtsLocalWait` / `AI_TTS_LOCAL_WAIT=1`（Edge 可达时它仍是又快又好听的第一选择）；
+>   `speakAnswerForRoom` 顺序改成 **Edge → 本地 Qwen(需显开) → ai-tts-fail**，且整段答案
+>   改**按句流水线**（`splitForTts` 最多 3 段，合成完一段立刻发一段）；
+>   判据 `serverVoiceReady()` **只写一处**，`tts:` 标记 / `/config.json` 的 `aiTtsEnabled` /
+>   预热后的 `ai-tts-state` 广播三处共用它（原先各判各的，会造出"页面让位、服务器不发"的两头静音）。
+>   应答在锁内等完但带 30s 保险丝；静音段不再占 ASR 并发闸。
+>   复测：提问→答案首字 2.8s、答案完成 3.0s、**答案上屏→通知前端回落浏览器朗读 0.0s**
+>   （以前这个等待是"永远不来"）。
+> ⑤ **仓库卫生（搬 D 盘后排查）**：`models/`(4.1GB) 曾被 `git add -A` 带进索引（目录自带 LFS
+>   `.gitattributes`）→ 加 `.gitignore` + `git rm -r --cached`（**磁盘文件一个未动**，
+>   引擎照常加载）；`.workbuddy/` 同样取消跟踪；**仍未解决**：4.1GB LFS 对象还躺在 `.git/lfs`、
+>   本轮全部改动仍未提交且**仓库无 remote**（唯一副本在 D 盘）。
+> **回归（2026-10-02 实测）**：`test:asr` **28 通过/1 跳过**（+10 静音幻觉清洗与能量闸）、
+>   `test:asr-live` **PASS**（一条拼接音频跑完断言：**静音期零字幕、"说→停→再说"只入库 1 条、
+>   AI 只应答 1 次**——修复前实测 8+ 次；并断言"声明 tts:'server' 就必须给出 ai-audio 或
+>   ai-tts-fail"，杜绝无头静音）、`test:sfu` **189/189**（+2 引擎可见性/口径一致）、
+>   `test:smoke` **196/196**（+7 让位闸例外、队列销账时机、hush 清队列、状态翻转监听、唤醒去重）；
+>   新记 **坑 64/65/66**（坑 65 是本轮自查抓到的**我自己写的假绿**：换进程推流=换 UDP 源端口
+>   =comedia transport 丢包，"0 条"绿得可疑 → 改成一条拼接 wav 一次推流）。
+> **★ 2026-10-02e AI 头像重做 + Piik 四条取长 + pyprobe 收口（用户："有重影、一直重复一个动作"；
+> "Piik 四条我都想实现"；"把现有问题都解决"）**——
+> ① **头像重影的真相是两层节奏叠加**：形象素材是 82 帧循环 WebP，抽帧（`ffmpeg -i x.webp f%02d.png`）
+>   看到 f41 头部/肩部带**半透明偏移残影**（AI 生成动画烘进帧里了），而 CSS 又对这张"本来就在动"的图
+>   叠了一层 `aiFaceBreathe` 缩放 → 重影+发抖；而"一直重复一个动作"是循环素材的本性（不可能看场合变招）。
+>   **修法 = 形象与动作彻底分开**：一张干净静帧（取循环起始帧 → `xiaoming-idle.png`，行与格共用同一张，
+>   坑 47）+ 动作全交给 CSS；每元素同一时刻只允许一条动画（常驻呼吸在 `.ai-face`、状态律动与小动作互斥
+>   由 `armAiGestures()` 保证）；idle/listening 每 7~14s 随机演**一次性**小动作（nod/tilt/peek-l/peek-r/
+>   sway/breath-deep），演完摘类，`animationend` 与超时保险丝共用一个只生效一次的 finish。
+>   顺手删掉从未被调用的 `aiAvatarSvg()` 及其整套 `.ai-svg*` CSS（死代码），并修圆盘尺寸：
+>   旧 `width:min(76%,320px)` 在 403×227 的扁格里顶天（实测顶部留白 -3px、压名牌 -49px）→
+>   改**按高度**定尺寸 `height:min(66%,224px)` + `top:43%` + `object-fit: contain`。
+> ② **Piik 四条全部落地**：**(a) 每路独立音量 0~200%**——安全分层：0~100% 走 `video.volume`
+>   （零风险），>100% 才挂 WebAudio `GainNode` 且此时必须 `video.muted=true`（否则双重回声），
+>   增强不可用**回落 100% 而不是静音**；流换对象（replaceTrack/D6）必须重挂（`n.stream !== srcObject`，
+>   否则"调大音量反而没声"）；三条删格路径都 `detachTileGain`（长跑不漏节点）；按成员 id 存 localStorage。
+>   **(b) 只听不看**——新信令 `set-consumer-paused {consumerId,paused}`（服务器 `consumer.pause()`，
+>   前端 display:none **不省带宽**、只有服务器停转发才省）；权限天然按 `socket.consumers` 隔离
+>   （结构上关不掉别人的画面）；**ABR 守卫** `if (consumer.paused) return`（坑 21/62 同一条纪律）。
+>   **(c) 定向回应**——react 消息加 `to`（复用 F5 批注的定向头语义，广播通道 + 应用层过滤），
+>   成员行「只对 TA 回应」按钮 + 回应条「→ 小张」胶囊，20s 过期 + 发完即清；
+>   诚实边界写进注释：**定向 ≠ 隐私**（消息仍到所有人手里）。**(d) 进房前 ICE 预检**（第 34 步）——
+>   一次性 RTCPeerConnection 用**同一批下发的 ICE**收集候选，relay>srflx>host>无 四档结论 + 三色，
+>   把坑 36 的"沉默故障"说成人话并指回《部署手册》；不阻塞进会。
+> ③ **★ 新坑 67：探测超时被当成"没装"在 Qwen 模块上复发（三处同源已收口成 pyprobe.js）**——
+>   实测 `import qwen_asr` 冷启动 **21.7s**、`import qwen_tts` **18.4s**（torch 一族），
+>   而三个模块的探测都写死 `timeout: 15000` + "err 即没装" → 机器一冷就误判、本地引擎悄悄不启用；
+>   更糟的是 `warm()` 恒返回 undefined，启动日志**无条件打 🔥 已预热**（假绿，没人会去怀疑一行日志）。
+>   修法：新增 `sfu/ai/pyprobe.js` 作唯一实现（区分 enoent/ModuleNotFound/timeout、超时重试一趟 90s、
+>   解释器逐个试），`warm()` 返回 boot() 结果、调用方按返回值说实话。
+> **回归（2026-10-02 实测）**：`test:smoke` **224/224**（+28：头像 8 条、音量 7 条、只听不看 4 条、
+>   定向回应 4 条、ICE 自检 5 条；本轮首次让测试读 style.css——坑 26 那类 CSS 缺陷过去无人值守）、
+>   `test:sfu` **191/191**（+2 暂停门禁/错误不传染）、`test:e2e-media` **15/15**（原 5 项 →
+>   真浏览器实证：暂停前解码帧 66→97、暂停后 **97→97 停增**、恢复 116→146；40% 走元素音量、
+>   180% 走音频图且元素静音、回 100% 解除静音；ICE 自检实测出「打洞可用」）、
+>   `test:asr` 28 通过/1 跳过、`test:asr-live` PASS、`doctor` 19/2/0；
+>   仓库卫生：`.git` 从 4.4G 降到 293M（孤立 LFS 对象已确认 0 引用后删除，`models/` 权重原封未动）。
+> **★ 2026-10-02f 让 Qwen 音色"能用得起"：语音流水线 + 引擎自适应字数预算**
+> （用户："有没有办法用 Qwen 的音色但延迟低一点，这太高了"）——
+> ① **结构性那一刀：LLM 与 TTS 重叠**（`makeSpeakPipeline`）。原来必须等整段答案生成完
+>   才开始合成第一句，而 `aiBrain` 本来就是流式的（每 12 字一吐）——现在每收到一段增量就
+>   切出"已完整"的句子立刻送合成，LLM 写第 2、3 句的时间与第 1 句的合成时间互相盖住。
+>   配套：`answerTs` 提前生成（音频可能比 chat-message 先到，两者要靠同一个 ts 配对），
+>   客户端加 `playedServerTts` 集合——**已经播过的 ts 不再挂回落账**，否则之后一条
+>   `ai-tts-fail` 会把念过的答案再念一遍。
+> ② **引擎自适应字数预算**（`config.aiTtsMaxChars` 默认 48）：只在"慢引擎（本地 Qwen）说话"
+>   时生效，超预算的部分只以文字显示并打日志。Edge 可达时预算放宽到 500——
+>   **约束要按引擎的能力定**，一刀切等于给可用引擎降级。
+> ③ 播报链拆成 `synthAndEmit`（单段）+ `speakAnswerForRoom`（整段，@ai 用）+ 流水线（语音问答用），
+>   三者共用同一个"要么出声、要么 ai-tts-fail"的收口（杜绝无头静音）。
+> ④ 新配置键写进 `config.example.json`（复制即用）：`aiTtsLocalWait`（本地神经音色是否抢实时播报，
+>   默认 false）、`aiTtsMaxChars`。实测数据：本地 Qwen3-TTS 单句 12s、整段 44s（RTF>1，
+>   合成比播放慢，这是 CPU 自回归的硬账，不是 bug）。
+> **回归**：冒烟 224/224、信令 191/191 复跑全绿（流水线重构后）；
+> `npm run bench:tts`（`scripts/bench-tts.py`）基准在量 dtype / non_streaming_mode / 批量三句 等开关的真实收益，
+> 结论回来再决定要不要改 worker 的加载参数（**不凭猜调优**）。
+> ⚠️ **待人工浏览器验证**（命令行验不了）：两窗真开会时"喊小明→它只答一次、不再重复刷屏"、
+>   AI 语音**听不听得见**（Edge 端点仍 403，本地 Qwen3-TTS 音色是否真的出声）、
+>   说完到出字幕的体感延迟、以及"它听不到声音"是否还在发生（若还在，看服务器日志有没有
+>   `🤖 AI 小明开始聆听` 与 `[ASR/qwen-local]`/`[ASR/常驻]` 两类行，能立刻定位断在哪一环）。
+
+
+> **★ 2026-10-02g 「不说话」与「还在用 whisper」的最后两半（用户："还是失败了…它回答的时候不说话
+> / 我要的是不乱说话不是不说话 / 你可以直接测试直到能正常使用"）**——本轮全部在**真浏览器**里取证。
+> ① **"还在用 whisper"是界面在撒谎，不是引擎没切**：`config.asrEngine` 早已是 `qwen-local`、
+>   转写实测 `[ASR/qwen-local] 1.4s / 2.4s`，但**三处硬编码的 "whisper" 字样**分别写在
+>   字幕状态徽标、toast、流程日志，加上服务器启动那行无条件打 `whisper.exe`——
+>   用户只能看见界面那行字，于是得出"根本没切换"的结论（坑 67 的 UI 版：**过期声明比缺失更糟**，
+>   它会让人去装已经装好的东西）。修法：`/config.json` 的 `asrEngine` 存进 `serverAsrEngine`，
+>   三处 UI 与启动日志统一走 `asrEngineCn()`，启动日志改成"主引擎 = qwen-local；whisper 仅作兜底"。
+> ② **"回答时不说话"还有第三条独立死锁**（前两条已在 02d/02e 修掉）：
+>   `hushAiSpeech()` 每条字幕到达都开一个 **8 秒静默窗**，而语音对话的真实时序是
+>   「说完 → 字幕到（开窗）→ 1.5~6s 后**这条提问的答案**送到」——答案永远落在自己开的窗里，
+>   且顺手 `pendingServerTts.delete(ts)` 把浏览器回落账也销了 = **两头静音、零报错**。
+>   修法 = **认人别认时间**：拉黑"被打断那一轮的 ts"（同一流水线分段共用 ts），新一轮是新 ts 天然放行，
+>   不依赖两端时钟对齐；时间窗只留作"段没带 ts"的兜底判据。
+>   浏览器那一轨同源：抢话闸的 700ms 字幕窗仍然每轮误杀，因为
+>   **"字幕刚到"证明的是 1~3 秒前有人在说话**，而答案恰恰紧跟在自己的字幕后面——
+>   改成**以麦克风即时信号为主判据**（130ms 级），字幕窗只在"根本没有麦克风可量"时兜底。
+> ③ **朗读不再等整段答案写完**：`ai-stream` 的增量只进气泡不上嘴，长答案要等终态才开口。
+>   新增 `speakStreamPart` + `enqueueAiSpeech(say,{replace})` 分句泵（`aiSpeakGen` 按代作废），
+>   流里一出现完整一句就念、终态只补剩下的尾巴（前缀对不上则整段重念，**宁重不漏**）。
+>   本轮自己写出来又被真机抓走的两个坑：(a) 朗读读的是 `box.buf`——那是 DOM **攒批后会被清空**的缓冲，
+>   函数与调用点都对，但它永远只能看到一帧内的三五个字，句子根本不可能出现（改为独立副本 `box.rawAll`）；
+>   (b) `cancel()` 掉的旧句子会**迟到地**回调 `onerror`，若它先于新一轮的第一句到达就把新队列整个倒空，
+>   症状正是"第一轮问候语念完之后 AI 再也不出声"（顺序改为 cancel→清队列/断泵→再 push，并加代号守卫）。
+> ④ **录音进程静音自愈**：`ffmpeg` 听觉进程在约 30s 无 RTP 后自己退出（`Error during demuxing`），
+>   于是"挂在那儿没说话"之后 AI 永久失聪——`spawnRecorder()` 加 `exit` 自愈重启（≤5 次、换 segDir、
+>   RMS 一来就重置计数），日志 `🩹 AI 听觉管线…自愈重启`。
+> **实测（全部真跑，不是推断）**：`test:smoke` **237/237**（+41）、`test:sfu` **191/191**、
+>   `test:asr` **28 通过/1 跳过**、`test:asr-live` **PASS**（qwen-local 转写 1.4s/2.4s，
+>   静音期零字幕、ASR 2 条 / 应答 2 次，语音交付回落浏览器朗读 **1.6s**）；
+>   真浏览器（room 605280）取证三条：字幕状态显示 **「🖥️ 服务器转写（本机 Qwen3-ASR）」**、
+>   抢话闸——字幕 1ms 前刚到 + 麦克风静默 → `speechSynthesis.speak` **被调用且 speaking=true**
+>   （旧 2500ms 闸在此刻必然吞掉），麦克风真出声 → **被拦**（礼仪没丢）；
+>   唤醒到答案 **2.7s**、答案到出声不再需要第二个等待，流式一句一 enqueue（46 次增量 → 3 句排队）。
+> ⚠️ **仍需人工验证**：真人开麦两窗对谈的体感（假媒体在自动化浏览器里被拒授权，量不出真机手感）、
+>   Edge 端点恢复后服务端神经语音是否切回、以及本地 Qwen3-TTS 音色（`aiTtsLocalWait`，CPU 一句 ~12s 仍未变）。
+
+> **★ 2026-10-03a 六项连跑：弹窗循环 / 界面说实话 / AI 会操作会议实体 / 共享分层 /
+> 选层器根本没出现 / 远程桌面手感延迟 2287ms→153ms**——用户点了六件事：
+> ①语音彻底解决 ②前端丑 ③远程操控到底 ④会议本体完善+降延迟 ⑤AI 能操作实体（例：打开白板）
+> ⑥把一份 hero 落地页提示词融进来。全部真跑取证，不是"应该没问题"。
+> ① **用户被原生弹窗循环卡住（"一直弹这个"）**：服务器重启 → 内存房间没了 →
+>   D6 自动重连拿旧 `myRoom` 再 join → `room-not-found` → **`alert()` 阻塞主线程** →
+>   点掉 → 又重连 → 又弹。两个错叠加：**用阻塞模态报一个会重复发生的事件** +
+>   **`myRoom` 从来没有作废路径**（进过房就永远自认为在房里，徽标还挂着死房号）。
+>   修法是把"房间没了"做成一次**状态迁移** `giveUpRoom()`（清 myRoom/密码/令牌 + 拆媒体 +
+>   回加入页），提示交给页内 toast。三条房间类 alert 全部下掉，冒烟加一条
+>   **"全文件 0 次 alert( 调用"** 的结构断言（注释里也别写 `alert(`，会被自己的断言抓到）。
+> ② **测试不许抢开发者的端口（用户："测试的时候不要退出 agent 啊"）**：
+>   `test:sfu` 默认 3001、`test:asr-live` 也起在 3001/3443 —— 于是每跑一次回归就要先把
+>   用户正在用的那一台踢掉，而"复用已有实例"又是坑 57 的假绿。改成
+>   **信令 3011 / 语音自测 3017 + `SFU_NO_HTTPS=1` + 端口被占明确拒绝 + 环境变量可换**，
+>   实测跑完两套回归后 3001 的 PID 一个没变。判据：**测试自起服务、自占端口**。
+> ③ **"回答时不说话"的第三条独立死锁**（前两条见 02d/02e）：`hushAiSpeech()` 每条字幕
+>   都开 8 秒静默窗，而语音对话的真实时序是「字幕到（开窗）→ 1.5~6s 后**这条提问的答案**到」
+>   → 答案永远落在自己开的窗里，还顺手销掉 `pendingServerTts` 回落账 = **两头静音零报错**。
+>   修法 = **认人别认时间**：拉黑"被打断那一轮的 ts"（同一条流水线分段共用 ts），
+>   新一轮是新 ts 天然放行，不依赖两端时钟对齐。浏览器那一轨同源：抢话闸改成
+>   **以麦克风即时信号为主判据**（字幕只证明"1~3 秒前有人在说话"，而答案总跟在字幕后面）。
+>   顺带把朗读搬进流式：**一轮答案的第一句"只说最新"**（实测旧寒暄占满队列把新答案
+>   堵到 8.1s 才出声，改完 1.97s）。
+> ④ **AI 会操作会议实体（第 36 步）**：`ROOM_ACTIONS` 白名单（开/关白板、开/关字幕、
+>   切演讲者/宫格）+ `detectRoomAction` 规则路由**排在 LLM 之前**（tools-first，坑 38），
+>   服务器只广播 `room-control {action, byName, ts}`，客户端照表落地。
+>   **边界写死**：只动"房间级共享状态"，凡动用户设备的（摄像头/共享/静音别人/发消息）
+>   一律不进这张表 —— 冒烟里有一条**结构断言**：白名单里出现 camera/screen/mute/record 直接红。
+>   中文规则把"关"排在"开"前面判（「把白板关掉」否则跨词命中"打开白板"），
+>   动词表要覆盖同义词（第一次只写「打开字幕」，测试用「开启实时字幕」就整条不命中，
+>   症状恰是"AI 回了漂亮话、什么都没做"）。断言按**事件真的到了两个客户端**写，不按回复措辞。
+> ⑤ **屏幕共享补 simulcast**：共享一直是单层全分辨率上传，弱网观众只能
+>   "卡成幻灯片或什么都看不见"二选一；而服务器 ABR 的守卫是 `kind==='video' && layerCount>1`
+>   —— **层数>1 就自动生效，服务器零改动**。新增 `SCREEN_SIMULCAST_ENCODINGS`
+>   （250k/1.2M/2.8M，比摄像头整体高一档：屏幕是文字线条，压狠了看不清等于没共享）
+>   + `contentHint='detail'` + 单层兜底。
+> ⑥ ★ **选层器从来没被创建出来**（写 e2e 断言才抓到的真 bug）：服务器的
+>   `layer-changed(initial)` 在 consume 的 **ack 之前** emit，而格子要等 ack 回来才登记进
+>   `consumerTiles` → 通知到达时 `tile` 是 undefined → `ensureLayerPicker` 直接 return →
+>   DOM 里一个 `.layer-pick` 都没有（真浏览器实测：层数 3 明明在 `layerState` 里，画面却选不了）。
+>   修法顺着"一个概念只有一个来源"：**`layerState` 是账本，格子一出现就照账本补渲染**，
+>   不去调服务器 emit 时序。
+> ⑦ ★ **远程桌面手感延迟 2287ms → 153ms（15 倍）**：控制台以前只报 RTT 与帧率，
+>   而"点下去→画面动"是另一条链（输入→代理执行→重画→抓屏→编码→回传→解码）。
+>   量出来才看见根因：**CDP screencast 是变化驱动的，像素没变就一帧都不发** ——
+>   点了空白处 / 点了无视觉反馈的控件 / 只是移动鼠标，控制端就一直收不到画面，
+>   体感"它半天才动"，而这**不是带宽慢，是没人报信**。
+>   修法 = **输入回声帧** `scheduleEcho()`：注入后 120ms 复查，若抓屏没出帧就主动
+>   `captureScreenshot` 补一帧；三重限流（突发合并 / 已出帧就不补 / 仍走帧间隔闸门），
+>   `stopStream()` 撤权时清定时器（撤权后还去抓屏 = 多一次无谓的隐私面）。
+>   回归上限从 3000ms 收到 **800ms**，让这条断言同时是"回声帧还在不在"的哨兵。
+> ⑧ **`test:asr-live` 的"0 条也全绿"（坑 65 在我自己写的测试里复发）**：有一次实跑
+>   `ASR 0 条 / 应答 0 次`，而下面每条断言都是"==0 / <=2" → 整组绿，绿的是"音频根本没进系统"。
+>   补了**正向对照**（必须至少一条字幕真带上所说的那句 + 至少应答一次，否则直接红并列出四步排查），
+>   PASS 行现在打印"正解命中 N 条（证明音频真进去了）"。
+>   顺带查清自愈记账的错：ffmpeg 长时间无 RTP 会**干净退出（code=0）**，旧写法把它算进
+>   5 次崩溃预算 → 预热等 65 秒就把预算烧光、真语音来时耳朵已经死了（目录里留着 -r1…-r5）。
+>   改成**活过 15s 且 code=0 = 静音退场，自愈不限次**；崩溃仍 5 次封顶；
+>   不再每代换目录（`-segment_start_number` 接着上一代编号写）。
+> ⑨ **首页 hero 化（第 35 步 + style.css 第 28 节）**：借落地页的**编排语言**
+>   （模糊引导语 → 打字机主句 → 胶囊 CTA → 严格 z-index 分层 → prefers-reduced-motion 降级），
+>   **不借它的资源**——参考稿用外链视频 + 外链字体，与本项目"零依赖 + 可离线 PWA"冲突，
+>   背景改纯 CSS 光晕 + SVG 噪点，字体继续本地衬线栈。顶栏三个入口全部接真功能
+>   （检查设备 / 复用第 34 步那颗 ICE 按钮 / 开设备码面板），**不写假链接**；
+>   冒烟新增一条**零依赖红线断言**：index.html 里出现 `href/src="http…"` 或 CSS 里出现
+>   `@import url(http…)` 直接红。移动形态有意**不做汉堡菜单**（这一屏本身就是全屏遮罩，
+>   再叠一层菜单遮罩只是给同一块地方放两张遮罩），理由写进 CSS 注释。
+> **回归（2026-10-03 实测）**：`test:smoke` **254/254**（+17：hero 5 条、AI 房间动作 4 条、
+>   共享分层 3 条、弹窗循环 2 条、朗读流水线与闸门若干）、`test:sfu` **196/196**（+5 房间动作）、
+>   `test:e2e-media` **19/19**（+4：3 层 simulcast 真协商、降层真的让 videoWidth 320→160、
+>   交回自动不锁死）、`test:e2e` **16/16**（+1 手感延迟 153ms）、`test:agent` **24/24**、
+>   `test:asr-live` **PASS**（正解命中 1~2 条，qwen-local 转写 1.4~2.4s）、`test:asr` 28+1skip。
+> **新记坑 69 / 坑 70**。
+> ⚠️ **仍需人工浏览器验证**：屏幕共享的三层是否真协商（自动化浏览器里 `getDisplayMedia`
+>   被拒授权 = `NotAllowedError`，这条命令行验不了；摄像头那条同一段代码已被 e2e 实证 3 层）、
+>   首页 hero 在真机宽屏下的观感、AI 房间动作在第二台设备上的同步表现。
+
+
 > **09-24b 三条新功能：真 OS 级远程桌面（B 档）+ 跨网一键发布 + SW 缓存纪律（代码已落地并已验证，本次同步文档）**——
 > ① **B 档「真 OS 级远程桌面」✅（原"毕设才开、违背零依赖需拍板"作废）**：新增本地代理
 >   `agent/`——`agent/cdp.js`（约 470 行，**手写 CDP 客户端**：启动真实 Chromium，`--remote-debugging-port`
@@ -724,7 +947,192 @@
 > ③ **启动网址**：监听 0.0.0.0 时把 `https://0.0.0.0:3443` 打给用户——0.0.0.0 是监听语义
 >   不是访问语义，没法点（"不是本来的网址"根因）。改为一律打 `http://localhost:3001` +
 >   🔒 `https://localhost:3443`，另起一行 🌐 局域网地址给真实 IP（announcedIp 自动纠偏后）。
-> **回归**：冒烟 168/168 + 客户端/服务器语法过；服务器已重启（启动打印四行全可点）。
+> ④ **★ scrypt 参数升档 + 平滑重哈希（路线图 0.3 第 5 条收官）**：password.js 引入**代际**——
+>   V1=scrypt(pw,salt,32)（Node 默认参数，存量账号全是它）、V2=scrypt(pw,salt,64,{N:32768,
+>   maxmem:64MB})（密钥翻倍 + 成本翻倍，新哈希一律用它；**maxmem 必须显式放大**，否则正好
+>   压线 Node 默认 32MB 抛 "memory limit exceeded"，本机复现）；代数判别 = 按 hex 长度
+>   （64/128 字符），verifyPassword **按存量哈希自动选参数**，新老并存互不干扰；
+>   **服务器登录成功后自动重哈希**（换新盐 + V2 重算写回——明文只在"刚输对"的一瞬存在，
+>   错过就没有合法升级窗口），用户无感，真实库里 Guoge 等老账号下次登录即升级。
+>   **顺带修掉 store.js 一个生产级缺陷**：closeDb() finalize 了预编译语句后再调用会抛
+>   "statement has been finalized"（测试真实踩中）——重构为 **openDb() 惰性打开 + 可重开**，
+>   "关了再用"从崩溃变成自然恢复，require 即建库语义不变。
+>   **回归（本次实测）**：信令 **187/187**（+2 平滑重哈希：预置 V1 老账号登录 → 库里哈希变
+>   128 字符且换盐）+ test:store **55/55**（+6 V2/代数判别/升级写回）+ 冒烟 168/168 +
+>   test:shutdown **9/9**（closeDb 可重开重构后复验）。
+
+> **★ 09-30c 服务端神经语音（Edge TTS 协议，零 npm 依赖，AI 语音去"AI 味"的主攻）**——
+> 用户长期抱怨"AI 助理声音难听/AI 味"：浏览器 speechSynthesis 读的是**用户机器上装了什么音色**，
+> 多数 Windows 只有老式 SAPI 音色（Huihui 一族）——本机音色天花板决定了播报质量。
+> ① **新文件 `sfu/ai/tts.js`**：微软 Edge 神经语音（晓晓/云希一族，当前免费且最自然的中文音色）
+>   的 WebSocket 协议纯手写实现——Sec-MS-GEC 防滥用令牌（Windows 纪元 tick 按 300s 取整 +
+>   SHA256 大写）、speech.config + ssml 两段文本帧、二进制帧 2 字节大端头长 + MP3 分片、
+>   Path:turn.end 收尾；**Node 内置 crypto + WebSocket 即实现，零新 npm 依赖**。
+>   附 LRU 结果缓存（同一句不重复合成）+ 并发闸（TTS_CONCURRENCY=2）+ 超长文本按句切分。
+> ② **双轨纪律落地**：本机经加速器实测**四变体全 403**（bing/msedgeservices 端点 × 带/无 GEC
+>   ——端点可达性随网络出口而定，外部不可控）→ **启动探测**（合成"你好" 6s，10 分钟 TTL 重探）
+>   通过才在 /config.json 下发 `aiTtsEnabled:true`；不可达 → 前端自动回落浏览器 speechSynthesis，
+>   **功能永不降级，状态永远可见**（启动日志明说走哪条路）。AI_TTS=0 强制关。
+> ③ **管线**：AI 回答（语音问答 asrWakeAndAnswer + @ai 问答两处挂点）→ 合成 MP3 → 内存货架
+>   `putAudio`（128 位随机 id，30 条上限 + 30 分钟清扫）→ 广播 `ai-audio {url,ts}` → 前端
+>   `<audio>` 播放；HTTP `GET /ai-tts/:id.mp3`（id 白名单闸，非法格式直接 404）。
+> ④ **客户端契约**：`aiTtsEnabled=true` 时浏览器 TTS **整体让位**（防同一条答案两个声音），
+>   只听 ai-audio；**抢话 hush 同样管辖服务端 MP3**（用户开口 → pause）。false 时行为与
+>   之前完全一致（浏览器 TTS）。
+> ⑤ **回归（本次实测）**：`npm run test:tts` **10/10**（+1 SKIP：真合成轨随网络出口，双轨约定）+
+>   信令 **187/187** + 冒烟 **189/189** + test:asr **18 通过/1 跳过**；服务器启动探测日志、
+>   /config.json 下发、非法 id 404 全部实测验证。
+> ⑥ **TEST_ASR 升级为全闭环自测（耳朵→脑子→嘴）**：自测服务器自己连一个真实 socket.io 客户端
+>   进房（join-room），断言唤醒句触发 asrWakeAndAnswer → aiBrain → **全房 chat-message(from=ai-bot)
+>   真有应答**——首跑就把"嘴"也闭环了：AI 把「帮我记一下…」识别为纪要意图 → 真生成
+>   `/minutes/999999/…-segment.md`（LLM 撰写）→ 回答带路径，"听→懂→做→说"四层全通。
+>   **调试路上连环抓到三个 fixture 缺字段崩溃**（房间号必须 6 位数字 / 成员缺 `talk` Map =
+>   aiBrain 静默崩 / 缺 `producers·dataProducers·consumers` Map = joinRoom 与 net-level 定时器崩）
+>   + **修掉 asrWakeAndAnswer 的静默吞错 catch**（失败现在有 logEvent + 控制台日志，不再无头案）。
+>   房间号 '999999'，诊断用 TEST_ASR_DEBUG=1。回归：test:asr-live **PASS（全闭环）** + 信令 **187/187**。
+
+> **★ 09-30d 二次取长补短 + 语音体验工程化（用户点名"语音体验还是很差 / 继续学 billd-desk"）**——
+> ① **语音最大感知项：唤醒应答流式化**。原实现等 aiBrain 完整返回才广播——说完话到看到
+>   回答首字 ≈ 5s(段)+3s(转写)+2~4s(LLM 全文)≈ 10s+ 全程干等。现在 asrWakeAndAnswer 与
+>   @ai 问答**同构走 ai-stream**（LLM 每 12 字吐一次，首字延迟 ≈ 5s+3s+0.5s，感知减半；
+>   终态 chat-message 照发，双路哲学不变）；ai-state 的 thinking 阶段（检索中/换说法/整理）
+>   同步透传。**分段默认 5s→4s**（asr.js + config.example 同步），说完平均再早 ~1s 出字幕。
+> ② **远程控制三件（借鉴 billd-desk 控制台）**：
+>   · **会话时长显示**——首帧起计，rdState 行带 "· mm:ss"（每帧刷新顺带更新，零定时器）；
+>   · **全屏按钮 rdFull**——全屏 rdConsole 本体，切换后 rdFit 重适配；
+>   · **剪贴板双向**——📋 推（读本机剪贴板 → clipboard-sync ctl2host → agent 写进对方
+>     **网页**剪贴板）/ 📥 拉（remote-input {kind:'clipboard-read'} 老通道新语义 → agent 读
+>     网页剪贴板 → clipboard-sync host2ctl 回来 → 复用既有 host2ctl 监听写本地）。
+>     **诚实边界**：CDP 够不着 OS 系统剪贴板，覆盖的是浏览器工作区主场景（复制网页资料/
+>     粘贴到网页输入框）；cdp.js 连接时 Browser.grantPermissions 预授权 clipboardReadWrite。
+> ③ **TTS 端点复测仍 403**（加速器出口，外部不可控）——回落浏览器 TTS，神经语音等
+>   网络出口变化后自动激活（探测 + 10min 重探在跑）。
+> ④ **回归（本次实测）**：test:agent **24/24**（真 Chromium，applyInput/cdp 改动后复验）+
+>   冒烟 **189/189** + 信令 **187/187**；服务器已重启。
+
+> **★ 09-30e 全链路延迟极限化（用户点名"各方面延迟降到极限"）**——
+> ① **★ ASR worker 开机预热**：worker 模型加载 ~13s，原来服务器启动后的**第一句**语音
+>   要白等这 13s（"第一次识别特别慢"的元凶）。现在启动时后台合成 0.3s **静音 wav**
+>   （纯内存拼 44 字节头，零 ffmpeg 依赖）喂 worker 走完"加载→推理→返回"全链路——
+>   语音在线后第一句即 0.8~3s 档。**实修一坑**：预热最初在启动回调里查 WHISPER，
+>   而探测是异步的 → 静默空跑（日志都不出）；改为"先等探测收敛再判断"。
+> ② **写稳采样 250→150ms**：段边界判定更快（轮询"段文件大小两次一致"的间隔收紧）。
+> ③ **AI 语音应答入字幕账本**（name='AI 小明'）：纪要/RAG 检索从此包含"AI 自己说过什么"
+>   ——追问"你刚才说了什么"能检索到；只入账本不上字幕条（AI 的话在聊天气泡已有）。
+> ④ **延迟盘点（实测）**：说完→字幕 ≈ 4s 段(均 2s)+0.15s 写稳+1~3s 转写；字幕→AI 首字
+>   ≈0.5s（流式已上屏）；唤醒→应答动作（纪要/操作）同步走。远程控制帧间隔已闭环自适应
+>   （2~24fps 硬钳），控制端只留最新帧渲染——链路各环节已到"教学版架构"的下限。
+> ⑤ **回归（本次实测）**：test:asr-live **PASS**（转写逐字全对 + AI 纪要动作应答）+
+>   信令 **187/187** + 冒烟 **189/189**；服务器已重启且预热日志 🔥 确认。
+> ⑥ **★ E3-media 落地（路线图 0.4 P1，`npm run test:e2e-media` 首跑 5/5 全 PASS）**：
+>   **两个真实 Chromium**（假摄像头/假授权 UI，专用端口 3016 防假绿）双页游客进同一房——
+>   A 建房拿号 → B 凭号加入 → 双方成员数=2 → **双侧出现 videoWidth>0 的在流画面**
+>   （produce/consume/resume/订阅绑定任何一环断了它都是 0，最硬的端到端证据）→ 双侧截图存档。
+>   **"会议本体"从此有自动化回归**——音视频核心链路改坏会被一条命令抓到，不再依赖人工双窗。
+>
+> **★ 2026-10-01b Qwen3-ASR 第二引擎 + Piik 取长（用户点名"学 Piik + 试试 Qwen3-ASR，先备份"）**——
+> ① **备份先行**：改造前的 whisper 实现（`sfu/ai/asr.js` + `asr_worker.py`）完整复制到
+>   `backup/asr-whisper-20261001/`（git 历史为权威备份，此目录为"看得见的回滚点"）。
+> ② **ASR 引擎可插拔（`sfu/ai/asr_qwen.js`）**：QwenLM/Qwen3-ASR（阿里开源 SOTA，52 语言/
+>   方言）经 **DashScope qwen3-asr-flash** 兼容口接入——`config.asrEngine`=auto（默认）/
+>   whisper/qwen；auto = 配了 `DASHSCOPE_API_KEY`（env 或 .env，与 provider 同链）且探测通过
+>   就优先 Qwen，单段失败自动回落 whisper 常驻 worker（功能永不降级）；`/metrics` 加
+>   `sfu_ai_asr_engine_qwen` gauge。**SSRF 白名单**：仅 https + DashScope 官方双域，
+>   伪造内网端点直接抛错（test:qwen 有断言）。诚实边界：本地 vLLM/transformers 路线
+>   需 GPU/较重 torch 栈，笔记本 CPU 上会慢于常驻 whisper——所以云端口是默认形态。
+> ③ **`npm run test:qwen` 双轨**：Mock 轨 5/5 全过（无 key 空串约定 / 端点白名单 / probe=false）；
+>   真测轨（key 就位才跑）探测+TTS 真转写。**激活方式**：`.env` 加 `DASHSCOPE_API_KEY=sk-xxx`
+>   重启即用，whisper 照常兜底。
+> ④ **Piik 取长两件**：① **共享带音频**——getDisplayMedia 开 `audio:true`，勾选标签页音频时
+>   作为第二路 audio producer（source 'screen-audio'）推上会，停止共享随循环关闭；
+>   ② **画中画按钮**（控制坞 🖼 pipBtn，借鉴 Piik"灵活观看"）——把 tile-main/共享大画面
+>   requestPictureInPicture 浮窗化，零依赖。**实修坑**：pipBtn 误写成裸名（client 惯例是
+>   `const x = $('x')`）→ 冒烟桩顶层 ReferenceError 连环挂 13 项——改回 $() 模式即全绿。
+> ⑤ **回归（本次实测）**：test:qwen **5/5**（+1 真测轨 SKIP）+ 冒烟 **189/189** +
+>   信令 **187/187**；服务器已重启。
+>
+> **★ 2026-10-01c Qwen3 本地双引擎全通（用户点名"一直跑到都实现"）**——
+> ① **装包**：`pip install qwen-asr qwen-tts`（transformers 后端；两个 pip 并发跑会撞
+>   Windows 文件锁——串行装）。SoX 警告**非致命**（qwen_tts 打印但生成照常工作）。
+> ② **模型落位**：modelscope 下载 0.6B 档到 `models/qwen3-asr-0.6b`（1.8G）与
+>   `models/qwen3-tts-0.6b`（2.4G）——服务器启动时发现本地目录就自动把引擎指过去
+>   （免 HF 运行时下载）；磁盘剩 7G 用 0.6B 档正合适。
+> ③ **两个常驻 worker**（`sfu/ai/qwen_asr_worker.py` / `qwen_tts_worker.py`，
+>   与 whisper worker 同款 JSONL 协议；Node 侧 `asr_qwen_local.js` / `tts_qwen.js`，
+>   spawn 全字面量安全形态）：**模型只加载一次**。
+> ④ **实测（本机 CPU）**：ASR 本地转写「小明，明天下午三点开评审会。」**逐字全对还带标点**
+>   （首段含加载 ~50s，纯转写 **1.9s** —— 与 whisper small worker 同档）；TTS 本地合成
+>   第二句 **9.1s**（CPU 自回归生成，真实自持音色）。
+> ⑤ **引擎链（带防卡死门控）**：ASR = qwen-local 只用"已就绪"的 worker（未就绪期间
+>   whisper 兜底，开机 warm() 后台加载不卡字幕）；TTS = Qwen 本地（已预热才用）→ Edge
+>   （探测）→ 浏览器 TTS。**config.json 已切 asrEngine=qwen-local**（用户点名切换；
+>   whisper 全程自动兜底）。音频货架支持 wav/mp3 双类型（前端 <audio> 无感）。
+> ⑥ **回归（本次实测）**：test:qwen **10/10**（+1 SKIP：ASR/TTS 本地双轨 + 端点白名单 +
+>   第2次加速断言）+ **test:asr-live PASS**（新引擎链下全闭环）+ 信令 **187/187**。
+>
+> **★ 09-30f 观测扩展 + 模型评测（路线图 0.4 P4/P2，2026-10-01）**——
+> ① **watch.js 语音链路告警（P4）**：消费 /metrics 新双 gauge——`sfu_ai_asr_worker_enabled=0`
+>   连续 2 轮（`WATCH_ASR_WORKER_MISS` 可调）→ 告警"已退回 CLI，字幕慢 3~5 倍"；
+>   `sfu_ai_tts_enabled` 翻转（true↔false）→ 即时提醒（端点可达性随出口网络漂移）。
+>   长跑值守时"耳朵或嘴悄悄坏了"会自动喊人，不再无头案。
+> ② **ASR 模型选型评测（P2-②，`npm run bench:asr`）**：常驻 worker 真实生产路径下
+>   三档实测（3 句 TTS 中文，命中=关键词）：tiny 首段 12.1s/后续 **0.7s**/命中 6/9；
+>   base 12.8s/1.1s/6/9；small 17.1s/3.1s/6/9。**结论：small 保持默认**（此前实测
+>   "产品评审会"tiny 转成"平省会"而 small 全对——真词准确率差异本批 TTS 样本未复现，
+>   以下限参考）；tiny 是低配机/省内存备选。诚实边界：TTS 合成≠真人嗓音，命中数是下限。
+> ③ 路线图 `后续升级方向.md` 已全面刷新（0.1 六行回填 + 基线 + **0.4 满功率下一批**，
+>   P1 e2e-media 标 ✅；P2-②③/P3/P4 执行后回填 ✅）。
+> ④ **回归**：watch/bench 均为新增独立脚本，既有套件不受影响；`npm run bench:asr` 实测通过。
+>
+> **★ 09-30g 静音驱动早转写（P2-③，"各方面延迟降到极限"的最后一刀）+ 论文提纲（P3）**——
+> ① **早转写**：段 ffmpeg 加 `-af astats(ametadata print)` 每 0.5s 从 stdout 吐 RMS——
+>   说话（RMS>-38dB）→ 静音 1.2s → **快照转写"正在写的段"**（copyFileSync 快照是合法截断，
+>   whisper 内部 ffmpeg 能解；doneSet 先占位防双跑；handleSegment 删的是副本、原文件继续写，
+>   封口后由轮询清扫）。说完平均再省 **~2s**。三道防坑：`seg-` 前缀过滤（防 `f-` 副本被
+>   轮询/收尾误捡=重复转写）、Windows 原文件占用删不掉下轮再试、`ASR_FLUSH=0` 逃生舱。
+>   尾巴丢失窗口 ≤ 当前窗剩余且仅在"刚说完话"触发——已写进注释。
+> ② **论文提纲初稿起草（P3，`论文提纲-初稿.md`）**：7 章 + 附录，每节标注素材来源与
+>   实测数据（对比实验=Mesh vs SFU 双版本、性能数字=bench 系列实测、安全=代际哈希与
+>   门禁边界、创新区=第 4 章 AI 助理），详略待导师意见。
+> ③ **回归（本次实测）**：`test:asr-live` **PASS**（早转写路径全闭环）+ 信令 **187/187**。
+>
+> **★ 09-30b 取长补短：借鉴 billd-desk 落地「设备码直连」+「真桌面画质档」（远程控制主线，仅 SFU 主版本）**——
+> 用户给出 `github.com/galaxy-s10/billd-desk` 要求"学其可取之处完善本项目，尤其远程控制"。
+> 先读实其交互模型（**稳定设备码 + 连接口令 + 无人值守安全口令 + 常用设备 + 画质档**），
+> 再按本项目的**零依赖红线**取舍：**采纳交互与安全模型，不采纳全 OS 控制与 H.264/265 硬编码**
+> （那需要原生客户端/编码器），也不做设备持久化（本轮明确押后）。
+> ① **设备码配对直连**（`desk-register`/`desk-connect`/`desk-granted`/`desk-pending`）：
+>   **核心决策 = 设备码就是一个私有 `isDesk` 房间的房号**——于是 `remote-frame` 三道闸
+>   （身份/授权在册对/体量）、16 字节帧编解码、canvas 控制台、手机 Pointer Events
+>   **一行都没改**就全部复用；控制端走 `deskEnterRoom()` **轻量进房**（只登记门禁，
+>   不建媒体不广播成员）。两条授权路径（安全口令=无人值守直接登记 `remoteCtl`；
+>   连接口令=代理终端按 y 走 `remote-answer`）**都发同一条 `desk-granted`**，前端只听一个事件。
+>   代理离线**即刻毁房**（不留 60s 宽限：没人认领的设备码留着只会占号）。
+> ② **画质档 + 弱网自适应**：控制端 `.rd-bar` 四颗（自动/流畅/标准/高清）走
+>   `remote-input` 的 `{kind:'quality'}`——**老通道新语义**（复用门禁与限流，不新造事件）；
+>   代理 `applyQuality` → `cdp.setScreencast()` 重开抓屏（`_scListenerBound` 防监听器叠加）。
+>   **★ 本轮最大的设计教训（坑 62）**：闭环自适应（`remote-quality`）先存在，画质档后加，
+>   两者**都写同一个 `agent._frameGap`** → 流畅档设 5fps、自适应立刻顶回硬下限 6fps，
+>   表现为"点了流畅但帧率没真降"且毫无报错。改成**三层分工**：档位只定中枢 `rdTargetFps`
+>   （切档时清空采样数组，否则拿旧节奏判断新链路会立刻误降）→ 自适应只在中枢 ±2 微调
+>   → 代理/服务器对任何请求**硬钳 2~24**（策略线与安全线**有意分开**）。档位 fps 下限
+>   必须等于 `RD_FPS_MIN`（两处 5→6 同改，否则两来源取值区间不重叠）。
+> **回归（2026-09-30 实测，本次全绿）**：`test:sfu` **184/184**（+19 设备码全链路：格式/在线/
+>   错口令/busy 互斥/无人值守直授权/待确认→y 后开控制台/口令错不发 granted/**房间码在桌面房内
+>   照旧受三道闸**/释放后帧流停/代理离线毁房）+ `test:smoke` **189/189**（+11：设备码入口
+>   与 Overlay、桌面路径不复用会议内 remote-request 逻辑、切档发 `{kind:'quality'}`、
+>   自适应只在策略区间内取值、自动档开关、未知档名降级）+ `test:agent` **24/24**（真 Chromium：
+>   切档同时改到帧率**和**编码参数、切档后仍持续推帧、无重复 ack、未知档不致命）+
+>   `test:e2e` **15/15**（真双窗 + 手机视口，页面自证 `client.js` 是当前版本指纹）。
+>   实修三处**我自己的测试缺陷**（都不是代码错）：坑 **61**（服务器先 emit 后回 ack，
+>   await 一 resolve 就断言读到 null，要等一拍 + 监听器先注册）、坑 **63**（用 `document.title`
+>   当"画面变化"触发器——不动像素，screencast 就是不出帧，症状与"链路断了"一模一样）、
+>   冒烟里 `payload.event` 内层没有 `to`（要查整条 payload，坑 51 家族）。
+> ⚠️ **待人工浏览器验证**（命令行验不了，见交付清单）：设备码直连入口真机手感、
+>   无人值守/需确认两条路径、画质档切换的观感差、弱网下自动降档是否真的降；
+>   **诚实边界**：设备码只存内存（**代理重启即换码**）、口令内存明文比较（教学级，
+>   HTTPS 自签为传输层兜底）、CDP 只控 Chromium 窗口内部。
+
 
 ---
 
@@ -774,6 +1182,7 @@
 
 | 29 | **AI Bot 参会者 + N2 纪要 + C1 AI 远程操作员（09-19b/09-19c/09-19g，主版本独有）** | 以参会者身份入会（room-state `isBot`，服务端 ffmpeg astats 音频管线"听"响度）；N2 纪要 `buildMinutes`（字幕账本 + 待办关键词规则层 + LLM 双轨，落 `sfu/minutes/<房间>/`，值守定时分段 + 离开出终稿，`/minutes` 双白名单防穿越）；C1 操作员：服务器开真实 socket.io 控制端连自己，**授权链路与人类完全同一套、绝不豁免**，计划-执行型 agent 把目标翻成 remote-input 序列（服务器端 16 字节帧编码） | 27 | sfu/server.js AI 基建块 + `buildMinutes` + `runAiOperator`、sfu/public/client.js AI 按钮/`@ai`/AI 操作按钮 |
 | 31 | **★ AI 智能内核：RAG 检索 + 会话记忆 + 意图分类 + 结构化行动项 + 操作员 ReAct 闭环（09-24e，主版本独有，本轮重点）** | 新文件 `sfu/ai/brain.js`（零依赖，可单测）：**① BM25 检索器**（中文 **bigram 分词** + IDF/TF饱和/长度归一 + 时间衰减 + 说话人加成 + 证据块字符预算）——修掉"只喂最近 8 条字幕"导致**长会早期信息问不出来**的硬伤；**② ConversationMemory** 多轮记忆（环形上限 + 截断 + **指代时把上一轮问题一起检索**做廉价指代消解）；**③ classifyIntent** LLM 意图分类（替代正则，修掉"帮我整理下今天聊了啥"匹配不上→**纪要根本没生成**的能力错位；动作型高置信时短路省钱，未知标签 fail-safe 落回规则）；**④ extractActions** 行动项**结构化三元组** `{owner,task,due}`（LLM 理解指代/去重，规则轨**宁可留空不可编造**→ 标"待认领"；**内容交 LLM、格式交代码**，两轨格式一致）；**⑤ 操作员 ReAct 闭环**：每步收集**服务端可确定的三类观测**（转发门禁结果/控制权/执行轨迹）喂回 LLM 判断达成与修正（≤4 轮），**结论三档措辞**——出现过输入丢弃就明确报"⚠️ 可能未完全生效"，不再无条件报成功；**⑥ 证据链 UI**：气泡摊开 `📚 检索 N 条取 M 条 · 💬 第 K 轮 · 🎯 意图`（流式与非流式都带）。**本轮实修 4 个真缺陷**：`RoomBrain` 漏 `memory.push`（记忆整体失效）、行动项正则贪婪（`压测报告我负责`→owner=`压测报告我`；用 lookbehind + 集体词表修）、**基于不存在的 `remote-input-ack` 写闭环**（grep 证伪后改用转发在线状态）、验证脚本消息竞态（先清空再 emit，按 ts 过滤） | — | `sfu/ai/brain.js`、`sfu/server.js`（`aiBrain` 重构 / `getRoomBrain` / `disposeRoomBrain` / `buildMinutes` 行动项表 / `runAiOperator` 闭环 / `remote-input-fwd-result`）、`sfu/public/client.js` 证据链段、`style.css` `.msg-ai-trace`、`scripts/{test-ai-brain,verify-ai-live}.js`（AGENTS 坑 **41~44**） |
+| 32 | **★ 设备码配对直连 + 真桌面画质档与弱网自适应（09-30，借鉴 billd-desk，仅 SFU 主版本）** | **① 设备码直连**：被控端代理 `desk-register` 拿到一个 6 位设备码（**= 一个私有 `isDesk` 房间的房号**），控制端在登录页「🖥️ 用设备码连接」输码 + 连接口令即可 `desk-connect` 直连——**不用先建房、不用进会议**。两条授权路径：口令=**安全密码** → 服务器直接登记 `remoteCtl`（无人值守，`desk-granted{unattended:true}`）；只匹配连接密码 → 转发 `remote-request` 给代理终端按 y，确认后通用授权处理器发 `desk-granted{unattended:false}`。**核心取舍 = 设备码就是房号**：三道闸门（身份 `isAgent` / 授权在册对 / 体量 ≤900KB+120fps）、16 字节帧编解码、canvas 控制台、手机 Pointer Events **一行不改**全部复用；控制端走 `deskEnterRoom()` **轻量进房**（只 `socket.join` + `room.members.add` + `socket.roomNumber`，不建媒体、不广播成员）。**② 画质档**：`流畅/标准/高清` 三颗（`QUALITY_PRESETS`：q30/6fps/1280×800 · q55/12fps/1600×1000 · q80/20fps/1920×1200），走 `remote-input` 的 `{kind:'quality'}` **老通道新语义**（复用门禁与限流）；代理侧 `applyQuality` → `cdp.setScreencast()` **重开抓屏**（监听器 `_scListenerBound` 防叠加）。**★ 三层帧率分工（本轮最容易设计错的地方）**：策略层=档位定"中枢" `rdTargetFps`；执行层=`rdDecideFps` 闭环只在中枢附近 ±2 微调（实测帧间隔+RTT，经 `remote-quality` 回传）；硬安全层=代理/服务器对**任何**请求钳 2~24。档位 fps 下限必须等于 `RD_FPS_MIN`（曾填 5 → 客户端立刻顶回 6，两来源互相拉扯，表现为"选了流畅但帧率没真降"= 坑 47 家族）。**诚实边界**：设备码只存内存（**代理重启即换码**，billd 的"常用设备/持久化"本轮明确没做）；连接/安全口令在内存里**明文比较**（教学级，HTTPS 自签是传输层兜底）；CDP 只控 Chromium 窗口内部。 | 12 / 13 / 14 | `sfu/server.js`（`deskEnterRoom`/`desk-register`/`desk-connect` + `remote-answer` 的 `isDesk` 补发 + disconnect 的 `agent-offline` 即毁房）、`agent/index.js`（`QUALITY_PRESETS`/`applyQuality`）、`agent/cdp.js`（`setScreencast`）、`sfu/public/client.js`（`RD_PRESETS`/`setRdPreset`/`rdDecideFps`/`doDeskConnect`）、`sfu/public/index.html`（`#deskOverlay` + `.rd-bar` 画质组）、`sfu/protocol.js` 09-30 段；`scripts/{test-sfu-signaling,test-sfu-client-smoke,test-agent}.js`（AGENTS 坑 **61~63**） |
 
 
 **双版本架构形态（主次已调换）**：**SFU 版（sfu/ 目录/3001，mediasoup 服务器转发，腾讯会议同款）为
@@ -853,7 +1262,8 @@ webrtc/
 │   └── test-publish.js          # ★ 09-24b 发布链回归（29 项，含 --check 过期闸）
 ├── agent/                       # ★ 09-24b 真 OS 级远程桌面 · 被控端代理（零新依赖）
 │   ├── cdp.js                   #   手写 CDP 客户端（驱动真实 Chromium：抓屏/注入输入）
-│   └── index.js                 #   代理主体（agent-hello 进房 → 推帧 + 执行 remote-input）
+│   └── index.js                 #   代理主体（★ 09-30 两种进房：设备码 desk-register / 老用法 agent-hello
+│                                #     → 推帧 + 执行 remote-input + applyQuality 画质档）
 ├── publish-mesh/                # ★ 09-24b 由 publish.js 生成的发布包（白名单拷贝，勿手工改）
 └── public/
     ├── index.html         # 布局：左主区(房间面板[含密码框]/视频网格/控制/日志) + 右聊天侧边栏
@@ -877,10 +1287,11 @@ npm run start:demo     # 一键起两版（Mesh 3000 + SFU 3001）并打印地�
 npm run start:lan      # 局域网交付：探 IP → 生成 sfu/config.json（HTTPS 自签+announcedIp+TURN）→ 放行防火墙
 npm run build:sfu-vendor  # 一次性：打包 mediasoup-client → sfu/public/vendor/（改依赖后重跑）
 npm test               # Mesh 版信令回归（必须先起 3000）★ 2026-09-24 实测 36/36
-npm run test:sfu       # SFU 版信令回归（必须先起 3001，且 AI_OP_STEP_MS=20）★ 2026-09-24 实测 149/149（Mock 轨 / LLM 轨各跑一遍；含门禁边界 + 房间令牌断言）
-npm run test:store     # ★ 09-24 账号存储层回归（node:sqlite：迁移保留 salt/hash / 改密换盐 / 删号安全闸 / 完整性）★ 49/49
-npm run test:shutdown  # ★ 09-24 优雅退出回归（关 Worker / 关库 WAL checkpoint / 幂等 / 5s 保险丝）★ 9/9
-npm run test:smoke     # SFU 版**前端**无头冒烟（假 DOM/假 mediasoup，零依赖不用起服务器）★ 2026-09-24 实测 136/136
+npm run test:sfu       # SFU 版信令回归（必须先起 3001，且 AI_OP_STEP_MS=20）★ 2026-09-30 实测 184/184
+                       #   （3001 被占时用 `TEST_SFU_PORT=3011 npm run test:sfu`，见坑 31/57）
+npm run test:store     # ★ 09-24 账号存储层回归（node:sqlite：迁移保留 salt/hash / 改密换盐 / 删号安全闸 / 完整性 / ★09-30 口令 V2 平滑重哈希）★ 55/55
+npm run test:shutdown  # ★ 09-24 优雅退出回归（关 Worker / 关库 WAL checkpoint / 幂等 / 5s 保险丝）★ 09-30 复跑 9/9
+npm run test:smoke     # SFU 版**前端**无头冒烟（假 DOM/假 mediasoup，零依赖不用起服务器）★ 2026-09-30 实测 189/189
 npm run admin:list     # ★ 09-24 管理员 CLI（另有 grant/revoke/adduser/passwd/purge；purge 默认干跑、`--yes` 才删）
 npm run test:ai        # AI 双轨自检（无 key 只跑 Mock 轨并提示，有 key 两条都跑）★ 10/10
 npm run test:asr       # ★ 09-28 服务端语音识别自测（探测必须成功 / 系统 TTS 真语音转写 / 唤醒与追问窗口 / 在线 asrEnabled / 配置模板可解析）★ 15/15
@@ -893,14 +1304,23 @@ npm run test:record    # D+2 服务器侧录制端到端自测（需已装 ffmpe
 npm run test:turn      # ICE 可达性实测（对 config 每个 STUN/TURN 手搓 STUN Binding，3s 超时）
 npm run soak          # C3-N1 服务器耐久自测（默认 7 小时过夜；--minutes 2 压缩自测；结束对账"一条不丢"）
 npm run bench          # E4 压力基准（4/8/16 路，约 1 分钟，独立 Worker，不用起 3001）
-npm run agent          # ★ 09-24b 启动被控端桌面代理（--room 123456；真机远程桌面的被控端）
-npm run test:agent     # ★ 09-24b 桌面代理端到端（真起 Chromium：抓屏 JPEG + 坐标注入 ±3px + 远程导航）★ 16/16
-npm run test:e2e       # ★ 09-24b 真机远程桌面 e2e（真双窗 + 390×844 手机视口双指/单指，出截图）
+npm run agent          # ★ 09-24b 启动被控端桌面代理；★ 09-30 两种用法：
+                       #   不带 --room = 设备码模式（推荐，启动即打印 6 位设备码，可加
+                       #   --connect-password / --secure-password(=无人值守) / --code 固定码）
+                       #   带 --room 123456 = 老用法，进既有会议房
+npm run test:agent     # ★ 09-24b 桌面代理端到端（真起 Chromium：抓屏 JPEG + 坐标注入 ±3px + 远程导航
+                       #   + ★ 09-30 画质档 ⑥e~⑥e5）★ 2026-09-30 实测 24/24（专用端口 3012，被占明确拒绝）
+npm run test:e2e       # ★ 09-24b 真机远程桌面 e2e（真双窗 + 390×844 手机视口双指/单指，出截图）★ 15/15（专用端口 3013）
 npm run publish:mesh   # ★ 09-24b 一键发布 Mesh 版（生成 publish-mesh/ → 体检 → 可选 --tunnel/--bundle/--check）
 npm run test:publish   # ★ 09-24b 发布链回归（含 --check 过期闸：源码改了不重发必报错）★ 2026-09-24 实测 30/30
 node --check public/client.js && node --check server.js      # 改完 Mesh 版 JS 查语法
 node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU 版 JS 查语法
 # ★ 09-24 全部回归合计 440 项全绿：SFU 149 + 存储 49 + 优雅退出 9 + 冒烟 136 + Mesh 36 + 代理 16 + 发布 30 + e2e 15
+# ★ 09-30 远程控制本轮**实测**（6 组 476 项全绿）：SFU 184 + 冒烟 189 + 存储 55 + 优雅退出 9 + 代理 24 + e2e 15；
+#   Mesh 36 / 发布 30 本轮**未重跑**（未触碰对应代码路径，数字仍是 09-24 的）。
+#   存储 49→55：工作区里另有一批**未提交**的 09-30 安全改动（`sfu/password.js` 口令 V2 + 平滑重哈希、
+#   `sfu/store.js` 惰性开库可重开、`scripts/legacy-user-fixture.js` 测试基建），本轮重跑 test:store/shutdown 复验为绿，
+#   **但它不属于"设备码 + 画质档"这次任务**，提交与文档回填要分开对待。
 ```
 
 - ✅ **`npm run doctor`**：环境自检（17 项 / 4 组：环境·配置·端口·跨网 ICE），失败项都给"怎么修"；`node scripts/doctor.js --json` 出结构化结果。换机器 / 交付前先跑一遍。
@@ -996,6 +1416,8 @@ node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU �
 | HTTP（非信令） | `GET /api/rooms` / `GET /dashboard` / `GET /config.json` / `GET /recordings/<file>` / `GET /minutes/<房间>/<file>` / `GET /api/minutes?room=` / `POST|GET /api/captions`（09-17e 值守归档：落盘/回读） | 观测快照 JSON / 面板页 / 下发 ICE + `lanUrl` + `aiEnabled`（**只给布尔值，密钥绝不下发**） / 录制产物下载 / 纪要 md 下载（路径穿越均已钳制、静态响应 `no-store`） | 观测面板、可达性、D+2 交付、N2 纪要 |
 | C→S 应答 + S→C 广播 | `ai-join` / `ai-leave` / `ai-ask` / `ai-minutes` / `ai-op` | `ai-join`→`{aiBot}`（bot 以 `isBot` 虚拟成员进 room-state）；`ai-ask {question}`→**先回执** `{started,streamId}` 再 `ai-stream{id,delta,done}` 增量 + 终态 `chat-message{...,streamId,ai:{mock,tokens}}`（前端按 streamId 去重；助理缺位时自动邀请）；`ai-minutes {type,since}`→`{file,path,mock}`；`ai-op {goal}`→`{started}`（AI 以真实控制端走完整授权链路，不豁免） | 09-19b/c/g + **09-24 流式与双轨**（详见 `sfu/protocol.js` 的 AI 段契约） |
 | C→S 应答 + S→C 定向 | `agent-hello` / `remote-frame` / `remote-meta`（★ 09-24b 真 OS 级远程桌面） | `agent-hello {roomNumber,password?,name?,platform?,browser?}`→`{roomNumber,memberId}`（置 `isAgent`、名加 `🖥️ ` 前缀；三道校验同 join-room，**代理无特权**、满员照样被拒）；`remote-frame {to,frame}` 被控端→S→控制端（二进制 JPEG，**三道闸**：①`isAgent` 身份闸 ②host→controller 授权闸 ③≤900KB + 120 帧/秒体量闸；`volatile` 发不排队）；`remote-meta {to,url,title,viewport}` 回真实地址/标题（普通 emit）；控制输入**复用 `remote-input`**（16 字节帧不变，agent 新增 `navigate`/`window` 走老通道新语义） | 真机远程桌面（本地代理 `agent/` + `sfu/public/` 的 `#rdConsole`，含手机 Pointer Events 单指/双指） |
+| C→S 应答 + S→C 定向 | `desk-register` / `desk-connect` / `desk-granted` / `desk-pending`（★ 09-30 设备码配对直连，借鉴 billd-desk） | `desk-register {name,platform,browser,connectPassword,securePassword,code?}`→`{deviceCode}`（被控端代理专用；**设备码就是房号**——建一个 `isDesk:true` 的私有房间，`router:null` 不碰媒体，同一时刻只允许它的 agent 在场，代理离线**即刻毁房**、不留 60s 宽限）；`desk-connect {deviceCode,password}`→`{granted,hostId,hostName}`（控制端**不用进会议**；校验顺序=格式→限流 10 次/分→设备在线→连接口令（连接密码**或**安全密码任一匹配）→互斥 `busy`；随后 `deskEnterRoom()` **轻量进房**：只 `socket.join`+`room.members.add`+`socket.roomNumber`，**不建 Transport、不订阅媒体、不广播成员**）；口令=安全密码 → 服务器直接登记 `remoteCtl` 并广播 `remote-state` + 发 `desk-granted{unattended:true}`；否则转 `remote-request` 给代理、给控制端发 `desk-pending`，代理确认后通用 `remote-answer` 处理器补发 `desk-granted{unattended:false}`——**两条路径前端只听一个事件**。⚠️ ack 与事件是两趟往返，断言要等一拍（坑 61） | 设备码直连远程桌面（登录页「🖥️ 用设备码连接」→ `#deskOverlay`） |
+| C→S 定向（**老通道新语义**） | `remote-input` 的 `{kind:'quality', preset}` | 走**与鼠标键盘完全相同**的 `remote-input` 门禁（不新造事件 = 复用闸门与限流）；`preset` ∈ `smooth`/`standard`/`hd`，代理 `applyQuality` 改 `quality/fps/长边上限` 并 `cdp.setScreencast()` **重开抓屏**；未知档名忽略且当前档不变（拼错不致命）。**三层帧率**：档位定中枢（策略 6~24）→ `remote-quality` 闭环 ±2 微调 → 代理/服务器对任何请求硬钳 **2~24**（安全线比策略线更宽，两层有意分开） | 画质档按钮 + 弱网自适应（`#rdConsole` 的 `.rd-bar` 四颗） |
 
 ---
 
@@ -1426,6 +1848,161 @@ node --check sfu/public/client.js && node --check sfu/server.js  # 改完 SFU �
     ▎**控制律要抽成纯函数**（`rdDecideFps`）才可穷举断言——性能逻辑同样需要确定性，
       否则只能"跑起来看着还行"，而画面忽快忽慢在真机上极难复现。
 
+61. **★ 服务器"先发事件、后回 ack"——一拿到 ack 就断言必然读到 null**（09-30 实修，设备码轮）：
+    `desk-connect` 的处理体是 `socket.emit('desk-pending', …)` / `io.to(房号).emit('remote-state'|'desk-granted', …)`
+    **在前**，`return ok(callback, {granted:false})` 在**后**。测试里写成
+    `const resp = await request('desk-connect', …); ok('应答里 granted 应为 false', resp.data.granted === false)`
+    ——await resolve 的那一刻事件已经收到、断言却先于 ack 的**网络往返**跑，读到 `undefined`，
+    三条断言全红。**代码没错，是断言站错了时间位置**（同坑 3"监听先于 emit"的镜像：
+    那条讲"注册要早"，这条讲"读要晚一拍"）。
+    修法：ack 断言前补 `await sleep(400)`，且**监听器一律在 `desk-connect` 之前注册**
+    （`remote-state` 那一版就是因为挂监听晚了，事件飞过去、数组永远空）。
+    **判据：凡是"一个信令会触发 ≥2 个出站消息（事件 + ack）"的断言，都要显式说明依赖了先后顺序。**
+
+62. **★ 一个执行器不能有两个控制回路——档位是"策略"、自适应是"微调"，必须显式分层**（09-30 实修）：
+    闭环自适应（`remote-quality` 回传 fps）已经存在之后，我又加了画质档
+    （`{kind:'quality'}` 带 fps/quality/尺寸）。两者**都写同一个 `agent._frameGap`**，
+    结果两条回路互相拉扯：流畅档把 `_frameGap` 设成 5fps，客户端自适应下一拍又把建议顶回
+    硬下限 `RD_FPS_MIN=6` → 表现为"**点了流畅但帧率没真降下去**"，且没有任何报错。
+    修法（= 坑 47"一个概念只能有一个来源"的执行版）：
+      · **档位只定中枢**（`rdTargetFps`，切换时清空采样数组 `rdIntervals`/`rdLastFrameAt`，
+        否则拿"切档前的旧节奏"当"新链路状态"判断，会立刻误降一档）；
+      · **自适应只在中枢附近 ±2 微调**，不再自己发明目标；
+      · **档位 fps 下限必须等于自适应下限**（两处 5→6 同改，`agent/QUALITY_PRESETS` 与
+        `client/RD_FPS_MIN`），否则两个来源的取值区间根本不重叠；
+      · **硬安全层单独保留**（代理/服务器钳 2~24）：它防"乱传参数把对端拖垮"，
+        与"正常该用多少"是两层职责，**别合并**（合并后想加 3fps 超省流档就得放宽安全线）。
+    **通用判据：给某个状态新增一个写入方之前，先 grep 谁还在写它。**
+
+63. **★ 测"变化才推帧"必须制造**真的会变色**的变化——`document.title` 不算**（09-30 实修）：
+    切画质档后要断言"重开 screencast 没把链路搞断"，我用
+    `setInterval(() => { document.title = "t" + Date.now(); }, 50)` 当触发器，
+    帧数几乎不涨 → ⑥e3 红。**症状和"链路真的断了"一模一样**，差点去查 `cdp.setScreencast` 的
+    stop/start 接线（那段其实是对的，另有 ⑥e4"监听器不叠加"作证）。
+    根因：CDP screencast 是**合成器级**的变化检测，改标题不动任何像素。
+    正解 = 改**绘制属性**：`document.body.style.background = "hsl(...)"` 每 60ms 变一次。
+    顺带把下一段 ⑦ 的重复触发器删掉（两个同写 background 的定时器只会让后面的断言
+    "必然通过"，掩盖真实帧率）。
+    **判据：断言"某个依赖 X 的机制还活着"之前，先确认你真的产生了 X**——
+    与坑 55（测空状态前先确认你在的那个空对象）同源：**测试的触发条件本身也要被验证。**
+
+64. **★ 外部模型"没人说话时也会还你一句话"：语义输出的门槛必须量**能量**（2026-10-02 实修，本轮最贵的一条）**：
+    用户报"AI 助理一直收到重复的一句话 / 对话很混乱 / 后来它回答没有说话"——三条症状是**同一个根**。
+    现场证据在 `sfu/captions/cap-746646-20261002.jsonl`：账本里每 2.4~4s 一条一模一样的
+    **`请用简体中文输出。`**（`asr:true`）。那不是有人在说话，那是 whisper 在**纯静音段**
+    把 `--initial_prompt` 顺着"续写"成了句子——**模型不会返回空，它会编一个看起来像输出的东西**。
+    ▎为什么旧门槛挡不住：管线判的是 `size < 40000`，量的是**时长**；一段 4s 静音有 128KB，
+    照样进转写。而 `transcribeFile()` 的注释白纸黑字写着"返回空串表示这段没人说话"——
+    **这个假设本身就是错的**，所以全链路没有任何一处能拦住它。
+    ▎放大链（一个源缺陷如何变成三个体验灾难）：假字幕 → 落进 20s 追问窗口（`isFollowUp`）
+    → 每条都触发一次完整应答（流式气泡 + TTS + 再入账本）→ 应答风暴 + 账本污染（纪要也跟着错）
+    → 每条假字幕又把 `lastUserSpeechTs` 往前推 → 浏览器朗读的"迟到不读"闸被永久关闭
+    → 用户看到的就是"它答应了却不说话"。
+    ▎修法（两道，缺一不可）：① **能量闸** `Asr.measureWavLevel()`——转写前直接读 wav 样本算峰值
+    dBFS（64000 次数组遍历，亚毫秒、零进程），整段低于 -45dB 就删段不叫模型；
+    ② **语义清洗** `Asr.cleanTranscript()`——擦提示词回显与经典幻句（「字幕by XXX」「谢谢大家」），
+    擦完只剩标点/单字就返回空串。**并且**下游补重复句闸、AI 回声闸、在途锁与最小应答间隔。
+    ▎通用判据：**凡是拿外部模型/第三方 API 的"有输出"当作"有内容"用的地方，都要问一句
+    "输入为空/无效时它会还我什么？"** 这类缺陷单件测试永远不红（探测正常、转写正常、逻辑正常），
+    只有"把真音频推上真管线再盯着账本"才看得见——所以本轮把断言补进了 `test:asr-live`。
+    ▎顺带一条同源旧账：`--initial_prompt` 这类"给模型的指令句"要写成**不会被当成句子回显**的
+    中性名词短语（现在是一个常量 `Asr.ASR_PROMPT`，Node 侧单一来源，worker 经 env 取用）。
+
+65. **★ 换进程推流 = 换 UDP 源端口 = comedia transport 不再收包：一条"0 条"的假绿（2026-10-02 实修）**：
+    为 G2（重复句）补测试时，我第二次用**新的 ffmpeg 进程**往同一个 PlainTransport 推流，
+    断言"账本新增 0 条"——**通过了，但它绿得可疑**：ingest 用的是 `comedia: true`，
+    它只认**第一个发包者的 addr:port**，第二个进程换了临时端口，包**整批被丢弃**。
+    也就是说音频根本没进系统，"没有重复字幕"当然成立。
+    ▎修法：所有需要"多段音频"的断言改成**一条拼接好的 wav、一个进程、一次推流**
+    （说 → 停 6s → 再说 → 停 3s），静音与重复都待在同一条流里，断言才有意义。
+    ▎通用判据：**断言"某量为 0"之前，必须先证明"输入真的进去了"**——
+    与坑 57（复用端口上已有的服务器=假绿）、坑 63（触发条件本身也要被验证）同族。
+    本轮还顺手记下：项目里第一次写出 G2 时我没意识到自己在测一个空转的链路，
+    是"0 条 + 0 次应答"这个**过于干净**的结果让人起疑的。
+
+66. **★ 双轨系统的"让位闸"会把回落路径一起挡死（2026-10-02 实修）**：
+    AI 语音有两条轨：服务端神经语音（MP3）与浏览器 `speechSynthesis`。设计是"服务端可用 → 浏览器让位"，
+    合成失败时服务器补发 `ai-tts-fail` 让浏览器**回落朗读**。但回落调用的还是同一个
+    `speakAiText()`，而它开头那句 `if (aiTtsEnabled) return;` **一视同仁地把回落也挡了**——
+    于是"服务器声明会有音频 → 音频没来 → 浏览器又被让位闸拦住"= **永久静音，且没有任何报错**。
+    另一半原因同样致命：`aiTtsEnabled` 只在进房时从 `/config.json` 读一次（结果被
+    `asrCfgPromise` 缓存），而端点可达性是**会漂的**（Edge 403 随网络出口变化）——一次性快照必然失真。
+    ▎修法三件：① 让位闸加**例外口**（`speakAiText(text, {force:true})`，只有"确认服务端这条已失败"能绕）；
+    ② 状态漂移要**广播**（服务器定期重探 + 翻转时 `io.emit('ai-tts-state')`，客户端当场改标志位）；
+    ③ 客户端连吃两次失败就**本地临时停用**服务端轨 5 分钟（自愈，不必等服务器重探）。
+    ▎附带抓到同类一处：`ai-audio` 在 `play()` **之前**就 `pendingServerTts.delete(ts)` 销账，
+    404/被自动播放策略拒绝时既无声音也无回落——**销账时机应当是"真的开始播了"（onplaying）**。
+    ▎通用判据：**写"降级/让位"条件时，要顺带检查"降级路径自己是否也被同一个条件挡住了"**；
+    **凡是缓存下来的能力开关，都必须有一条失效或翻转时重新下发的通路。**
+
+67. **★ 探测超时被当成"没装"——同一个坑在第三个模块上复发（2026-10-02 实修，收口成 pyprobe.js）**：
+    09-24 修 ffmpeg 时立过这条纪律（坑 37：**要区分"真没装"与"此刻没答上来"**），但当时只改了 ffmpeg 一处。
+    Python 模块探测在三个文件里各写了一份同样的 `execFile(python, ['-c','import X'], {timeout: 15000}, err => !err)`
+    （asr.js 探 whisper、asr_qwen_local.js 探 qwen_asr、tts_qwen.js 探 qwen_tts）。
+    ▎实测：`import qwen_asr` 冷启动 **21.7s**、`import qwen_tts` **18.4s**（torch 一族就是这么慢）
+    → 15s 上限一冷就误判"没装" → 本地 Qwen 引擎**悄悄不启用**，用户侧表现为
+    "识别还是那么慢、AI 说话还是机械音"，而且没有任何一行报错。
+    ▎更糟的一半是**假日志**：`warm()` 写成 `try { await boot(); } catch {}`，恒返回 undefined，
+    调用方 `.then()` 里无条件打印"🔥 已预热"——**探测失败也报成功**。
+    没人会去怀疑一行自己打的 ✅/🔥，这类假绿比红更危险（同坑 57/65）。
+    ▎修法：新增 `sfu/ai/pyprobe.js` 作**唯一实现**（与 password.js / jsonc.js 同一条路）：
+    ① 按 errno/输出区分 `enoent` / `ModuleNotFoundError` / `timeout`；② 超时**再给一趟长预算重试**
+    （冷启动只发生一次，重试几乎必中，而正常路径不被拖慢）；③ 解释器逐个试；
+    ④ `warm()` 返回 `boot()` 的真实结果，调用方按返回值决定打 🔥 还是打 ⚠️。
+    ▎通用判据：**外部依赖的"可用性探测"必须有失败分类与重试，且探测结论要能被下游证伪**——
+    凡是"探测失败 → 关掉某功能"的地方，都要有一条"这个功能确实开着"的断言（本轮补在 test:qwen 的本地轨）。
+
+68. **★ 共享变量有两个读者时，"攒批清空"的那一个会把另一个变成静默空转（2026-10-02 实修）**：
+    给流式答案做"按句朗读"时，我写成 `speakStreamPart(box, box.buf)`——函数逻辑对、调用点接上了、
+    `node --check` 过、冒烟也绿（它断言的是源码形状），但**这条通路永远无事发生**。
+    根因：`box.buf` 是 DOM 增量渲染的**攒批缓冲**，`applyStreamBuf()` 每帧把它 `textContent +=` 之后
+    就 `box.buf = ''`。于是朗读侧每次看到的都只是"一帧内的三五个字"，
+    而"三五个字里出现句末标点"几乎不可能 → 切句永远切不出东西，`if (cut - from < 6) return;` 永远命中。
+    ▎症状与"功能没做"一模一样（**AI 不出声**），但代码看起来完全正确——
+    这类缺陷不在逻辑里，在**两个读者对同一个变量的假设冲突**里。
+    正解：给朗读侧一份**不被消费的全文副本** `box.rawAll`（累加、只读），
+    攒批缓冲继续归 DOM 用。判据：**写下"读 X 的当前值"之前，先 grep 谁还在写 X、谁会把它清空。**
+    ▎同一轮另一处同源：`speechSynthesis.cancel()` 只让旧句子"**听不见**"，不让它"**不再回调**"——
+    被取消的那句会迟到地触发 `onerror`，而那时新一轮的句子已经 push 进队列，
+    旧回调里的 `aiSpeakQueue.length = 0` 会把**新答案的上一句整个倒空**
+    （表现就是"第一轮问候语念完之后 AI 再也不出声"）。
+    修法两件缺一不可：**顺序改为 cancel → 清队列/断泵 → 再 push**，
+    外加"泵代号"（`aiSpeakGen`）让旧闭包一看代号不对就静默退出。
+    ▎通用判据：**取消一个异步操作时，要连带取消它的回调所有权**（令牌/代号/epoch 都行），
+    与坑 66"降级路径不能被同一个让位闸挡死"同族——都是"清理动作比它看起来更广泛"。
+
+
+69. **★ 顶层调用写在它依赖的 const 之前 = 静默砍掉文件后面的所有代码（2026-10-03 实修）**：
+    给首页加 hero 时把 `initHero()` 紧跟在 `initIcePrecheck()` 后面调用，
+    而它要读的 `const HERO_TEXT` 声明在下面几十行处 —— TDZ 抛错。
+    ▎真正贵的不是那行错，而是**它把本文件后面所有顶层语句一起砍掉**：
+    实测 `initAiChips / initBoardActions / initAiVoice / renderBoard / renderChatUnread / renderAiChips`
+    **六个初始化一个都没跑**。而页面看起来是好的（大部分初始化在更前面就做完了），
+    控制台也什么都没报（脚本异常发生在加载阶段，工具里看不到红字）。
+    更巧的是：同一轮用户正好在抱怨"AI 回答没声音"——`initAiVoice()` 被砍掉是它的可能成因之一。
+    ▎**判据：顶层那串 `init*()` 是有顺序依赖的语句流，任何一行抛错都会截断后面全部。**
+    所以：① 调用点写在它依赖的 const/函数**之后**；
+    ② 新增 init 调用后，**必须在真浏览器里确认后面那几个 init 也跑了**
+       （本次靠"页面元素在不在"发现，下次可以直接打印一条"尾部初始化完成"）；
+    ③ 与坑 57/65 同族：**静默截断比报错危险，因为报错有人会去看。**
+
+70. **★ 变化驱动的信源必须配"输入回声"，否则"没反应"和"反应慢"分不开（2026-10-03 实修）**：
+    远程桌面控制台报"点下去 → 画面动"要 **2287ms**，而链路本身很快（RTT 低、帧率正常）。
+    根因：CDP `Page.startScreencast` 是**合成器级变化检测**——像素没变就一帧都不发。
+    于是"点了空白处 / 点了没有视觉反馈的控件 / 鼠标只是移动"这些情况下，
+    控制端**根本收不到任何画面**，直到别处恰好有个变化。
+    ▎用户描述永远是"它反应很慢"，但真相是"**没人报信**"——
+    这两种病的处方完全不同：前者要加带宽/降分辨率，后者要**主动补一帧**。
+    ▎修法（`agent/index.js` 的 `scheduleEcho()`）：注入输入后 120ms 复查，
+    若这期间抓屏没出过帧，就主动 `Page.captureScreenshot` 补一帧推过去。
+    实测 **2287ms → 153ms**。三重限流防它变成风暴：突发输入合并成一次补帧、
+    抓屏已经出帧就不补、补出来的帧仍走帧间隔闸门。
+    ▎**通用判据：凡是"对端只在有变化时才说话"的通道（变化检测抓屏、diff 同步、
+    事件溯源广播、只在数据变化时推流的订阅），都要问一句
+    "我发了请求但它那边没变化，我怎么知道请求到了？"** ——
+    答案是给这条通道配一个**回声/心跳**，而不是把超时调大。
+    ▎顺带一条安全纪律：`stopStream()`（撤权/断线）要把待发的回声定时器一起清掉——
+    控制权已经收回还去抓屏，等于多一次无谓的隐私面。
 
 
 ---
@@ -1520,6 +2097,22 @@ LEARN.md 第 4/5 节进度（✅=已完成，🔜=待做）：
    client.js **第 30 步**（看门狗/溢出归档/值守统计）+ `/api/captions` + `npm run soak`；
    信令 **72/72** + 冒烟 **87/87** + soak 压缩 PASS；导读 **LEARN.md 5.19.5**；
    N2 定时纪要（LLM 分段总结+终稿）等 key；真 7h 过夜在 0.2 节人工清单。
+5.17 ✅ **2026-09-30b 远程控制取长补短（借鉴 billd-desk，仅 SFU 主版本）**——
+   **设备码配对直连**（`desk-register`/`desk-connect` → 设备码 = 私有 `isDesk` 房号，
+   全套授权门禁与帧闸门**零改动复用**；安全口令=无人值守直授权 / 连接口令=终端按 y，
+   两条路径同发 `desk-granted`）+ **真桌面画质档**（`.rd-bar` 自动/流畅/标准/高清，
+   走 `remote-input` 的 `{kind:'quality'}` 老通道新语义）+ **三层帧率分工**
+   （档位定中枢 / 闭环自适应 ±2 微调 / 代理与服务器硬钳 2~24）。
+   第 2 节功能表 **32** 行、协议新增 09-30 段、坑 **61~63**；导读 **LEARN.md 5.39**；
+   路线图 `后续升级方向.md` **B 档 09-30 补刀**。
+   **回归（本次实测）**：信令 **184/184** + 冒烟 **189/189** + `test:agent` **24/24**（真 Chromium）
+   + `test:e2e` **15/15** + `test:store` **55/55** + `test:shutdown` **9/9**（6 组 476 项）；
+   ⚠️ **待人工验证**：设备码直连真机手感、无人值守与需确认两路径、
+   画质档观感差、弱网自动降档（另记诚实边界：设备码仅内存、口令明文比较、只控 Chromium 窗口内）。
+   ▎**另记（工作区里还躺着另一批未提交改动，不属本轮任务）**：`sfu/password.js` 口令 **V2 + 平滑重哈希**
+   （scrypt N 32768/r8/64B；V1 只用于校验存量；按 hex 长度判代、不加前缀）、`sfu/store.js` **惰性开库可重开**
+   （`closeDb()` 后再调用不再抛 "statement has been finalized"）、`scripts/legacy-user-fixture.js` 测试基建。
+   存储层因此 49 → **55**。**提交与教学导读回填要和"设备码 + 画质档"分开**，别混成一个 commit。
 
 6. 🔜 **下一步 = `后续升级方向.md` 第 1 节「AI 会议助手主攻」（2026-09-24 已大幅推进，剩三条尾巴）**——
    **本次已完成**：阶段 0~2 三件套脚本（`scripts/chat.js` / `summarize.js`（map-reduce 长文本）/

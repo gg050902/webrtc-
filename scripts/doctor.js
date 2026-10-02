@@ -457,8 +457,64 @@ const FIREWALL_HINT = [
       });
   }
 
-  /* ════════ B. 配置 ════════ */
+  // A7 常驻 ASR worker（★ 09-29：模型只加载一次，转写每段省 2~4s 固定启动开销）
+  if (asr.ok) {
+    let pyName = null;
+    try { pyName = await Asr.pythonNameForWorker(); } catch (e) { pyName = null; }
+    if (pyName && fs.existsSync(path.join(__dirname, '..', 'sfu', 'ai', 'asr_worker.py'))) {
+      add('A', 'A7-asr-worker', 'ok', `常驻转写 worker 就绪（${pyName} + asr_worker.py，模型只加载一次）`,
+        { detail: '每段只付纯转写时间（实测 0.8~3.0s，对比 CLI 每段 10~14s）——识别灵敏度的最大单一保障', priority: 54 });
+    } else {
+      add('A', 'A7-asr-worker', 'warn', '常驻转写 worker 不可用 → 退回 CLI 逐段转写（每段多付 2~4s 模型加载，字幕偏慢）',
+        { detail: 'worker 需要能 import whisper 的 python（PATH 上），且 sfu/ai/asr_worker.py 存在',
+          advice: '确认 python 在 PATH 且 pip install -U openai-whisper 装在同一个解释器里', priority: 28 });
+    }
+  } else {
+    add('A', 'A7-asr-worker', 'skip', 'whisper 未安装，跳过常驻 worker 检查', { priority: 5 });
+  }
 
+  // A8 服务端神经语音（★ 09-30c：AI 语音去"AI 味"——Edge TTS 端点可达性随网络出口而定）
+  {
+    const Tts = require('../sfu/ai/tts.js');
+    let reachable = false;
+    try { reachable = !!(await Tts.synthesize('你好', { timeoutMs: 6000 })); } catch (e) { reachable = false; }
+    if (reachable) {
+      add('A', 'A8-tts', 'ok', `服务端神经语音可用（${Tts.DEFAULT_VOICE}）——AI 回答将合成 MP3 下发，不再吃本机音色`,
+        { detail: 'AI 声音 = 服务器端统一音色，用户机器装什么音色不再重要', priority: 53 });
+    } else {
+      add('A', 'A8-tts', 'warn', 'Edge 神经语音端点不可达（403/断网，随网络出口而定）→ AI 语音回落浏览器 TTS',
+        {
+          detail: '功能不降级：客户端自动用 speechSynthesis；换网络出口（关加速器/换节点）重启服务器即可自动激活',
+          advice: '想用神经语音：换一个网络出口后重启；或检查代理是否拦截 wss://speech.platform.bing.com',
+          priority: 24,
+        });
+    }
+  }
+
+  // A9 口令哈希代际（★ 09-30：V1→V2 平滑重哈希——只读统计，不写库）
+  try {
+    const store = require('../sfu/store.js');
+    const pwMod = require('../sfu/password.js');
+    const users = store.listUsers();
+    store.closeDb();
+    const legacy = users.filter((u) => pwMod.needsUpgrade(u.hash));
+    if (!users.length) {
+      add('A', 'A9-password', 'ok', '账号库为空（首次注册即产生 V2 哈希）', { priority: 8 });
+    } else if (!legacy.length) {
+      add('A', 'A9-password', 'ok', `全部 ${users.length} 个账号已是 V2 哈希（scrypt N=32768/64B，参数达标）`, { priority: 40 });
+    } else {
+      add('A', 'A9-password', 'warn', `${legacy.length}/${users.length} 个账号还是 V1 哈希（旧参数）`,
+        {
+          detail: `V1 账号：${legacy.slice(0, 5).map((u) => u.username).join('、')}${legacy.length > 5 ? ' …' : ''}`,
+          advice: '无需操作：这些账号**下次登录成功时自动平滑升级**到 V2（换新盐重算，密码不变）',
+          priority: 20,
+        });
+    }
+  } catch (e) {
+    add('A', 'A9-password', 'warn', `账号库读取失败（${String(e && e.message).slice(0, 60)}）——跳过哈希代际检查`, { priority: 6 });
+  }
+
+  /* ════════ B. 配置 ════════ */
   // B1 config.json 存在且合法
   if (!loaded.exists) {
     add('B', 'B1-config', 'warn', 'sfu/config.json 不存在 → 服务器用默认值运行（本机演示模式）',

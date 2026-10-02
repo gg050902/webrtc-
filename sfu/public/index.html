@@ -304,6 +304,8 @@
         <button id="fxBtn" class="btn" disabled title="滤镜/磨皮/虚拟背景（绿幕抠像，经 replaceTrack 上行）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l1.8 4.7 4.7 1.8-4.7 1.8L12 17l-1.8-4.7-4.7-1.8 4.7-1.8L12 4z"/><path d="M18.5 4v3M20 5.5h-3"/></svg><span>滤镜</span></button>
         <!-- ★ 09-17 实时字幕（第 29 步，AI 线 L1）：Web Speech API 识别自己的麦克风，成稿经 SCTP 广播全房 -->
         <button id="capBtn" class="btn" disabled title="实时字幕：识别自己的麦克风转文字并广播（Web Speech API）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="13" rx="2.5"/><path d="M7 11.5h4M13.5 11.5h3.5M7 15h7"/></svg><span>字幕</span></button>
+        <!-- ★ 2026-10-01 画中画（借鉴 Piik 观看体验）：把主画面/演讲者/共享画面浮动到所有窗口之上 -->
+        <button id="pipBtn" class="btn" disabled title="画中画：把当前大画面（演讲者/共享）浮动到所有窗口之上"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="14" rx="2.5"/><rect x="12.5" y="11" width="7" height="5.5" rx="1"/></svg><span>画中画</span></button>
         <!-- ★ 09-13 F4：表情回应（走 D+1 SCTP 数据通道广播，全房表情飞屏） -->
         <span class="ctl-sep" aria-hidden="true"></span>
         <!-- ★ G4 低带宽模式（第 32 步）：把所有远端画面锁到最低清晰度层（simulcast 第 1 层）。
@@ -559,6 +561,9 @@
       <input id="rdUrl" class="rd-url" placeholder="输入网址后回车，例：bilibili.com" spellcheck="false" autocomplete="off">
       <button id="rdGo" class="btn rd-ibtn" title="打开网址">前往</button>
       <button id="rdMax" class="btn rd-ibtn" title="最大化对方浏览器窗口">⛶</button>
+      <button id="rdFull" class="btn rd-ibtn" title="全屏 / 退出全屏（借鉴 billd-desk）">▣</button>
+      <button id="rdClipPush" class="btn rd-ibtn" title="把我的剪贴板推给对方（粘进对方网页）">📋</button>
+      <button id="rdClipPull" class="btn rd-ibtn" title="拉取对方网页剪贴板到我的剪贴板">📥</button>
       <!-- ★ 09-30 画质档（流畅/标准/高清/自动）：走 remote-input 的 {kind:'quality'} 老通道新语义 -->
       <span class="rd-q">
         <button id="rdQAuto" class="btn rd-ibtn is-on" title="自动：按实测帧率弱网降档">自动</button>

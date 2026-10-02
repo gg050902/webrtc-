@@ -267,6 +267,12 @@ class Cdp {
     this.pageWs = await this._openWs(page.webSocketDebuggerUrl);
     await this._send(this.pageWs, 'Page.enable');
     await this._send(this.pageWs, 'Runtime.enable');
+    // ★ 09-30d（借鉴 billd-desk）：预授权剪贴板——远程会话的"复制/粘贴"主场景
+    //   依赖页面 navigator.clipboard，而 Chrome 默认拒绝无用户手势的剪贴板访问；
+    //   这里把权限授给浏览器，之后 agent 的读写就不必模拟手势（授权对全站生效）。
+    await this._send(this.browserWs, 'Browser.grantPermissions', {
+      permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'],
+    }).catch(() => { /* 旧版内核不支持则跳过：剪贴板功能退化，其余不受影响 */ });
     return page;
   }
 

@@ -57,6 +57,29 @@ const Digest = require('./ai/digest');
  *   ② 兜底候选把 node 当 python 用（process.execPath + `-m whisper`），永远失败。
  *   现在探测/转写/唤醒判定都走 asr.js：编码环境与参数只写一遍，可被自测脚本直接复用。 */
 const Asr = require('./ai/asr');
+/* ★ 2026-10-01 Qwen3-ASR 第二引擎（用户点名"试试 Qwen3-ASR"）：
+ * ▎QwenLM/Qwen3-ASR（阿里开源 SOTA，52 语言/方言）经 DashScope qwen3-asr-flash 云端推理
+ *   接入——免本地 GPU、复杂声学鲁棒；与 whisper 常驻 worker **可插拔共存**：
+ *   asrEngine=auto（默认）时配了 DASHSCOPE_API_KEY 且探测通过就优先 Qwen，单段失败/没配 key
+ *   自动回落 whisper（功能永不降级）；=whisper 强制本地；=qwen 强制云端（失败按"这段没有"）。
+ * ▎备份：改造前的 whisper 实现在 backup/asr-whisper-20261001/（git 历史为权威备份）。 */
+const QwenAsr = require('./ai/asr_qwen');
+function asrEngineMode() {
+  return String(CONFIG.asrEngine || process.env.ASR_ENGINE || 'auto').toLowerCase();
+}
+/* ★ 2026-10-01 Qwen3 本地引擎（模型下载到 models/ 后 CPU 推理，免 key 免 GPU）：
+ * ▎ASR：asr_qwen_local.js（常驻 worker，同 whisper worker 协议）；
+ * ▎TTS：tts_qwen.js（同款常驻协议）——引擎链 = Qwen 本地（活着就优先）→ Edge（探测）
+ *   → 浏览器 TTS；ASR 链 = 按 asrEngine 配置（auto 时 whisper worker 优先，qwen-local
+ *   用 config.asrEngine='qwen-local' 显式启用——本地 0.6B 延迟未经基准前不抢默认）。 */
+const QwenLocalAsr = require('./ai/asr_qwen_local');
+const QwenTts = require('./ai/tts_qwen');
+let qwenAsrLocal = null;
+function getQwenLocalAsr() {
+  if (process.env.ASR_QWEN_LOCAL === '0') return null;
+  if (!qwenAsrLocal) qwenAsrLocal = QwenLocalAsr;
+  return qwenAsrLocal.dead ? null : qwenAsrLocal;
+}
 /* ★ 09-29 常驻 ASR worker（单例）：
  * ▎CLI 转写每段都要重启 Python + 重载模型（固定 2~4s+），分段持续转写场景下
  *   字幕滞后越滚越大——"识别不灵敏"的最大单一原因。worker 模型只加载一次，
@@ -69,6 +92,103 @@ function getResidentAsr(model) {
   if (process.env.ASR_WORKER === '0') return null;
   if (!asrWorker) asrWorker = Asr.createResidentTranscriber({ model });
   return asrWorker.dead ? null : asrWorker;
+}
+
+/* ★ 09-30e 常驻 worker **开机预热**（延迟极限化第①刀）：
+ * ▎worker 的模型加载要 ~13s——不预热的话，服务器启动后**第一句**语音要白等这 13s
+ *   （用户印象里"第一次识别特别慢"的元凶）。预热 = 启动时后台合成一段 0.3s 静音 wav
+ *   喂给 worker 转写一次：模型加载完，之后每段只付纯转写时间。
+ * ▎静音 wav 是纯内存拼的 44 字节头 + 零样本——不依赖 ffmpeg，转写结果是空串，
+ *   正好走完"加载→推理→返回"全链路，但不产生任何字幕副作用。 */
+async function prewarmAsrWorker() {
+  try {
+    // ★ 先等 whisper 探测收敛（启动回调时探测还是异步进行中——早检查会静默空跑，已实测踩中）
+    for (let i = 0; !WHISPER && i < 100; i++) await new Promise((r) => setTimeout(r, 100));
+    if (!WHISPER || process.env.ASR_WORKER === '0') return;
+    const w = getResidentAsr(CONFIG.asrModel || Asr.DEFAULT_MODEL);
+    if (!w) return;
+    const os = require('os');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'asr-warm-'));
+    const wav = path.join(dir, 'warm.wav');
+    const sampleRate = 16000, dataBytes = Math.floor(sampleRate * 0.3) * 2; // 0.3s 静音
+    const buf = Buffer.alloc(44 + dataBytes);
+    buf.write('RIFF', 0); buf.writeUInt32LE(36 + dataBytes, 4); buf.write('WAVE', 8);
+    buf.write('fmt ', 12); buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22);
+    buf.writeUInt32LE(sampleRate, 24); buf.writeUInt32LE(sampleRate * 2, 28);
+    buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34);
+    buf.write('data', 36); buf.writeUInt32LE(dataBytes, 40);
+    fs.writeFileSync(wav, buf);
+    await w.transcribe(wav, { timeoutMs: 90000 });
+    fs.rmSync(dir, { recursive: true, force: true });
+    console.log('🔥 ASR 常驻 worker 已预热（模型加载完成）——第一句语音不用再等模型加载');
+  } catch (e) {
+    console.log(`⚠️ ASR worker 预热失败（不影响功能，第一段会多等几秒）：${e && e.message}`);
+  }
+}
+
+/* ★ 09-30c 服务端神经语音（Edge TTS，零 npm 依赖，见 sfu/ai/tts.js）：
+ * ▎为什么：浏览器 speechSynthesis 读的是"用户机器上装了什么音色"——多数 Windows
+ *   只有老式 SAPI 音色，机械感重（用户反复抱怨的"AI 味/难听"）。Edge 神经语音
+ *   （晓晓）是目前免费且最自然的中文音色，协议是纯 WebSocket，Node 内置能力即可实现。
+ * ▎双轨纪律（同 ASR 探测的老教训）：端点可达性随网络/出口 IP 变化（实测本机经加速器
+ *   一直 403）——**启动探测 + 定期重探**，通过才下发 aiTtsEnabled=true；不通过时前端
+ *   自动回落浏览器 TTS，功能永不降级，状态永远可见。
+ * ▎AI_TTS=0 可强制关闭（排障用）。 */
+const Tts = require('./ai/tts');
+const aiTtsState = { enabled: false, probedAt: 0, probing: false, lastError: null };
+async function probeAiTts({ force = false } = {}) {
+  if (process.env.AI_TTS === '0') { aiTtsState.enabled = false; return false; }
+  const TTL = 10 * 60000;
+  if (!force && aiTtsState.probedAt && Date.now() - aiTtsState.probedAt < TTL) return aiTtsState.enabled;
+  if (aiTtsState.probing) return aiTtsState.enabled;
+  aiTtsState.probing = true;
+  try {
+    const buf = await Tts.synthesize('你好', { timeoutMs: 6000 });
+    aiTtsState.enabled = !!buf;
+    aiTtsState.lastError = buf ? null : 'endpoint-unreachable';
+  } catch (e) { aiTtsState.enabled = false; aiTtsState.lastError = String(e && e.message).slice(0, 80); }
+  aiTtsState.probedAt = Date.now();
+  aiTtsState.probing = false;
+  if (aiTtsState.enabled) console.log('🔊 服务端神经语音可用（Edge TTS·晓晓）——AI 回答将合成 MP3 下发');
+  else console.log(`🔈 服务端神经语音不可达（${aiTtsState.lastError}）——AI 语音回落浏览器 TTS`);
+  return aiTtsState.enabled;
+}
+/* 合成并广播一条 AI 语音（挂"嘴"的两处：语音问答 asrWakeAndAnswer、@ai 问答）。
+ * ts 用 chat-message 同一条时间戳——前端按 ts 配对"这条答案的朗读"。 */
+async function speakAnswerForRoom(roomNumber, text, ts) {
+  const clean = String(text || '').replace(/\*\*/g, '').slice(0, 500);
+  if (!clean) return;
+  let delivered = false;
+  /* ★ 2026-10-01 语音引擎链：Qwen 本地（活着就优先，音色自持）→ Edge 神经（探测通过）
+     → 全失败补发 ai-tts-fail（前端回落浏览器朗读同一条文本——声音永不缺席）。 */
+  try {
+    if (QwenTts.alive) { // ★ 只用已预热的 worker——未就绪时直接落 Edge/浏览器，不卡应答
+      const wav = await QwenTts.synthesize(clean);
+      if (wav && wav.buf) {
+        const id = Tts.putAudio(wav.buf, 'wav');
+        io.to(roomNumber).emit('ai-audio', { url: `/ai-tts/${id}.wav`, ts });
+        logEvent('info', 'ai-tts', { roomNumber, bytes: wav.buf.length, engine: 'qwen-local' });
+        delivered = true;
+      }
+    }
+  } catch (e) { /* Qwen 本地失败 → 落 Edge */ }
+  if (!delivered && aiTtsState.enabled) {
+    try {
+      const buf = await Tts.synthesize(clean,
+        { voice: CONFIG.aiTtsVoice || undefined }); // 音色可配（config.aiTtsVoice，默认晓晓）
+      if (buf) {
+        const id = Tts.putAudio(buf, 'mp3');
+        io.to(roomNumber).emit('ai-audio', { url: `/ai-tts/${id}.mp3`, ts });
+        delivered = true;
+        logEvent('info', 'ai-tts', { roomNumber, bytes: buf.length });
+      }
+    } catch (e) {
+      logEvent('warn', 'ai-tts-failed', { roomNumber, reason: String(e && e.message).slice(0, 80) });
+    }
+  }
+  if (!delivered) {
+    io.to(roomNumber).emit('ai-tts-fail', { ts }); // ★ 前端收到后回落浏览器朗读同一条文本
+  }
 }
 /* ★ 09-24 账号存储层：node:sqlite（零新依赖的真数据库）
  * ▎从"整文件 JSON 读写"换成 SQLite 的原因见 sfu/store.js 文件头。
@@ -461,7 +581,29 @@ async function requestHandler(req, res) {
       remoteDesktop: true,
       // 代理启动命令模板：前端把它显示在页面上，用户复制到终端就能起代理（省得记参数）
       agentCommand: `node agent/index.js --room ${'{房间号}'}`,
+      // ★ 09-30c 服务端神经语音（Edge TTS）：探测通过才 true——前端据它决定
+      //   "AI 说话走服务器 MP3"还是"回落浏览器 speechSynthesis"，避免双重声音。
+      aiTtsEnabled: aiTtsState.enabled,
     }));
+    return;
+  }
+
+  // ★ 09-30c AI 语音 MP3 下发：id 是 128 位随机 hex（不可枚举），内容是 AI 生成的回答
+  //   文本转写——非敏感内容，id 即能力（与"录像签名 URL"相比，这里的暴露面小得多）。
+  if (pathname.startsWith('/ai-tts/')) {
+    const id = decodeURIComponent(pathname.slice('/ai-tts/'.length)).replace(/\.(mp3|wav)$/i, '');
+    const entry = /^[a-f0-9]{32}$/.test(id) ? Tts.getAudio(id) : null;
+    if (!entry) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('audio expired or not found');
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': entry.type === 'wav' ? 'audio/wav' : 'audio/mpeg',
+      'Content-Length': entry.buf.length,
+      'Cache-Control': 'private, max-age=600',
+    });
+    res.end(entry.buf);
     return;
   }
 
@@ -671,6 +813,14 @@ function buildMetrics(snap) {
   L.push(`sfu_ai_llm_completion_tokens_total ${aiS.completionTokens}`);
   help('sfu_ai_llm_cost_cny', 'gauge', 'Estimated cumulative LLM spend in CNY');
   L.push(`sfu_ai_llm_cost_cny ${aiS.costCny}`);
+  /* ★ 09-30c 语音链路指标：ASR 常驻 worker 与神经语音的"是否启用"各一个 gauge——
+   *   语音体验出问题时先看这两个：是"耳朵没就位"还是"嘴没就位"，一眼分清。 */
+  help('sfu_ai_asr_worker_enabled', 'gauge', '1 when the resident whisper worker is alive (0 = CLI fallback)');
+  L.push(`sfu_ai_asr_worker_enabled ${getResidentAsr(CONFIG.asrModel || Asr.DEFAULT_MODEL) ? 1 : 0}`);
+  help('sfu_ai_tts_enabled', 'gauge', '1 when Edge neural TTS endpoint is reachable (0 = browser speechSynthesis fallback)');
+  L.push(`sfu_ai_tts_enabled ${aiTtsState.enabled ? 1 : 0}`);
+  help('sfu_ai_asr_engine_qwen', 'gauge', '1 when the Qwen3-ASR (DashScope) engine is active for new transcriptions');
+  L.push(`sfu_ai_asr_engine_qwen ${(asrEngineMode() !== 'whisper' && QwenAsr.readKey()) ? 1 : 0}`);
   help('sfu_room_members', 'gauge', 'Members per room');
   for (const r of rooms) L.push(`sfu_room_members{room="${r.roomNumber}"} ${r.counts.members}`);
   help('sfu_producer_bytes_total', 'counter', 'Cumulative bytes forwarded per producer');
@@ -1329,7 +1479,7 @@ const clientIp = (socket) => (socket.handshake && socket.handshake.address) || '
  *   原因见那个文件头：两处各存一份实现时，任何一边改了参数，CLI 建的账号就登不上，
  *   而且报错只会说"用户名或密码不对"，排查方向全被带偏。
  *   这里解构出来，下面原有调用点（hashPassword(pw, salt)）一个字都不用改。 */
-const { hashPassword, newSalt, randomPassword } = require('./password');
+const { hashPassword, newSalt, randomPassword, needsUpgrade, verifyPassword } = require('./password');
 function validUsername(u) {
   return typeof u === 'string' && /^[a-zA-Z0-9_一-龥]{2,16}$/.test(u);
 }
@@ -1782,54 +1932,110 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
         try { if (curRec) curRec.kill(); } catch (e) { /* 已退 */ }
       });
       // 单个 ffmpeg 持续录音并分段（无空窗——旧串行模式在转写期间丢语音，是"不灵敏"的根因）
+      // ★ 09-30f 静音驱动早转写参数：说完静音 1.2s 就快照转写"正在写的段"（不等窗口封口）
+      const FLUSH_MS = Math.max(600, Number(process.env.ASR_FLUSH_SILENCE_MS) || 1200);
+      const FLUSH_DB = Number(process.env.ASR_FLUSH_DB) || -38;
+      let lastVoiceTs = 0;
+      let flushedBase = null;
       curRec = require('child_process').spawn(FFMPEG_BIN, [
         '-loglevel', 'error', '-protocol_whitelist', 'file,udp,rtp',
         '-fflags', '+genpts', '-i', sdpFile,
         '-ar', '16000', '-ac', '1',
+        '-af', 'astats=metadata=1:reset=8000,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-',
         '-f', 'segment', '-segment_time', String(segSec), '-segment_format', 'wav',
         '-reset_timestamps', '1',
         path.join(segDir, 'seg-%04d.wav'),
-      ], { stdio: ['ignore', 'ignore', 'ignore'] });
+      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+      // RMS 行解析：`lavfi.astats.Overall.RMS_level=-38.2`（每 0.5s 一行；-inf=纯静音）
+      curRec.stderr.on('data', (d) => {
+        if (process.env.ASR_DEBUG_FFMPEG) console.log(`[asr-ffmpeg] ${String(d).slice(0, 200)}`);
+      });
+      curRec.stdout.on('data', (d) => {
+        const matches = String(d).match(/RMS_level=(-?[\d.]+|-inf)/g);
+        if (!matches || !matches.length) return;
+        const last = matches[matches.length - 1].split('=')[1];
+        const db = last.startsWith('-inf') ? -99 : parseFloat(last);
+        if (Number.isFinite(db) && db > FLUSH_DB) lastVoiceTs = Date.now();
+      });
 
-      // 一个段的完整处理：静音丢弃 → whisper 转写 → 入库 + 上字幕 + 唤醒判定
+      // 一个段的完整处理：静音丢弃 → 转写 → **累积进当前语句**（不再每段独立上字幕/唤醒）。
+      /* ★ 2026-10-01 实修（用户实测"AI 收到重复的一句话/对话混乱/抢着答半句"的根因）：
+       *   4s 固定窗口 + 抢跑会把一个长句**切成多个片段**，每片独立触发"上字幕+唤醒判定"
+       *   → AI 对着半句就抢答、连续几段给出相似回答（= "重复的一句话"）、字幕片段风暴
+       *   又把 TTS 全程 hush（= "回答没有说话"）。
+       *   修法 = **语句组装**：段文本先累积到 utterances[member]；静音间隙（抢跑/封口后
+       *   超 UTTERANCE_GAP_MS 无新片段）才"成句"——成句时一次性：入账本 + 上字幕 + 唤醒判定。
+       *   字幕条中途显示**累积中的半句**（interim，不进历史），成句后的全句才进历史。 */
+      const UTTERANCE_GAP_MS = Math.max(800, Number(process.env.ASR_UTTERANCE_GAP_MS) || 1500);
+      const utterances = new Map(); // memberId → { text, lastAt }
       const handleSegment = async (full, baseName) => {
         if (doneSet.has(baseName)) return false;
         doneSet.add(baseName);
         let size = 0;
         try { size = fs.statSync(full).size; } catch (e) { return false; }
         if (size < 40000) { try { fs.unlinkSync(full); } catch (e) { /* 已删 */ } return false; } // 静音/太短
-        // ★ 09-29：优先常驻 worker（省掉每段的模型加载）；不可用自动回退 CLI
-        const worker = getResidentAsr(asrModel);
+        // ★ 转写引擎选择（2026-10-01）：qwen（DashScope 云）→ qwen-local（本地 0.6B）→ 常驻 whisper → CLI
+        const engine = asrEngineMode();
         const t0 = Date.now();
-        const text = worker
-          ? await worker.transcribe(full)
-          : await Asr.transcribeFile(WHISPER, full, { outDir: segDir, model: asrModel });
-        const via = worker ? '常驻' : 'CLI';
+        let text = '';
+        let via = '';
+        if ((engine === 'qwen' || engine === 'auto') && QwenAsr.readKey()) {
+          text = await QwenAsr.transcribeFile(full);
+          if (text) via = 'qwen';
+        }
+        if (!text && (engine === 'qwen-local' || (!text && engine === 'auto' && process.env.ASR_QWEN_LOCAL === '1'))) {
+          const local = getQwenLocalAsr();
+          if (local && local.alive) {          // ★ 只用"已就绪"的 worker——未就绪期间 whisper 兜底，不卡字幕
+            text = await local.transcribe(full);
+            if (text) via = 'qwen-local';
+          }
+        }
+        if (!text && engine !== 'qwen') {
+          // 本地 Qwen 失败也回落 whisper（显式 qwen-local 模式同样兜底——"不要有 bug"优先于引擎洁癖）
+          const worker = getResidentAsr(asrModel);
+          text = worker
+            ? await worker.transcribe(full)
+            : await Asr.transcribeFile(WHISPER, full, { outDir: segDir, model: asrModel });
+          via = worker ? '常驻' : 'CLI';
+        }
         try { fs.unlinkSync(full); } catch (e) { /* 已删 */ }
         if (!text || !rooms.get(roomNumber)) return false;
         console.log(`🤖 [ASR/${via}] ${speakerName}（转写 ${((Date.now() - t0) / 1000).toFixed(1)}s）：${text.slice(0, 50)}`);
-        // 入库（落盘 + 喂 AI 看板，唯一通道）→ 上字幕条 → 唤醒/追问判定
-        ingestCaptions(roomNumber, [{
-          ts: Date.now(), from: memberId, name: speakerName, text: text.slice(0, 500), asr: true,
-        }]);
-        io.to(roomNumber).emit('asr-caption', { name: speakerName, text: text.slice(0, 200) });
+        // 累积进当前语句 + 字幕条显示"累积中的句子"（interim：不进历史、不触发唤醒）
+        const u = utterances.get(memberId) || { text: '', lastAt: 0 };
+        u.text = `${u.text} ${text}`.trim().slice(0, 800);
+        u.lastAt = Date.now();
+        utterances.set(memberId, u);
+        io.to(roomNumber).emit('asr-caption', { name: speakerName, text: u.text.slice(0, 200), interim: true });
         logEvent('info', 'asr-segment', { roomNumber, member: memberId, chars: text.length });
-        await asrWakeAndAnswer(roomNumber, memberId, text, speakerName);
         return true;
+      };
+
+      // 成句：静音间隙到了 → 一次性 入账本 + 上字幕(定稿) + 唤醒判定（这才是完整的一句话）
+      const finalizeUtterance = async (memberId) => {
+        const u = utterances.get(memberId);
+        if (!u || !u.text) return;
+        utterances.delete(memberId);
+        if (!rooms.get(roomNumber)) return;
+        ingestCaptions(roomNumber, [{
+          ts: Date.now(), from: memberId, name: speakerName, text: u.text.slice(0, 500), asr: true,
+        }]);
+        io.to(roomNumber).emit('asr-caption', { name: speakerName, text: u.text.slice(0, 200) });
+        await asrWakeAndAnswer(roomNumber, memberId, u.text, speakerName);
       };
 
       // 挑一个"已经写完"的段：排除最新（正在写）+ 两次采样大小一致
       const pickReadySegment = async () => {
         let names = [];
         try {
-          names = fs.readdirSync(segDir).filter((f) => f.endsWith('.wav') && !doneSet.has(f)).sort();
+          names = fs.readdirSync(segDir).filter((f) => f.startsWith('seg-') && f.endsWith('.wav') && !doneSet.has(f)).sort();
         } catch (e) { return null; }
         if (names.length < 2) return null;            // 最新那段在写，等它封口
         const baseName = names[names.length - 2];
         const full = path.join(segDir, baseName);
         try {
           const s1 = fs.statSync(full).size;
-          await new Promise((r) => setTimeout(r, 250));
+          await new Promise((r) => setTimeout(r, 150)); // ★ 09-30e：写稳采样 250→150ms（段边界延迟再收一点）
           const s2 = fs.statSync(full).size;
           if (s1 !== s2) return null;                 // 还在增长 → 下一轮再说
           if (process.env.ASR_DEBUG_PICK) console.log(`[asr-pick] ${speakerName} → ${baseName} (${s1}B)`);
@@ -1840,18 +2046,55 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
       const recordLoop = async () => {
         await new Promise((r) => setTimeout(r, 300)); // 等首段产生
         while (alive && rooms.get(roomNumber)) {
+          // ★ 语句组装：静音间隙超过 UTTERANCE_GAP_MS → 成句（入账本+定稿字幕+唤醒判定）。
+          //   ⚠️ 必须在轮询之前查——说完话后不再有新段，放 continue 之后成句就永远不会执行
+          //   （实测：账本空、AI 永不应答的假失败根因）。
+          try {
+            const now = Date.now();
+            for (const [mid, u] of [...utterances]) {
+              if (now - u.lastAt > UTTERANCE_GAP_MS) await finalizeUtterance(mid);
+            }
+          } catch (e) { /* 成句失败不拖垮循环 */ }
           const pick = await pickReadySegment();
-          if (!pick) { await new Promise((r) => setTimeout(r, 500)); continue; }
+          if (!pick) { await new Promise((r) => setTimeout(r, 300)); continue; }
           try { await handleSegment(pick.full, pick.baseName); } catch (e) { /* 单段失败不拖垮循环 */ }
+          // 清理已被跳过/处理完的旧段（Windows 上文件仍被 ffmpeg 写着时删不掉，下轮再试）
+          try {
+            for (const f of fs.readdirSync(segDir)) {
+              if (doneSet.has(f)) { try { fs.unlinkSync(path.join(segDir, f)); } catch (e) { /* 占用中 */ } }
+            }
+          } catch (e) { /* 目录清理竞态 */ }
+          // ★ 09-30f 静音早转写（抢跑）：说完静音超阈值且"正在写的段"有足够音频 →
+          //   快照转写（doneSet 先占位防双跑；handleSegment 删的是快照副本，原文件继续写）。
+          //   尾巴丢失窗口 ≤ 当前窗剩余：只在"刚说完话"时触发，概率低；ASR_FLUSH=0 关闭。
+          if (process.env.ASR_FLUSH !== '0' && alive && lastVoiceTs && Date.now() - lastVoiceTs > FLUSH_MS) {
+            try {
+              const all = fs.readdirSync(segDir).filter((f) => f.startsWith('seg-') && f.endsWith('.wav')).sort();
+              const newest = all[all.length - 1];
+              if (newest && newest !== flushedBase && !doneSet.has(newest)) {
+                const full = path.join(segDir, newest);
+                const size = fs.existsSync(full) ? fs.statSync(full).size : 0;
+                if (size >= 48000) { // ≥1.5s 音频才值得抢跑（40000B 门槛之上留余量）
+                  const copy = path.join(segDir, 'f-' + newest);
+                  fs.copyFileSync(full, copy);
+                  flushedBase = newest;
+                  doneSet.add(newest); // 占位：封口后常规轮询与收尾都会跳过
+                  try { await handleSegment(copy, newest); } catch (e) { /* 抢跑失败走常规路径 */ }
+                }
+              }
+            } catch (e) { /* 抢跑失败不影响常规转写 */ }
+          }
         }
         // 收尾：把最后一段（ffmpeg 已停、不再增长）也转出来——别丢最后半句话
         try {
-          const rest = fs.readdirSync(segDir).filter((f) => f.endsWith('.wav') && !doneSet.has(f)).sort();
+          const rest = fs.readdirSync(segDir).filter((f) => f.startsWith('seg-') && f.endsWith('.wav') && !doneSet.has(f)).sort();
           for (const f of rest) {
             if (!rooms.get(roomNumber)) break;
             try { await handleSegment(path.join(segDir, f), f); } catch (e) { /* 收尾失败可忽略 */ }
           }
         } catch (e) { /* 目录已被清理 */ }
+        // ★ 收尾成句：管线退出前把未完结的累积语句走完整流程（入账本+字幕+唤醒）
+        try { for (const [mid] of [...utterances]) await finalizeUtterance(mid); } catch (e) { /* 忽略 */ }
       };
       recordLoop();
       return;
@@ -2220,14 +2463,47 @@ async function asrWakeAndAnswer(roomNumber, memberId, text, speakerName) {
     /* 追问时把"是谁在问"带进问题里：brain 的会话记忆是房间级的，
      * 模型只有知道说话人，才能答对"我刚才说的那个"这类指代。 */
     const question = followUp ? `（${who} 继续说）${clean}` : clean;
-    const r = await aiBrain(roomNumber, question.slice(0, 300));
-    io.to(roomNumber).emit('ai-state', { state: 'speaking', text: r.text });
-    io.to(roomNumber).emit('chat-message', {
-      from: 'ai-bot', name: '🤖 AI 小明', text: r.text, ts: Date.now(),
+    /* ★ 09-30d 语音应答流式化（"语音体验还是差"的最大感知项）：
+     * ▎原实现等 aiBrain 完整返回才广播——说完话到看到回答首字要 5s（段）+ 3s（转写）
+     *   + 2~4s（LLM 全文）≈ 10s+，全是干等；
+     * ▎现在与 @ai 问答同构走 ai-stream：LLM 每 12 字吐一次，首字延迟 ≈ 5s+3s+0.5s。
+     *   "增量先行保证手感，终态兜底保证不丢"——同一套双路哲学（终态 chat-message 仍发）。 */
+    const streamId = `asr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    io.to(roomNumber).emit('ai-stream', { id: streamId, delta: '', done: false, start: true, mock: AI.aiEnabled() === false });
+    const r = await aiBrain(roomNumber, question.slice(0, 300), (delta) => {
+      io.to(roomNumber).emit('ai-stream', { id: streamId, delta, done: false });
+    }, (phase) => {
+      io.to(roomNumber).emit('ai-state', { state: 'thinking', phase }); // 阶段透传（检索中/换说法/整理答案）
     });
+    io.to(roomNumber).emit('ai-stream', {
+      id: streamId, delta: '', done: true, mock: !!r.mock,
+      hitList: r.evidence || [],
+    });
+    io.to(roomNumber).emit('ai-state', { state: 'speaking', text: r.text });
+    const answerTs = Date.now();
+    io.to(roomNumber).emit('chat-message', {
+      from: 'ai-bot', name: '🤖 AI 小明', text: r.text, ts: answerTs, streamId: undefined,
+      // ★ 2026-10-01：服务端 TTS 链路（Qwen 本地/Edge）会送音频 → 前端别用浏览器 TTS 搶读；
+      //   合成失败时服务器补发 ai-tts-fail，前端回落浏览器朗读（文字永远不丢）。
+      tts: (QwenTts.alive || aiTtsState.enabled) ? 'server' : undefined,
+    });
+    /* ★ 09-30e：AI 的**语音回答**也入字幕账本——纪要/检索（RAG）从此包含"AI 自己说过什么"
+     *   （否则追问"你刚才说了什么"时，检索不到它自己的话）。只入账本不上字幕条
+     *   （字幕条是"人说话"，AI 的话在聊天气泡里已经有）。 */
+    try {
+      ingestCaptions(roomNumber, [{
+        ts: answerTs, from: 'ai-bot', name: 'AI 小明', text: String(r.text).slice(0, 500), asr: false,
+      }]);
+    } catch (e) { /* 账本失败不影响应答 */ }
+    speakAnswerForRoom(roomNumber, r.text, answerTs); // ★ 09-30c：服务端神经语音（可用时）
     setTimeout(() => io.to(roomNumber).emit('ai-state', { state: 'idle' }),
       Math.min(12000, 2000 + r.text.length * 90));
-  } catch (e) { /* 回答失败不影响转写循环 */ }
+  } catch (e) {
+    /* ★ 09-30：回答失败**不再静默**——静默 catch 让"AI 没应答"变成无头案
+     *   （TEST_ASR 自测第一个真抓到的就是这种：fixture 少个字段，整链路无声死掉）。 */
+    logEvent('warn', 'ai-answer-failed', { roomNumber, reason: String(e && e.message).slice(0, 120) });
+    console.log(`⚠️ AI 应答失败（房间 ${roomNumber}）：${e && e.message}`);
+  }
 }
 
 /* ★ 09-27 服务端 ASR（字幕转写，用户点名“开启那个字幕转写”）：
@@ -3384,7 +3660,7 @@ io.on('connection', (socket) => {
       }
       loginFails.delete(username); // 锁已过期：从零开始
     }
-    if (!u || hashPassword(password, u.salt) !== u.hash) {
+    if (!u || !verifyPassword(password, u.salt, u.hash)) {
       if (u) { // ★ 只对存在的账号计数（对空气计数 = 锁人 DoS）
         const rec = loginFails.get(username) || { count: 0, lockedUntil: 0 };
         rec.count += 1;
@@ -3397,6 +3673,19 @@ io.on('connection', (socket) => {
       return fail(callback, '用户名或密码不对');
     }
     loginFails.delete(username); // 登录成功：失败计数清零
+    /* ★ 09-30 平滑重哈希（路线图 0.3 第 5 条的最后一块）：存量账号（V1 哈希）登录成功时，
+     *   用 V2 参数重算并写回（顺带换新盐——重哈希本就该换盐）。用户无感（密码没变、
+     *   登录照常成功），库里的哈希却悄悄升级；失败不影响本次登录（下次登录再试）。
+     * ▎为什么挂在"登录成功"之后：重哈希需要**明文密码**，而明文只在"用户刚输对"的这一瞬
+     *   存在于内存——错过这个时机就再也没有合法的升级窗口。 */
+    if (needsUpgrade(u.hash)) {
+      try {
+        const ns = newSalt();
+        store.setPassword(username, ns, hashPassword(password, ns));
+        logEvent('info', 'auth-rehash', { username, algo: 'v1->v2' });
+        console.log(`🔐 账号 ${username} 的口令哈希已平滑升级到 V2 参数`);
+      } catch (e) { /* 升级失败不挡登录 */ }
+    }
     const token = issueToken(username);
     bindIdentity(username, u.displayName, u.avatar, u.role);
     console.log(`👤 登录成功: ${username}`);
@@ -4266,8 +4555,10 @@ io.on('connection', (socket) => {
     // 兜底归位：各端 TTS 读完本地自然回 idle；无 TTS 端按答案长度估时归位
     setTimeout(() => io.to(roomNumber).emit('ai-state', { state: 'idle' }),
       Math.min(12000, 2000 + (r.text || '').length * 90));
+    const answerTs = Date.now();
     io.to(roomNumber).emit('chat-message', {
-      from: 'ai-bot', name: '🤖 AI 小明', text: r.text, ts: Date.now(), streamId,
+      from: 'ai-bot', name: '🤖 AI 小明', text: r.text, ts: answerTs, streamId,
+      tts: (QwenTts.alive || aiTtsState.enabled) ? 'server' : undefined, // ★ 同上：服务端语音标记
       /* ★ 09-24e：把"这条答案是怎么来的"一起广播出去——检索自几千条字幕里的哪几条、
        *   这是第几轮追问、意图是什么。**智能不该是玄学**：用户能看到 AI 真的去查了会议记录，
        *   而不是凭空编了一段话。这也是最有力的"AI 不是空壳"的现场证据。
@@ -4286,6 +4577,7 @@ io.on('connection', (socket) => {
         hitList: r.evidence || [],
       },
     });
+    speakAnswerForRoom(roomNumber, r.text, answerTs); // ★ 09-30c：服务端神经语音（可用时）
     logEvent('info', 'ai-ask', {
       roomNumber, by: socket.id, qLen: question.length, mock: !!r.mock,
       tokens: (r.usage && r.usage.totalTokens) || 0, intent: r.intent || null,
@@ -4869,6 +5161,27 @@ io.on('connection', (socket) => {
       : '🤖 AI 模式：[Mock] —— 未配置 DEEPSEEK_API_KEY（可写进项目根 .env），全部功能走本地规则降级，链路照样跑得通');
     probeFfmpeg();
     checkAnnouncedIp();
+    probeAiTts(); // ★ 09-30c：服务端神经语音可用性探测（不阻塞启动；10 分钟 TTL 定期重探）
+    prewarmAsrWorker(); // ★ 09-30e：常驻 ASR worker 开机预热（第一句语音不再等 13s 模型加载）
+      // ★ 2026-10-01：本地模型目录存在时，Qwen 引擎默认指向本地（免 HF 运行时下载）
+      try {
+        if (fs.existsSync(path.join(__dirname, 'models', 'qwen3-asr-0.6b'))) {
+          process.env.QWEN_ASR_MODEL = process.env.QWEN_ASR_MODEL || path.join(__dirname, 'models', 'qwen3-asr-0.6b');
+        }
+        if (fs.existsSync(path.join(__dirname, 'models', 'qwen3-tts-0.6b'))) {
+          process.env.QWEN_TTS_MODEL = process.env.QWEN_TTS_MODEL || path.join(__dirname, 'models', 'qwen3-tts-0.6b');
+          QwenTts.warm().then(() => {
+            console.log('🔥 Qwen3-TTS 本地 worker 已预热（AI 回答将用本地音色朗读）');
+          }).catch(() => {});
+        }
+        // asrEngine='qwen-local' 显式启用时，开机预热本地 Qwen 听觉 worker（加载要几分钟）
+        if (asrEngineMode() === 'qwen-local' && process.env.QWEN_ASR_MODEL) {
+          getQwenLocalAsr().warm().then(() => {
+            console.log('🔥 Qwen3-ASR 本地 worker 已预热（之后的语音片段将用 qwen-local 转写）');
+          }).catch(() => {});
+        }
+      } catch (e) { /* 本地模型绑定失败不影响主流程 */ }
+    setInterval(() => Tts.sweepAudio(), 60000).unref(); // 过期 MP3 清扫（30 分钟寿命）
     if (httpsServer) {
       httpsServer.listen(tlsCfg.port || 3443, () => {
         console.log(`🔒 HTTPS: https://${listenOn}:${tlsCfg.port || 3443}（自签证书，浏览器点"继续访问"即可）`);
@@ -5058,13 +5371,36 @@ async function runAsrSelfTest() {
     });
     // ④ 造一个最小房间（真实房间的"人说话"就是生产出这路 producer，此处等价）
     const selfRoom = {
-      roomNumber: 'SELFASR', router, ownerId: 'selftest-member',
-      members: new Set([{ id: 'selftest-member', displayName: '自测说话人' }]),
+      roomNumber: '999999', router, ownerId: 'selftest-member',
+      members: new Set([{
+        id: 'selftest-member', displayName: '自测说话人',
+        producers: new Map(), dataProducers: new Map(), consumers: new Map(),
+        // ↑ joinRoom 投影 / net-level 定时器都要遍历这些 Map（缺了 = 定时崩，自测逐个抓到）
+      }]),
       aiBot: true, createdAt: Date.now(), state: {},
+      talk: new Map(), // ★ aiBrain 要读发言统计（少了它整条应答链路静默崩——自测真抓到过）
     };
     rooms.set(selfRoom.roomNumber, selfRoom);
+    // ④.5 连一个真实 socket.io 客户端进房（服务器进程自己连自己）——
+    //   为了断言"AI 真的应答了"（chat-message from=ai-bot）：闭环=耳朵→脑子→嘴，
+    //   只断言转写账本是不够的——那只验了耳朵。
+    const { io: Client } = require('socket.io-client');
+    const probe = Client(`http://127.0.0.1:${PORT}`, { transports: ['websocket'], reconnection: false });
+    const botReplies = [];
+    if (process.env.TEST_ASR_DEBUG) probe.onAny((ev, ...args) => console.log(`🧪 [probe] ${ev}`, JSON.stringify(args).slice(0, 120)));
+    probe.on('chat-message', (m) => { if (m && m.from === 'ai-bot' && m.text) botReplies.push(m); });
+    await new Promise((resolve, reject) => {
+      probe.on('connect', resolve);
+      probe.on('connect_error', () => reject(new Error('自测客户端连接失败')));
+      setTimeout(() => reject(new Error('自测客户端连接超时')), 8000);
+    });
+    const joinAck = await new Promise((resolve) => {
+      probe.emit('join-room', { roomNumber: '999999' }, (resp) => resolve(resp));
+      setTimeout(() => resolve(null), 2500); // join 无 ack 的兜底（防挂）
+    });
+    if (process.env.TEST_ASR_DEBUG) console.log('🧪 [probe] join ack:', JSON.stringify(joinAck).slice(0, 120));
     // ⑤ 启动真实听觉管线（与浏览器开会完全同一段代码）
-    await startAiAudioPipe('SELFASR', producer, 'selftest-member');
+    await startAiAudioPipe('999999', producer, 'selftest-member');
     // ⑥ ffmpeg 把 TTS 语音推进来（payloadType/SSRC 与上面约定一致）
     const sender = require('child_process').spawn(FFMPEG_BIN, [
       '-loglevel', 'error',
@@ -5077,7 +5413,7 @@ async function runAsrSelfTest() {
     await sleep(2000);
     // ⑦ 轮询字幕账本：等 asr:true 且含语义关键词的条目（转写 5s 段 + worker 应在 60s 内出结果）
     const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const capFile = path.join(CAPTIONS_DIR, `cap-SELFASR-${day}.jsonl`);
+    const capFile = path.join(CAPTIONS_DIR, `cap-999999-${day}.jsonl`);
     const deadline = Date.now() + 90000;
     let hit = null;
     while (Date.now() < deadline && !hit) {
@@ -5092,7 +5428,13 @@ async function runAsrSelfTest() {
       } catch (e) { /* 文件还没出现 */ }
       if (!hit) await sleep(1000);
     }
+    // ⑦.5 AI 应答断言：唤醒句（带"小明"）必须触发 asrWakeAndAnswer → aiBrain → 全房广播。
+    //   等待期间保持管线活着（LLM/Mock 应答是异步的，收尾太早会掐断在途的回答）。
+    const replyDeadline = Date.now() + 60000;
+    while (Date.now() < replyDeadline && !botReplies.length) await sleep(1000);
+    const aiReplied = botReplies.length > 0;
     // ⑧ 收尾：先断 RTP 源（管线会在 producerclose 后自动退场），再清测试痕迹
+    try { probe.disconnect(); } catch (e) { /* 忽略 */ }
     sender.kill();
     await sleep(500);
     producer.close();
@@ -5102,7 +5444,11 @@ async function runAsrSelfTest() {
     try { fs.rmSync(capFile, { force: true }); } catch (e) { /* 忽略 */ }
     if (!hit) throw new Error('90s 内字幕账本未出现 asr 转写（管线某段断了，看上方聆听/转写日志）');
     console.log(`🧪 [TEST_ASR] PASS —— 转写并入库：「${hit.text}」（说话人 ${hit.name}）`);
-    if (process.env.TEST_ASR_EXIT === '1') process.exit(0);
+    if (!aiReplied) throw new Error('AI 未应答（耳朵听到了但嘴没动：唤醒词→aiBrain→chat-message 断链）');
+    console.log(`🧪 [TEST_ASR] AI 应答：「${String(botReplies[0].text).slice(0, 60)}」`);
+    // ★ 2026-10-01：走优雅退出——连带清理 whisper/qwen 常驻 worker 与管线子进程
+    //   （直接 process.exit 会把 python worker 留成孤儿，多次运行内存越积越多）
+    if (process.env.TEST_ASR_EXIT === '1') { await gracefulShutdown('selftest-end'); return; }
   } catch (err) {
     console.error(`🧪 [TEST_ASR] FAIL —— ${err.message}`);
     if (process.env.TEST_ASR_EXIT === '1') process.exit(1);
@@ -5153,6 +5499,23 @@ async function gracefulShutdown(signal) {
   try { store.closeDb(); } catch (e) { /* 忽略 */ }
   // ④ 关常驻 ASR worker（★ 09-29：不关会留一个 python 进程占着模型内存）
   try { if (asrWorker) asrWorker.kill(); } catch (e) { /* 忽略 */ }
+  try { QwenTts.kill(); } catch (e) { /* 忽略 */ }
+  // ⑤ ★ 2026-10-01：杀掉所有 AI 听觉管线的 ffmpeg（不杀会留孤儿占着 RTP 端口——
+  //    服务器重启后新管线可能分到同一端口，收不到流表现为"AI 全程听不见"，实测踩中）
+  try {
+    for (const [, set] of aiAudioPipes) {
+      for (const pipe of set) { try { pipe.proc && pipe.proc.kill(); } catch (e) { /* 忽略 */ } }
+    }
+    aiAudioPipes.clear();
+  } catch (e) { /* 忽略 */ }
+  // ⑥ 同步兜底：进程真正退出前再补一刀（exit 事件只有同步代码可跑）
+  process.on('exit', () => {
+    try {
+      for (const [, set] of aiAudioPipes) {
+        for (const pipe of set) { try { pipe.proc && pipe.proc.kill(); } catch (e) { /* 忽略 */ } }
+      }
+    } catch (e) { /* 忽略 */ }
+  });
 
   clearTimeout(hardTimer);
   console.log('👋 已安全退出（Worker 已关、数据库已 checkpoint）。');

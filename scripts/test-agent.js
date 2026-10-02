@@ -248,8 +248,40 @@ const TEST_PAGE = 'data:text/html;charset=utf-8,' + encodeURIComponent(`<!doctyp
   CTL.s.emit('remote-quality', { to: agent.sock.id, fps: fpsBefore });
   await sleep(300);
 
-  // 动态验证"变化才推帧"：让页面动起来，帧数应当持续增长
+  /* ---- ★ 09-30 画质档（billd 取长补短）：档位切换必须真的换掉编码参数并继续推帧 ----
+   * ▎为什么要端到端而不是单测预设表：切档穿过 remote-input(JSON) → 代理 applyQuality
+   *   → cdp.setScreencast（stop+start）。中间任何一步失手，症状都是"画面卡在旧画质"
+   *   或直接停帧——只有"切档后仍能收到新帧"这条断言能证明重开这一路是安全的
+   *   （重开若把 Page.screencastFrame 监听器叠上去，会出现每帧重复 ack/重复回调）。 */
+  const framesBeforePreset = frames.length;
+  CTL.s.emit('remote-input', { to: agent.sock.id, event: { kind: 'quality', preset: 'hd' } });
+  await sleep(600);
+  ok('⑥e 画质档切换：代理记下当前档并把帧间隔改成该档的 fps',
+    agent.qualityPreset === 'hd' && Math.round(1000 / agent._frameGap) === 20,
+    `实际档=${agent.qualityPreset} / ${Math.round(1000 / agent._frameGap)}fps`);
+  ok('⑥e2 切档同时改上行编码参数（quality 与长边上限，不只是帧率）',
+    agent.cfg.quality === 80 && agent._maxDim && agent._maxDim.maxWidth === 1920,
+    `q=${agent.cfg.quality} dim=${JSON.stringify(agent._maxDim)}`);
+  /* ⚠️ 触发器必须改"真的会变色"的东西：screencast 是**变化才推帧**，
+   *   我第一版用 document.title 计时（每秒在变），帧数却几乎不涨，
+   *   断言当场红了 —— 但那不是"切档把链路搞断"，是**测试没制造画面变化**。
+   *   同坑 55：测边界状态前先确认你操作的确实是那个对象；这里先确认"页面真的在动"。 */
   await agent.cdp.evaluate('setInterval(() => { document.body.style.background = "hsl(" + (Date.now()/20 % 360) + ",60%,90%)"; }, 60)');
+  const keptStreaming = await waitFor(() => frames.length > framesBeforePreset + 2, 8000);
+  ok('⑥e3 切档后画面持续推帧（重开 screencast 没把链路搞断）', keptStreaming,
+    `切换前后帧数 ${framesBeforePreset} → ${frames.length}`);
+  ok('⑥e4 帧里没有重复 ack 堆积（每帧回调一次 —— 监听器只绑一次的验证）',
+    frames.slice(framesBeforePreset).every((f) => !!f && !!f.frame));
+  // 未知档名必须被忽略（不能让一个拼错的字符串把画面停掉）
+  CTL.s.emit('remote-input', { to: agent.sock.id, event: { kind: 'quality', preset: 'ultra-4k-max' } });
+  await sleep(300);
+  ok('⑥e5 未知画质档被忽略且当前档不变（拼错不致命）', agent.qualityPreset === 'hd');
+  // 回到标准档，后面的坐标/滚动断言按默认帧率跑
+  CTL.s.emit('remote-input', { to: agent.sock.id, event: { kind: 'quality', preset: 'standard' } });
+  await sleep(400);
+
+  // 动态验证"变化才推帧"：页面从上面 ⑥e3 起就一直在动（不再重复挂 setInterval，
+  //   两个同写 background 的定时器只会让后面的断言更"必然通过"，掩盖真实频率）
   const before = frames.length;
   await sleep(1800);
   ok('⑦ 页面变化时持续推帧（screencast 的变化驱动语义生效）', frames.length > before);

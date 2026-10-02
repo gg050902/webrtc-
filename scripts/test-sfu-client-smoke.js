@@ -242,6 +242,10 @@ const socketStub = {
     rec.emits.push(ev);
     if (ev === 'remote-input') { rec.remoteInputs++; rec.remoteInputPayloads.push(payload); }
     if (ev === 'remote-request') rec.remoteRequestTo = payload && payload.to;   // ★ 09-24
+    if (ev === 'desk-connect') {                                                // ★ 09-30 设备码直连
+      rec.lastDeskConnect = payload;
+      return cb({ data: { granted: false, hostId: 'DEVICEGRANTHOST1', hostName: '🖥️ 客厅电脑' } });
+    }
     if (ev === 'clipboard-sync') rec.clipboardSends++;
     if (ev === 'file-chunk') rec.fileChunks++;
     if (ev === 'file-offer') { rec.fileOffers++; rec.lastFileOffer = payload; }
@@ -1367,6 +1371,90 @@ const emit = (ev, payload) => {
      documentStub.getElementById('agentHint').classList.contains('hidden'));
   ok('09-24 指引卡片里的启动命令带真实房间号（复制即用）',
      String(documentStub.getElementById('agentCmd').textContent).includes('--room'));
+
+  /* ════════════════════════════════════════════════════════════
+   * ★ 09-30 设备码直连 + 画质档（前端）—— 取长补短自 billd-desk
+   *   ▎断言重点：① 入口是"另一条路"，但**授权之后共用同一个控制台**（不许长出第二套 UI）；
+   *              ② 画质档必须真的从 remote-input 老通道发出去（复用门禁），
+   *                 且手动档与自动档互斥（两个来源抢一个执行器的症状就是"按钮亮着但没生效"）。
+   * ════════════════════════════════════════════════════════════ */
+  console.log('\n--- 09-30 设备码直连 + 画质档（前端）---');
+
+  // ① 登录卡上的「用设备码远程控电脑」→ 打开设备码面板（不经过会议）
+  const deskOv = documentStub.getElementById('deskOverlay');
+  const authOv = documentStub.getElementById('authOverlay');
+  authOv.classList.remove('hidden');
+  deskOv.classList.add('hidden');
+  guard('点设备码入口', () => documentStub.getElementById('authDeskBtn').dispatch('click'));
+  ok('09-30 登录卡有设备码入口，点击后打开直连面板（不用先进会）',
+     !deskOv.classList.contains('hidden') && authOv.classList.contains('hidden'));
+
+  // ② 码格式不对 → 本地就拦下（不发信令，省一次无谓往返，也避免把脏输入送进服务器）
+  rec.lastDeskConnect = null;
+  const deskCodeEl = documentStub.getElementById('deskCode');
+  const deskPassEl = documentStub.getElementById('deskPass');
+  const deskMsgEl = documentStub.getElementById('deskMsg');
+  deskCodeEl.value = '12';
+  guard('提交短设备码', () => documentStub.getElementById('deskConnectBtn').dispatch('click'));
+  ok('09-30 设备码非 6 位时本地拦截（不发 desk-connect）',
+     rec.lastDeskConnect === null && /6 位/.test(String(deskMsgEl.textContent)));
+
+  // ③ 正常提交 → desk-connect {deviceCode, password}
+  rec.lastDeskConnect = null;
+  deskCodeEl.value = '246810';
+  deskPassEl.value = 'pw123';
+  guard('提交设备码', () => documentStub.getElementById('deskConnectBtn').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 30));
+  ok('09-30 设备码+连接密码提交到服务器（一条信令替代"建房→进房→申请控制"三步）',
+     !!rec.lastDeskConnect && rec.lastDeskConnect.deviceCode === '246810' && rec.lastDeskConnect.password === 'pw123');
+  // 桩回的 ack 是 granted:false（需人工确认）→ 面板给出确定提示，而不是"点了没反应"
+  ok('09-30 需人工确认时给出等待提示（不静默）',
+     /等待对方/.test(String(deskMsgEl.textContent)));
+
+  // ④ 授权到达（模拟被控端确认/无人值守）→ **同一个真桌面控制台**被打开、面板收起
+  rdEl.classList.add('hidden');
+  deskOv.classList.remove('hidden');
+  guard('设备码授权', () => emit('desk-granted', { hostId: RD, hostName: '🖥️ 客厅电脑', unattended: true }));
+  ok('09-30 desk-granted 打开的是同一个远程桌面控制台（不长出第二套 UI）',
+     !rdEl.classList.contains('hidden') && deskOv.classList.contains('hidden'));
+  ok('09-30 控制台副标题显示设备名（来自 desk-register 的 🖥️ 前缀名）',
+     /客厅电脑/.test(String(documentStub.getElementById('rdMeta').textContent)));
+
+  // ⑤ 画质档：点「高清」→ 走 remote-input 老通道发 {kind:'quality'}（复用同一道服务器门禁）
+  rec.remoteInputPayloads.length = 0;
+  const qHd = documentStub.getElementById('rdQHD');
+  const qAuto = documentStub.getElementById('rdQAuto');
+  qAuto.classList.add('is-on');
+  guard('点高清档', () => qHd.dispatch('click'));
+  /* 找的是**整条载荷**（含 to），不是里面的 event —— 一开始写成 .map(p=>p.event).find(...)
+   *  再去读 qMsg.to 就永远是 undefined（"断言写得像真的，其实读了个空气"）。
+   *  与坑 51 同源：冒烟里读嵌套结构，每一层都要明确自己在读哪一层。 */
+  const qMsg = rec.remoteInputPayloads.find((p) => p && p.event && p.event.kind === 'quality' && p.event.preset === 'hd');
+  ok('09-30 切画质档走 remote-input（不新造事件 = 复用门禁与限流）',
+     !!qMsg && qMsg.to === RD);
+  /* ★ 手动档与自动档**互斥**是这里最该钉住的一条：
+   *   两套逻辑同时调帧率会互相拉扯（用户点了高清、3 秒后自动档又拖回标准），
+   *   表现为"按钮亮着但画面没变"。所以点手动档必须把 is-on 从"自动"摘掉。 */
+  ok('09-30 手动档生效时自动档标记被摘掉（两个来源不会抢一个执行器）',
+     qHd.classList.contains('is-on') && !qAuto.classList.contains('is-on'));
+
+  // ⑥ 回到自动档 → 重新发一次当前档（让对端状态与界面一致），并恢复自动标记
+  rec.remoteInputPayloads.length = 0;
+  guard('点自动档', () => qAuto.dispatch('click'));
+  ok('09-30 回到自动档时自动标记恢复且当前档重发一次（界面与对端不错位）',
+     qAuto.classList.contains('is-on') &&
+     rec.remoteInputPayloads.some((p) => p && p.event && p.event.kind === 'quality'));
+
+  // ⑦ 静态契约：HTML 里四颗档按钮与设备码面板控件都在（前端改名会静默断线，这里钉住）
+  const htmlSrc = fs.readFileSync(path.join(__dirname, '..', 'sfu', 'public', 'index.html'), 'utf8');
+  ok('09-30 index.html 含 自动/流畅/标准/高清 四档按钮',
+     ['rdQAuto', 'rdQSmooth', 'rdQStd', 'rdQHD'].every((id) => htmlSrc.includes('id="' + id + '"')));
+  ok('09-30 index.html 含设备码面板（码/密码/连接/返回）与登录卡入口',
+     ['deskOverlay', 'deskCode', 'deskPass', 'deskConnectBtn', 'deskBackBtn', 'authDeskBtn']
+       .every((id) => htmlSrc.includes('id="' + id + '"')));
+
+  // ⑧ 撤权收起控制台，别让后面的断言带着"仍在控制"的状态跑
+  guard('收尾释放', () => { try { documentStub.getElementById('rdRelease').dispatch('click'); } catch (e) {} });
 
   if (problems.length) {
     console.log(`\n⚠️ 捕获到 ${problems.length} 个运行时异常：`);

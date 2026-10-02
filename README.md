@@ -94,6 +94,8 @@
 | 💬 字幕 Otter 式排版 | 字幕历史按说话人分组成段（段头名字+时间、段内逐句、最新句鎏金高亮）——Otter.ai 的转写排版节奏 | 纯前端重排（09-19b） |
 | 🖥️ 真 OS 级远程桌面（B 档） | 控制端在**网页里**操作被控电脑上**真实的浏览器窗口**：开任意真实网站、点真实按钮、滚真实页面，地址栏显示对方真实 URL | 本地代理 `agent/`：手写 **CDP** 客户端（`Page.startScreencast` 抓屏 + `Input.*` 注入真输入，零新依赖）；新信令 `agent-hello`/`remote-frame`/`remote-meta` + 复用 `remote-input`；三道闸门（身份/授权/体量），原则"**信任 ≠ 免检查**"（09-24，SFU 主版本） |
 | 📱 手机控电脑 | 手机上也能控被控电脑：单指 = 鼠标（移动/点击/拖拽），**双指 = 滚轮**，中文整段输入绕开 IME；成员行有 `🖥️` 前缀 +「可被控」徽标 +「控制电脑」按钮 | 控制台 canvas 交互**全部用 Pointer Events**（一套逻辑覆盖鼠标/触摸/触控笔，自己维护"当前几根手指"账本）；隐藏 IME 捕获框整段转发 + CDP `Input.insertText`（09-24，真机实测双指滚动让被控端 `scrollY 0→1000`） |
+| 🔑 设备码配对直连（B 档补刀，09-30） | 被控电脑 `npm run agent` 启动即得一个 **6 位设备码**；控制端在登录页「🖥️ 用设备码远程控电脑」输码 + 连接口令**直接连那台电脑**——**不用建房、不用进会议** | `desk-register`/`desk-connect`/`desk-granted`/`desk-pending`；**设备码 = 私有 `isDesk` 房间的房号**（画面帧三道闸门与 16 字节控制帧零改动复用），控制端 `deskEnterRoom()` 轻量进房；**安全口令=无人值守直接授权 / 连接口令=对方终端按 y**，两路径同发 `desk-granted`（借鉴 `billd-desk` 的交互模型，不取 Electron 原生客户端；`LEARN.md` 5.39） |
+| 🎚️ 真桌面画质档 + 三层帧率（09-30） | 控制台四颗：自动 / 流畅(6fps) / 标准(12) / 高清(20)，切档**同时改 JPEG 质量、帧率与长边上限**；"自动"档弱网自己降、链路稳了再升 | 走 `remote-input` 的 `{kind:'quality'}`（**老通道新语义** = 复用门禁与限流）；代理 `applyQuality` → `cdp.setScreencast()` 重开抓屏（监听器只绑一次）；**档位定中枢 → 闭环 ±2 微调 → 硬钳 2~24** 三层分工（策略线与安全线分开，坑 62） |
 | 🚀 一键发布公网链接 | 一条命令把 Mesh 版打成"别人点开就能进"的发布包：生成 → 体检 → 可选开隧道拿公网地址 | `scripts/publish.js`（`npm run publish:mesh`）：白名单拷贝 + **每次清空重建（副本永不漂移）** + 真起一次验证 `/config.json` 下发 TURN + `--tunnel`/`--bundle`/`--check`（09-24） |
 | 🧊 跨网 ICE 下发（Mesh） | Mesh 版"跨网连不上"的根因是 ICE 打洞：把 ICE 从代码挪进 `mesh.config.json`，由服务器 `/config.json` 下发 | 根 `server.js` 加 `/config.json` 路由（带 `no-store`）+ 启动 ICE 自检；根 `public/client.js` 加 `ICE_SERVERS`/`iceReady`，建 peer 前一律 `await iceReady`（09-24） |
 | 📴 Service Worker 缓存纪律 | 修掉"改了代码刷新不生效"：会变的资源（client.js/style.css/页面）改 **network-first**，不变的 vendor 才 cache-first；加 `?nosw=1` 逃生舱 | `sfu/public/sw.js` 按资源性质分两路 + 缓存名 `meeting-v1 → v2`；根因"SW 不看 HTTP 缓存头"（09-24） |
@@ -134,13 +136,46 @@ Node 程序（Node 22 内置 `fetch`/`WebSocket`，不引任何 npm 包）：
 | 文件 | 干什么 | 关键实现 |
 |---|---|---|
 | `agent/cdp.js`（约 470 行） | 手写的 **CDP（Chrome DevTools Protocol，就是 F12 背后那套协议）** 客户端：启动真实 Chromium（Edge/Chrome，`BROWSER_BIN` 可指定）→ `--remote-debugging-port` 连上去 | `Page.startScreencast` 抓屏（**帧变化才推 + `screencastFrameAck` 自带背压**）、`Input.dispatchMouseEvent` / `Input.insertText` / `Input.dispatchKeyEvent` 注入真实输入 |
-| `agent/index.js`（约 430 行） | 被控端代理主体：连 socket.io 信令 → `agent-hello` 进房 → 收到授权后推画面帧 + 执行输入指令 | 零新依赖（复用根目录 `node_modules` 里的 socket.io-client）；命令行 `--room --server --password --name --url --port --profile --quality --fps --minutes --auto-allow --headless` |
+| `agent/index.js`（约 430 行） | 被控端代理主体：连 socket.io 信令 → 进房（★ 09-30 起**两种用法**：设备码 `desk-register` / 老用法 `agent-hello`）→ 收到授权后推画面帧 + 执行输入指令 + `applyQuality` 切画质档 | 零新依赖（复用根目录 `node_modules` 里的 socket.io-client）；命令行 `--code --connect-password --secure-password --room --server --password --name --url --port --profile --quality --fps --minutes --auto-allow --headless` |
 
 ```bash
-npm run agent                              # = node agent/index.js
-node agent/index.js --room 123456          # 连本机 3001；被控机终端会弹确认，按 y 才放行
-node agent/index.js --room 123456 --auto-allow   # 演示用自动放行（有风险，文档已写明）
+# ★ 09-30 推荐用法：设备码模式（不用先建房、不用进会议）
+npm run agent                                        # 启动即打印一个 6 位「设备码」
+node agent/index.js --connect-password 1234          # 主控端要输对连接密码才进得来
+node agent/index.js --code 888888 --secure-password s3cr3t   # 固定设备码 + 无人值守（不用等对方按 y）
+
+# 老用法：把这间电脑当成会议成员来控（先进网页建房拿到房号）
+node agent/index.js --room 123456                    # 被控机终端会弹确认，按 y 才放行
+node agent/index.js --room 123456 --auto-allow       # 演示用自动放行（有风险，文档已写明）
 ```
+
+控制端（手机或另一台电脑的浏览器）：**登录页 → 「🖥️ 用设备码远程控电脑」→ 输 6 位码 + 密码 → 连接**，
+全屏远程桌面控制台直接打开，全程不建房、不进会议。
+
+> **★ 09-30 取长补短：借鉴开源项目 `galaxy-s10/billd-desk`**（教学见 `LEARN.md` 5.39）
+>
+> 取了它的**交互与安全模型**（稳定设备码 / 连接口令 / 无人值守安全口令 / 画质档），
+> **没取**它的实现栈（Electron 原生客户端 + H.264/265 硬件编码——违背本项目零依赖红线），
+> "常用设备列表 / 设备持久化"这一项明确押后。
+>
+> **核心决策 = 设备码就是一个私有桌面房间的房号**（`room.isDesk`）：
+> 于是画面帧的三道闸门、16 字节控制帧编解码、canvas 控制台、手机 Pointer Events
+> **一行都没改**就全部复用；控制端只做一次"轻量进房"（登记门禁，不建媒体、不广播成员）。
+> 授权两条路径——口令=**安全密码** → 服务器直接授予（无人值守）；只匹配**连接密码** →
+> 转发请求给被控端终端按 y——**两条路径都发同一条 `desk-granted`**，前端只有一张开控制台的代码。
+
+**画质档 + 三层帧率**（`.rd-bar` 上四颗：自动 / 流畅 / 标准 / 高清）：
+
+| 档 | JPEG 质量 | 目标帧率 | 长边上限 | 适用 |
+|---|---|---|---|---|
+| 流畅 `smooth` | 30 | 6 fps | 1280×800 | 公网 / 手机热点，滚动看视频不卡 |
+| 标准 `standard` | 55 | 12 fps | 1600×1000 | 一般宽带默认 |
+| 高清 `hd` | 80 | 20 fps | 1920×1200 | 局域网，读小字看细节 |
+
+切档走的是**与鼠标键盘同一条 `remote-input` 通道**（`{kind:'quality'}`，老通道新语义 =
+白拿服务器门禁与限流，且 AI 操作员/会议内控制/设备码直连三条路径同时获得该能力）。
+帧率是**三层分工**：**档位定中枢**（策略 6~24）→ **闭环自适应只在中枢 ±2 微调**（实测帧间隔与
+RTT 回传 `remote-quality`）→ **代理与服务器对任何请求硬钳 2~24**（安全线比策略线更宽，两层有意分开）。
 
 > ⚠️ **能力边界要诚实说**：CDP 只能控制 **Chromium 浏览器窗口内部**，控不了开始菜单 /
 > 记事本 / Excel（那需要 Win32 `SendInput` 等系统级 API，不在"零新依赖"约束内）。
@@ -156,6 +191,33 @@ node agent/index.js --room 123456 --auto-allow   # 演示用自动放行（有�
 协议侧新增 `agent-hello` / `remote-frame` / `remote-meta` 三个事件，控制输入**复用既有的
 `remote-input`**（见 `sfu/protocol.js` 的 09-24 段）；授权链路与人类被控端一字不差——agent 没有任何特权。
 
+> **★ 09-30 取长补短（借鉴开源远程控制 `galaxy-s10/billd-desk`）：远程控制不再要求"先开个会"**
+>
+> 原来要控一台电脑，你得先建房、让被控代理进这个房、再在成员列表点「控制电脑」——
+> 远程控制被强行寄生在"会议"里。现在学 billd 的**设备码配对**：
+>
+> ```bash
+> node agent/index.js                                    # 随机生成 6 位设备码
+> node agent/index.js --code 823847                      # 自己指定设备码
+> node agent/index.js --connect-password 1234            # 连接口令（需被控端终端按 y 确认）
+> node agent/index.js --secure-password  9999            # 安全口令（无人值守：口令对 → 服务器直接授权）
+> node agent/index.js --room 123456                      # 老形态照旧：作为会议成员入会
+> ```
+>
+> 控制端在**登录页**点「🖥️ 用设备码远程控电脑」→ 输设备码 + 口令 → 直接出画面，
+> **全程不用建房、不用进会议**。
+>
+> **实现上最值钱的一条决策**：设备码 = **一个私有 `isDesk` 房间的房号**（无 Router、不做媒体转发）。
+> 于是画面帧三道闸门、16 字节控制帧、canvas 控制台、手机 Pointer Events **一行未改全部复用**；
+> 控制端只做一次**轻量进房**（`deskEnterRoom()`：只登记门禁，不建 Transport、不订媒体、不广播成员），
+> 避免把整套会议逻辑拖进远程控制。代理离线 → 设备码即刻作废（不留 60s 宽限：没人应答的码留着只会占号）。
+>
+> **两条授权路径，前端只认一个事件**：安全口令 → 服务器直接登记 `remoteCtl` 并回
+> `desk-granted{unattended:true}`；连接口令 → 转 `remote-request` 给代理等人工按 `y`，
+> 确认完成后由通用授权处理器回 `desk-granted{unattended:false}`。**"要不要人在场"这个差异
+> 只体现在入口，不渗进控制台**——所以开控制台全项目只有一处代码。
+>
+
 **📱 手机控电脑（本次重点）**：控制台（`sfu/public/` 新增的全屏 `#rdConsole`：canvas 画画面 +
 地址栏 + 工具条 + 隐藏 IME 捕获框）的 canvas 交互**全部用 Pointer Events** 实现，一套逻辑覆盖
 鼠标 / 触摸 / 触控笔：
@@ -169,7 +231,12 @@ node agent/index.js --room 123456 --auto-allow   # 演示用自动放行（有�
 > **真机实测（本次）**：真浏览器双窗口验证——被控端真实 URL 变成 `https://example.com/`；
 > 坐标换算逐像素精确（视口 1254×707，期望 627,297 = 实际 627,297）；手机双指滑动后被控端
 > 页面**真的滚了**（`scrollY 0 → 1000`）；手机单指点击触发被控端真实按钮。
-> 自动化回归：`npm run test:agent`（16/16）、`npm run test:e2e`（端到端 15 项全过，出截图）。
+> 自动化回归：`npm run test:agent`（09-30 起 **24/24**，含画质档四条真机断言）、
+> `npm run test:e2e`（端到端 15 项全过，出截图）。
+
+> ⚠️ **设备码这条路的诚实边界**：设备码**只存内存**——代理重启就换码（所以还做不到 billd 的
+> "常用设备列表"）；连接/安全口令在服务器内存里**明文比较**（教学级，HTTPS 自签只是传输层兜底，
+> 不是存储层安全）；一台设备**同一时刻只能被一个人控**（与会议内互斥同源，有意为之）。
 
 ---
 
@@ -330,7 +397,9 @@ npm run start:sfu
 - **WAL 日志模式**（`PRAGMA journal_mode = WAL`）：读不挡写、写不挡读——服务器"随时有人登录（读）、随时有人注册/审计（写）"正需要这个并发模型；
 - **两张表**：`users(username PK, salt, hash, display_name, role, created_at)`、`audit(id PK AUTOINCREMENT, ts, kind, actor, detail)` + `idx_audit_ts` 索引；
 - **自动迁移**：首次启动若 `sfu/users.json` 存在且 users 表为空 → 整表搬入，**原样保留 salt/hash（绝不重新哈希，否则老密码永久失效）**，搬完把旧文件改名 `users.json.imported-<YYYYMMDD>` 保留不删（留退路）；
-- **口令单一实现** `sfu/password.js`：`scrypt(password, salt, 32) → hex`，盐 16 字节随机、hex 存库，校验用 `crypto.timingSafeEqual`；服务器与 `scripts/admin.js` **require 同一份**——原先两边"照抄"，任一处参数漂移都会导致 CLI 建的账号在网页上永远登不上。
+- **口令单一实现** `sfu/password.js`：`scrypt(password, salt, …) → hex`，盐 16 字节随机、hex 存库，校验用 `crypto.timingSafeEqual`；服务器与 `scripts/admin.js` **require 同一份**——原先两边"照抄"，任一处参数漂移都会导致 CLI 建的账号在网页上永远登不上。
+- **口令哈希代际 + 平滑重哈希（09-30，`npm run test:store` 55/55 实测）**：scrypt 的 cost 参数（N/r/p）是"以当下硬件为标尺"的，会随硬件发展过时。现在 **V1（默认 N=16384 / 32 字节）只用于校验存量账号**，**新哈希一律 V2（N=32768, r=8, p=1 / 64 字节）**；代际**按 hex 长度判**（不加版本前缀——库里 V1 本就没前缀，再加前缀等于多迁一次格式）；**老账号登录成功时服务器顺手用新参数重算并换新盐写回**，用户无感（密码没变），库里的哈希悄悄升级——"参数过时"这个存量问题就此自愈。
+  ⚠️ 这批改动**目前还在工作区未提交**，且 `LEARN.md` 的教学导读尚未回填（与本轮"设备码 + 画质档"是两件事，交付要分开）。
 
 ### 管理员 CLI（`scripts/admin.js`）
 
@@ -398,9 +467,10 @@ webrtc/
 ├── deploy/coturn/          # 自建 TURN 包（docker-compose.yml + turnserver.conf）
 ├── scripts/
 │   ├── test-signaling.js   # Mesh 信令回归（npm test，需先起 3000）★ 36/36
-│   ├── test-sfu-signaling.js  # SFU 信令回归（npm run test:sfu，需先起 3001）★ 149/149
-│   ├── test-sfu-client-smoke.js # SFU 前端无头冒烟（npm run test:smoke，零依赖不用起服务器）★ 136/136
-│   ├── test-store.js       # ★ 09-24 账号存储层回归（node:sqlite：迁移/改密/删号安全闸）★ 49/49
+│   ├── test-sfu-signaling.js  # SFU 信令回归（npm run test:sfu，需先起 3001）★ 2026-10-03 实测 196/196
+│   ├── test-sfu-client-smoke.js # SFU 前端无头冒烟（npm run test:smoke，零依赖不用起服务器）★ 2026-10-03 实测 254/254
+│   ├── test-store.js       # ★ 09-24 账号存储层回归（node:sqlite：迁移/改密/删号安全闸/口令 V2 平滑重哈希）★ 55/55
+│   ├── legacy-user-fixture.js # ★ 09-30 造一个"V1 老账号"进库（只为验证平滑重哈希，别手搓旧参数哈希）
 │   ├── test-shutdown.js    # ★ 09-24 优雅退出回归（关 Worker/关库 checkpoint/幂等/5s 保险丝）★ 9/9
 │   ├── admin.js            # ★ 09-24 管理员 CLI（list/grant/revoke/adduser/passwd/purge，薄封装 store）
 │   ├── test-turn.js        # ICE 可达性实测（手搓 STUN Binding / TCP 探测）
@@ -408,7 +478,7 @@ webrtc/
 │   ├── start-demo.js       # 一键起两版并打印地址
 │   ├── start-lan.js        # 局域网交付（生成 sfu/config.json + HTTPS 入口）
 │   ├── publish.js          # ★ 09-24 一键发布公网链接（生成 publish-mesh/ → 体检 → 可选隧道；--tunnel/--bundle/--check）
-│   ├── test-agent.js       # ★ 09-24 桌面代理端到端（真浏览器/真画面/真注入）★ 16/16
+│   ├── test-agent.js       # ★ 09-24 桌面代理端到端（真浏览器/真画面/真注入；09-30 增画质档断言）★ 24/24
 │   ├── test-e2e-remote-desktop.js # ★ 09-24 真机远程桌面 e2e（真双窗 + 手机视口，出截图）
 │   └── test-publish.js     # ★ 09-24 发布链回归（含 --check 过期闸）★ 30/30
 ├── agent/                  # ★ 09-24 真 OS 级远程桌面 · 被控端代理（零新依赖）
@@ -466,13 +536,13 @@ webrtc/
 ## 🧪 运行回归测试
 
 ```bash
-npm run test:sfu   # SFU 主版本信令：需先起 3001（AI 操作员断言要 AI_OP_STEP_MS=20 node sfu/server.js）★ 2026-09-24 实测 149/149（含门禁边界 + 房间令牌断言：该拦的拦、该放的放、跨房/篡改/过期一律 401）
-npm run test:store # 账号存储层 node:sqlite：迁移保留 salt/hash、改密、删号安全闸、完整性 ★ 2026-09-24 实测 49/49
-npm run test:shutdown # 优雅退出：关 Worker / 关库 checkpoint / 幂等 / 5s 保险丝 ★ 2026-09-24 实测 9/9
+npm run test:sfu   # SFU 主版本信令：需先起 3001（AI 操作员断言要 AI_OP_STEP_MS=20 node sfu/server.js）★ 2026-10-03 实测 196/196（含门禁边界 + 房间令牌断言：该拦的拦、该放的放、跨房/篡改/过期一律 401；09-30 +设备码配对直连与画质档断言）
+npm run test:store # 账号存储层 node:sqlite：迁移保留 salt/hash、改密、删号安全闸、完整性 ★ 2026-09-30 实测 55/55（+「口令哈希 V2 / 平滑重哈希」7 项）
+npm run test:shutdown # 优雅退出：关 Worker / 关库 checkpoint / 幂等 / 5s 保险丝 ★ 2026-09-30 复跑 9/9
 npm test           # Mesh 对照版信令：需先 npm start（连 localhost:3000）★ 2026-09-24 实测 36/36
-npm run test:smoke # SFU 前端无头冒烟（零依赖，不用起服务器）★ 2026-09-24 实测 136/136
+npm run test:smoke # SFU 前端无头冒烟（零依赖，不用起服务器）★ 2026-10-03 实测 254/254
 npm run test:ai    # AI 双轨自检：无 key 只跑 Mock 轨并提示怎么配；有 key 两条都跑 ★ 10/10
-npm run test:asr   # ★ 服务端语音识别自测（探测必须成功/系统 TTS 真语音转写/唤醒与追问窗口/在线 asrEnabled/配置模板可解析）★ 2026-09-28 实测 15/15
+npm run test:asr   # ★ 服务端语音识别自测（探测必须成功/系统 TTS 真语音转写/唤醒与追问窗口/在线 asrEnabled/配置模板可解析）★ 2026-10-03 实测 28 通过/1 跳过
 npm run test:ai-brain # AI 内核单测（BM25 检索/会话记忆/意图分类/行动项/会议范围/实时看板）★ 70/70
 npm run verify:ai  # AI 真服务器端到端（起真服务器+真信令+真模型，验检索/记忆/意图/抗幻觉/参会语义）★ 17/17
 npm run verify:board # ★ AI 看板真浏览器端到端（CDP 驱动真 Edge，验真实 DOM 渲染/语音链路/证据展开/行动项认领）★ 21/21
@@ -484,13 +554,13 @@ npm run ai:summarize # AI 脚本：文本/文件/房间字幕 → markdown 纪�
 npm run ai:agent   # AI 脚本：手写 ReAct 工具循环（--goal "…" --maxsteps 6 --verbose）
 npm run publish:mesh # ★ 一键发布 Mesh 版：生成 publish-mesh/ → 体检 → （可选）开隧道（--tunnel/--bundle/--check）
 npm run test:publish # 发布链回归（含 --check 过期闸：源码改了不重新发布就必须报错）★ 2026-09-24 实测 30/30
-npm run agent        # ★ 启动被控端桌面代理（需 --room 123456；真机远程桌面的"被控端"）
-npm run test:agent   # 桌面代理端到端（真起 Chromium：验抓屏 JPEG + 坐标注入 + 远程导航）★ 16/16
-npm run test:e2e     # 真机远程桌面 e2e（真双窗 + 模拟手机双指滚动/单指点击，出截图）★ 2026-09-24 实测 15/15
+npm run agent        # ★ 启动被控端桌面代理。两种入会方式：`--room 123456`（当会议成员）或 `--code 123456 --connect-password xxx`（设备码配对直连，不用开会）
+npm run test:agent   # 桌面代理端到端（真起 Chromium：验抓屏 JPEG + 坐标注入 + 远程导航 + 画质档切档）★ 2026-09-30 实测 24/24
+npm run test:e2e     # 真机远程桌面 e2e（真双窗 + 模拟手机双指滚动/单指点击，出截图）★ 2026-09-30 实测 15/15
 npm run admin:list   # 管理员 CLI：看库里有哪些账号 / 谁是 admin（另有 grant/revoke/passwd/adduser/purge）
 ```
 
-> ✅ **合计 440 项断言全绿**（2026-09-24 实测）：SFU 信令 149 + 存储层 49 + 优雅退出 9 + 冒烟 136 +
+> ✅ **合计 440 项断言全绿**（2026-09-24 实测，历史基线；当前最新数字见下方各条"增量"）：SFU 信令 149 + 存储层 49 + 优雅退出 9 + 冒烟 136 +
 > Mesh 36 + 桌面代理 16 + 发布链 30 + 真浏览器 e2e 15 = **440**。
 >
 > ★ **2026-09-28 增量（服务端 ASR 成为唯一识别路径）**：SFU 信令 **154/154**、
@@ -499,8 +569,24 @@ npm run admin:list   # 管理员 CLI：看库里有哪些账号 / 谁是 admin�
 >
 > ★ **2026-09-29 增量（G6-② 房间权限分级）**：SFU 信令 **160/160**（+6 四级角色断言）、
 > 前端冒烟 **168/168**、**`npm run test:asr` 15/15**（带真服务器复测）。详见 `AGENTS.md` 09-29 条目。
+>
+> ★ **2026-09-30 增量（性能专项 + 取长补短：设备码配对直连 + 真桌面画质档）**：
+> SFU 信令 **184/184**、前端冒烟 **189/189**、存储层 **55/55**、优雅退出 **9/9**、
+> 桌面代理 **`npm run test:agent` 24/24**、真浏览器 e2e **15/15** —— 本次重跑的这 **6 组合计 476 项全绿**。
+> 本轮**未重跑**：Mesh 36、发布链 30（数字仍是 09-24 的，别当今日实测引用）。
+> 存储层由 49 → **55**：新添「口令哈希 V2 / 平滑重哈希」一节（scrypt 参数升档 + 老账号登录时自动升级写回）。
+> 事件与取舍见 `LEARN.md` 5.39，回归纪律见 `AGENTS.md` 坑 57~63。
+>
+> ★ **2026-10-02 增量（语音链路根因修复 → 界面说实话 → 第三条静音死锁，四轮连跑）**：
+> SFU 信令 **191/191**、前端冒烟 **237/237**、`test:asr` **28 通过/1 跳过**、
+> `test:asr-live` **PASS**（qwen-local 转写实测 1.4s / 2.4s，静音期零字幕、
+> ASR 2 条 / 应答 2 次，语音交付回落浏览器朗读 **1.6s**）、`test:e2e-media` **15/15**、
+> `test:qwen` **10/10**、`doctor` 全绿。本轮最值得记的三条教学结论写进
+> `AGENTS.md` 坑 **64~68**：**「装了 ≠ 用上了」的 UI 版**（界面硬编码 whisper 字样，
+> 让用户判定引擎没切）、**「让位/静默」类闸门会把刚生成的那一轮一起挡死**
+> （判据要认人不认时间）、**共享变量有两个读者时，攒批清空的那个会让另一个静默空转**。
 
-- SFU 版测试（**2026-09-24 实测：149 通过 / 0 失败**；冒烟 **136/136**）：房间/密码复用 + mediasoup Router 能力 +
+- SFU 版测试（**2026-09-30 实测：184 通过 / 0 失败**；冒烟 **189/189**；09-24 基线为 149/136）：房间/密码复用 + mediasoup Router 能力 +
   Transport 创建与防重 + consume 错误路径 + 远程协助（授权/互斥/输入门禁/二进制与中文透传）+
   A/D 档（成员状态白名单、房主踢人、剪贴板门禁、文件配额、限时授权、切层错误路径）+
   D+ 档（`sctpParameters`/`produce-data`/`consume-data`、跨房间录制目标被拒、VP9 能力、
@@ -561,11 +647,14 @@ npm run admin:list   # 管理员 CLI：看库里有哪些账号 / 谁是 admin�
   追问结合上文（"那他什么时候交"→"周五之前提交"）、**换个说法触发纪要并真的落盘**、
   结构化行动项表格、抗幻觉。**为什么必须单独做这一层**：本项目吃过"模块单测全过、
   但调用方忘了接线"的亏（见 AGENTS 坑 41）——集成点只有跑起来才能验。
-- **桌面代理端到端 `npm run test:agent`（2026-09-24 实测：16 通过 / 0 失败）**：
+- **桌面代理端到端 `npm run test:agent`（2026-09-30 实测：24 通过 / 0 失败；09-24 基线 16 项）**：
   真起 Chromium + 真跑服务器 + 真授权 + 真收 JPEG 帧 + 真注入 16 字节控制帧再回页面读坐标。
   最严的一条是坐标：发归一化 (0.5, 0.5)，页面 `clientX` 必须**正好**等于视口宽一半（±3px）——
   实测视口 1254×707，期望 (627,297) = 实际 (627,297)，跨分辨率都点得准。
-- **真机远程桌面 e2e `npm run test:e2e`（2026-09-24 实测：15 项全过）**：
+  09-30 新增的画质档断言走**同一条老通道**（`remote-input` 里 `{kind:'quality', preset}`）：
+  切「高清」后代理确实重开抓屏（fps/quality/分辨率都变）、画面**持续推帧**（重开没把链路搞断）、
+  重复切档**不堆监听器**、未知档位**忽略而不崩**。
+- **真机远程桌面 e2e `npm run test:e2e`（2026-09-30 复跑：15 项全过）**：
   真浏览器双窗口走完整流程（游客进会 → 创建房间 → 起 agent → 授权 → 收真画面 → 远程导航
   到 `https://example.com/` → 切手机视口 390×844 试双指滚动与单指点击 → 退出控制），
   截图落在临时目录 `wb-rd-shots/`。**它的 profile 每次清空**——否则测的是缓存不是代码（见 LEARN.md）。
@@ -628,6 +717,15 @@ npm run admin:list   # 管理员 CLI：看库里有哪些账号 / 谁是 admin�
 | 42 | **★ AI 参会升级：从「被问才答」到「参会者」（09-25，本轮重点）** | **① 有存在感**：入会**致辞**（报出「我是谁 / 我能听见什么（**实测**管线数）/ 怎么用我」）+ 离会告别 + 终稿纪要到场——改造前点了按钮聊天区一个字都没有，用户困惑「我点了它到底来没来」；**② 有主动性**：新文件 `sfu/ai/digest.js`（零依赖、可单测）——字幕持续流入即实时抽成「🎯决定 / ⚠️风险 / ✅行动项 / 💬议题」汇成**侧栏会议看板**，并由 `maybeAiSpeakUp` **主动开口**（45s 冷却 + 每次只说一条：不停插话的 AI 比不说话更糟）；**③ 说得的话能被核对**：证据链从**数字**变成**事实**——`🔍 看 AI 依据的 N 条`点开看到**原话**并标注来源；**④ 前提修复（最关键）**：字幕原是「攒满 500 条才上传」（`cap.log` 既是热窗口又是上传队列）→ **服务器要等一整段会议才知道发生了什么**，服务端 AI 全部滞后。拆成「保留历史 / 上传队列」两条独立的路 + 窗口自适应（AI 在场 12 条）+ 6s 定时兜底。**⑤ 前端**：侧栏改分段式（成员/看板/聊天，原 id 契约零改动 + 补聊天未读角标）、快捷问法 chips、看板「出纪要」、**AI 语音播报**（原生 `speechSynthesis` 零依赖、默认关、先洗 markdown）。**本轮最值得记的是两个自我推翻**：(a) 检索下界先设成「助理入会时刻」（听着正当），真浏览器当场打脸——助理几乎总是**中途被请进来**的，一入会就瞎 → **一请来就是个废人**；改为「房间创建时刻」后中途入会能答全本场、上一场会仍被挡住（AGENTS 坑 45/46）；(b) 证据栏固定显示检索命中 → 问「这场会都定了什么」时证据里赫然是「李四 **午饭吃什么**」——**界面在无声撒谎**，改为「哪个来源真驱动了答案就展示哪个」（坑 47）。另修复：纪要分钟级时间戳互相覆盖（数据丢失路径）、纪要/看板风险口径不一致（改为同源）、寒暄与答案抢道（加 `quiet`）、定时上行只 flush 不 spill、意图分类把「问事实」判成「要文件」、看板把「定在 X 日」错分到行动项（并加「定在 + 时间/数值」lookahead 防「固 **定在** 线」跨词命中，坑 49）。回归：`test:ai-brain` **55/55**、`verify:ai` **13/13**、**`verify:board` 真浏览器 21/21**、`test:smoke` **159/159**、`test:sfu` **165/165**、`test:store` 49/49、`test:shutdown` 9/9、`test:agent` 19/19、`test:e2e` 15/15 |
 | 43 | **★ 服务端 ASR 成为唯一识别路径 + AI 多轮语音对话（09-28）** | "whisper 装了却没用上"事故修复：根因 = whisper CLI 在中文 Windows/GBK 控制台打印帮助 UnicodeEncodeError → 探测误判"未装" → 前端静默退回浏览器识别。新增 `sfu/ai/asr.js` **唯一实现层**（UTF-8 环境变量 + `--help` 退出码口径 + 形态白名单 + tiny 默认 + 简体 initial_prompt + 并发闸）；**多人会议真缺陷两处**：分段录音按 memberId 分目录（原全体共用互相覆盖）、跳过"正在写的半截文件"（丢句尾）；`ingestCaptions` 公共函数让 ASR 字幕补喂 AI 看板；**唤醒词容错 + 20s 追问窗口**（免唤醒多轮）；`sfu/jsonc.js` 容错解析带注释配置模板。回归：`test:asr` **15/15**（系统 TTS 真语音→whisper 转写闭环实测）、信令 154/154、冒烟 168/168 |
 | 44 | **G6-② 房间权限分级 + ASR 常驻转写 worker（09-29）** | **四级角色** `roleOf`（owner=建房者 > admin=平台管理员 > member=登录用户 > guest=游客；owner 判定优先于登录态）随 room-state 显式投影下发；**权限点最小集**：kick=owner/admin、record-start=member 及以上（游客不能录——审计需要身份，fail fast）；前端 admin 盾形徽标 + 踢人入口放开到 admin（服务器仍是权威校验）。**听觉管线**：① 从"录 15s→转写→再录"（串行，转写期间语音全丢）改为单 ffmpeg 持续分段 + 轮询写稳段转写；② **常驻 whisper worker**（`asr_worker.py`，模型只加载一次）——CLI 每段固定 2~4s 启动开销取消，实测每段转写 10~14s → **0.8~3.0s（快约 10 倍）**；spawn 全字面量参数（模型走 env），连崩 3 次自动回退 CLI；asrModel 默认升 small（准确率可感知提升）；**`test:asr-live` 语音闭环端到端 PASS**（TTS 语音→RTP→听觉管线→转写→账本，「小明，帮我记一下明天下午三点的评审会。」逐字全对）。**G6-③ 生产化**：注册密码强度策略（下限可配 + 至少两类字符）与**登录失败锁定**（连错 5 次锁 15 分钟、正确密码也拒、只对存在账号计数防锁人 DoS）。回归：信令 **165/165**（+11 角色与安全断言）、冒烟 **168/168**、test:asr **19/19**、test:shutdown 9/9、test:store 49/49 |
+| 45 | **性能与流畅度专项（09-30）** | 先量再改：白板一次 300 点拖拽 **302 条 SCTP 消息**（该量的不是 CPU，是消息条数）→ 按帧打包 **302→3 条（-99%）**、重绘 4.3ms→0.6ms 且不随点数增长；AI 流式每 token 一次 `scrollTop=scrollHeight` = **强制同步布局 ~200 次/条答案** → 改攒批按 rAF 刷（逐字依旧连续、打字不再卡顿）；远程抓屏从"开机写死 12fps"改**闭环自适应**（控制端实测帧间隔 + RTT → 回传建议 → 被控端只调本地限流间隔，下一帧即生效）；**测试基建防"假绿"**：`test:agent` / `test:e2e` 原先"3001 有服务器就复用它"→ 改专用端口（3012/3013）+ 被占明确拒绝 + 可用环境变量换端口（**假绿比假红危险得多**）。见 `AGENTS.md` 坑 57~60、`后续升级方向.md` 1.10 |
+| 46 | **★ 取长补短·设备码直连 + 真桌面画质档（09-30b，借鉴开源 `billd-desk`，仅 SFU 主版本）** | **① 设备码配对直连**：被控端 `npm run agent` 启动即得 6 位设备码，控制端在登录页「🖥️ 用设备码远程控电脑」输码 + 连接口令即连，**不用建房、不用进会议**；核心决策 = **设备码就是一个私有 `isDesk` 房间的房号**，于是画面帧三道闸门 / 16 字节控制帧 / canvas 控制台 / 手机 Pointer Events **一行未改全部复用**，控制端只做一次轻量进房（`deskEnterRoom`：登记门禁，不建媒体、不广播成员）。授权两路径（**安全口令 = 无人值守**，服务器直接登记；**连接口令 = 需对方终端按 y**，走原 `remote-answer`）**都发同一条 `desk-granted`**，前端只有一张开控制台的代码。**② 画质档**：流畅(6fps/q30/1280) / 标准(12/55/1600) / 高清(20/80/1920)，走 `remote-input` 的 `{kind:'quality'}` **老通道新语义**（白拿门禁与限流，AI 操作员 / 会议内控制 / 设备码直连三条路径同时获得）；**三层帧率分工**（档位定中枢 → 闭环 ±2 微调 → 代理与服务器硬钳 2~24；策略线与安全线有意分开，坑 62「一个执行器不能有两个控制回路」）。**明确没取**：Electron 原生客户端 + H.264/265 硬编（违背零依赖红线）、常用设备列表 / 设备持久化（押后）。教学导读 **LEARN.md 5.39**；回归 信令 **184/184**（+19）+ 冒烟 **189/189**（+11）+ `test:agent` **24/24**（真 Chromium：切档后仍持续推帧 / 无重复 ack）+ `test:e2e` **15/15** |
+| 47 | **★ 语音双轨工程化 + 全链路延迟极限化（09-29 ~ 09-30e，用户点名"语音真正实现/延迟降到极限"）** | **耳朵**：常驻 whisper worker（`sfu/ai/asr_worker.py`，模型只加载一次，每段转写 10~14s→**0.8~3.0s**）+ **开机预热**（静音 wav 预载模型，第一句不再等 13s）+ 分段 5s→4s + 写稳采样 150ms；**嘴巴**：服务端神经语音 Edge TTS（`sfu/ai/tts.js`，零 npm 依赖手写协议，端点探测双轨不可达回落浏览器 TTS）+ **抢话三层"让话"**（麦克风能量即时闸 ≈130ms / 字幕闸 / 迟到不读）；**体感**：唤醒应答流式化（ai-stream 逐字上屏）；**闭环自测** `test:asr-live`（TTS 语音→RTP→真实听觉管线→转写→**AI 应答断言**，实测 AI 把「帮我记一下」判成纪要意图并真落盘）。回归：test:asr 18+1、test:tts 10+1、asr-live PASS、信令 187/187、冒烟 189/189 |
+| 48 | **E3-media 多人音视频真浏览器回归 + 路线图满功率化（2026-10-01）** | `npm run test:e2e-media` 首跑 **5/5**：两个真实 Chromium（假摄像头/假授权 UI，专用端口 3016）双页游客进同一房，断言成员数=2 + **双侧 `videoWidth>0` 在流画面**（音视频链路任何一环断了都是 0）+ 双侧截图。**"会议本体"从此有自动化回归**，核心链路全部不依赖人工；`后续升级方向.md` 刷新（0.1 六行回填 + 基线 + **0.4 满功率下一批** P1~P5）；watch.js 增语音链路告警（ASR worker 掉线 / 神经语音翻转）；`npm run bench:asr` 模型选型评测（tiny/base/small 延迟+命中实测） |
+| 49 | **★ 语音链路根因修复：静音幻觉 / 应答风暴 / 两条"不出声"死锁（2026-10-02d）** | 用户五症（重复一句话、对话混乱、延迟大、后来不出声、听不见）**同源**：whisper 在纯静音段把 `--initial_prompt` 续写成「请用简体中文输出。」（证据在 `sfu/captions/cap-746646-*.jsonl`），旧门槛 `size<40000` 量的是**时长**不是**能量**。**四道修**：`measureWavLevel()` 能量闸（Node 读 PCM 算峰值 dBFS，没出声**连模型都不叫**）+ `cleanTranscript()` 语义清洗 + 成句处重复句/AI 回声闸 + 应答在途锁与最小间隔；"不出声"另有两条真死锁（让位闸把 `ai-tts-fail` 回落也挡死 → 加 `force` 例外；`aiTtsEnabled` 进房读一次终身缓存 → 服务器定期重探 + 翻转广播 + 客户端连败自愈）；**实测**：静音期零字幕、"说→停→再说"只入库 1 条、AI 只应答 1 次（修复前 8+） | `sfu/ai/asr.js`、`sfu/server.js`（管线/闸/播报）、`sfu/public/client.js`（音频队列与回落）、AGENTS 坑 **64/65/66** |
+| 50 | **★ AI 头像重做 + Piik 四条取长 + Qwen 引擎接线收口（2026-10-02e）** | 头像"重影"= **82 帧循环 WebP 帧内残影 + CSS 又叠一层缩放**（两层节奏），"只会一个动作"= 循环素材的本性 → **形象与动作分开**：一张干净静帧 + 每元素同一时刻只一条动画 + idle 每 7~14s 随机演一次性小动作（6 种）；Piik 四条：**每路独立音量 0~200%**（0~100% 走 `video.volume`，>100% 才挂 WebAudio 增益且元素静音；流换对象必重挂）、**只听不看**（新信令 `set-consumer-paused` → 服务器 `consumer.pause()`，前端隐藏不省带宽；ABR 加 paused 守卫）、**定向回应**（react 带 `to`，广播通道 + 应用层过滤；定向 ≠ 隐私）、**进房前 ICE 预检**（第 34 步，把坑 36 的沉默故障说成人话）；另修 **Qwen 双引擎"写了从没生效"**（模型目录按项目根解析）与**探测超时被当没装**（`import qwen_asr` 实测 21.7s > 旧 15s 上限，且 `warm()` 失败也打 🔥）→ 收口成 `sfu/ai/pyprobe.js` | `sfu/public/client.js` 第 34 步、`sfu/ai/pyprobe.js`、`sfu/server.js`、`style.css` 第 27 节；AGENTS 坑 **67**；回归 冒烟 **224** / 信令 **191** / e2e-media **15**（真浏览器实证暂停后解码帧停增） |
+| 51 | **★ 让 Qwen 音色「能用得起」：LLM×TTS 语音流水线 + 引擎自适应字数预算（2026-10-02f）** | 用户点名「有没有办法用 Qwen 的音色但延迟低一点」。结构性那一刀 = **让 LLM 与 TTS 重叠**：`aiBrain` 本来就是流式的（每 12 字一吐），过去却要等整段写完才开始合成第一句——现在新增 `makeSpeakPipeline`，每收到一段增量就切出「已完整」的句子立刻送合成，**LLM 写第 2、3 句的时间被第 1 句的合成时间盖住**。配套三件：`answerTs` 提前生成（音频可能比 chat-message 先到，两者靠同一个 ts 配对）、客户端 `playedServerTts` 集合（**已经播过的不再挂回落账**，否则之后一条 `ai-tts-fail` 会把念过的答案再念一遍）、`splitForTts` 按句切段（最多 3 段，合成完一段发一段）。**引擎自适应字数预算** `config.aiTtsMaxChars`（默认 48）只在「慢引擎（本地 Qwen）说话」时生效，Edge 可达时放宽到 500——**约束要按引擎的能力定**，一刀切等于给可用引擎降级。播报链拆成 `synthAndEmit`（单段）/`speakAnswerForRoom`（整段）/流水线（语音问答），三者共用同一个「**要么出声、要么 ai-tts-fail**」的收口，杜绝无头静音；判据 `serverVoiceReady()` **只写一处**（`tts:` 标记 / `/config.json` 的 `aiTtsEnabled` / 预热后的 `ai-tts-state` 广播三处共用它，原先各判各的会造出「页面让位、服务器不发」的两头静音）。实测本地 Qwen3-TTS 单句 12s、整段 44s（RTF>1，CPU 自回归的硬账，不是 bug）→ 策略定为**实时播报默认浏览器朗读**，自持音色放 `aiTtsLocalWait` 显式开关。`npm run bench:tts` 量 dtype / non_streaming_mode / 批量三句等开关的真实收益（**不凭猜调优**）| `sfu/server.js`、`sfu/public/client.js`、`sfu/config.example.json`、`scripts/bench-tts.py`；回归 冒烟 **224/224** / 信令 **191/191** |
+| 52 | **★「还在用 whisper」与「回答时不说话」的最后两半：界面说实话 + 第三条静音死锁（2026-10-02g，真浏览器取证）** | ① **「还在用 whisper」是界面在撒谎，不是引擎没切**：`config.asrEngine` 早已是 `qwen-local`、实测转写 `[ASR/qwen-local] 1.4s / 2.4s`，但字幕状态徽标 / toast / 流程日志**三处硬编码 whisper 字样**、服务器启动那行也无条件打 `whisper.exe`——用户只能看见界面那行字，于是判定「根本没切换」（坑 67 的 UI 版：**过期声明比缺失更糟，它会让人去装已经装好的东西**）。修法：`/config.json` 的 `asrEngine` 存进 `serverAsrEngine`，四处统一走 `asrEngineCn()`，启动日志改口「主引擎 = qwen-local；whisper 仅作兜底」。② **第三条独立静音死锁**（前两条在 02d/02e 已修）：`hushAiSpeech()` 每条字幕到达都开一个 **8 秒静默窗**，而语音对话的真实时序是「说完 → 字幕到（开窗）→ 1.5~6s 后**这条提问的答案**送到」，答案永远落在自己开的窗里，且顺手 `pendingServerTts.delete(ts)` 把浏览器回落账也销了 = **两头静音、零报错**。修法 = **认人别认时间**：拉黑「被打断那一轮的 ts」（同一条流水线分段共用 ts），新一轮是新 ts 天然放行，**不依赖两端时钟对齐**；时间窗只留作「段没带 ts」时的兜底判据。浏览器那一轨同源：抢话闸的 700ms 字幕窗仍然每轮误杀——因为**「字幕刚到」证明的是 1~3 秒前有人在说话**，而答案恰恰紧跟在自己的字幕后面；改成**以麦克风即时信号为主判据**（130ms 级），字幕窗只在「根本没有麦克风可量」时兜底。③ **朗读不再等整段答案写完**：新增 `speakStreamPart` + `enqueueAiSpeech(say,{replace})` 分句泵（`aiSpeakGen` 按代作废），流里一出现完整一句就念、终态只补剩下的尾巴（前缀对不上则整段重念，**宁重不漏**）；本轮自己写出来又被真机抓走的两个坑记成 **坑 68**（朗读读的是 DOM 攒批后会被清空的 `box.buf` → 通路静默空转，改为独立副本 `box.rawAll`；`cancel()` 掉的旧句子会迟到回调、把新队列整个倒空）。④ **听觉进程静音自愈**：ffmpeg 约 30s 无 RTP 就自己退出 → 「挂在那儿没说话」之后 AI 永久失聪，`spawnRecorder()` 加 `exit` 自愈重启（≤5 次、换 segDir、RMS 一来就重置计数）| `sfu/public/client.js`、`sfu/server.js`；AGENTS 坑 **68**；回归 冒烟 **237/237** / 信令 **191/191** / `test:asr` **28 通过+1 跳过** / `test:asr-live` **PASS**（语音交付回落浏览器朗读实测 **1.6s**）/ 真浏览器取证：字幕状态显示「本机 Qwen3-ASR」、字幕 1ms 前刚到**仍能出声**、麦克风真出声**被拦**（礼仪没丢）|
+| 53 | **★ 六项连跑：弹窗循环 / AI 会操作会议实体 / 共享分层 / 选层器根本没出现 / 远程桌面手感延迟 2287ms→153ms（2026-10-03a）** | **① 用户被原生弹窗循环卡住**（「一直弹这个」）：服务器重启 → 内存房间没了 → D6 自动重连拿旧 `myRoom` 再 join → `room-not-found` → **`alert()` 阻塞主线程** → 点掉 → 又重连 → 又弹。两个错叠加：**用阻塞模态报一个会重复发生的事件** + **`myRoom` 从来没有作废路径**。修法 = 把「房间没了」做成一次**状态迁移** `giveUpRoom()`（清 myRoom/密码/令牌 + 拆媒体 + 回加入页），提示交给页内 toast；三条房间类 alert 全下掉，冒烟加一条「全文件 0 次 alert(」的结构断言。**② 测试不许抢开发者的端口**（用户：「测试的时候不要退出 agent 啊」）：`test:sfu` 与 `test:asr-live` 原来都起在 3001/3443 → 每跑一次回归就要踢掉用户那台。改成**信令 3011 / 语音自测 3017 + `SFU_NO_HTTPS=1` + 占用即明确拒绝 + 环境变量可换**，实测跑完两套回归 3001 的 PID 一个没变。**③ AI 会操作会议实体（第 36 步）**：`ROOM_ACTIONS` 白名单（开关白板 / 开关字幕 / 切演讲者·宫格）+ `detectRoomAction` **排在 LLM 之前**路由（tools-first，坑 38），服务器只广播 `room-control {action,byName,ts}`，客户端照表落地；**边界写死**：只动房间级共享状态，动用户设备的一律不进这张表（冒烟有一条结构断言：白名单出现 camera/screen/mute/record 直接红）。中文规则把「关」排在「开」前面判，动词表要覆盖同义词（只写「打开字幕」时，「开启实时字幕」整条不命中 → 症状恰是「AI 回了漂亮话、什么都没做」）。**④ 屏幕共享补 simulcast**：共享一直是单层全分辨率，弱网观众只能「卡成幻灯片或什么都看不见」二选一；而服务器 ABR 的守卫是 `kind==='video' && layerCount>1` → **层数>1 就自动生效，服务器零改动**。新增 `SCREEN_SIMULCAST_ENCODINGS`（250k/1.2M/2.8M，比摄像头整体高一档：屏幕是文字线条）+ `contentHint='detail'` + 单层兜底。**⑤ ★ 选层器从来没被创建出来**（写 e2e 断言才抓到的真 bug）：服务器的 `layer-changed(initial)` 在 consume 的 **ack 之前** emit，而格子要等 ack 回来才登记进 `consumerTiles` → 通知到达时 `tile` 是 undefined → `ensureLayerPicker` 直接 return。修法顺着「一个概念只有一个来源」：**`layerState` 是账本，格子一出现就照账本补渲染**，不去调服务器 emit 时序。**⑥ ★ 远程桌面手感延迟 2287ms → 153ms（15 倍）**：控制台原来只报 RTT 与帧率，而「点下去→画面动」是另一条链。量出来才看见根因：**CDP screencast 是变化驱动的，像素没变就一帧都不发** ——点了空白处/无视觉反馈的控件时控制端根本收不到画面，体感「半天才动」，**这不是带宽慢，是没人报信**。修法 = **输入回声帧** `scheduleEcho()`（注入后 120ms 复查，抓屏没出帧就主动 `captureScreenshot` 补一帧；三重限流；`stopStream()` 撤权时清定时器——撤权后还去抓屏等于多一次无谓的隐私面）。回归上限从 3000ms 收到 **800ms**，让这条断言同时是「回声帧还在不在」的哨兵。**⑦ 首页 hero 化（第 35 步 + style.css 第 28 节）**：借落地页的编排语言（模糊引导语 → 打字机主句 → 胶囊 CTA → 严格 z-index 分层 → prefers-reduced-motion 降级），**不借它的资源**——参考稿用外链视频 + 外链字体，与本项目「零依赖 + 可离线 PWA」冲突，背景改纯 CSS 光晕 + SVG 噪点；顶栏三个入口全部接真功能；冒烟新增**零依赖红线断言**（index.html 出现 `href/src="http…"` 或 CSS 出现 `@import url(http…)` 直接红）。**⑧ `test:asr-live` 的「0 条也全绿」（坑 65 在我自己写的测试里复发）**：补**正向对照**（必须至少一条字幕真带上所说的那句 + 至少应答一次，否则直接红并列出四步排查）；顺带查清自愈记账错误：ffmpeg 长时间无 RTP 会**干净退出（code=0）**，旧写法把它算进 5 次崩溃预算 →  预热等 65 秒就把预算烧光、真语音来时耳朵已经死了。改成**活过 15s 且 code=0 = 静音退场不限次**，崩溃仍 5 次封顶；不再每代换目录（`-segment_start_number` 接着上一代编号写）。| `sfu/public/client.js` 第 35/36 步、`sfu/server.js`（`ROOM_ACTIONS`/`applyRoomAction`/`spawnRecorder` 自愈分类）、`agent/index.js`（`scheduleEcho`）、`style.css` 第 28 节、`sfu/protocol.js`（`room-control`）、`scripts/{run-asr-live,test-sfu-signaling,test-e2e-media,test-e2e-remote-desktop}.js`；AGENTS 坑 **69/70**；回归 冒烟 **254/254** / 信令 **196/196** / e2e-media **19/19**（真浏览器实证 3 层 + 降层让 videoWidth 320→160）/ e2e **16/16**（手感延迟实测 153ms）/ agent **24/24** / asr-live **PASS** |
 
 **下一步方向**（`后续升级方向.md` 是唯一权威）：
 - ✅ **A 档（A1~A7）与 D 档（D1~D6）已全部完成**（2026-09-11，SFU 主版本）；

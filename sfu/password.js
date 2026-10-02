@@ -18,11 +18,14 @@
  *     同样的密码在两个账号上哈希不同 → 彩虹表失效、批量破解失效。
  *   · 只存 salt + hash，**永不存明文**，也不做可逆加密（能解密的密码等于没加密）。
  *
- * ▎诚实边界（面试会被追问）：本教学版没有做
- *   · 密码强度策略（只校验长度下限）、
- *   · 登录失败锁定 / 验证码（只有内存级限流）、
- *   · 参数升级机制（scrypt 的 N/r/p 升档后如何平滑重哈希）。
- *   生产应补上，尤其是最后一条——算法参数会随硬件发展而过时。
+ * ▎★ 09-30 代际与平滑重哈希（补上"参数升级机制"这块最大的诚实边界）：
+ *   · V1 = scrypt(pw, salt, 32)（Node 默认参数 N=16384）——存量账号全是它；
+ *   · V2 = scrypt(pw, salt, 64, { N: 32768, r: 8, p: 1 })——密钥翻倍 + 成本参数
+ *     N 翻倍，**新哈希一律用它**；单次数十毫秒，登录/注册无感，离线爆破成本翻倍；
+ *   · 代数判别 = 按 hex 长度（64/128 字符），不做版本前缀（库里已有 V1 没前缀，
+ *     长度本身就是无歧义判别器）；
+ *   · **平滑重哈希**：老账号登录成功时，服务器用新参数重算并写回（换新盐）——
+ *     用户无感（密码没变），库里的哈希悄悄升级。参数过时问题就此自愈。
  * ════════════════════════════════════════════════════════════════ */
 'use strict';
 
@@ -30,8 +33,17 @@ const crypto = require('crypto');
 
 /** 盐的字节数（hex 后是 32 个字符） */
 const SALT_BYTES = 16;
-/** 派生密钥长度（字节）。32 字节 = 256 位，与主流做法一致。 */
+/** V1 派生密钥长度（字节）：32 字节 = 256 位，Node scrypt 默认参数（N=16384）。
+ *  ★ 09-30 起只用于**存量账号**的校验与平滑升级，新哈希一律走 V2。 */
 const KEY_LEN = 32;
+/** ★ 09-30 V2 参数：密钥 64 字节 + 成本参数 N 翻倍（32768）。
+ *  ▎为什么升：scrypt 的 N/r/p 是"以当下硬件为标尺"的——参数会随硬件发展而过时
+ *    （路线图 0.3 第 5 条的存量缺口）。V2 单次 ≈ 数十毫秒，登录/注册无感。
+ *    再往后要升 V3 时照同一条路走即可（hashAlgoOf 加一个长度分支）。 */
+const KEY_LEN_V2 = 64;
+/* ★ maxmem 必须显式放大：Node 的 scrypt 默认 maxmem = 32MB，而 128*N*r = 32MB
+ *   正好压线 → 实测抛 "memory limit exceeded"（本机复现）。给 64MB 余量。 */
+const SCRYPT_V2 = { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 };
 
 /** 生成一个新盐（hex 字符串，直接可入库存 TEXT） */
 function newSalt() {
@@ -39,24 +51,55 @@ function newSalt() {
 }
 
 /**
- * 计算口令哈希。**必须是唯一的实现**——任何"照抄一份"都会埋下登不上的隐患（见文件头）。
+ * 计算口令哈希（**当前版本 = V2**）。**必须是唯一的实现**——任何"照抄一份"都会
+ * 埋下登不上的隐患（见文件头）。
  * @param {string} password 明文口令（只在内存里存活这一瞬）
  * @param {string} salt 该账号的盐（hex）
- * @returns {string} hex 编码的派生密钥
+ * @returns {string} hex 编码的派生密钥（V2 = 128 个字符）
  */
 function hashPassword(password, salt) {
+  return crypto.scryptSync(String(password), String(salt), KEY_LEN_V2, SCRYPT_V2).toString('hex');
+}
+
+/** V1 哈希（旧参数）：**只为两件事保留**——① 校验还没升级的存量账号；
+ *  ② 测试里造一个"老账号"来验证平滑升级。新代码不要调它。 */
+function hashPasswordLegacy(password, salt) {
   return crypto.scryptSync(String(password), String(salt), KEY_LEN).toString('hex');
 }
 
 /**
- * 校验口令。
+ * 判断一个存量哈希属于哪一代：按 hex 长度判（V1=64 字符、V2=128 字符）。
+ * ▎为什么不做版本前缀：库里已有 V1 数据没有前缀，加前缀反而要迁移旧格式；
+ *   长度本身就是无歧义的判别器（两代密钥长度不同），对损坏数据返回 unknown。
+ */
+function hashAlgoOf(storedHash) {
+  const h = String(storedHash || '');
+  if (h.length === KEY_LEN_V2 * 2) return 'v2';
+  if (h.length === KEY_LEN * 2) return 'v1';
+  return 'unknown';
+}
+
+/** 该账号的哈希是否需要升级到当前版本（平滑重哈希的触发条件）。 */
+function needsUpgrade(storedHash) {
+  return hashAlgoOf(storedHash) !== 'v2';
+}
+
+/**
+ * 校验口令：**按存量哈希的代数自动选参数**——V1 库存用旧参数验，
+ * V2 用新参数验，升级过程新老并存互不干扰。
  * ▎用 timingSafeEqual 而不是 === ：字符串比较一旦不等就短路返回，
  *   比较耗时会随"前缀猜对了多少位"变化，理论上可被计时侧信道逐步逼近。
  *   timingSafeEqual 是定长的，不泄露匹配进度。（这是纵深防御，不是本项目的主要威胁。）
  * ▎长度不等时先返回 false：timingSafeEqual 对长度不同的 Buffer 会直接抛错。
  */
 function verifyPassword(password, salt, expectedHash) {
-  const actual = Buffer.from(hashPassword(password, salt), 'hex');
+  const algo = hashAlgoOf(expectedHash);
+  const actual = Buffer.from(
+    algo === 'v2'
+      ? crypto.scryptSync(String(password), String(salt), KEY_LEN_V2, SCRYPT_V2).toString('hex')
+      : hashPasswordLegacy(password, salt),
+    'hex',
+  );
   const expected = Buffer.from(String(expectedHash || ''), 'hex');
   if (actual.length !== expected.length) return false;
   return crypto.timingSafeEqual(actual, expected);
@@ -73,4 +116,8 @@ function randomPassword(len = 16) {
   return out;
 }
 
-module.exports = { SALT_BYTES, KEY_LEN, newSalt, hashPassword, verifyPassword, randomPassword };
+module.exports = {
+  SALT_BYTES, KEY_LEN, KEY_LEN_V2,
+  newSalt, hashPassword, hashPasswordLegacy, verifyPassword,
+  hashAlgoOf, needsUpgrade, randomPassword,
+};

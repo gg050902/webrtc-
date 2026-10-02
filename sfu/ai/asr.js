@@ -29,7 +29,7 @@ const { execFile } = require('child_process');
  *   准确率差距是用户可感知的，2s 的差距不是）。要更快/更省内存用 WHISPER_MODEL=tiny。
  * ▎分段：5s（越小越灵敏、越大上下文越完整）。两者都可用环境变量覆盖。 */
 const DEFAULT_MODEL = process.env.WHISPER_MODEL || 'small'; // ★ 09-27d：tiny 中文常出繁体/错字，small 准确率显著更高（模型 466MB 自动缓存）
-const DEFAULT_SEGMENT_SEC = Math.max(3, Math.min(15, Number(process.env.ASR_SEGMENT_SEC) || 5));
+const DEFAULT_SEGMENT_SEC = Math.max(3, Math.min(15, Number(process.env.ASR_SEGMENT_SEC) || 4));
 
 /* ▎UTF-8 是硬要求，不是优化：Windows 默认 GBK 控制台下，whisper 打印帮助/进度里的
  *   非 GBK 字符会抛 UnicodeEncodeError（已实测复现）——探测直接失败、转写输出也可能

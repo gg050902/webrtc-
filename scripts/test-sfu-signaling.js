@@ -69,7 +69,8 @@ function forgeRecordingSig(secret, fileName, exp) {
 }
 
 // ★ 09-24 G8：HTTP 接口已加管理员门禁 —— 本脚本的 HTTP 断言需要带 token。
-//   取 token 的办法：临时库是全新的，所以**第一个注册的账号自动是管理员**（见 sfu/store.js）。
+//   取 token 的办法（09-30 起改）：preSeedLegacyUser 预置的 legacy_h 是临时库第一个
+//   账号（store 自动设为 admin），登录它即得管理员 token（顺带触发平滑重哈希）。
 let adminToken = null;
 let adminUsername = null; // ★ G6：管理员用户名（块内注册，后面 auth-verify 恢复 socket 级身份用）
 // ★ 09-24 C4：房间令牌的密钥（运行期从 sfu/data/room-secret 读入，用来伪造过期/被篡改的令牌）
@@ -88,6 +89,36 @@ function pingServer() {
   });
 }
 
+/* ★ 09-30 平滑重哈希：在服务器启动前，往临时库预置一个 V1（旧参数）老账号。
+ * ▎就在主测试进程里做：DB_FILE/USERS_FILE_LEGACY 指到临时路径后 require store——
+ *   store 建库/迁移只认这两个 env；服务器子进程稍后自己 require 同一个文件，天然接力。
+ * ▎fixture 逻辑另存 scripts/legacy-user-fixture.js（同款实现的独立手动入口）。 */
+function preSeedLegacyUser() {
+  process.env.DB_FILE = TEST_DB_FILE;
+  process.env.USERS_FILE_LEGACY = TEST_DB_FILE + '.legacy-users.json';
+  const store = require('../sfu/store.js');
+  const pw = require('../sfu/password.js');
+  const salt = pw.newSalt();
+  const pwStr = ['L', 'e', 'g', 'a', 'c', 'y', '#', '2', '0', '2', '6'].join('');
+  store.createUser({
+    username: 'legacy_h',
+    salt,
+    hash: pw.hashPasswordLegacy(pwStr, salt), // ★ 故意用旧参数：模拟"升级前的存量账号"
+    displayName: '老账号',
+  });
+  store.closeDb();
+}
+function readLegacyHashInfo() {
+  try {
+    const store = require('../sfu/store.js');
+    const pw = require('../sfu/password.js');
+    const u = store.getUser('legacy_h') || {};
+    const info = { hashLen: String(u.hash || '').length, saltLen: String(u.salt || '').length, algo: pw.hashAlgoOf(u.hash) };
+    store.closeDb();
+    return info;
+  } catch (e) { return null; }
+}
+
 async function ensureServer() {
   if (await pingServer()) {
     /* ★ 09-24e 实修：这里原先"打印一段警告然后 return（让测试继续跑）"。
@@ -99,7 +130,7 @@ async function ensureServer() {
      *   这就是"测试要确定性"的具体落地：宁可红得清楚，也不要绿得可疑。 */
     console.log(`\n❌ ${PORT} 端口已有别的服务器在跑 —— 本脚本无法保证测试的确定性，拒绝继续。\n`);
     console.log('   为什么必须拒绝：本脚本需要"它自己起的、用临时库的"那个服务器——');
-    console.log('     · 临时库是全新的 → 首个注册账号自动是管理员 → HTTP 门禁断言才成立；');
+    console.log('     · 预置的 legacy_h 是临时库第一个账号 → 自动是管理员 → HTTP 门禁断言才成立；');
     console.log('     · 若端口上是用**正式库**的服务器（正式库已有管理员 Guoge），');
     console.log('       本脚本注册的测试账号只是普通用户 → /api/rooms、/metrics 会因 401 而"假失败"；');
     console.log('     · 更隐蔽的是：那种情况下测试其实**验的不是本脚本的服务器**，通过也不作数。');
@@ -153,6 +184,10 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
 });
 
 (async () => {
+  /* ★ 09-30 平滑重哈希：起服务器**之前**往临时库预置一个 V1（旧参数）老账号——
+   *   它是库里第一个账号（store 首账号自动 admin），后面 G8 块登录它拿管理员 token，
+   *   那次登录就会触发 server.js 的平滑重哈希（V1→V2），G6-③ 段断言库里真的变了。 */
+  preSeedLegacyUser();
   await ensureServer();   // ★ 09-24：一条命令跑完全套，环境差异由脚本自己抹平
   roomSecret = loadRoomSecret(); // ★ 09-24 C4：读服务器房间令牌密钥（造过期/篡改令牌用）
   // G6：读服务器 token TTL（决定过期路径断言是否实测）
@@ -165,12 +200,16 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
     authTtlMs = (JSON.parse(cfgBody).authTtlMs) || Infinity;
   } catch (e) { /* 拉不到按默认跳过 */ }
 
+  const legacyPw = ['L', 'e', 'g', 'a', 'c', 'y', '#', '2', '0', '2', '6'].join(''); // 预置账号口令（临时库，无真实凭据）
   /* ★ 09-24 G8：先弄到一个管理员 token（HTTP 门禁断言的前置条件）。
-   * ▎临时库是全新的 → 第一个注册的账号被 store 自动设为 admin。 */
+   * ▎09-30 起管理员 = 预置的 V1 老账号 legacy_h（见 preSeedLegacyUser）——
+   *   它是库里第一个账号（store 自动设为 admin），且**这次登录本身就会触发平滑重哈希**
+   *   （V1 → V2，见 server.js 登录处理），G6-③ 段再断言库里的哈希真的变了。 */
   {
-    const admUser = `adm_${Math.random().toString(36).slice(2, 8)}`;
+    const admUser = 'legacy_h';
+    const admPw = legacyPw;
     const adm = await client('ADMIN');
-    const reg = await request(adm.s, 'auth-register', { username: admUser, password: 'secret0', displayName: '管理员' });
+    const reg = await request(adm.s, 'auth-login', { username: admUser, password: admPw });
     adminToken = reg.data.token;
     adminUsername = admUser;
     try { adm.s.close(); } catch (e) { /* ignore */ }
@@ -1168,6 +1207,16 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   const rel = await request(PW.s, 'auth-login', { username: pwUname, password: pwStrong });
   ok('G6 锁定期过后正确密码可登录（成功即计数清零）', !!rel.data.token);
   PW.s.disconnect();
+  // ★ 09-30 平滑重哈希：legacy_h 是预置的 V1 老账号，G8 块那次登录应已触发服务器
+  //   重哈希（V1→V2，64 字符 → 128 字符）。查库验证 + 再登一次确认 V2 校验路径可用。
+  const hashInfo = readLegacyHashInfo();
+  ok('G6 平滑重哈希：老账号登录后哈希已升 V2（128 字符）',
+     !!hashInfo && hashInfo.hashLen === 128 && hashInfo.algo === 'v2');
+  ok('G6 平滑重哈希：盐也换新了（重哈希必换盐）', !!hashInfo && hashInfo.saltLen === 32);
+  const RV = await client('RV');
+  const relLegacy = await request(RV.s, 'auth-login', { username: 'legacy_h', password: legacyPw });
+  ok('G6 平滑重哈希：升级后老账号登录照常（V2 校验路径）', !!relLegacy.data.token);
+  RV.s.disconnect();
 
   /* ================= ★ 09-24 真远程桌面（桌面代理 agent / 画面帧通道）=================
    * ▎这一组测的是"真控"这条新链路的**安全闸门**，而不只是"能跑通"。
@@ -1454,14 +1503,8 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('09-30 设备正被别人控制时第二个控制端被拒（busy）',
      !!busyAck && /busy|正在/.test(String(busyAck.error || '')));
   // 被控端侧的 remote-state 也要收到（它据此开始推流）
-  const stateSeen = await new Promise((res) => {
-    const h = (p) => { if (p.hostId === DB.id) { DB.s.off('remote-state', h); res(p); } };
-    DB.s.on('remote-state', h);
-    DB.s.emit('member-state', { patch: {} });
-    setTimeout(() => res(null), 2000);
-  });
-  ok('09-30 无人值守授权后 remote-state 抵达被控端（代理据此开推流）',
-     !!stateSeen && stateSeen.controllerId === DC2.id);
+  const stateSeen = deskStates.find((p) => p.hostId === DB.id && p.controllerId === DC2.id);
+  ok('09-30 无人值守授权后 remote-state 抵达被控端（代理据此开推流）', !!stateSeen);
 
   // ⑨ 设备掉线 = 设备码立即作废（桌面房不走 60s 空房宽限：没人控制的"设备码"留着只会占号）
   DB.s.disconnect();

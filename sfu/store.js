@@ -111,10 +111,21 @@ const LEGACY_USERS_FILE = process.env.USERS_FILE_LEGACY
  *   于是"读不挡写、写不挡读"——这正是一个常驻服务器需要的并发模型。
  *   代价：会多出 meeting.db-wal / meeting.db-shm 两个文件（.gitignore 用 sfu/data/ 一并盖住）。
  * ────────────────────────────────────────────────────────────── */
-const db = new DatabaseSync(DB_FILE);
-db.exec('PRAGMA journal_mode = WAL');
+/* ★ 09-30 重构：db 与预编译语句改为**惰性打开 + 可重开**。
+ * ▎为什么：closeDb() 之后（优雅退出/测试收尾/CLI 用完）如果还有调用进来（例如
+ *   测试进程在 closeDb 后再次 getUser），旧实现会拿"已被 finalize 的语句"直接抛
+ *   "statement has been finalized"——真实复现过。现在 openDb() 检测到句柄为空就
+ *   重建连接 + 重建全部预编译语句，"关了再用"从崩溃变成自然恢复。
+ * ▎require 即建库的语义不变：模块底部会调一次 openDb() + 迁移。 */
+let db = null;
+let SQL = null;
 
-db.exec(`
+function openDb() {
+  if (db) return db;
+  db = new DatabaseSync(DB_FILE);
+  db.exec('PRAGMA journal_mode = WAL');
+
+  db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     username     TEXT PRIMARY KEY,
     salt         TEXT NOT NULL,
@@ -125,12 +136,7 @@ db.exec(`
   );
 `);
 
-/* 审计日志表：把"谁在什么时候做了什么"落到库里（原先只有 JSONL 文件日志）。
- * ▎为什么还要入库？——文件日志适合"回放/取证"，但"这个账号最近干了什么"这种查询，
- *   用 SQL 一句就够，用 grep 就太原始。两类存储各司其职。
- * ▎为什么在 ts 上建索引？——审计列表永远是"按时间倒序取最近 N 条"，
- *   没索引就得全表扫描 + 排序；有索引直接顺着 B 树倒着读。 */
-db.exec(`
+  db.exec(`
   CREATE TABLE IF NOT EXISTS audit (
     id     INTEGER PRIMARY KEY AUTOINCREMENT,
     ts     INTEGER NOT NULL,
@@ -140,37 +146,34 @@ db.exec(`
   );
 `);
 
-/* ★ 09-26 头像系统：users 表补 avatar 列（幂等迁移——老库首次打开自动加列，老数据 avatar 为 null）*/
-{
-  const cols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
-  if (!cols.includes('avatar')) db.exec('ALTER TABLE users ADD COLUMN avatar TEXT');
-}
-db.exec('CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);');
+  /* ★ 09-26 头像系统：users 表补 avatar 列（幂等迁移——老库首次打开自动加列，老数据 avatar 为 null）*/
+  {
+    const cols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+    if (!cols.includes('avatar')) db.exec('ALTER TABLE users ADD COLUMN avatar TEXT');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);');
 
-/* ──────────────────────────────────────────────────────────────
- * 第 3 步：语句预编译
- * ▎node:sqlite 的 prepare() 返回可复用的 StatementSync；预编译一次、反复 run，
- *   省掉每次调用重新解析 SQL 的开销。用参数占位符（?）而不是拼字符串，
- *   顺带把 SQL 注入挡在门外——用户名里塞 ' OR 1=1 -- 也只会被当成普通字符串。
- * ────────────────────────────────────────────────────────────── */
-const SQL = {
-  insertUser: db.prepare(
-    'INSERT INTO users (username, salt, hash, display_name, role, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
-  insertUserIgnore: db.prepare(
-    'INSERT OR IGNORE INTO users (username, salt, hash, display_name, role, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
-  getUser: db.prepare(
-    'SELECT username, salt, hash, display_name, role, avatar, created_at FROM users WHERE username = ?'),
-  listUsers: db.prepare(
-    'SELECT username, salt, hash, display_name, role, avatar, created_at FROM users ORDER BY created_at ASC, username ASC'),
-  setAvatar: db.prepare('UPDATE users SET avatar = ? WHERE username = ?'),
-  countUsers: db.prepare('SELECT COUNT(*) AS n FROM users'),
-  hasAdmin: db.prepare("SELECT 1 AS x FROM users WHERE role = 'admin' LIMIT 1"),
-  setRole: db.prepare('UPDATE users SET role = ? WHERE username = ?'),
-  setPassword: db.prepare('UPDATE users SET salt = ?, hash = ? WHERE username = ?'),
-  deleteUser: db.prepare('DELETE FROM users WHERE username = ?'),
-  insertAudit: db.prepare('INSERT INTO audit (ts, kind, actor, detail) VALUES (?, ?, ?, ?)'),
-  listAudit: db.prepare('SELECT id, ts, kind, actor, detail FROM audit ORDER BY ts DESC, id DESC LIMIT ?'),
-};
+  /* 语句预编译：prepare() 一次、反复 run（省解析开销）；占位符顺带挡 SQL 注入。 */
+  SQL = {
+    insertUser: db.prepare(
+      'INSERT INTO users (username, salt, hash, display_name, role, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
+    insertUserIgnore: db.prepare(
+      'INSERT OR IGNORE INTO users (username, salt, hash, display_name, role, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
+    getUser: db.prepare(
+      'SELECT username, salt, hash, display_name, role, avatar, created_at FROM users WHERE username = ?'),
+    listUsers: db.prepare(
+      'SELECT username, salt, hash, display_name, role, avatar, created_at FROM users ORDER BY created_at ASC, username ASC'),
+    setAvatar: db.prepare('UPDATE users SET avatar = ? WHERE username = ?'),
+    countUsers: db.prepare('SELECT COUNT(*) AS n FROM users'),
+    hasAdmin: db.prepare("SELECT 1 AS x FROM users WHERE role = 'admin' LIMIT 1"),
+    setRole: db.prepare('UPDATE users SET role = ? WHERE username = ?'),
+    setPassword: db.prepare('UPDATE users SET salt = ?, hash = ? WHERE username = ?'),
+    deleteUser: db.prepare('DELETE FROM users WHERE username = ?'),
+    insertAudit: db.prepare('INSERT INTO audit (ts, kind, actor, detail) VALUES (?, ?, ?, ?)'),
+    listAudit: db.prepare('SELECT id, ts, kind, actor, detail FROM audit ORDER BY ts DESC, id DESC LIMIT ?'),
+  };
+  return db;
+}
 
 // 行 → 对外的 JS 对象（把下划线的列名翻译成前端更好用的 camelCase）
 const toUser = (r) => (r ? {
@@ -188,15 +191,18 @@ const toUser = (r) => (r ? {
  * ────────────────────────────────────────────────────────────── */
 
 function getUser(username) {
+  openDb();
   if (typeof username !== 'string' || !username) return null;
   return toUser(SQL.getUser.get(username));
 }
 
 function countUsers() {
+  openDb();
   return SQL.countUsers.get().n;
 }
 
 function hasAdmin() {
+  openDb();
   return !!SQL.hasAdmin.get();
 }
 
@@ -210,6 +216,7 @@ function hasAdmin() {
  * ▎唯一约束：同名再插会抛 UNIQUE constraint failed，调用方（注册信令）需 try/catch。
  *   库层兜底比应用层 if 检查更可靠（并发下应用层检查会漏）。 */
 function createUser({ username, salt, hash, displayName, avatar, role, createdAt } = {}) {
+  openDb();
   let finalRole = role;
   let autoAdmin = false;
   if (!finalRole) {
@@ -233,6 +240,7 @@ function createUser({ username, salt, hash, displayName, avatar, role, createdAt
 }
 
 function listUsers() {
+  openDb();
   return SQL.listUsers.all().map(toUser);
 }
 
@@ -240,11 +248,13 @@ function listUsers() {
  * ▎只允许 'user' / 'admin' 两档：角色是安全边界，白名单外的一律拒绝，
  *   避免"手滑写成 adminn"这种拼写错误把门禁悄悄打开。 */
 function setAvatar(username, avatar) {
+  openDb();
   if (typeof username !== 'string' || !username) return;
   SQL.setAvatar.run(avatar == null ? null : String(avatar), username);
 }
 
 function setUserRole(username, role) {
+  openDb();
   if (role !== 'user' && role !== 'admin') throw new Error(`非法角色：${role}（只允许 user/admin）`);
   return SQL.setRole.run(role, username).changes > 0;
 }
@@ -256,6 +266,7 @@ function setUserRole(username, role) {
  *   库层只管存取。这样两边各司其职，也避免库层依赖 crypto。
  * ▎返回 false = 没有这个账号（changes 为 0），而不是抛错——调用方按"改没改成"处理。 */
 function setPassword(username, salt, hash) {
+  openDb();
   return SQL.setPassword.run(String(salt), String(hash), username).changes > 0;
 }
 
@@ -266,6 +277,7 @@ function setPassword(username, salt, hash) {
  * ▎想真的删掉它？先把别的账号提权为 admin（npm run admin:grant），再删这个。
  * ▎返回 true=删掉了，false=账号不存在。 */
 function deleteUser(username) {
+  openDb();
   const u = getUser(username);
   if (!u) return false;
   if (u.role === 'admin') {
@@ -282,6 +294,7 @@ function deleteUser(username) {
  *   写失败不该拖垮主路，但这里**不吞异常**——审计是安全能力，静默失败等于没有审计；
  *   由调用方决定怎么处理（server.js 里用 try/catch 包住并打警告）。 */
 function appendAudit(kind, actor, detail) {
+  openDb();
   const detailText = detail == null
     ? null
     : (typeof detail === 'string' ? detail : JSON.stringify(detail));
@@ -289,6 +302,7 @@ function appendAudit(kind, actor, detail) {
 }
 
 function listAudit(limit = 100) {
+  openDb();
   const n = Math.max(1, Math.min(Number(limit) || 100, 1000));
   return SQL.listAudit.all(n).map((r) => ({
     id: r.id, ts: r.ts, kind: r.kind, actor: r.actor, detail: r.detail,
@@ -304,6 +318,7 @@ function listAudit(limit = 100) {
  * ▎为什么 catch 住异常也返回字符串而不是抛：调用方（测试/巡检）想拿到的是"结论"，
  *   库都打开不了时，'error: ...' 本身就是结论；抛出去只会让探针把巡检流程带崩。 */
 function integrityCheck() {
+  openDb();
   try { return db.prepare('PRAGMA integrity_check').get().integrity_check; }
   catch (e) { return 'error: ' + e.message; }
 }
@@ -311,7 +326,8 @@ function integrityCheck() {
 /* closeDb —— 关库（测试收尾、CLI 退出都用它） * ▎为什么要显式关：node:sqlite 的句柄不关，进程退出前 wal 未做 checkpoint，
  *   临时文件可能残留；显式 close 让清理干净可预期。 */
 function closeDb() {
-  try { db.close(); } catch (e) { /* 已关或从未打开：忽略 */ }
+  try { if (db) db.close(); } catch (e) { /* 已关或从未打开：忽略 */ }
+  db = null; SQL = null; // ★ 09-30：置空句柄——下次任何调用经 openDb() 自然重开
 }
 
 /* ──────────────────────────────────────────────────────────────
