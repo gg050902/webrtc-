@@ -2264,6 +2264,13 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
       });
       // 单个 ffmpeg 持续录音并分段（无空窗——旧串行模式在转写期间丢语音，是"不灵敏"的根因）
       // ★ 09-30f 静音驱动早转写参数：说完静音 1.2s 就快照转写"正在写的段"（不等窗口封口）
+      /* ★ 2026-10-03 别再往下调这个 1200：实测过，**调到 900 反而慢一倍**
+       *   （同一 fixture 各连跑：1200ms → 3.5s / 3.8s；900ms → 9.6s / 7.1s；n=2，效果量远大于波动）。
+       *   机制：抢跑一发生就把那段**标记为已处理**，封口后的完整版不会再转；
+       *   判早了快照里只有半句（句中换气被当成"说完了"），尾巴只能等下一个分段边界，
+       *   于是既丢半句、又更晚定稿。
+       *   ▸ 这正是要"先量再改"的原因：按直觉 900 应该更快 300ms。
+       *   ▸ 想再降延迟，动 `asrSegmentSec` 或换更快的引擎，别动这道闸。 */
       const FLUSH_MS = Math.max(600, Number(process.env.ASR_FLUSH_SILENCE_MS) || 1200);
       const FLUSH_DB = Number(process.env.ASR_FLUSH_DB) || -38;
       let lastVoiceTs = 0;
