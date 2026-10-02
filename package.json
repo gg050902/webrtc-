@@ -30,6 +30,7 @@
     "doctor": "node scripts/doctor.js",
     "test:ai": "node scripts/test-ai.js",
     "test:asr": "node scripts/test-asr.js",
+    "test:watch": "node scripts/test-watch.js",
     "test:tts": "node scripts/test-tts.js",
     "test:e2e-media": "node scripts/test-e2e-media.js",
     "bench:asr": "node scripts/bench-asr-accuracy.js",

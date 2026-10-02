@@ -22,7 +22,7 @@ const argOf = (name, dft) => {
 const BASE = argOf('--url', 'http://localhost:3001');
 const INTERVAL = Math.max(5, parseInt(argOf('--interval', '10'), 10)) * 1000;
 const MAX_RSS = parseInt(argOf('--max-rss', '512'), 10) * 1048576;
-const voiceState = { asrMiss: 0, tts: null }; // ★ 09-30f：语音链路翻转检测的上一轮状态
+const voiceState = { asrMiss: 0, tts: null, counters: {}, fallbackRounds: 0, gapRounds: 0 }; // ★ 09-30f：语音链路翻转检测的上一轮状态；counters 是 10-03 退化诊断的计数基准
 const WEBHOOK = process.env.WATCH_WEBHOOK_URL || null;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;   // ★ 09-24 G8：接口门禁后必须带 token
 const AUTH_HEADERS = ADMIN_TOKEN ? { Authorization: `Bearer ${ADMIN_TOKEN}` } : {};
@@ -49,6 +49,71 @@ function alert(key, text) {
   lastAlert.set(key, now);
   console.log(`[${ts()}] 🚨 告警[${key}] ${text}`);
   pushWebhook(text);
+}
+
+/* ★ 2026-10-03 语音/协作的**退化诊断**抽成纯函数。
+ * ▎为什么单独抽出来：这是"判断逻辑"，判断错的代价是**要么天天误报、要么永远不报**，
+ *   两种都让人很快放弃看告警。而它跑在长跑值守里，没法靠"打开浏览器看一眼"验证——
+ *   所以必须能拿合成输入穷举断言（同 rdDecideFps 那条纪律：性能/判断类逻辑
+ *   恰恰最需要确定性，否则只能"跑起来看着还行"）。
+ * @param metricsText /metrics 的原始文本
+ * @param collab      /api/rooms 里的 collab（要 asrEngine：配置期望用哪个引擎）
+ * @param prev        上一轮的计数器快照（会被就地更新）
+ * @param state       跨轮状态（fallbackRounds / gapRounds），同样就地更新
+ * @returns {Array<{key:string, text:string}>} 本轮要报的告警
+ */
+function diagnoseVoiceAndCollab(metricsText, collab, prev, state) {
+  const out = [];
+  if (!metricsText) return out;
+  const counterOf = (key) => {
+    const m = new RegExp(key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ' (\\d+)').exec(metricsText);
+    return m ? Number(m[1]) : 0;
+  };
+  const delta = (key) => { const v = counterOf(key); const d = v - (prev[key] || 0); prev[key] = v; return d; };
+  const labelsOf = (base) => [...new Set(
+    (metricsText.match(new RegExp(base + '\\{[^}]+\\}', 'g')) || [])
+      .map((s) => /="([^"]*)"/.exec(s)).filter(Boolean).map((m) => m[1]),
+  )];
+
+  /* ① 引擎退化：配置说"用 qwen-local"，而这一轮真出字幕的段**全都来自兜底引擎**。
+   *    要求连续 2 轮才报——启动预热期本地 worker 没就绪，走兜底是**正确行为**，
+   *    一有变化就报等于天天误报（误报的代价是以后没人看告警）。 */
+  const expected = collab && collab.asrEngine;
+  const EXPECTED_KEYS = { 'qwen-local': ['qwen-local'], qwen: ['qwen'], whisper: ['常驻', 'CLI'] };
+  const want = EXPECTED_KEYS[expected] || [];
+  if (want.length) {
+    let mine = 0; let other = 0;
+    for (const eng of labelsOf('sfu_ai_asr_segments_total')) {
+      const d = delta(`sfu_ai_asr_segments_total{engine="${eng}"}`);
+      if (want.indexOf(eng) >= 0) mine += d; else other += d;
+    }
+    if (mine === 0 && other > 0) {
+      state.fallbackRounds += 1;
+      if (state.fallbackRounds === 2) {
+        out.push({ key: 'asr-engine-fallback', text: `配置的主引擎是 ${expected}，但连续两轮的字幕都由兜底引擎转写（慢 3~5 倍）——查本地 Qwen worker 是否没起来（sfu/logs 或启动日志那行 🔥/⚠️）` });
+      }
+    } else {
+      if (state.fallbackRounds >= 2) out.push({ key: 'asr-engine-ok', text: `主引擎 ${expected} 已回到转写一线（兜底轮数 ${state.fallbackRounds} 结束）` });
+      state.fallbackRounds = 0;
+    }
+  }
+  /* ② 白板归档被拒：客户端在送脏数据（非法颜色/坐标），或版本与服务器不同步。
+   *    这条几乎不会误报——正常客户端只会送 hex 颜色 + 0~1 坐标。 */
+  const rejected = delta('sfu_board_records_total{op="rejected"}');
+  if (rejected > 0) out.push({ key: 'board-rejected', text: `白板归档有 ${rejected} 笔被服务器拒绝（颜色/坐标不合法）——客户端可能在送脏数据` });
+
+  /* ③ 房间动作"说了没做"：服务器发出了指令，客户端却一次都没回执。
+   *    同样要连续 2 轮：回执是异步的，单轮里可能只是还没到。 */
+  let issued = 0; let applied = 0;
+  for (const a of labelsOf('sfu_room_control_total')) issued += delta(`sfu_room_control_total{action="${a}"}`);
+  for (const a of labelsOf('sfu_room_control_applied_total')) applied += delta(`sfu_room_control_applied_total{action="${a}"}`);
+  if (issued > 0 && applied === 0) {
+    state.gapRounds += 1;
+    if (state.gapRounds === 2) out.push({ key: 'room-control-gap', text: `房间动作发出了 ${issued} 条却没有任何客户端回执 —— 客户端的 room-control 处理表可能漏了分支（AI 说了但没做）` });
+  } else {
+    state.gapRounds = 0;
+  }
+  return out;
 }
 
 async function tick() {
@@ -130,16 +195,32 @@ async function tick() {
         : '服务端神经语音不可达——AI 语音已回落浏览器 TTS（本机音色）');
     }
     if (tts !== null) voiceState.tts = tts;
+    /* ★ 2026-10-03 退化诊断（引擎退回兜底 / 白板归档被拒 / 房间动作没人执行）。
+       判断逻辑在纯函数 diagnoseVoiceAndCollab 里，这里只负责把结果变成告警
+       （限流由 alert() 的 key 去重做：同类 5 分钟内不刷屏）。 */
+    for (const a of diagnoseVoiceAndCollab(metricsText, (snap && snap.collab) || null, voiceState.counters, voiceState)) {
+      alert(a.key, a.text);
+    }
   }
 }
 
-console.log(`👀 watch 启动：每 ${INTERVAL / 1000}s 轮询 ${BASE}` +
-  (WEBHOOK ? '，webhook 已配置' : '，webhook 未配置（设 WATCH_WEBHOOK_URL 启用）') +
-  '。告警规则：服务拉不到 / 健康分<' + SCORE_MIN + ' / 宽限期<10s / rss 超限 / ASR worker 掉线 / 神经语音翻转。Ctrl+C 退出。');
-if (!ADMIN_TOKEN) {
-  console.log('⚠️  未设置 ADMIN_TOKEN —— /api/rooms 与 /metrics 现在需要管理员身份，会一直 401。');
-  console.log('   用法：ADMIN_TOKEN=<token> npm run watch');
-  console.log('   取 token：会议页用管理员账号登录 → 控制台 JSON.parse(localStorage.wb_auth).token');
+/* 被当模块 require 时只导出判断函数、**不打日志也不开循环**——
+   这样退化诊断可以被合成输入穷举断言。
+   ▎为什么非要能 require：这段逻辑跑在**长跑值守**里，判断错了的代价是要么天天误报、
+   要么永远不报，两种都会让人放弃看告警；而没有别的办法验证「判断错了」这件事本身。 */
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { diagnoseVoiceAndCollab };
 }
-tick();
-setInterval(tick, INTERVAL);
+if (require.main === module) {
+  console.log(`👀 watch 启动：每 ${INTERVAL / 1000}s 轮询 ${BASE}` +
+    (WEBHOOK ? '，webhook 已配置' : '，webhook 未配置（设 WATCH_WEBHOOK_URL 启用）') +
+    '。告警规则：服务拉不到 / 健康分<' + SCORE_MIN + ' / 宽限期<10s / rss 超限 / ASR worker 掉线 / ' +
+    '神经语音翻转 / 主引擎退回兜底 / 白板归档被拒 / 房间动作无人执行。Ctrl+C 退出。');
+  if (!ADMIN_TOKEN) {
+    console.log('⚠️  未设置 ADMIN_TOKEN —— /api/rooms 与 /metrics 现在需要管理员身份，会一直 401。');
+    console.log('   用法：ADMIN_TOKEN=<token> npm run watch');
+    console.log('   取 token：会议页用管理员账号登录 → 控制台 JSON.parse(localStorage.wb_auth).token');
+  }
+  tick();
+  setInterval(tick, INTERVAL);
+}
