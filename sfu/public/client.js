@@ -1533,9 +1533,12 @@ socket.on('chat-message', ({ from, text, ts, msgId, name, ai, streamId, tts }) =
       if (streamId) streamSpokenRaw.delete(streamId);
       if (spoken && String(text).startsWith(spoken)) {
         const rest = String(text).slice(spoken.length);
+        /* 终态只补念剩下的尾巴时**不再换轮次锚点**（replace:false）：
+           这一轮的延迟已经在第一句 onstart 时量过了，拿尾巴再量一次会得到一个偏大的数，
+           那个数混进了"LLM 写完剩下几句的时间"，不再是"嘴"的延迟。 */
         if (rest.trim()) enqueueAiSpeech(speakableText(rest), { replace: false });
       } else {
-        speakAiText(text);
+        speakAiText(text, { answerTs: ts });
       }
     }
     maybeHintAiVoice(); // ★ 09-28：语音没开时提示一次"可以听它说话"（对话闭环的手感所在）
@@ -1549,7 +1552,15 @@ socket.on('chat-message', ({ from, text, ts, msgId, name, ai, streamId, tts }) =
    *   "文字已经写完 → 声音才出来"之间（合成 + 上架 + 取回），
    *   而首字时刻混进了 LLM 的生成速度，量出来就不是"嘴"的延迟了。
    * ▎窗口只留最近 30 条（长会里不会有人回头看很久的答案的朗读延迟）。 */
-  if (from === 'ai-bot' && tts === 'server' && node && typeof ts === 'number') {
+  /* ★ 2026-10-03 登记"这条答案的文字到齐了"，等第一段声音真的播起来时相减。
+   * ▎为什么两种 tts 都登记（原先只登记服务端那条）：**今天实际听到的几乎全是浏览器朗读**，
+   *   只量服务端等于给一条平时不跑的路装表，而用户真正等的那条仍然没有数。
+   *   我在报告里写过"浏览器朗读几乎即时"——那是没量过的假设，现在去量它。
+   * ▎为什么锚在 chat-message 而不是 ai-stream 首字：那条链路的等待恰恰发生在
+   *   "文字已经写完 → 声音才出来"之间（合成 + 上架 + 取回 + 排队），
+   *   而首字时刻混进了 LLM 的生成速度，量出来就不是"嘴"的延迟了。
+   * ▎窗口只留最近 30 条（长会里不会有人回头看很久的答案的朗读延迟）。 */
+  if (from === 'ai-bot' && node && typeof ts === 'number' && !voiceAnswerAt.has(ts)) {
     voiceAnswerAt.set(ts, { at: Date.now(), node });
     if (voiceAnswerAt.size > 30) voiceAnswerAt.delete(voiceAnswerAt.keys().next().value);
   }
@@ -1635,6 +1646,15 @@ socket.on('ai-stream', ({ id, delta, done, mock, trace, hitList }) => {
     chatList.scrollTop = chatList.scrollHeight;
     box = { node, nameEl, textEl };
     aiStreamNodes.set(id, box);
+    /* ★ 2026-10-03 流式答案的延迟锚点登记在**气泡创建那一刻**。
+     * ▎为什么不能沿用 chat-message 那次登记：流式终态会在前面就被 early-return
+     *   （增量已经渲染过，不再插第二条气泡），所以那条路上永远拿不到 node，
+     *   读数就只会出现在"非流式"的少数场景里 —— 而**语音问答的答案基本都是流式的**。
+     *   ▸ key 用 streamId 而不是 ts：Map 只做内部配对，两种 key 不会互相影响；
+     *     服务端 MP3 那条仍然按 ts 配对（ai-audio 带的是 ts），口径不变。
+     *   ▸ 起点选"气泡出现（第一个字上屏）"，与"文字到齐"同样是**嘴之前的最后一个用户可见点**。 */
+    voiceAnswerAt.set(id, { at: Date.now(), node });
+    if (voiceAnswerAt.size > 30) voiceAnswerAt.delete(voiceAnswerAt.keys().next().value);
   }
   if (delta) {
     /* ★ 2026-10-02 流式答案的按句朗读要一份**不被消费的全文副本**（rawAll）。
@@ -3213,7 +3233,7 @@ function maybeHintAiVoice() {
   showToast('🔈 想直接"听"小明说话？点控制坞的「AI 语音」开关即可（浏览器语音合成，零依赖）');
 }
 
-function speakAiText(text, { force = false } = {}) {
+function speakAiText(text, { force = false, answerTs } = {}) {
   if (!aiVoiceOn || !SPEECH_OK) return;
   /* ★ 09-30c 双轨闸：服务端神经语音可用时，AI 的声音走服务器 MP3（ai-audio 事件），
    *   本地 speechSynthesis 整体让位——避免"同一条答案两个声音先后读"的灾难。
@@ -3250,7 +3270,7 @@ function speakAiText(text, { force = false } = {}) {
        *  ② 分句队列：按句末标点切段排队朗读，句间自然停顿、语调重新起势，
        *     接近真人节奏；新回答到来 cancel+清队列，“只说最新”语义不变；
        *  ③ 参数：rate 1.02（自然音色语速快，过快吞字）、pitch 1.05 略亮。 */
-      enqueueAiSpeech(say, { replace: true });
+      enqueueAiSpeech(say, { replace: true, answerTs });
     } catch (e) { /* 播报失败绝不影响会议功能 */ }
 }
 
@@ -3262,7 +3282,16 @@ function speakAiText(text, { force = false } = {}) {
  *   朗读盖住（服务器上那套 makeSpeakPipeline 是同一个思路，搬到浏览器这一轨）。
  * ▎replace=true：新一轮答案（清队列、掐掉正在念的）；false：同一轮的后半句，
  *   **接在队列尾巴后面**（绝不能 cancel，否则自己把自己的上一句掐了）。 */
-function enqueueAiSpeech(say, { replace = true } = {}) {
+function enqueueAiSpeech(say, { replace = true, answerTs } = {}) {
+  /* ★ 2026-10-03 浏览器朗读也要有延迟读数（第 38 步的后半）。
+   * ▎为什么要补：播报读数原先**只在服务端 MP3 那条路上出现**，
+   *   而今天真实听到的几乎全是浏览器 speechSynthesis（Edge 端点 403、本地音色不抢实时）。
+   *   我在报告里写过"浏览器朗读几乎即时"——那是**一个从没量过的假设**。
+   *   量法与服务端那条同一条纪律：起点=答案文字到齐（answerTs 那一轮），
+   *   终点=**u.onstart**（真的开始发音），不是"我 speak 了"。
+   * ▎replace=true 才换轮次锚点：一轮答案被切成多句，只有第一句的等待是"用户感知的延迟"，
+   *   后面几句是连着念的，量出来会偏小且没有意义。 */
+  if (replace && typeof answerTs === 'number') aiSpeakRoundTs = answerTs;
   const sentences = String(say || '').split(/(?<=[。！？!?；;])/).reduce((acc, seg) => {
     if (!seg) return acc;
     if (acc.length && (acc[acc.length - 1] + seg).length < 6) acc[acc.length - 1] += seg;
@@ -3292,6 +3321,7 @@ function enqueueAiSpeech(say, { replace = true } = {}) {
 /* 泵按"代"作废：新一轮答案 cancel+重排后，旧泵闭包的回调（尤其 onerror）
    还可能迟到到达，让它看一眼代号为不对就静默退出，而不是去动新队列/新标志。 */
 let aiSpeakGen = 0;
+let aiSpeakRoundTs;   // ★ 2026-10-03 本轮答案"文字到齐"的时刻（浏览器朗读延迟读数的起点）
 function startAiSpeakPump() {
   if (aiSpeakPumping) return;
   aiSpeakPumping = true;
@@ -3307,6 +3337,16 @@ function startAiSpeakPump() {
     u.rate = 1.02;
     u.pitch = 1.05;
     if (voice) u.voice = voice;
+    /* ★ 2026-10-03 第一轮发音开始时量一次延迟，之后本内不再重复记
+     *   （aiSpeakRoundTs 置空 = 一句答案只落一个读数，与服务端那条 onplaying 同口径）。 */
+    if (typeof aiSpeakRoundTs === 'number') {
+      const roundTs = aiSpeakRoundTs;
+      u.onstart = () => {
+        if (gen !== aiSpeakGen) return;
+        aiSpeakRoundTs = undefined;
+        noteVoiceLatency(roundTs);
+      };
+    }
     u.onend = () => setTimeout(speakNext, 120); // 句间自然停顿
     u.onerror = () => setTimeout(speakNext, 120); // 被 cancel 也会走这儿：靠代号判断该不该继续
     window.speechSynthesis.speak(u);
@@ -3364,7 +3404,7 @@ function speakStreamPart(box, rawBuf) {
    *   语义上也站得住：答案开始往外流 = 用户刚问了话，此刻还排在队里的旧寒暄就是过期内容。
    *   另：spokeFirst 只在**真的排进队列之后**才置位——若第一句被抢话闸拦下，
    *   下一句仍按"本轮第一句"处理（否则会出现"整轮都在往后追加、却从没人清过旧队列"）。 */
-  enqueueAiSpeech(say, { replace: firstOfThisAnswer });
+  enqueueAiSpeech(say, { replace: firstOfThisAnswer, answerTs: id });
   box.spokeFirst = true;
   box.spokenChars = cut;   // ★ 必须推进：不推进就等于每来一个增量都把同一句重新念一遍
   if (!box.spokenRaw) box.spokenRaw = '';
@@ -3437,7 +3477,7 @@ function playNextServerTts() {
     const t = typeof item.ts === 'number' ? pendingServerTts.get(item.ts) : undefined;
     if (t) {
       pendingServerTts.delete(item.ts);
-      speakAiText(t, { force: true }); // 音频文件取不到（货架已清/网络断）→ 自己念
+      speakAiText(t, { force: true, answerTs: item.ts }); // 音频取不到 → 自己念，延迟仍记在这一轮上
     }
     playNextServerTts();
   };
@@ -3552,7 +3592,7 @@ socket.on('ai-tts-fail', ({ ts } = {}) => {
     aiTtsFailStreak = 0;
     log('🔈 服务端语音连续失败，这段时间改由浏览器朗读（服务器重探成功后自动切回）');
   }
-  if (t) { pendingServerTts.delete(ts); speakAiText(t, { force: true }); }
+  if (t) { pendingServerTts.delete(ts); speakAiText(t, { force: true, answerTs: ts }); }
 });
 
 /* ★ 09-30 抢话修复①：用户一开口，AI 立即闭嘴。

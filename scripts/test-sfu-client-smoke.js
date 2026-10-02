@@ -864,6 +864,22 @@ const emit = (ev, payload) => {
   ok('播报延迟：找不到锚点时什么都不报、不崩（不编数）',
     rec.emits.filter((e) => e === 'ai-speech-lat').length === vlatBefore2);
 
+  /* ★ 2026-10-03 浏览器朗读这一轨也要有读数。
+   * ▎断言的重点是"两条路都要有数"：原先只有服务端 MP3 那条装表，
+   *   而今天实际听到的几乎全是 speechSynthesis（Edge 403 / 本地音色不抢实时）——
+   *   那等于给一条平时不跑的路装了表，用户真正等的那条仍然没有数。 */
+  const brTs = 1790000000500;
+  const vlatBeforeBr = rec.emits.filter((e) => e === 'ai-speech-lat').length;
+  guard('浏览器朗读：收到非服务端语音的 AI 答案', () => emit('chat-message', {
+    from: 'ai-bot', name: 'AI 小明', text: '这是浏览器朗读的一条答案。', ts: brTs,
+  }));
+  ok('播报延迟：浏览器朗读这一轨也登记锚点（不再只量服务端那条）',
+    vm.runInContext(`voiceAnswerAt.has(${brTs})`, ctx) === true);
+  vm.runInContext(`voiceAnswerAt.get(${brTs}).at = Date.now() - 1500`, ctx);
+  guard('浏览器朗读：模拟发音开始', () => vm.runInContext(`noteVoiceLatency(${brTs})`, ctx));
+  ok('播报延迟：浏览器这一轨同样上报一次',
+    rec.emits.filter((e) => e === 'ai-speech-lat').length === vlatBeforeBr + 1);
+
   /* ---- ★ 2026-10-03 第 39 步：两个延迟读数进值守日报 ----
    * ▎为什么要断这个：日报是"早上拿到手的那份东西"，如果它不含链路质量，
    *   这一夜到底快不快就只剩"当时屏幕上瞟过一眼"——**证据必须能过夜**。 */
@@ -873,10 +889,11 @@ const emit = (ev, payload) => {
    *   两次取时之间只要跨过 1ms 就变成 2301 —— 上一版写成精确相等，
    *   于是一条正确的实现会因为**机器的抖动**偶发判红。
    *   判据：**凡是由时间推导出来的期望值，断言就必须带容差**（同坑 28 的帧率教训）。 */
-  const vLast = Number(vm.runInContext('aiVoiceLats[aiVoiceLats.length - 1].ms', ctx));
+  /* ▸ 这里刻意查"窗口里**存在**这一条"而不是读尾元素：
+     *   同一个冒烟会话后面还会再产生读数（浏览器朗读那一组），尾元素会被换掉。 */
   ok('播报延迟进入滚动窗口（上限 60 条，长跑不涨）',
-    vm.runInContext('aiVoiceLats.length', ctx) >= 1 && vLast >= 2300 && vLast < 2600,
-    `实测 ${vLast}ms`);
+    vm.runInContext(`aiVoiceLats.some((x) => x.ms >= 2300 && x.ms < 2600)`, ctx) === true &&
+    vm.runInContext('aiVoiceLats.length', ctx) <= 60);
   /* ▎日报这一节的断言刻意**直接调用那个被抽出来的纯函数**：
    *   原来整段拼串写在点击回调里，谁都调不到，于是"日报里到底有没有链路质量"
    *   只能靠人肉点一下看——抽成 buildSentryReport() 才第一次可断言（这也是抽它的理由）。 */
@@ -1339,10 +1356,12 @@ const emit = (ev, payload) => {
    *   这里钉的是形状：让位闸必须有例外、回落必须带 force、队列与销账时机必须成立——
    *   这几条错一条，用户侧症状都是同一个"它答应了却没声音"（且没有任何报错）。 */
   ok('2026-10-02 让位闸留了例外口（ai-tts-fail 的回落不再被自己挡住）',
-    /function speakAiText\(text, \{ force = false \} = \{\}\)/.test(clientSrc) &&
+    /function speakAiText\(text, \{ force = false(, answerTs)? \} = \{\}\)/.test(clientSrc) &&  /* 2026-10-03 加了可选 answerTs：浏览器朗读也要量延迟 */
     /if \(aiTtsEnabled && !force\) return;/.test(clientSrc));
   ok('2026-10-02 回落调用真的带 force: true（不带走闸等于白回落）',
-    (clientSrc.match(/speakAiText\(t, \{ force: true \}\)/g) || []).length >= 2);
+    /* 2026-10-03：回落调用现在还额外带 answerTs（浏览器这一轨也要量延迟），
+     *   所以判据改成"两处回落都带 force 且都带轮次锚点"——比原来更严，不是放松。 */
+    (clientSrc.match(/speakAiText\(t, \{ force: true, answerTs: [^}]+ \}\)/g) || []).length >= 2);
   ok('2026-10-02 服务端音频走顺序队列（按句流水线分段到达，不再互相掐）',
     /const serverTtsQueue = \[\]/.test(clientSrc) && /function playNextServerTts/.test(clientSrc));
   ok('2026-10-02 销账时机=真的开始播（onplaying），取不到文件有 onerror 回落',
@@ -1411,7 +1430,7 @@ const emit = (ev, payload) => {
    *   是最糟的一类 bug（用户为了"看看是不是缓存的锅"点开它，然后就再也关不掉了）。 */
   ok('2026-10-02 一轮答案的第一句"只说最新"（旧寒暄不会把新答案堵在队尾）',
     /const firstOfThisAnswer = !box\.spokeFirst;/.test(clientSrc) &&
-    /enqueueAiSpeech\(say, \{ replace: firstOfThisAnswer \}\)/.test(clientSrc));
+    /enqueueAiSpeech\(say, \{ replace: firstOfThisAnswer(, answerTs: id)? \}\)/.test(clientSrc));
   /* ▎记账位必须推进：不推进 = 每个增量都把同一句重新入队（症状是"AI 鬼打墙一样重复半句"，
    *   与本轮用户投诉的"一直收到重复的一句话"字面一样，但根因完全不同）。 */
   ok('2026-10-02 朗读记账位会推进（spokenChars = cut，不会同一句重念）',
@@ -1555,12 +1574,12 @@ const emit = (ev, payload) => {
     /\[ROOM_TOKEN_KEY, LEGACY_TOKEN_KEY\]/.test(srvSrc) &&
     /\[RECORDING_URL_KEY, LEGACY_TOKEN_KEY\]/.test(srvSrc));
   ok('2026-10-02 同一轮的后半句是"追加"（replace:false，绝不 cancel 掉正在念的上一句）',
-    /function enqueueAiSpeech\(say, \{ replace = true \}/.test(clientSrc) &&
+    /function enqueueAiSpeech\(say, \{ replace = true(, answerTs)? \}/.test(clientSrc) &&
     /if \(replace\) \{[\s\S]{0,600}?window\.speechSynthesis\.cancel\(\);[\s\S]{0,200}?aiSpeakPumping = false;/.test(clientSrc));
   ok('2026-10-02 终态只补念剩下的尾巴；前缀对不上就整段重念（宁可重复也不漏声）',
     /startsWith\(spoken\)/.test(clientSrc) &&
     /slice\(spoken\.length\)/.test(clientSrc) &&
-    /\}\s*else \{\s*speakAiText\(text\);/.test(clientSrc));
+    /\}\s*else \{\s*speakAiText\(text, \{ answerTs: ts \}\);/.test(clientSrc));  /* 2026-10-03 带上轮次锚点，浏览器这一轨才有读数 */
   ok('2026-10-02 朗读队列只有一条泵（流式追加时不会两条链抢同一个队列）',
     /let aiSpeakPumping = false/.test(clientSrc) && /if \(aiSpeakPumping\) return;\s*aiSpeakPumping = true;/.test(clientSrc));
   ok('2026-10-02 服务端那一轨在时浏览器不抢（aiTtsEnabled 直接不念，防双声）',
