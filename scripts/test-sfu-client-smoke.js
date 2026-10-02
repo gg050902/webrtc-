@@ -1408,6 +1408,25 @@ const emit = (ev, payload) => {
   ok('2026-10-03 共享码率档高于摄像头（屏幕是文字线条，压狠了看不清等于没共享）',
     Number((clientSrc.match(/SCREEN_SIMULCAST_ENCODINGS = \[[\s\S]*?maxBitrate: (\d+), scaleResolutionDownBy: 1/) || [, '0'])[1]) >
     Number((clientSrc.match(/SIMULCAST_ENCODINGS = \[[\s\S]*?maxBitrate: (\d+), scaleResolutionDownBy: 1/) || [, '0'])[1]));
+  /* ---- ★ 2026-10-03 白板持久化（第 26d 步的下游）----
+   * ▎实时笔迹仍走 SCTP（延迟一点没变），只有"画完的一笔"报给服务器记账。
+   *   这里钉的是两件事：① **别把中间的 draw 点也复制一份到信令上**
+   *   （那就是把刚按帧合并掉的流量原样退回 300 倍，坑 58 刚修过的东西）；
+   *   ② 恢复画布时**颜色要再校验一次**——账本来自服务器，但服务器数据同样不可信任到
+   *   可以直接拼进 strokeStyle 的程度（双端各一道闸，任何一道漏了另一道兜住）。 */
+  ok('2026-10-03 白板只上报"整笔/撤销/清空"，不逐点上报（否则等于把 SCTP 流量复制进信令）',
+    /if \(op === 'end'\) \{[\s\S]{0,400}?socket\.emit\('board-record'[\s\S]{0,200}?op: 'stroke'/.test(clientSrc) &&
+    /else if \(op === 'undo' \|\| op === 'clear'\) \{\s*socket\.emit\('board-record', \{ op \}\);/.test(clientSrc) &&
+    !/op: 'draw'/.test(clientSrc));
+  ok('2026-10-03 恢复白板时颜色再校验一次（服务器数据也不许直接拼进 strokeStyle）',
+    /socket\.on\('board-state'[\s\S]{0,700}?\/\^#\[0-9a-fA-F\]\{3,8\}\$\/\.test\(String\(s\.color/.test(clientSrc) &&
+    /socket\.on\('board-state'[\s\S]{0,900}?redrawBoard\(\)/.test(clientSrc));
+  /* ▎色板 09-19e 改成 {v,n} 之后，初值漏了 `.v`：`ctx.strokeStyle = 对象` 被浏览器**静默忽略**，
+   *   于是"进白板的第一笔永远是黑的"，点过一次色点又正常 —— 只有真去读账本才发现。
+   *   钉法：白板这条路上所有会流进 strokeStyle 的颜色，初值与兜底都必须是 `.v`。 */
+  ok('2026-10-03 白板颜色初值与兜底都是 hex 字符串（strokeStyle 收到对象会被静默忽略）',
+    /let boardColor = BOARD_COLORS\[0\]\.v;/.test(clientSrc) &&
+    /return BOARD_COLORS\[h % BOARD_COLORS\.length\]\.v;/.test(clientSrc));
   ok('2026-10-02 同一轮的后半句是"追加"（replace:false，绝不 cancel 掉正在念的上一句）',
     /function enqueueAiSpeech\(say, \{ replace = true \}/.test(clientSrc) &&
     /if \(replace\) \{[\s\S]{0,600}?window\.speechSynthesis\.cancel\(\);[\s\S]{0,200}?aiSpeakPumping = false;/.test(clientSrc));

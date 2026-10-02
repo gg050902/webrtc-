@@ -861,9 +861,59 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   await sleep(400);
   ok('2026-10-02 「开启实时字幕」→ captions-on（字幕这条 AI 的"耳朵"也能被语音指令开关）',
      rcA.length === 1 && rcA[0].action === 'captions-on');
-  const aiState2P0 = waitEvent(A.s, 'room-state');
+
+  /* ★ 2026-10-03 白板持久化：笔迹实时仍走 SCTP，服务器只收"画完的一笔"，
+   *   于是**晚进房的人与刷新的人都能看到别人画的东西**（过去是空白画布）。
+   * ▎断言为什么都从"新客户端收到什么"来写：这是唯一能证明"账本真的被补发"的视角；
+   *   只断言服务器内存里有那条记录，等于什么都没验（坑 56 的接线纪律）。 */
+  const boardOf = async (label) => {
+    const BC = await client('BC-' + label);
+    const got = [];
+    BC.s.on('board-state', (p) => got.push(p));
+    const mp = waitEvent(BC.s, 'room-members');
+    BC.s.emit('join-room', { roomNumber: ROOM, password: created.password || '' });
+    await Promise.race([mp, sleep(6000)]);
+    await sleep(600);
+    try { BC.s.disconnect(); } catch (e) { /* 忽略 */ }
+    await sleep(500);   // 让这次 disjoin 引起的 room-state 广播先走完，别污染后面的断言
+    return got;
+  };
+  A.s.emit('board-record', { op: 'stroke', color: '#b93a26', pts: [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]] });
+  await sleep(400);
+  const bs1 = await boardOf('stroke');
+  ok('2026-10-03 画完的一笔被服务器记账，并补发给晚进房的人',
+     bs1.length === 1 && bs1[0].entries.length === 1 &&
+     bs1[0].entries[0].color === '#b93a26' && bs1[0].entries[0].pts.length === 3);
+  /* 恶意/畸形输入必须进不了账本——颜色会被写进 canvas strokeStyle、坐标会被写进点数组，
+   * 这条断言防的是"归档通道变成新的注入面"。 */
+  A.s.emit('board-record', { op: 'stroke', color: 'javascript:alert(1)', pts: [[0.1, 0.1]] });
+  A.s.emit('board-record', { op: 'stroke', color: '#86a876', pts: 'not-an-array' });
+  A.s.emit('board-record', { op: 'stroke', color: '#86a876', pts: [[9, -3], [0.2, 0.3]] });   // 越界坐标要钳回 0~1
+  await sleep(400);
+  const bs2 = await boardOf('dirty');
+  const e2 = (bs2[0] && bs2[0].entries) || [];
+  ok('2026-10-03 脏数据进不了账本（非法颜色 / 非数组点被拒），越界坐标被钳回 0~1',
+     e2.length === 2 && e2[1].color === '#86a876' &&
+     e2[1].pts[0][0] <= 1 && e2[1].pts[0][1] >= 0);
+  A.s.emit('board-record', { op: 'clear' });
+  await sleep(400);
+  const bs3 = await boardOf('clear');
+  ok('2026-10-03 「清空」后账本为空（晚来的人不会看到一屏旧笔迹）', bs3.length === 0);
+  /* ★ 2026-10-03 这条断言改成"等**满足条件的那一条**快照"，而不是"等下一条快照"。
+   *   起因是上面白板那组测试会反复 join/disjoin 临时客户端，每一次都触发一条
+   *   room-state 广播——"下一条"完全可能是别人进出房引起的、bot 还在里面的旧快照。
+   *   这正是坑 44/61 那一族：**断言站错了时间位置，代码没错。**
+   *   判据：凡是"等某个状态变化"的断言，要按**条件**轮询，不能按"下一个事件"。 */
+  const noBotState = new Promise((resolve) => {
+    const t0 = Date.now();
+    const h = (st) => {
+      const hasBot = (st.members || []).some((m) => m.isBot);
+      if (!hasBot || Date.now() - t0 > 4000) { A.s.off('room-state', h); resolve(st); }
+    };
+    A.s.on('room-state', h);
+  });
   await request(A.s, 'ai-leave', {});
-  const aiState2 = await Promise.race([aiState2P0, sleep(800).then(() => null)]);
+  const aiState2 = await Promise.race([noBotState, sleep(6000).then(() => null)]);
   ok('09-19 ai-leave 后 room-state 不再含 bot',
      aiState2 && !(aiState2.members || []).some((m) => m.isBot));
   /* ★ 09-24 体验改版：bot 不在房时不再冷冰冰地 fail，而是**自动邀请入会**——

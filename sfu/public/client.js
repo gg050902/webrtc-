@@ -1210,7 +1210,7 @@ function resetMediaState() {
   annotDataProducer = null;
   try { if (boardDataProducer) boardDataProducer.close(); } catch (e) { /* 同上 */ }
   boardDataProducer = null;
-  boardStrokes.length = 0; // 白板账本随重连作废（全房同步重置由"清空"广播或重进房完成）
+  boardStrokes.length = 0; // 重连先清本地账本；★ 2026-10-03 起重回房间时服务器会用 board-state 把账本补回来
   for (const dc of dataConsumers.values()) { try { dc.close(); } catch (e) { /* 同上 */ } }
   dataConsumers.clear();
   pendingDataSubs.length = 0;
@@ -3465,6 +3465,22 @@ socket.on('room-control', ({ action, byName } = {}) => {
   if (done) showToast(`🤖 ${who}：${done}（全房间同步）`, 'info');
 });
 
+/* ★ 2026-10-03 白板账本补发：晚进房/刷新的人不再面对一块空白画布。
+ *   数据是服务器内存里的权威账本（见 sfu/server.js 的 board-record），
+ *   这里只做"照账本重放"——与 resize 时的重绘走同一条 redrawBoard 路径（事件溯源的红利：
+ *   画出来的东西 = 账本的投影，所以恢复画布只需要恢复账本）。 */
+socket.on('board-state', ({ entries } = {}) => {
+  if (!Array.isArray(entries) || !entries.length) return;
+  boardStrokes.length = 0;
+  for (const s of entries) {
+    if (!s || !Array.isArray(s.pts) || !s.pts.length) continue;
+    const color = /^#[0-9a-fA-F]{3,8}$/.test(String(s.color || '')) ? String(s.color) : '#1a1a1a';
+    boardStrokes.push({ color, pts: s.pts.map((p) => ({ x: Number(p[0]) || 0, y: Number(p[1]) || 0 })) });
+  }
+  redrawBoard();
+  showToast(`🖌️ 已恢复白板 ${boardStrokes.length} 笔（你进来之前别人画的）`, 'info');
+});
+
 /* ★ 2026-10-02 服务端语音状态翻转要跟着走（配合服务器那条"定期重探"）：
  *   进房时读到的 aiTtsEnabled 是一次性快照，而端点可达性会漂（Edge 403 是常态）。
  *   服务器重探后广播这条，页面当场改让位闸——不然就回到"两边都不出声"那个死局。 */
@@ -5249,15 +5265,22 @@ const BOARD_COLORS = [
   { v: '#2b2724', n: '墨' }, { v: '#b93a26', n: '朱砂' }, { v: '#a5802f', n: '鎖金' },
   { v: '#3a5a7a', n: '黛蓝' }, { v: '#5a7a44', n: '竹青' },
 ];
-let boardColor = BOARD_COLORS[0];
+/* ★ 09-19e 色板改成 {v 十六进制, n 色名} 之后，这里漏了 `.v`：
+ *   boardColor 初始是**对象**，而 `ctx.strokeStyle = 对象` 会被浏览器**静默忽略**
+ *   ——不报错、不警告，笔迹一律画成默认黑。症状是"色板点了没反应"，
+ *   而点过一次色点之后 boardColor 变成字符串，又正常了 → 只有"进白板第一笔"必黑。
+ *   本轮做白板持久化时暴露：服务器按 hex 校验颜色，把这笔"{v,n}"直接拒了，
+ *   才顺着查到这里。**一个静默失败的赋值 + 一个只在特定路径上才正确的初值**，
+ *   是最难被肉眼发现的那类前端 bug（node --check、冒烟、截图都看不出来）。 */
+let boardColor = BOARD_COLORS[0].v;
 const boardStrokes = []; // 事件溯源账本
 let boardDrawing = false;
 let boardOn = false;
 
-function boardColorFor(id) { // 对端没带 color 时的兜底（浅底用深色板）
+function boardColorFor(id) { // 对端没带 color 时的兜底（浅底用深色板）；★ 返回 hex 字符串，同上
   let h = 0;
   for (const ch of String(id)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
-  return BOARD_COLORS[h % BOARD_COLORS.length];
+  return BOARD_COLORS[h % BOARD_COLORS.length].v;
 }
 
 const boardOverlay = $('boardOverlay');
@@ -5640,6 +5663,23 @@ function sendBoard(op, p, batch) {
     payload.pts = batch.map((q) => [Number(q.x.toFixed(3)), Number(q.y.toFixed(3))]);
   }
   boardDataProducer.send(JSON.stringify(payload));
+  /* ★ 2026-10-03 持久化：**只有"本地动作"走到这里**（远端收到的笔迹走 handleBoardMessage
+   *   → applyBoardOp，不经过 sendBoard），所以在这里顺手报给服务器不会重复记账。
+   *   只报三件事：画完的一笔（带全部点）、撤销、清空——**中间的 draw 点不报**，
+   *   否则就是把 SCTP 的流量原样复制一份到信令上，白挨一遍往返。 */
+  try {
+    if (op === 'end') {
+      const s = boardStrokes[boardStrokes.length - 1];
+      if (s && s.pts && s.pts.length) {
+        socket.emit('board-record', {
+          op: 'stroke', color: s.color,
+          pts: s.pts.slice(0, 600).map((q) => [Number(q.x.toFixed(3)), Number(q.y.toFixed(3))]),
+        });
+      }
+    } else if (op === 'undo' || op === 'clear') {
+      socket.emit('board-record', { op });
+    }
+  } catch (e) { /* 归档上报失败不能影响画 */ }
 }
 
 /* ──────────────────────────────────────────────────────────────

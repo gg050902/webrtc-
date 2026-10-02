@@ -1033,6 +1033,12 @@ async function handleApiRooms(res) {
 const CAPTIONS_DIR = path.join(__dirname, 'captions');
 fs.mkdirSync(CAPTIONS_DIR, { recursive: true }); // 启动时确保目录在（幂等，已存在不报错）
 
+/* ★ 2026-10-03 白板账本的落盘目录（与字幕同一套"内存=热窗口 / 文件=权威副本"哲学）。
+ *   注意分工：**内存账本**负责给晚进房的人补发画布，**jsonl** 负责跨重启的归档与审计
+ *   （房间本身是内存结构，服务器一重启房间就没了，所以 jsonl 不是热路径的数据源，别搞反）。 */
+const BOARDS_DIR = path.join(__dirname, 'boards');
+fs.mkdirSync(BOARDS_DIR, { recursive: true });
+
 // 读 POST body 的小 helper（原生 http 没有现成的；2MB 上限防滥用——挂一夜的字幕也就几 MB）
 function readJsonBody(req, limit = 2 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
@@ -2667,6 +2673,37 @@ function applyRoomAction(roomNumber, action, byName) {
   return { ok: true, cn: spec.cn, done: spec.done };
 }
 
+/* ── ★ 2026-10-03 白板持久化：服务器侧的账本与上限 ─────────────────────
+ * ▎为什么笔迹要"两条路"：实时笔迹继续走 SCTP 数据通道（低延迟、不过服务器），
+ *   只有**画完的一笔**（op=end）才作为一条 `board-record` 报给服务器存档。
+ *   于是延迟一点没变差，而"刷新就没了 / 晚来的人看见白布"这个老边界被补掉。
+ * ▎上限是这条功能里最重要的安全项：一场长会画几千笔、每笔几百点，
+ *   没有上限就是一台服务器被一个房间慢慢吃光内存。
+ *   超限**丢最旧的笔**（画布是热窗口，全量在 jsonl 里）。 */
+const BOARD_LEDGER_MAX = 400;        // 内存里最多留多少笔（发给新人时用）
+const BOARD_STROKE_MAX_PTS = 600;    // 单笔最多多少个点
+const BOARD_COLOR_RE = /^#[0-9a-fA-F]{3,8}$/;
+/** 校验并规整一笔客户端报上来的笔迹；不合法返回 null（绝不把未校验数据塞进账本）。 */
+function sanitizeBoardStroke(color, pts) {
+  if (!BOARD_COLOR_RE.test(String(color || ''))) return null;
+  if (!Array.isArray(pts) || pts.length < 1) return null;
+  const out = [];
+  for (const q of pts.slice(0, BOARD_STROKE_MAX_PTS)) {
+    if (!Array.isArray(q) || q.length < 2) continue;
+    const x = Number(q[0]); const y = Number(q[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    out.push([Math.min(1, Math.max(0, x)), Math.min(1, Math.max(0, y))]);
+  }
+  return out.length ? { color: String(color), pts: out } : null;
+}
+/** 追加一行到 sfu/boards/<房间>-<日期>.jsonl（append-only，坏行读取时跳过）。 */
+function appendBoardLine(roomNumber, obj) {
+  try {
+    fs.appendFileSync(path.join(BOARDS_DIR, `board-${roomNumber}-${new Date().toISOString().slice(0, 10)}.jsonl`),
+      JSON.stringify(obj) + '\n');
+  } catch (e) { /* 归档失败不能影响开会 */ }
+}
+
 async function aiBrain(roomNumber, question, onDelta, onPhase) {
   const room = rooms.get(roomNumber);
   const members = room ? [...room.members] : [];
@@ -4174,6 +4211,13 @@ io.on('connection', (socket) => {
      *   这就是"令牌只发给令牌所属的那个 socket"的落点，绝不用广播。 */
     socket.emit('room-members', { roomNumber, members: memberList, roomToken: socket.roomToken });
 
+    /* ★ 2026-10-03 白板账本补发给新人（只发给他自己，和 room-members 同一条纪律）。
+     *   过去白板只活在每个客户端内存里：谁刷新、谁晚进房，看到的都是空白画布
+     *   ——AGENTS 里写着的"批注不落屏"边界，这条把它补掉一半（白板补了，屏幕批注仍按原边界）。 */
+    if (Array.isArray(room.boardLedger) && room.boardLedger.length) {
+      socket.emit('board-state', { entries: room.boardLedger.slice(-BOARD_LEDGER_MAX), ts: Date.now() });
+    }
+
     // ② 通知老成员"来新人了"（老成员不用现在做什么，等他 produce 时会收到 new-producer）
     socket.to(roomNumber).emit('new-member', { id: socket.id });
 
@@ -4200,6 +4244,7 @@ io.on('connection', (socket) => {
       producerOwner: new Map(),   // ★ D2/D4：producerId -> socketId（把"某路媒体"翻译回"某个人"）
       createdAt: Date.now(),      // ★ 09-13 观测面板：房间创建时间（算会议时长用）
       talk: new Map(),            // ★ 09-13 发言时长统计：socketId -> 累计发言秒数（D2 延伸）
+      boardLedger: [],            // ★ 2026-10-03 白板笔迹账本（服务器权威副本，见 board-record）
     });
     console.log(`🆕 新房间已创建：${roomNumber}（创建者 ${socket.id}）${password ? '🔒 已设密码' : ''}`);
     logEvent('info', 'room-created', { roomNumber, by: socket.id, hasPassword: !!password });
@@ -4894,6 +4939,37 @@ io.on('connection', (socket) => {
   socket.on('ai-leave', (payload = {}, callback) => {
     if (!socket.roomNumber || !rooms.get(socket.roomNumber)) return fail(callback, '不在房间里');
     ok(callback, { aiBot: setAiBot(socket.roomNumber, false) === true });
+  });
+
+  /* ★ 2026-10-03 白板笔迹归档（配合 client.js 第 26d 步的持久化改造）。
+   * ▎实时笔迹仍然走 SCTP 数据通道（不过服务器、延迟不变），
+   *   这里只收"画完的一笔"——所以一条消息 = 一笔，而不是一个点。
+   * ▎边界照实说：这是**尽力而为的归档**。客户端断线时那一笔可能没报上来，
+   *   刷新后可能少一笔；但白板是协作草图，不是合同文本，
+   *   为它上一套两阶段提交是拿错的东西去换对的代价（延迟与复杂度）。
+   *   真正的权威记录在 sfu/boards/*.jsonl，内存账本只负责"给新人补发画布"。 */
+  socket.on('board-record', (msg = {}) => {
+    const roomNumber = socket.roomNumber;
+    const room = roomNumber && rooms.get(roomNumber);
+    if (!room || !Array.isArray(room.boardLedger)) return;   // 不在房间 / 桌面房没有白板
+    const op = String(msg.op || '');
+    if (op === 'clear') {
+      room.boardLedger = [];
+      appendBoardLine(roomNumber, { ts: Date.now(), by: socket.id, op: 'clear' });
+      return;
+    }
+    if (op === 'undo') {
+      const removed = room.boardLedger.pop();
+      if (removed) appendBoardLine(roomNumber, { ts: Date.now(), by: socket.id, op: 'undo', color: removed.color });
+      return;
+    }
+    if (op === 'stroke') {
+      const s = sanitizeBoardStroke(msg.color, msg.pts);
+      if (!s) return;                                        // 校验不过直接丢，绝不塞脏数据
+      room.boardLedger.push(s);
+      if (room.boardLedger.length > BOARD_LEDGER_MAX) room.boardLedger.splice(0, room.boardLedger.length - BOARD_LEDGER_MAX);
+      appendBoardLine(roomNumber, { ts: Date.now(), by: socket.id, op: 'stroke', color: s.color, n: s.pts.length });
+    }
   });
 
   /* ★ 09-24 体验修复：以前 bot 不在房里的回答是冷冰冰的一句 fail(……需要先点 AI 助理按钮)。
