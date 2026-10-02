@@ -41,7 +41,14 @@ const state = {
   gets: 0,          // /api/rooms 健康检查次数
   reconnects: 0,    // 断线自动重连次数（socket.io 自动重连，这里只记账）
   errors: 0,        // 一切异常（健康检查非 200 / 归档失败 / 回读对账不平）
+  /* ★ 2026-10-03 字幕延迟采样（来自服务器 collab.capLat，不在脚本里另算一份）。
+   *   capLatSamples 存的是**每次心跳时的累计均值**——所以最终报告里那句"整夜均值"
+   *   其实是"各次快照均值的均值"，略偏乐观（早期快样本会拉低），
+   *   但趋势与超阈值次数是准的；要精确值请读 /metrics。这行注释就是为了别把它当精确值。 */
+  capLatSamples: [],
+  capLatOver: 0,
 };
+const CAP_LAT_WARN_MS = Math.max(1000, Number(process.env.SOAK_CAP_LAT_WARN_MS) || 6000);
 const LOG_DIR = path.join(__dirname, '..', 'sfu', 'logs');
 fs.mkdirSync(LOG_DIR, { recursive: true });
 const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -132,6 +139,21 @@ const rss0 = process.memoryUsage().rss;
       state.gets++;
       const mine = (snap.rooms || []).some((r) => String(r.roomNumber) === String(roomNumber));
       if (!mine) throw new Error('快照里找不到本房间（房间可能被销毁）');
+      /* ★ 2026-10-03 第 39 步续：长跑期间顺手把**字幕延迟**记进心跳。
+       * ▎为什么值得加：soak 原来只回答"有没有断"，答不了"通的时候有多慢"——
+       *   而挂一夜最想知道的恰恰是后者（早上拿到 7 小时字幕，值不值得看取决于滞后多大）。
+       *   数据来自服务器累计的 collab.capLat（与 /metrics、界面读数同一个来源，不另算一份）。
+       * ▎只在**真的量到过**时记录：本自测推的是脚本归档、不是真音频，
+       *   所以多数夜晚 n=0 —— 那就如实写"未采到"，绝不编一个数（同坑 57/65 的判据）。 */
+      const cl = ((snap.collab || {}).capLat) || {};
+      if (cl.n > 0) {
+        const avg = cl.sum / cl.n;
+        state.capLatSamples.push(avg);
+        if (avg > CAP_LAT_WARN_MS) {
+          state.capLatOver++;
+          heartbeat(`⚠️ 字幕延迟均值 ${(avg / 1000).toFixed(1)}s 超阈值（${cl.n} 句，最慢 ${(cl.max / 1000).toFixed(1)}s）`);
+        }
+      }
     } catch (err) {
       state.errors++;
       heartbeat(`❌ 健康检查失败：${err.message}`);
@@ -183,6 +205,20 @@ const rss0 = process.memoryUsage().rss;
     heartbeat('──────────── 值守报告 ────────────');
     heartbeat(`时长 ${mins} 分钟 · 房间 ${roomNumber} · 信令消息 ${state.msgs} 条 · 断线重连 ${state.reconnects} 次`);
     heartbeat(`归档：POST ${state.posts} 次共 ${state.archived} 条 · 回读 ${back} 条 · ${balanced ? '✅ 对账一致' : '❌ 对账不平'}`);
+    /* ★ 2026-10-03 字幕延迟一行：**如实说"有没有采到"**。
+     *   本自测推的是脚本生成的归档、不是真音频，所以多数夜晚 n=0 ——
+     *   那不是失败，而是"这条指标今晚没有被 exercising"；
+     *   把它写成 ❌ 会让人去查一个不存在的问题（同坑 57 的反面：假红也伤人）。
+     *   真有语音时（开着 AI 助理挂一夜）这里就有数了，而且超阈值只告警不计错——
+     *   延迟是"体验指标"，让它把一夜的自测判成 FAIL 会掩盖真正的可用性问题。 */
+    if (state.capLatSamples.length) {
+      const avgAll = state.capLatSamples.reduce((a, b) => a + b, 0) / state.capLatSamples.length;
+      heartbeat(`字幕延迟：${state.capLatSamples.length} 次采样 · 快照均值 ${(avgAll / 1000).toFixed(1)}s · `
+        + `最慢快照 ${(Math.max(...state.capLatSamples) / 1000).toFixed(1)}s · 超阈值(${CAP_LAT_WARN_MS / 1000}s) ${state.capLatOver} 次`
+        + `  ${state.capLatOver ? '⚠️（精确值读 /metrics）' : '✅'}`);
+    } else {
+      heartbeat('字幕延迟：本次未采到（本自测不推真音频；要量这条请开 AI 助理说真话，或跑 npm run test:asr-live）');
+    }
     heartbeat(`健康检查 ${state.gets} 次 · 错误 ${state.errors} · rss ${(mem.rss / 1048576).toFixed(0)}MB（起点 ${(rss0 / 1048576).toFixed(0)}MB）`);
     heartbeat(balanced && state.errors === 0 ? '✅ PASS（零错误且一条不丢）' : '❌ FAIL（存在错误或对账不平，见上）');
     try { socket.disconnect(); } catch (e) { /* 已断则忽略 */ }
