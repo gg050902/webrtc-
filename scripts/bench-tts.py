@@ -11,10 +11,15 @@
     ⑤ torch 线程数有没有吃满？
   每一条都对应一个可落地的改法；量不出来就别动 worker 的加载参数（坑 58：先量真正的瓶颈量）。
 
-▎输出：每行一个 JSON（kind=env/load/seq/stream_off/batch3/dtype_fail），人和脚本都能读。
-▎用法：npm run bench:tts（需要先 modelscope 下好 models/qwen3-tts-0.6b）
+▎输出：每行一个 JSON（kind=env/load/seq/stream_off/batch3/median/dtype_fail），人和脚本都能读。
+▎用法：npm run bench:tts            # 每格跑一次（快，但**不能用来给参数排序**）
+      npm run bench:tts -- --repeats 3   # 每格跑三次，额外输出中位数（要做结论就用它）
+▎为什么要 --repeats：第一版每格只跑一次，我据此写下"`non_streaming_mode` 没有收益"；
+  第二版跑完发现同一 dtype 内部相差 1.7 倍（bf16 流式 30 字 7.80 反而全表最慢），
+  **说明差异被机器噪声主导，n=1 根本排不了序**（同坑 53：别拿单个绝对值下判断）。
+  所以：排序必须由 median 说话，单跑的数字只用来估量级。
 ▎诚实边界：数字是**本机 CPU + 当前负载**下的实测值，换机器/后台在跑会议时都要重测；
-  本脚本会加载模型两次（fp32 与 bf16），每次约 1 分钟，全程约 5~10 分钟。
+  本脚本会加载模型两次（fp32 与 bf16），每次约 1 分钟；加 --repeats 3 全程约 15~30 分钟。
 """
 import sys
 import os
@@ -24,6 +29,19 @@ import time
 
 def log(**kw):
     print(json.dumps(kw, ensure_ascii=False), flush=True)
+
+
+def arg_of(name, default):
+    """自己解析 --repeats N（不引 argparse 之外的东西；这里连 argparse 都不必）。"""
+    for i, a in enumerate(sys.argv):
+        if a == name and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return default
+
+
+REPEATS = max(1, int(arg_of("--repeats", "1")))
 
 
 try:
@@ -53,35 +71,48 @@ def synth(model, text, **kw):
     return dt, len(wavs[0]) / sr
 
 
+def median(xs):
+    s = sorted(xs)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+def cell(model, kind, label, fn, chars=None):
+    """跑一个格子：REPEATS 次都记 JSON，repeats>1 时额外记一条 median。
+    ▸ 为什么每次都要单独打印而不是只打中位数：**方差本身就是结论**——
+      如果 fp32/bf16 的 spread 比它们的中位数差还大，那这张表就不支持"换 dtype 更快"，
+      只看 median 会把这件事藏起来（坑 53 的同一条：判断要连着它的置信度一起给）。"""
+    rtfs = []
+    for i in range(REPEATS):
+        try:
+            d, dur = fn()
+            rtf = d / max(dur, 0.01)
+            rtfs.append(rtf)
+            log(kind=kind, case=label, rep=i + 1, of=REPEATS,
+                chars=chars, secs=round(d, 1), audio_secs=round(dur, 2), rtf=round(rtf, 2))
+        except Exception as e:
+            log(kind=kind, case=label, error=str(e)[:160])
+    if len(rtfs) > 1:
+        log(kind="median", case=label, reps=len(rtfs), rtf=round(median(rtfs), 2),
+            spread=round(max(rtfs) - min(rtfs), 2), min=round(min(rtfs), 2), max=round(max(rtfs), 2))
+    return rtfs
+
+
 def one_pass(dt_name):
     import torch
     from qwen_tts import Qwen3TTSModel
     dtype = getattr(torch, dt_name)
     t0 = time.time()
     model = Qwen3TTSModel.from_pretrained(MODEL, dtype=dtype, device_map="cpu")
-    log(kind="load", dtype=dt_name, secs=round(time.time() - t0, 1))
+    log(kind="load", dtype=dt_name, secs=round(time.time() - t0, 1), repeats=REPEATS)
     torch.set_num_threads(os.cpu_count() or 8)
     log(kind="threads", set_to=torch.get_num_threads(), cpu=os.cpu_count())
     for name, txt in TEXTS.items():
-        try:
-            d, dur = synth(model, txt)
-            log(kind="seq", dtype=dt_name, case=name, chars=len(txt), secs=round(d, 1),
-                audio_secs=round(dur, 2), rtf=round(d / max(dur, 0.01), 2))
-        except Exception as e:
-            log(kind="seq", dtype=dt_name, case=name, error=str(e)[:160])
+        cell(model, "seq", "%s/%s" % (dt_name, name), lambda t=txt: synth(model, t), chars=len(txt))
     for name in ("med36", "long70"):
-        try:
-            d, dur = synth(model, TEXTS[name], non_streaming_mode=False)
-            log(kind="stream_off", dtype=dt_name, case=name, secs=round(d, 1),
-                audio_secs=round(dur, 2), rtf=round(d / max(dur, 0.01), 2))
-        except Exception as e:
-            log(kind="stream_off", dtype=dt_name, case=name, error=str(e)[:160])
-    try:
-        d, dur = synth(model, list(TEXTS.values()))
-        log(kind="batch3", dtype=dt_name, secs=round(d, 1), audio_secs=round(dur, 2),
-            rtf=round(d / max(dur, 0.01), 2))
-    except Exception as e:
-        log(kind="batch3", dtype=dt_name, error=str(e)[:160])
+        cell(model, "stream_off", "%s/%s" % (dt_name, name),
+             lambda n=name: synth(model, TEXTS[n], non_streaming_mode=False))
+    cell(model, "batch3", dt_name + "/batch3", lambda: synth(model, list(TEXTS.values())))
     del model
 
 
