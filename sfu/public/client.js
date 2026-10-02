@@ -1538,7 +1538,16 @@ socket.on('chat-message', ({ from, text, ts, msgId, name, ai, streamId, tts }) =
   // ★ 09-24：带 streamId 的是流式回答的"终态"——增量已经在同一个气泡里渲染过了，
   //   这里再插一条就是两遍。（终态仍然必要：给中途进房/丢过流事件的人兜底）
   if (streamId && aiStreamDone.has(streamId)) return;
-  appendChat(text, from, from === socket.id, 'signaling', name, ai);
+  const node = appendChat(text, from, from === socket.id, 'signaling', name, ai);
+  /* ★ 2026-10-03 登记"这条答案的文字到齐了"，等第一段音频真的播起来时相减。
+   * ▎为什么锚在 chat-message 而不是 ai-stream 首字：那条链路的等待恰恰发生在
+   *   "文字已经写完 → 声音才出来"之间（合成 + 上架 + 取回），
+   *   而首字时刻混进了 LLM 的生成速度，量出来就不是"嘴"的延迟了。
+   * ▎窗口只留最近 30 条（长会里不会有人回头看很久的答案的朗读延迟）。 */
+  if (from === 'ai-bot' && tts === 'server' && node && typeof ts === 'number') {
+    voiceAnswerAt.set(ts, { at: Date.now(), node });
+    if (voiceAnswerAt.size > 30) voiceAnswerAt.delete(voiceAnswerAt.keys().next().value);
+  }
 });
 
 /* ══════════════════════════════════════════════════════════════
@@ -1757,6 +1766,10 @@ function appendChat(text, sender, isMe, via, name, ai) {
   //   DOM 节点数是前端内存与重排开销的大头；超限剪最老的（字幕账本另有 jsonl 存档）。
   while (chatList.children.length > 300) chatList.firstChild.remove();
   chatList.scrollTop = chatList.scrollHeight;
+  /* ★ 2026-10-03 返回节点：语音播报延迟要在**它自己那条气泡**上落一个读数
+   *   （音频可能比气泡晚到好几秒，只能事后按 ts 找回这个节点）。
+   *   老调用方都忽略返回值，加这一行不改变任何既有行为。 */
+  return item;
 }
 
 /* 把一个问题发给 AI 助理（就是「@ai ...」走的那条路）。
@@ -3360,6 +3373,11 @@ let lastMicVoiceTs = 0;   // ★ 2026-10-02：最近一次麦克风真出声的�
 let aiTtsEnabled = false; // ★ 09-30c：服务端神经语音可用（/config.json 下发）
 let serverTtsEl = null;   // 播放服务端 MP3 的 <audio>（复用，hush 时暂停它）
 const pendingServerTts = new Map(); // ★ 2026-10-01：ts → 文本（服务端语音待送达/失败的回落账本）
+/* ★ 2026-10-03 播报延迟账本：ts → { 文字到齐时刻, 那条气泡的 DOM 节点 }。
+ *   音频真的开始播时用它算出"你看见答案 → 你听见它"这段等待，读数贴在气泡自己身上。
+ *   ▸ 为什么要 DOM 节点：语音比文字晚到几秒是常态，事后没有节点就无处可贴。
+ *   ▸ 声明在本文件后段没问题——这里全是事件回调里才执行的代码（顶层不读它，不会撞 TDZ）。 */
+const voiceAnswerAt = new Map();
 /* ★ 2026-10-02 语音流水线带来一个新的时序：第一句的音频可能**比 chat-message 先到**
  * （LLM 刚吐完第一句就去合成了）。这时 pendingServerTts 里还没有这条 ts，等气泡到达时
  * 再塞进去就成了一条"永远不会被销掉"的账——万一之后来了 ai-tts-fail，会把已经念过的
@@ -3402,6 +3420,7 @@ function playNextServerTts() {
       pendingServerTts.delete(item.ts);
       playedServerTts.add(item.ts);                  // 这条答案已经出声了
       if (playedServerTts.size > 60) playedServerTts.delete(playedServerTts.values().next().value);
+      noteVoiceLatency(item.ts);                     // ★ 2026-10-03 "文字到齐 → 真的开口"实测
     }
   };
   serverTtsEl.onended = () => { serverTtsBusy = false; serverTtsPlayingTs = undefined; playNextServerTts(); };
@@ -6332,6 +6351,32 @@ function renderCapStatus(text, level = '') {
   capStatus.textContent = text;
   capStatus.className = `cap-status ${level}`;
 }
+/* ★ 2026-10-03 第 38 步：把"看见答案 → 听见它开口"这段等待量出来，贴在**那条气泡自己身上**。
+ * ▎为什么单独量这一段：用户抱怨"它答应了却不说话 / 说话好慢"，而这条等待
+ *   （合成 + 上架 + 取回 + 排队）此前**完全没有任何读数**——`test:asr-live` 手工打印过一次
+ *   "答案上屏→首段 1.6s"，但开会时人看不见。同一条教训第二次用：
+ *   **先做成一个数字，才有得优化**（第 37 步的字幕延迟就是这个路径）。
+ * ▎只认"真的开始播"（onplaying）而不是"收到 ai-audio"：后者只证明服务器发了，
+ *   取不到文件/被自动播放策略拦截时用户其实一声没听见（坑 66 的同一条纪律）。
+ * @param ts 这条答案的时间戳（与 chat-message / ai-audio 共用同一个 ts 配对） */
+function noteVoiceLatency(ts) {
+  const rec = voiceAnswerAt.get(ts);
+  if (!rec) return;                    // 没有"文字到齐"锚点（例如音频先到、气泡还没渲染）→ 不编数
+  voiceAnswerAt.delete(ts);
+  const ms = Date.now() - rec.at;
+  if (!Number.isFinite(ms) || ms <= 0 || ms > 60000) return; // 异常值不进统计也不显示
+  const chip = document.createElement('span');
+  chip.className = 'msg-voice-lat';
+  chip.textContent = `🔊 ${(ms / 1000).toFixed(1)}s 后开口`;
+  chip.title = '这条答案：文字上屏 → 真的听见第一句声音，服务器合成 + 传输 + 排队都算在里面。'
+    + '慢通常是本地 Qwen 音色在 CPU 上合成（RTF>1）；浏览器朗读几乎是 0s。';
+  /* 贴在气泡正文与时间行之间；节点不足时直接挂末尾（假 DOM 与真 DOM 都不炸） */
+  if (rec.node && rec.node.lastChild) rec.node.insertBefore(chip, rec.node.lastChild);
+  else if (rec.node) rec.node.appendChild(chip);
+  // 上报给服务器做累计（权威统计在 /metrics，界面这个只是本条的读数）
+  socket.emit('ai-speech-lat', { ms });
+}
+
 /* ★ 2026-10-03 第 37 步：字幕延迟读数。
  * ▎数据来源是服务器（它才知道"这个人最后一次有声"是几点），本函数只负责显示与
  *   本地滚动统计——**不在浏览器重算延迟**，否则两处口径不同，界面上就会出现

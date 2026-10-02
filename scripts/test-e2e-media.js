@@ -310,6 +310,35 @@ const VIDEO_STATS = `JSON.stringify((() => {
     `悬浮提示摊开拆分：${capLatUi.after && capLatUi.after.title}`);
   chk(capLatUi.kept === '⏱ 2.4s', `脏值 latMs=0 不覆盖读数（保持「${capLatUi.kept}」，不编数）`);
 
+  /* ★ 2026-10-03 第 38 步：AI 气泡上的"🔊 X.Xs 后开口"同样要在真浏览器里验一次
+   *   （理由与上面那条一样：假 DOM 看不见 CSS）。这里手工登记一个锚点再调
+   *   noteVoiceLatency —— 顶层 const 在页面全局词法作用域里可见，所以能直接驱动。 */
+  console.log('⑩c 断言：AI 气泡的播报延迟读数（真浏览器）…');
+  const vlat = JSON.parse(await A.evaluate(`(() => {
+    const TS = 1790000000000;
+    const bubble = document.createElement('div');
+    bubble.className = 'msg ai-bot';
+    const time = document.createElement('div'); time.className = 'msg-time'; time.textContent = 't';
+    bubble.appendChild(document.createElement('div'));   // 正文占位
+    bubble.appendChild(time);
+    document.getElementById('chatList').appendChild(bubble);
+    voiceAnswerAt.set(TS, { at: Date.now() - 2300, node: bubble });
+    noteVoiceLatency(TS);
+    const chip = bubble.querySelector('.msg-voice-lat');
+    return JSON.stringify({
+      text: chip ? chip.textContent : '(无)',
+      color: chip ? getComputedStyle(chip).color : '',
+      radius: chip ? getComputedStyle(chip).borderRadius : '',
+      stillThere: voiceAnswerAt.has(TS),
+      lastChildIsTime: bubble.lastChild === time,
+    });
+  })()`));
+  chk(/🔊 2\.3s 后开口/.test(vlat.text), `读数贴在气泡上：「${vlat.text}」`);
+  chk(/^rgb\(/.test(vlat.color) && vlat.radius !== '0px',
+    `.msg-voice-lat 的样式真的生效（color=${vlat.color} radius=${vlat.radius}）`);
+  chk(vlat.stillThere === false && vlat.lastChildIsTime === true,
+    '锚点用完即销，且读数插在正文与时间行之间（不污染朗读文本）');
+
   /* ⑪ ★ 2026-10-03 首页 hero 的手机形态（390×844）
    * ▎为什么放到这条 e2e 里：hero 是本轮新加的、又是"用户第一眼"，
    *   而它最容易坏的地方恰恰是**小屏放不放得下**——

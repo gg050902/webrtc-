@@ -837,6 +837,32 @@ const emit = (ev, payload) => {
   guard('延迟拆分：老服务器不带 stage', () => emit('asr-caption', { name: '小张', text: '第九句', latMs: 2000 }));
   ok('延迟拆分：没有 stage 时不编拆分（只显示总数，功能不降级也不虚报）',
     capLatEl.textContent === '⏱ 2.0s' && !capLatEl.title.includes('末段拆分'));
+
+  /* ---- ★ 2026-10-03 第 38 步：播报延迟（看到答案 → 听见它开口）----
+   * ▎断言的重点与字幕那条一样：**没有锚点就不许编数**。
+   *   播报链路的失败形态是"答应了却没声音"，历史上查了三次，
+   *   而这三次里没有任何一行日志会红——所以这个读数必须被测试钉住它"什么时候不显示"。 */
+  const voiceTs = 1790000000000;
+  const emitsBeforeVlat = rec.emits.filter((e) => e === 'ai-speech-lat').length;
+  guard('播报延迟：收到带 tts:server 的 AI 答案', () => emit('chat-message', {
+    from: 'ai-bot', name: 'AI 小明', text: '好的，已经记下了。', ts: voiceTs, tts: 'server',
+  }));
+  ok('播报延迟：文字到齐即登记锚点（ts → {时刻, 气泡节点}）',
+    vm.runInContext(`voiceAnswerAt.has(${voiceTs})`, ctx) === true);
+  vm.runInContext(`voiceAnswerAt.get(${voiceTs}).at = Date.now() - 2300`, ctx);
+  guard('播报延迟：音频真的开始播（调 noteVoiceLatency）',
+    () => vm.runInContext(`noteVoiceLatency(${voiceTs})`, ctx));
+  ok('播报延迟：读数贴在**这条答案自己的气泡**上（🔊 2.3s 后开口）',
+    createdEls.some((e) => e.className === 'msg-voice-lat' && String(e.textContent).includes('2.3s')));
+  ok('播报延迟：上报服务器累计（权威统计在 /metrics，界面只是本条读数）',
+    rec.emits.filter((e) => e === 'ai-speech-lat').length === emitsBeforeVlat + 1);
+  ok('播报延迟：锚点用完即销（同一条答案的分段音频不会重复计数）',
+    vm.runInContext(`voiceAnswerAt.has(${voiceTs})`, ctx) === false);
+  const vlatBefore2 = rec.emits.filter((e) => e === 'ai-speech-lat').length;
+  guard('播报延迟：没有锚点的 ts（音频先到/气泡已被回收）',
+    () => vm.runInContext(`noteVoiceLatency(${voiceTs + 9999})`, ctx));
+  ok('播报延迟：找不到锚点时什么都不报、不崩（不编数）',
+    rec.emits.filter((e) => e === 'ai-speech-lat').length === vlatBefore2);
   ok('服务端字幕：单独记账 serverTotal', vm.runInContext('cap.sentry.serverTotal', ctx) >= 1);
   guard('服务端字幕：点关开关', () => capBtnEl.dispatch('click'));
   ok('服务端字幕：关掉只隐藏显示（提示服务器仍在转写）',
@@ -1516,6 +1542,23 @@ const emit = (ev, payload) => {
    *   而头像的"重影"恰好又是同一类跨文件问题：素材自带残影 + CSS 再叠一层缩放节奏，
    *   两边各演各的。只在 JS 里断言等于没断言，所以这里两边都钉。 */
   const cssSrc = fs.readFileSync(path.join(PUB, 'style.css'), 'utf8');
+  /* ══ ★ 2026-10-03 补一块一直没人检查过的代码：dashboard.html 的内联 JS ══
+   * ▎为什么现在才想到：面板是"一个页面 + 一段内联脚本"，既不在 node --check 的清单里，
+   *   也不在冒烟的执行范围里（冒烟只跑 client.js）。于是**改错一个括号，面板就是一张
+   *   永远不动的空白页，而回归全绿**——本轮刚好动了它（加播报延迟那一格），
+   *   动的同时把这块盲区补上，成本 3 行、收益是"以后每次动面板都有人管"。
+   * ▎手法：把 <script> 块抠出来交给 new Function() 只做**语法**检查（不执行——
+   *   执行需要 document/fetch，那是 e2e 的活），语法错会以异常形式抛出来。
+   * ▸ 复用上面那个 dashSrc（同一个文件读两遍是浪费，也是两个来源）。 */
+  const dashJs = (dashSrc.match(/<script>([\s\S]*?)<\/script>/g) || [])
+    .map((b) => b.replace(/^<script>/, '').replace(/<\/script>$/, '')).join('\n');
+  let dashErr = '';
+  try { new Function(dashJs); } catch (e) { dashErr = e.message; }
+  ok('2026-10-03 观测面板的内联脚本语法过得去（这块此前没有任何测试覆盖）',
+    dashJs.length > 400 && !dashErr, dashErr);
+  ok('2026-10-03 面板两条延迟读数共用一个算法（口径不会各漂各的）',
+    /const latCell = \(c\)/.test(dashSrc) &&
+    (dashSrc.match(/latCell\(cb\./g) || []).length >= 2);
   ok('2026-10-02 形象只有一张静帧（没有任何地方再把循环 WebP 当资源引用）',
     /const AI_PORTRAIT = /.test(clientSrc) && !/AI_ANIM/.test(clientSrc) &&
     !/(src|href)\s*=\s*.?["'`][^"'`]*xiaoming-(anim|talk)/.test(clientSrc));

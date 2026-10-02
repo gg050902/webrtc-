@@ -766,10 +766,17 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
    *     少发一行不会让任何功能变红，只会让那条告警**永远不响**——
    *     这正是坑 56"内层算出来了、外层没带出来"的指标版。 */
   ok('2026-10-03 /metrics 含字幕延迟三读数（avg/max/last）与样本计数',
-     met.text.includes('sfu_ai_asr_caption_count_total')
+     met.text.includes('sfu_ai_asr_caption_latency_ms_count_total')
      && /sfu_ai_asr_caption_latency_ms\{kind="avg"\} \d+/.test(met.text)
      && /sfu_ai_asr_caption_latency_ms\{kind="max"\} \d+/.test(met.text)
      && /sfu_ai_asr_caption_latency_ms\{kind="last"\} \d+/.test(met.text));
+  /* ★ 2026-10-03 第 38 步：播报延迟（看到答案→听见开口）同一形状的第二组。
+   *   两组必须同名同形，所以断言也照抄一遍——抄得整齐正是"口径一致"的证据。 */
+  ok('2026-10-03 /metrics 含播报延迟三读数与样本计数（与字幕那组同形）',
+     met.text.includes('sfu_ai_speech_latency_ms_count_total')
+     && /sfu_ai_speech_latency_ms\{kind="avg"\} \d+/.test(met.text)
+     && /sfu_ai_speech_latency_ms\{kind="max"\} \d+/.test(met.text)
+     && /sfu_ai_speech_latency_ms\{kind="last"\} \d+/.test(met.text));
   /* ▎这里自带一个取行助手，不复用下面 900 多行的 numOf：那个是**块级 const**，
    *   在本行还没声明 → TDZ 直接 ReferenceError（坑 69 的同族：位置错了它不报语义错，只炸运行顺序）。 */
   const numOfCap = (txt, key) => {
@@ -780,7 +787,7 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('2026-10-03 /api/rooms 的 collab.capLat 与 /metrics 同源（一个概念只有一个来源）',
      !!snapCap.collab && !!snapCap.collab.capLat
      && typeof snapCap.collab.capLat.max === 'number'
-     && snapCap.collab.capLat.n === numOfCap(met.text, 'sfu_ai_asr_caption_count_total')
+     && snapCap.collab.capLat.n === numOfCap(met.text, 'sfu_ai_asr_caption_latency_ms_count_total')
      && snapCap.collab.capLat.max === numOfCap(met.text, 'sfu_ai_asr_caption_latency_ms{kind="max"}'));
   // ★ 09-24 AI 用量可观测：调用次数/错误数/tokens/估算花费在同一份 metrics 面上
   ok('09-24 /metrics 含 AI 用量指标（调用/错误/tokens/花费 四组齐备）',
@@ -965,6 +972,27 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
        numOf(met2.text, 'sfu_room_control_applied_total{action="board-close"}'));
   ok('2026-10-03 白名单外的 action 进不了指标（防客户端打爆标签基数）',
      met3.text.includes('sfu_room_control_applied_total') && !met3.text.includes(evil));
+  /* ★ 2026-10-03 第 38 步：播报延迟上报信令。断言形状照抄上面那组"计数器真的在动"——
+   *   ▎因为这条最容易坏的地方正是"客户端发了、服务器没数"（坑 41：有状态被写入的功能，
+   *     必须有一条"写进去没有"的断言，只测纯函数会全绿）。
+   *   ▎同时验脏值不进统计：客户端自报的数字虽然不参与任何门禁，
+   *     但 0 / 负数 / 荒谬大值会把均值彻底带歪，那比没有指标更糟。 */
+  A.s.emit('ai-speech-lat', { ms: 2100 });
+  A.s.emit('ai-speech-lat', { ms: 0 });
+  A.s.emit('ai-speech-lat', { ms: -5 });
+  A.s.emit('ai-speech-lat', { ms: 999999 });
+  A.s.emit('ai-speech-lat', { ms: 'abc' });
+  await sleep(700);
+  const met4 = await httpReq('GET', `http://localhost:${PORT}/metrics`);
+  ok('2026-10-03 播报延迟上报：合法值 +1 且 max 记到 2100，五条脏值一条都不进统计',
+     numOf(met4.text, 'sfu_ai_speech_latency_ms_count_total') ===
+       numOf(met3.text, 'sfu_ai_speech_latency_ms_count_total') + 1 &&
+     numOf(met4.text, 'sfu_ai_speech_latency_ms{kind="max"}') >= 2100);
+  const snapSpeak = JSON.parse((await httpReq('GET', `http://localhost:${PORT}/api/rooms`)).text);
+  const spk = snapSpeak.collab && snapSpeak.collab.speakLat;
+  ok('2026-10-03 播报延迟与面板同源（/api/rooms 的 collab.speakLat 与 /metrics 读同一个对象）',
+     !!spk && spk.n === numOf(met4.text, 'sfu_ai_speech_latency_ms_count_total')
+       && spk.max === numOf(met4.text, 'sfu_ai_speech_latency_ms{kind="max"}'));
   /* ★ 2026-10-03 这条断言改成"等**满足条件的那一条**快照"，而不是"等下一条快照"。
    *   起因是上面白板那组测试会反复 join/disjoin 临时客户端，每一次都触发一条
    *   room-state 广播——"下一条"完全可能是别人进出房引起的、bot 还在里面的旧快照。

@@ -974,6 +974,7 @@ async function snapshotRooms() {
       roomApplied: COLLAB.roomApplied,
       board: COLLAB.board,
       capLat: COLLAB.capLat,   // ★ 2026-10-03 字幕延迟：{n, sum, max, last}（面板与 /metrics 同源，不另算一份）
+      speakLat: COLLAB.speakLat, // ★ 2026-10-03 播报延迟：同上，客户端实测上报
     },
     rooms: list,
   };
@@ -1006,18 +1007,25 @@ const COLLAB = {
    *     窗口本身 0.5s（astats reset=8000 @16kHz），所以这个起点天然偏晚 ≤0.5s，
    *     量出来的延迟是**下限**——宁可保守，也不要在界面上虚报"比实际更快"。 */
   capLat: { n: 0, sum: 0, max: 0, last: 0 },
+  /* ★ 2026-10-03 播报延迟（客户端实测："答案上屏 → 真的听见第一句"）。
+   *   与 capLat 同一条方法论：这条链路的故障全是"它答应了却没声音"，
+   *   没有读数时连"到底有没有出声"都要靠人猜（历史上查过三次才查明白）。 */
+  speakLat: { n: 0, sum: 0, max: 0, last: 0 },
 };
 function bump(obj, key) { obj[key] = (obj[key] || 0) + 1; }
 function bumpAsr(via, ms) {
   const s = COLLAB.asr[via] || (COLLAB.asr[via] = { n: 0, sec: 0 });
   s.n += 1; s.sec += (ms || 0) / 1000;
 }
-function bumpCapLat(ms) {
-  if (!Number.isFinite(ms) || ms <= 0) return;   // 0/NaN = 这一句没有可靠的有声起点，不污染统计
-  const c = COLLAB.capLat;
+/* 两条延迟共用一个累加器（同一形状、同一口径：n/sum/max/last），
+ * 免得两处各写一份"均值怎么算、最大值怎么更新"而慢慢漂移。 */
+function bumpLat(c, ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return;   // 0/NaN = 这一条没有可靠起点，不污染统计
   c.n += 1; c.sum += ms; c.last = Math.round(ms);
   if (ms > c.max) c.max = Math.round(ms);
 }
+function bumpCapLat(ms) { bumpLat(COLLAB.capLat, ms); }
+function bumpSpeakLat(ms) { bumpLat(COLLAB.speakLat, ms); }
 
 const PROCESS_START = Date.now();
 function buildMetrics(snap) {
@@ -1074,18 +1082,23 @@ function buildMetrics(snap) {
   for (const [via, s] of Object.entries(COLLAB.asr)) {
     L.push(`sfu_ai_asr_seconds_total{engine="${via}"} ${s.sec.toFixed(1)}`);
   }
-  /* ★ 2026-10-03 字幕端到端延迟（说完→定稿字幕）。三个数各有分工：
-   *   avg 看整体体感、max 看最坏一句话（"是不是偶尔卡很久"）、last 让 watch.js
+  /* ★ 2026-10-03 两组端到端延迟读数（字幕 / 播报），三行一组：
+   *   avg 看整体体感、max 看最坏一次（"是不是偶尔卡很久"）、last 让 watch.js
    *   能在**不重启**的前提下发现"延迟刚刚变差了"。
    *   ▎为什么不用 histogram bucket：零依赖手拼 Prometheus，直方图要 5 条线还得配
-   *   分位函数；三个 gauge 已足够回答"要不要继续降延迟"这一个决策问题。 */
-  const cl = COLLAB.capLat;
-  help('sfu_ai_asr_caption_count_total', 'counter', 'Finalized captions that carry a measurable end-of-speech latency');
-  L.push(`sfu_ai_asr_caption_count_total ${cl.n}`);
-  help('sfu_ai_asr_caption_latency_ms', 'gauge', 'End-of-speech -> caption latency in ms (avg / max / last)');
-  L.push(`sfu_ai_asr_caption_latency_ms{kind="avg"} ${cl.n ? Math.round(cl.sum / cl.n) : 0}`);
-  L.push(`sfu_ai_asr_caption_latency_ms{kind="max"} ${cl.max}`);
-  L.push(`sfu_ai_asr_caption_latency_ms{kind="last"} ${cl.last}`);
+   *   分位函数；三个 gauge 已足够回答"要不要继续降延迟"这一个决策问题。
+   *   ▸ 写成一个小函数而不是复制两遍：两组必须**口径完全一致**，
+   *     否则会出现"字幕那组有 last、播报那组没有"这种自相矛盾（坑 47）。 */
+  const latBlock = (base, c, doc) => {
+    help(`${base}_count_total`, 'counter', `Number of samples for: ${doc}`);
+    L.push(`${base}_count_total ${c.n}`);
+    help(base, 'gauge', `${doc}, in ms (avg / max / last)`);
+    L.push(`${base}{kind="avg"} ${c.n ? Math.round(c.sum / c.n) : 0}`);
+    L.push(`${base}{kind="max"} ${c.max}`);
+    L.push(`${base}{kind="last"} ${c.last}`);
+  };
+  latBlock('sfu_ai_asr_caption_latency_ms', COLLAB.capLat, 'end-of-speech to finalized caption');
+  latBlock('sfu_ai_speech_latency_ms', COLLAB.speakLat, 'answer shown to first audio actually playing (client reported)');
   help('sfu_ai_answers_total', 'counter', 'How many times the AI assistant actually replied');
   L.push(`sfu_ai_answers_total ${COLLAB.answers}`);
   help('sfu_ai_answer_throttled_total', 'counter', 'Replies suppressed by a gate (dup/echo/inflight/interval)');
@@ -5157,6 +5170,20 @@ io.on('connection', (socket) => {
     const action = String(msg.action || '');
     if (!ROOM_ACTIONS[action] || !msg.ok) return;
     bump(COLLAB.roomApplied, action);
+  });
+
+  /* ★ 2026-10-03 第 38 步：客户端上报"看见答案 → 听见它开口"的实测毫秒数。
+   * ▎为什么让客户端报而不是服务器自己算：服务器只知道"我什么时候把 MP3 上架"，
+   *   而用户等的是**浏览器真的把声音放出来**那一刻——中间还差取文件、解码、
+   *   排队、以及"被自动播放策略拦掉"这种根本不会发生在服务器侧的失败。
+   *   （同坑 66 的判据：销账时机必须是"真的开始播了"，读数也一样。）
+   * ▎信任边界：这是**客户端自报**的数字，只进平均值统计、不用于任何权限或配额判断，
+   *   所以只做区间钳制（超限丢弃），不做签名。伪造它能做的最坏的事是让指标难看，
+   *   而这条指标本来就不参与门禁。 */
+  socket.on('ai-speech-lat', (msg = {}) => {
+    const ms = Number(msg && msg.ms);
+    if (!Number.isFinite(ms) || ms <= 0 || ms > 60000) return; // 0 与超 1 分钟都不是真读数
+    bumpSpeakLat(ms);
   });
 
   /* ★ 2026-10-03 白板笔迹归档（配合 client.js 第 26d 步的持久化改造）。

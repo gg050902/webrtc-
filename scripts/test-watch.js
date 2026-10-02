@@ -17,19 +17,23 @@ function ok(cond, msg) {
   else { issues++; console.log(`  ❌ FAIL  ${msg}`); }
 }
 
-const m = (segs, rejected = 0, issued = 0, applied = 0, capLat = null, primaryReady = undefined) => {
+const m = (segs, rejected = 0, issued = 0, applied = 0, capLat = null, primaryReady = undefined, speakLat = null) => {
   const lines = [];
   for (const [eng, n] of Object.entries(segs)) lines.push(`sfu_ai_asr_segments_total{engine="${eng}"} ${n}`);
   lines.push(`sfu_board_records_total{op="rejected"} ${rejected}`);
   if (issued) lines.push(`sfu_room_control_total{action="board-open"} ${issued}`);
   if (applied) lines.push(`sfu_room_control_applied_total{action="board-open"} ${applied}`);
-  /* ★ 2026-10-03 字幕延迟三项 gauge：capLat = {n, avg, max} 或 null（null = 这一句都没量到过） */
-  if (capLat) {
-    lines.push(`sfu_ai_asr_caption_count_total ${capLat.n}`);
-    lines.push(`sfu_ai_asr_caption_latency_ms{kind="avg"} ${capLat.avg}`);
-    lines.push(`sfu_ai_asr_caption_latency_ms{kind="max"} ${capLat.max}`);
-    lines.push(`sfu_ai_asr_caption_latency_ms{kind="last"} ${capLat.max}`);
-  }
+  /* ★ 2026-10-03 两条端到端延迟各三项 gauge：{n, avg, max} 或 null（= 这条还没量到过）
+   *   ▸ 必须和 server 的 latBlock 一模一样：base 名、kind label、counter 命名，
+   *     任何一处改了另一边没跟上，这条测试就会"绿着什么都不验"（坑 56 的指标版）。 */
+  const latLines = (base, c) => c ? [
+    `${base}_count_total ${c.n}`,
+    `${base}{kind="avg"} ${c.avg}`,
+    `${base}{kind="max"} ${c.max}`,
+    `${base}{kind="last"} ${c.max}`,
+  ] : [];
+  lines.push(...latLines('sfu_ai_asr_caption_latency_ms', capLat));
+  lines.push(...latLines('sfu_ai_speech_latency_ms', speakLat));
   /* primaryReady：只有 true/false 才发这一行；undefined = 模拟**老服务器根本没有这行**。
    * ▎为什么要专门测这第三种：诊断如果把"读不到这行"当成 0（没就位），
    *   兜底告警在老服务器上就永远不响——"读不到"和"读到 0"是两件事。 */
@@ -37,7 +41,7 @@ const m = (segs, rejected = 0, issued = 0, applied = 0, capLat = null, primaryRe
   return lines.join('\n');
 };
 const run = (metrics, collab, prev, state) => diagnoseVoiceAndCollab(metrics, collab, prev, state);
-const fresh = () => ({ counters: {}, fallbackRounds: 0, gapRounds: 0, capSlowRounds: 0, bootWaitRounds: 0 });
+const fresh = () => ({ counters: {}, fallbackRounds: 0, gapRounds: 0, capSlowRounds: 0, speakSlowRounds: 0, bootWaitRounds: 0 });
 const has = (out, key) => out.some((a) => a.key === key);
 
 console.log('\n--- watch：语音与协作退化诊断（纯函数，合成输入）---');
@@ -152,7 +156,31 @@ console.log('\n--- watch：语音与协作退化诊断（纯函数，合成输�
   ok(none.length === 0, 'metrics 里没有延迟行（还没出过字幕）→ 不报错也不崩');
 }
 
-/* ⑦ 边界：metrics 拿不到 / collab 缺失都不能炸（值守脚本自己崩掉是最糟的结局） */
+/* ⑦ ★ 2026-10-03 播报延迟（看到答案→听见开口）：与字幕同一条判据，
+ *   但**必须单独钉一组**——两组共用一个函数时，只要 base 名写错一处，
+ *   那条告警就永远不响，而另一组照常绿（坑 56 的指标版）。 */
+{
+  const st = fresh();
+  const slow = { n: 4, avg: 15000, max: 22000 };   // 本地 Qwen3-TTS 在 CPU 上的典型量级
+  const o1 = run(m({}, 0, 0, 0, null, undefined, slow), { asrEngine: 'qwen-local' }, st.counters, st);
+  const o2 = run(m({}, 0, 0, 0, null, undefined, slow), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(!has(o1, 'speech-slow'), '播报延迟超阈值第 1 轮不报（连续两轮判据对两组都生效）');
+  ok(has(o2, 'speech-slow'), '连续两轮均值超 8s → 报播报延迟退化');
+  ok(/Qwen3-TTS/.test(o2.find((a) => a.key === 'speech-slow').text),
+    '播报告警文案要给出排查方向（慢引擎抢实时播报是最常见的一种）');
+  const back = run(m({}, 0, 0, 0, null, undefined, { n: 5, avg: 1200, max: 22000 }), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(has(back, 'speak-ok'), '播报恢复也报一条');
+}
+{
+  /* 两组互不串台：字幕爆表不该报播报，反之亦然 */
+  const st = fresh();
+  const a1 = run(m({}, 0, 0, 0, { n: 9, avg: 30000, max: 40000 }, undefined, null), { asrEngine: 'qwen-local' }, st.counters, st);
+  const a2 = run(m({}, 0, 0, 0, { n: 9, avg: 30000, max: 40000 }, undefined, null), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(has(a2, 'caption-slow') && !has(a2, 'speech-slow'),
+    '只有字幕超阈值时只报字幕（两组各判各的，不共用计数器也不共用读数）');
+}
+
+/* ⑧ 边界：metrics 拿不到 / collab 缺失都不能炸（值守脚本自己崩掉是最糟的结局） */
 {
   const st = fresh();
   ok(run('', null, st.counters, st).length === 0, 'metrics 为空 → 返回空数组不抛错');

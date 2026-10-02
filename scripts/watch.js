@@ -22,7 +22,7 @@ const argOf = (name, dft) => {
 const BASE = argOf('--url', 'http://localhost:3001');
 const INTERVAL = Math.max(5, parseInt(argOf('--interval', '10'), 10)) * 1000;
 const MAX_RSS = parseInt(argOf('--max-rss', '512'), 10) * 1048576;
-const voiceState = { asrMiss: 0, tts: null, counters: {}, fallbackRounds: 0, gapRounds: 0, capSlowRounds: 0 }; // ★ 09-30f：语音链路翻转诊断的上一轮状态；counters = 计数基准；*Rounds = 各条"连续两轮才算"的退化判据
+const voiceState = { asrMiss: 0, tts: null, counters: {}, fallbackRounds: 0, gapRounds: 0, capSlowRounds: 0, speakSlowRounds: 0, bootWaitRounds: 0 }; // ★ 09-30f：语音链路翻转诊断的上一轮状态；counters = 计数基准；*Rounds = 各条"连续两轮才算"的退化判据
 const WEBHOOK = process.env.WATCH_WEBHOOK_URL || null;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;   // ★ 09-24 G8：接口门禁后必须带 token
 const AUTH_HEADERS = ADMIN_TOKEN ? { Authorization: `Bearer ${ADMIN_TOKEN}` } : {};
@@ -144,24 +144,35 @@ function diagnoseVoiceAndCollab(metricsText, collab, prev, state) {
   } else {
     state.gapRounds = 0;
   }
-  /* ④ ★ 2026-10-03 字幕延迟变差：avg 超阈值且**样本够**才判。
-   *    ▎为什么门槛里要写 n>=3：只出过 1~2 句字幕时，均值会被一句长句完全带跑，
-   *      那是统计噪声不是链路退化（同坑 53 的判据——样本太小就不要拿比例/均值下结论）。
-   *    ▎为什么还要连续 2 轮：一次网络抖动或模型冷启动会抬一轮，报出来只会让人学会忽略告警。
-   *    ▸ 阈值可用 WATCH_CAP_LAT_WARN_MS 调；默认 6000ms ≈ "静音判定 + 分段 + 转写"叠满的实测上沿。 */
-  const capN = counterOf('sfu_ai_asr_caption_count_total');   // 无 label 的 counter，走 counterOf
-  const capAvg = gaugeOf('sfu_ai_asr_caption_latency_ms', 'avg');
-  const capWarnMs = Number(process.env.WATCH_CAP_LAT_WARN_MS) || 6000;
-  if (capN >= 3 && capAvg > capWarnMs) {
-    state.capSlowRounds = (state.capSlowRounds || 0) + 1;
-    if (state.capSlowRounds === 2) {
-      out.push({ key: 'caption-slow', text: `字幕延迟均值 ${(capAvg / 1000).toFixed(1)}s（最慢 ${(gaugeOf('sfu_ai_asr_caption_latency_ms', 'max') / 1000).toFixed(1)}s，样本 ${capN} 句），超过 ${capWarnMs / 1000}s 阈值`
-        + ` —— 查：①引擎是否退回兜底（看上面 asr-engine-fallback）②asrSegmentSec 是否被配大 ③CPU 是否被本地模型占满` });
+  /* ④ ★ 2026-10-03 两条端到端延迟退化（字幕 / 播报），共用同一个判据函数。
+   *    ▎为什么抽成一个函数：两组的"样本要够 + 连续两轮 + 报出 avg/max/样本数"完全同形，
+   *      复制两份必然出现"字幕两轮、播报三轮"这种口径漂移（坑 47）。
+   *    ▎为什么播报延迟单独一条很值：它的故障形态是"**答应了却不说话**"——
+   *      历史上查过三次才查明白，而这三次都没有任何一行日志会红。
+   *    ▸ 样本 <3 不下结论：一两句时均值被单个长句完全带跑，那是噪声不是退化（坑 53）。
+   *    ▸ 连续 2 轮：一次网络抖动或模型冷启动会抬一轮，报出来只会让人学会忽略告警。 */
+  const latRule = (stateKey, okKey, base, slowKey, cnName, warnMs, hints) => {
+    const n = counterOf(`${base}_count_total`);
+    const avg = gaugeOf(base, 'avg');
+    if (n >= 3 && avg > warnMs) {
+      state[stateKey] = (state[stateKey] || 0) + 1;
+      if (state[stateKey] === 2) {
+        out.push({ key: slowKey, text: `${cnName}均值 ${(avg / 1000).toFixed(1)}s`
+          + `（最慢 ${(gaugeOf(base, 'max') / 1000).toFixed(1)}s，样本 ${n} 次），超过 ${warnMs / 1000}s 阈值`
+          + ` —— 查：${hints}` });
+      }
+    } else {
+      if ((state[stateKey] || 0) >= 2) out.push({ key: okKey, text: `${cnName}恢复正常（均值 ${(avg / 1000).toFixed(1)}s）` });
+      state[stateKey] = 0;
     }
-  } else {
-    if ((state.capSlowRounds || 0) >= 2) out.push({ key: 'caption-ok', text: `字幕延迟恢复正常（均值 ${(capAvg / 1000).toFixed(1)}s）` });
-    state.capSlowRounds = 0;
-  }
+  };
+  const CAP_WARN_MS = Math.max(1000, Number(process.env.WATCH_CAP_LAT_WARN_MS) || 6000);
+  const SPK_WARN_MS = Math.max(1000, Number(process.env.WATCH_SPEAK_LAT_WARN_MS) || 8000);
+  latRule('capSlowRounds', 'caption-ok', 'sfu_ai_asr_caption_latency_ms', 'caption-slow', '字幕延迟（说完→上屏）',
+    CAP_WARN_MS, '①引擎是否退回兜底（看 asr-engine-* 那条）②asrSegmentSec 是否被配大 ③CPU 是否被本地模型占满');
+  latRule('speakSlowRounds', 'speak-ok', 'sfu_ai_speech_latency_ms', 'speech-slow', '播报延迟（看到答案→听见开口）',
+    SPK_WARN_MS, '①Edge 神经语音端点是否不可达（sfu_ai_tts_enabled）②本地 Qwen3-TTS 是否在 CPU 上合成（RTF>1，一句 ~12s）'
+    + '③是否 aiTtsLocalWait=1 让慢引擎抢了实时播报 ④客户端是否根本没在播（自动播放策略拦截）');
   return out;
 }
 
