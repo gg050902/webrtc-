@@ -608,6 +608,11 @@ const MIME = {
  * ▎配额可用 config.json（fileMaxMb / fileRoomMb / fileMaxCount）或环境变量
  *   （FILE_MAX_MB / FILE_ROOM_MAX_MB / FILE_MAX_COUNT）覆盖；显式配 0 = 关掉上传功能。 */
 const Files = require('./files');
+/* ★ 2026-10-10（B4「只有正向没有反向」审计）发言时长 → 占比的算法搬进纯函数模块。
+ *   ▎为什么值得单开一个文件：这段逻辑出错时不崩、不报错，只让界面那根细条的数字不对；
+ *   而"分母算上了已经离开的人"这个形状，内联在定时器里永远测不到（穷举断言需要纯函数，
+ *   同 `nets.js` / `rdDecideFps` 那条纪律）。 */
+const Talk = require('./talk');
 const FILE_LIMITS = Files.resolveLimits(CONFIG);
 /* 启动清扫：收走"上一辈子"留下的上传半成品（进程被杀/断电/磁盘满都会留下 .part）。
  * ▎为什么放在启动而不是定时：这些文件只可能来自**已经死掉的**那次上传，
@@ -1368,6 +1373,14 @@ async function snapshotRooms() {
         sharing: !!(m.state && m.state.sharing),
         hand: !!(m.state && m.state.hand),
         talkSec: Math.round(room.talk.get(m.id) || 0), // ★ 发言时长统计
+        /* ★ 2026-10-10（B4）把两张"只有正向没有反向"的台账的**条数**交出来：
+         *   talkEntries = 这间房的发言台账里有多少条（含已离开但还没被 disconnect 收走的），
+         *   dataConsumerCount = 这个人订阅的数据通道条数（订阅只 set、退订/断开才 delete）。
+         *   ▸ 为什么要暴露在快照里而不是只改代码：这两处一旦哪天又退回"只写不删"，
+         *     回归里那条 `talkEntries ≤ 成员数` 的断言会当场红；
+         *     不暴露就只能靠读代码信任我（坑 76：机制生效与否要看得见）。 */
+        talkEntries: room.talk.size,
+        dataConsumerCount: (m.dataConsumers && m.dataConsumers.size) || 0,
         consumers: m.consumers.size,                   // 他订阅了几路
         transports: (m.sendTransport ? 1 : 0) + (m.recvTransport ? 1 : 0),
       });
@@ -1796,6 +1809,16 @@ function buildMetrics(snap) {
   }
   help('sfu_workers', 'gauge', 'mediasoup Worker processes in the pool');
   L.push(`sfu_workers ${workers.length}`);
+  /* ★ B4（2026-10-10）正向/反向配对审计：登录票是**进程级、跨连接**的状态，
+   *   而它此前没有任何撤销路径会走"过期"这一支 —— 只有用户主动退出才删。
+   *   ▎为什么这一格值得单独开：票不删的后果不是报错，是"内存里一直有一张还能用的票"，
+   *     它在 /api/rooms 与 room-state 里都看不见（那些是房间投影），运维从任何界面都发现不了。
+   *     现在它有一个数，而清扫器（AUTH_SWEEP_MS）有没有真的在跑，看这个数会不会单调涨就知道了
+   *     —— "配了清扫器"与"清扫器在跑"是两件事（坑 76 同一条纪律）。
+   *   ▸ 只报此刻在册的总数，不报 per-user：那会把账号清单从观测面泄漏出去，而多账号漂移
+   *     这件事按总数一样能看出来（总数只增不减 = 撤销没生效）。 */
+  help('sfu_auth_tokens', 'gauge', 'Login tokens currently held in memory (a sweeper drops expired ones)');
+  L.push(`sfu_auth_tokens ${authTokens.size}`);
   /* ★ K1（2026-10-09）跨网：媒体端口形态是一条运维事实，得能从 /metrics 读到
    *   （watch/告警不必去猜配置——0 = 随机端口段且只有 UDP，>0 = 全服务器共用这个 UDP+TCP 号）。
    *   取的是 rtcServers.size 而不是配置值：端口被占退回随机段时，这里必须显示 0。 */
@@ -2517,6 +2540,24 @@ setInterval(() => {
  *   auth-refresh = 显式续期信令（前端定时调，长期会话不中断）。 */
 const AUTH_TTL_MS = Number(process.env.AUTH_TTL_MS) || 24 * 3600 * 1000;
 const authTokens = new Map(); // token -> { username, role, expiresAt }
+/* ★ 2026-10-10（B4）票也要有清扫器——原来只有"过期后懒删"（auth-verify 命中才删）。
+ *   ▎为什么这算缺陷而不是风格：一个登录过就不再回来的客户端会留下一条永久条目，
+ *   而 `rateBuckets`（同一份文件里、同一类"外部可写内存"）早就有 10 分钟一轮的清扫器
+ *   ——**同项目同一件事两种做法**，被漏掉的那个通常是最不像缺陷的那个（坑 57 的半迁移形状）。
+ *   ▸ 只在票**自然过期**时删，不碰仍然活跃的：滑动续期让活跃会话一直有效（G6-① 的语义）。
+ *   ▸ unref() 是不给测试和优雅退出添乱：长跑里没有别的活儿时它不该吊住进程。 */
+const AUTH_SWEEP_MS = Math.max(2000, Number(process.env.AUTH_SWEEP_MS)
+  /* 默认跟着 TTL 走（但不快于 2s、不快过 10 分钟）：回归里用 `AUTH_TTL_MS=2000` 开短 TTL 时，
+   * 清扫器也必须真的扫得动——否则"有清扫器但 10 分钟才扫一次"在这套测试里永远不会被跑到（坑 83）。 */
+  || Math.min(10 * 60000, Math.max(2000, AUTH_TTL_MS / 2)));
+setInterval(() => {
+  const now = Date.now();
+  let dropped = 0;
+  for (const [token, t] of authTokens) {
+    if (now > (t && t.expiresAt ? t.expiresAt : 0)) { authTokens.delete(token); dropped += 1; }
+  }
+  if (dropped) console.log(`🧹 清掉 ${dropped} 张过期登录票（当前在册 ${authTokens.size}）`);
+}, AUTH_SWEEP_MS).unref();
 
 /* ★ 09-29 G6-③ 生产化 Next：密码强度策略。
  * ▎只管**新注册**——已注册用户的登录不受影响（老密码继续能用；将来的"平滑重哈希"
@@ -6213,15 +6254,12 @@ function startNetLevelBroadcaster(roomNumber) {
   //   前端把它画成成员行下面的一根细占比条——"谁主导了这场会"一眼可见。
   room.talkTimer = setInterval(() => {
     if (!room.members.size) return;
-    const total = [...room.talk.values()].reduce((a, b) => a + b, 0);
-    const stats = [...room.members].map((m) => {
-      const sec = Math.round(room.talk.get(m.id) || 0);
-      return {
-        id: m.id,
-        sec,
-        share: total > 0 ? Math.round((sec / total) * 100) : 0,
-      };
-    });
+    /* ★ 2026-10-10（B4）算法搬进 `sfu/talk.js` 的纯函数（理由见那个文件的头部：
+     *   原来这里的分母是 `[...room.talk.values()]` 全加，而 `room.talk` 只有 set 没有 delete
+     *   ⇒ 一个人重连三次，分母里就留着三份他的历史秒数，**还在场的人的占比条被永久稀释**。
+     *   现在：分母只算还在场的人（这一处修"报数对不对"），disconnect 里删账（那一处修"内存涨不涨"），
+     *   两件事分开做、各自有断言（`talkShares` 的穷举单测 + 下面两条接线红线）。 */
+    const stats = Talk.talkShares(room.talk, [...room.members].map((m) => m.id));
     const json = JSON.stringify(stats);
     if (json === room.lastTalkStatsJson) return; // 没变化不打扰
     room.lastTalkStatsJson = json;
@@ -6256,6 +6294,45 @@ async function getOrCreateRouter(roomNumber) {
   return room.router;
 }
 
+/* ★ 2026-10-10（B4）把"订阅了某个已关闭频道"的数据消费者从服务器上收掉。
+ *   ▸ 为什么要主动收而不是等 mediasoup 级联：级联确实会关掉对端消费者（客户端会收到 closed），
+ *     但**服务器的台账**（每个 socket 的 `dataConsumers`）不会因此变短，
+ *     而它是"谁订阅了什么"的唯一回答来源；不清就是一张会越长越假的表（同一形状见 talk 台账）。
+ *   ▸ 只收"订阅了这个 dataProducerId 的那些"：一个人可能同时订着好几个人的聊天/白板频道，
+ *     整体清空会把还活着的那几路的账一起抹掉（那是另一种"清理动作比它看起来更广泛"，坑 66/68）。 */
+function closeDataConsumersOf(roomNumber, dataProducerId) {
+  const room = rooms.get(roomNumber);
+  if (!room) return 0;
+  let closed = 0;
+  for (const m of room.members) {
+    if (!m.dataConsumers) continue;
+    for (const [id, dc] of [...m.dataConsumers]) {
+      const mine = dc.dataProducerId === dataProducerId;
+      const alreadyDead = dc.closed === true;
+      if (!mine && !alreadyDead) continue;
+      if (!alreadyDead) { try { dc.close(); } catch (e) { /* 已随 Transport 关闭 */ } }
+      m.dataConsumers.delete(id);
+      if (mine) closed += 1;
+    }
+  }
+  return closed;
+}
+
+/* ★ 2026-10-10（B4）房间销毁 = 这场会的录制也收工。原来这条路上 ffmpeg 会一直挂着：
+ *   Router 关闭只是断了它的 RTP 来源，它自己不会判断"上游没了"，于是收工回调（补 trailer）
+ *   永远不跑、录制进程与 27000 段端口一直被占。放在 rooms.delete 之前，是为了让它还能
+ *   按 roomNumber 找到这几路（之后台账就没了）。 */
+function stopRoomRecordings(roomNumber, reason) {
+  let stopped = 0;
+  for (const rec of [...recordSessions.values()]) {
+    if (rec.roomNumber !== roomNumber) continue;
+    try { rec.stop(); } catch (e) { /* 已退出 */ }
+    stopped += 1;
+  }
+  if (stopped) logEvent('info', 'recordings-stopped', { roomNumber, reason, stopped });
+  return stopped;
+}
+
 /* ★ D+4：真正销毁一个房间（Router/定时器/台账全清）。
  *   之前这段逻辑内联在 disconnect 里"人走光立即执行"；
  *   现在抽成函数，供"空房 TTL 到期"与"显式清理"共用。
@@ -6273,14 +6350,26 @@ function destroyRoom(roomNumber, reason) {
   for (const [key, timer] of pendingRoomActionAcks) {
     if (key.startsWith(`${roomNumber}|`)) { clearTimeout(timer); pendingRoomActionAcks.delete(key); }
   }
-  // ★ N2：房间销毁时 bot 若在场 → 终稿纪要（异步，读的账本都在文件/闭包里，不依赖 room）
+  /* ★ N2：房间销毁时 bot 若在场 → 终稿纪要（异步，读的账本都在文件/闭包里，不依赖 room） */
   if (room.aiBot) {
     if (room.minutesTimer) { clearInterval(room.minutesTimer); room.minutesTimer = null; }
     if (room.warmTimer) { clearInterval(room.warmTimer); room.warmTimer = null; }
     buildMinutes(roomNumber, { type: 'final' }).catch(() => {});
   }
+  /* ★ 2026-10-10（B4）房间销毁 = 这场会的录制也收工。原来这条路上 ffmpeg 会一直挂着：
+   *   Router 关闭只是断了它的 RTP 来源，它自己不会判断"上游没了"，于是收工回调（补 trailer）
+   *   永远不跑、录制进程与 27000 段端口一直被占。放在 rooms.delete 之前，是为了让它还能
+   *   按 roomNumber 找到这几路（之后台账就没了）。 */
+  stopRoomRecordings(roomNumber, reason || 'room-destroyed');
   rooms.delete(roomNumber);
-  remoteCtl.delete(roomNumber);
+  /* ★ 2026-10-10（B4）这里原来是裸 `remoteCtl.delete(roomNumber)`——**绕过了 clearRemoteCtl**，
+   *   于是 A6 那把"限时授权"的 `ctl.timer` 不会被清，两端也收不到 `remote-ended`。
+   *   查的时候确认过：现存的三条销毁路径（TTL 到期 / 代理离线 / 显式清理）在此之前都先走了
+   *   disconnect 里的 `clearRemoteCtl(..., 'peer-left')`，所以今天还没有活的用户可见故障——
+   *   但"裸删 Map 而不走那个唯一的收口函数"正是将来出错的地方：谁给 destroyRoom 加一个新调用点
+   *   （管理员强制散会、崩溃恢复……），幽灵定时器与不广播就立刻变成真缺陷（坑 20 当年立的
+   *   三条路径都要清的纪律）。换成调用收口函数，成本一行，换的是**结构上不可能漏**。 */
+  clearRemoteCtl(roomNumber, reason || 'room-destroyed');
   /* ★ 2026-10-07 第 51 步：房间销毁 = 这场会的共享文件一起清掉。
    * ▎为什么删而不是留：它们是"**这场会**的共享材料"，不是网盘。留着有两个真实的坏处——
    *   ① 房间号会回收复用，下一场会打开面板可能看到上一场会的文件（隐私）；
@@ -8114,6 +8203,13 @@ io.on('connection', (socket) => {
     if (!dp) return fail(callback, '找不到这个 DataProducer');
     dp.close();
     socket.dataProducers.delete(dataProducerId);
+    /* ★ 2026-10-10（B4）关掉一个频道 = **别人那边订阅它的 DataConsumer 也要收**。
+     *   ▎原来这里只发了一条 `data-producer-closed` 通知，服务器自己的 `dataConsumers` 台账
+     *     从不 delete：mediasoup 会级联关掉对端消费者（客户端那边会收到 closed），
+     *     但服务器这张表继续留着死对象——而它是"谁订阅了什么"的唯一回答来源，
+     *     留着就意味着下一次按表办事时对着一个已关闭的 consumer 动手（disconnect 那条同理，已一并补）。
+     *   ▸ 只收"订阅了这个 dataProducer 的那些"，不整体清空（一个人可能同时订着好几个人的白板/聊天频道）。 */
+    closeDataConsumersOf(socket.roomNumber, dataProducerId);
     // 通知大家退订（和 producer-closed 同理）
     socket.to(socket.roomNumber).emit('data-producer-closed', { dataProducerId, from: socket.id });
     ok(callback, {});
@@ -8222,10 +8318,28 @@ io.on('connection', (socket) => {
           }
         }
 
+        /* ★ 2026-10-10（B4）他开的数据频道死了 = 别人订阅它的那些 DataConsumer 也要从台账里收掉。
+         *   放在 Transport 关闭**之前**做：那时 dc 还活着，能按 dataProducerId 精确匹配；
+         *   放到之后就只能靠 `dc.closed` 标记，而"为什么这条被删"就从读代码变成猜（坑 76）。 */
+        for (const dpId of [...socket.dataProducers.keys()]) closeDataConsumersOf(socket.roomNumber, dpId);
         // ★ SFU 特有：关掉 Transport 会级联关闭它上面的所有 Producer/Consumer，
         //   mediasoup 自动释放。手动逐条关也可以，但 transport.close() 一条就够
         if (socket.sendTransport) socket.sendTransport.close();
         if (socket.recvTransport) socket.recvTransport.close();
+        /* ★ 2026-10-10（B4「只有正向没有反向」审计）数据消费者也要收走。
+         *   ▸ 原来只有 `set`（⑤d 订阅处）没有 `delete`：Transport 一关，mediasoup 那边确实级联关闭了，
+         *     但服务器这张表一直留着已经死掉的对象——它同时是"他订阅了哪些"的**回答来源**，
+         *     留着幽灵条目意味着下一次按表办事（退订/统计）会对着一个 closed 的 consumer 动手。 */
+        for (const dc of socket.dataConsumers.values()) { try { dc.close(); } catch (e) { /* 已随 Transport 关闭 */ } }
+        socket.dataConsumers.clear();
+        /* ★ 2026-10-10 同一处审计抓到的**用户可见**缺陷：发言台账 `room.talk` 从来只有 set 没有 delete。
+         *   后果不是内存那么温和——talk-stats 的分母原本是 `[...room.talk.values()]` 全加起来，
+         *   而 mediasoup 的 socketId **每次重连都换**：一个人掉线重连三次，
+         *   分母里就留着三份"他过去说过的秒数"，于是剩下所有人的发言占比条被永久稀释
+         *   （而占比条正是"谁主导了这场会"那一格）。
+         *   ▸ 修法两件一起做（只做这一件不够）：这里删掉离开者的账 + 分母只算"还在场的人"
+         *     （见 talkShares 的纯函数；重连那一瞬间新旧 id 交替时，靠分母口径也不会算错）。 */
+        if (room.talk) room.talk.delete(socket.id);
 
         socket.to(socket.roomNumber).emit('peer-left', { id: socket.id });
 

@@ -599,10 +599,25 @@ function giveUpRoom(why) {
      「创建房间」就是原号续开（服务器会从字幕账本找回这一场的记忆）。 */
   resumeRoomNumber = gone || null;
   if (gone) {
-    try { localStorage.setItem('sfuLastRoom', gone); } catch (e) { /* 无痕模式 */ }
+    /* ★ 2026-10-10（B4）这里原来还写了一份 `localStorage.setItem('sfuLastRoom', gone)`——
+     *   全仓库**没有任何一处读它**（grep 过：只有这一行）。"写了没人读的状态"不是冗余而是隐患：
+     *   它看起来像"我们记住了死掉的房号"，于是下一个人会去信任它、或者反过来不敢删这套机制，
+     *   而真正生效的那条路是上面两行的内存变量 + 输入框预填。删。 */
     if (roomInput && !roomInput.value.trim()) roomInput.value = gone;
   }
   try { resetMediaState(); } catch (e) { /* 媒体本来就没起来过 */ }
+  /* ★ 2026-10-10（B4 反向配对）房间作废，这一场挂着的"待回落朗读账"也跟着作废。
+   *   ▎为什么这是缺陷而不是保险：每一笔 pendingServerTts 都配了一根 20 秒的客户端保险丝
+   *     （armServerTtsBackstop → fallBackToBrowserTts），它不认"房间还在不在"，只认"这条账还在不在"。
+   *     服务器重启 → room-not-found → 人已经退回加入页，而那根 20s 的钟还在走：
+   *     到点它就**用浏览器朗读把死房间里那条答案念出来**。用户在首页听见 AI 说话，
+   *     而界面上一个字都没说这是谁的——这正是"只有正向（挂账）没有反向（销账）"的形状。
+   *   ▸ 销账就够，不需要存定时器句柄：保险丝的动作前会先问"这条账还在不在"（见那行注释），
+   *     账没了它自然不响——这一条既有设计正是为了让撤销便宜。
+   *   ▸ 顺带把浏览器那一轨与正在播的服务端 MP3 一起停掉（hushAiSpeech 的收口，
+   *     它内部按 SPEECH_OK 自我保护，所以这里不需要再加判据）。 */
+  try { hushAiSpeech(); } catch (e) { /* 朗读本来就没起来过 */ }
+  pendingServerTts.clear();
   /* ★ 2026-10-06 房间没了，那张"邀请面板"就跟着作废：上面那行只把徽标藏了，
    *   面板是独立浮层、不会跟着藏——留着就是一张写着死房号的邀请卡，
    *   复制出去对方必然进不来。凡"链接依赖在房里"的界面，都要走这条作废路径。 */
@@ -1240,12 +1255,29 @@ function applyTileVolume(video, want) {
   video.volume = 1;
   return v;
 }
-const VOL_STORE_KEY = 'sfu.tileVol.v1'; // 按成员 id 记（谁吵谁安静，换场会还认得）
+/* ★ 2026-10-10（B4）这一行的注释原来写的是"谁吵谁安静，换场会还认得"——那是**过期声明**（坑 82）：
+ *   键是 socket.id，而 socket.id 每次连接都换（同一场会里对方重连一次就变），
+ *   所以这份记录跨不了一次重连，更跨不了场次。它真正的作用范围只有一件事：
+ *   同一场会里我把某个人调到 30%，他换个 producer（关摄像头再开）时格子重建，音量不该弹回 100%。
+ * ▸ 既然天然只会攒没人再读的条目，就得有上限——VOL_STORE_MAX 条按"最近调过"保留。
+ *   ▎两个细节都不是可有可无：① 先 delete 再 set，让"最近调过的键"排到对象末尾
+ *     （JS 对象里**已存在的键**改值不会挪位置，直接赋值会让最老那条永远赖在最前面被当成新的）；
+ *     ② socket.io 的 id 永远以字母/下划线开头，所以它不会被当成整数键而按数字顺序提前——
+ *     这条前提是"插入顺序≈最近顺序"成立的条件，换 id 方案时要重新检查（写在这是为了下次能查）。 */
+const VOL_STORE_KEY = 'sfu.tileVol.v1';
+const VOL_STORE_MAX = 60;
 function storedVolumes() {
   try { return JSON.parse(localStorage.getItem(VOL_STORE_KEY) || '{}') || {}; } catch (e) { return {}; }
 }
 function rememberVolume(id, v) {
-  try { const m = storedVolumes(); m[id] = Math.round(v * 100) / 100; localStorage.setItem(VOL_STORE_KEY, JSON.stringify(m)); } catch (e) { /* 隐私模式写不进就算了 */ }
+  try {
+    const m = storedVolumes();
+    delete m[id];                       // 见上面①：改值不挪位，先删再写才轮到末尾
+    m[id] = Math.round(v * 100) / 100;
+    const keys = Object.keys(m);
+    for (let i = 0; i < keys.length - VOL_STORE_MAX; i++) delete m[keys[i]];   // 剪掉最久没碰的那头
+    localStorage.setItem(VOL_STORE_KEY, JSON.stringify(m));
+  } catch (e) { /* 隐私模式写不进就算了 */ }
 }
 function addVolumeCtl(box, tile, remoteId) {
   if (box.dataset.volCtl) {
@@ -2664,7 +2696,6 @@ socket.on('remote-request', ({ from }) => {
   log(`🖱️ 成员 ${shortId(from)} 想控制你的屏幕...`);
   pendingFrom = from;
   remoteAskText.textContent = `成员 ${shortId(from)} 想远程控制你的屏幕，是否允许？`;
-  remoteAskText.textContent = `成员 ${shortId(from)} 想远程控制你的屏幕，是否允许？`;
   remoteAskBox.classList.remove('hidden');
 });
 
@@ -2709,6 +2740,13 @@ remoteBlockBtn.addEventListener('click', () => {
   log(`🚫 已把成员 ${shortId(who)} 加入黑名单，之后他的申请会被自动拒绝`);
   auditPush('授权', `将 ${shortId(who)} 加入黑名单并拒绝`);
   showToast(`🚫 不再允许成员 ${shortId(who)} 申请控制`, 'info');
+  /* ★ 2026-10-10（B4 反向配对）拉黑这个动作要**看得见**，而且要能撤销。
+   *   名单原先只进不出：`blockedPeers.add()` 之后全页面没有任何一处能 `delete()`，
+   *   而"我拉黑了 TA"与"TA 现在还在房里、我改主意了"之间没有桥——
+   *   唯一的"解除"是刷新整页（连带丢掉这场会的其它一切），那不叫撤销。
+   *   ▸ 这里重画一次成员列表，让那颗「解禁」立刻出现（名单是本地状态，服务器不知道，
+   *     所以只能由这一侧主动重绘——不重绘就要等下一次 room-state，可能永远不来）。 */
+  renderMembers(lastMembers);
   remoteAskBox.classList.add('hidden');
   pendingFrom = null;
 });
@@ -4903,6 +4941,28 @@ function renderMembers(members) {
     if (m.caption) addBadge(ICONS.cc, '字幕开启中'); // ★ 09-17b：实时字幕状态（member-state 白名单）
 
     if (!isMe) {
+      /* ★ 2026-10-10（B4 反向配对）「解禁」——拉黑要有反面。
+       *   ▎原来这条路是单向门：`blockedPeers.add(who)` 之后全文件没有任何一处 delete，
+       *     而这把锁的键是 socket.id——对方重连一次 id 就变，于是"永久拉黑"实际上只到
+       *     对方下次连接为止，而"这一场想放过 TA"却办不到。两个方向都不对：
+       *     承诺比能力强（说不解禁却会自动失效）与能力比承诺强一样糟。
+       *   ▸ 为什么挂在成员行而不是授权卡片：卡片只在有人申请时才弹，
+       *     而拉黑之后那个人**不再弹卡**（这正是拉黑的效果），
+       *     于是"撤销"只能落在那个人的名字上——他还在房里，名字一直看得见。 */
+      if (blockedPeers.has(m.id)) {
+        const unBtn = document.createElement('button');
+        unBtn.className = 'mini m-unblock';
+        unBtn.textContent = '解禁';
+        unBtn.title = `TA 在你本地黑名单里（申请控制会被自动拒绝）——点一下解除`;
+        unBtn.addEventListener('click', () => {
+          blockedPeers.delete(m.id);
+          log(`✅ 已把成员 ${shortId(m.id)} 移出本地黑名单，之后 TA 可以申请控制`);
+          auditPush('授权', `将 ${shortId(m.id)} 移出黑名单`);
+          showToast(`已解除对成员 ${shortId(m.id)} 的黑名单`, 'info');
+          renderMembers(lastMembers);   // 按钮就地消失（重建式渲染，不留半个状态）
+        });
+        row.appendChild(unBtn);
+      }
       // ★ D+2（09-15）：服务器侧录制 —— 点 ⏺ 开始录"TA 的摄像头+麦克风"（服务器 ffmpeg 落盘），
       //   再点 ⏹ 停止；产物经 /recordings/<file> 下载。服务器没装 ffmpeg 会弹明确提示。
       const recBtn = document.createElement('button');

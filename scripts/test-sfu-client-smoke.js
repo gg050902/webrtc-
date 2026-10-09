@@ -2617,6 +2617,55 @@ const emit = (ev, payload) => {
     /function giveUpRoom\(why\)/.test(clientSrc) &&
     /if \(myRoom\) \{[\s\S]{0,300}?giveUpRoom\(/.test(clientSrc) &&
     /myRoom = null;/.test(clientSrc));
+
+  /* ---- ★ 2026-10-10 B4「只有正向没有反向」：客户端三处撤销 + 一条结构红线 ----
+   * ▎这一组的形状与第 52 步（退出登录）完全一样：动作写得很完整，反面一行没写。
+   *   三条都是**行为断言**（真的调状态、真的读回来），不是"源码里有那行字"——
+   *   源码断言挡不住"写了但没接到正确位置"（坑 41/56 那一族已经栽过太多次）。 */
+  {
+    /* ① 拉黑要有解禁。名单键是 socket.id，而 blockedPeers 原先只有 add 没有 delete ⇒
+     *   单向门；同时"拉黑之后那一行的样子"也从来没人重绘过（拉黑的是本地状态，
+     *   服务器不知道，不会广播 room-state，所以不主动重画就一直不出现）。 */
+    vm.runInContext('blockedPeers.add("peer-block-me")', ctx);
+    emit('room-state', {
+      roomNumber: '123456',
+      members: [{ id: socketStub.id, owner: true }, { id: 'peer-block-me', name: '被拉黑的' }],
+      hostId: null, controllerId: null, expiresAt: null,
+    });
+    const rows = (documentStub.getElementById('memberList').children || []).filter((r) => r.dataset && r.dataset.id === 'peer-block-me');
+    const unBtn = rows.length && (rows[0].children || []).find((c) => String(c.className).includes('m-unblock'));
+    ok('B4 ★ 拉黑之后成员行出现「解禁」（单向门的第一半：让撤销看得见）',
+      !!unBtn, `rows=${rows.length} btn=${unBtn && unBtn.textContent}`);
+    if (unBtn) unBtn.click();
+    ok('B4 ★ 点「解禁」真的把 TA 从名单里删掉（不是只藏了按钮）',
+      vm.runInContext('blockedPeers.has("peer-block-me")', ctx) === false);
+    /* ▸ 判据按"那颗按钮的处理器函数体"取，而不是按"两行之间隔了多少字符"：
+     *   中间夹的教学注释长度会变，用窗口长度当判据迟早红成一次假故障（坑 96 那条"量具跟自己赛跑"的文字版）。 */
+    const blockHandler = (clientSrc.match(/remoteBlockBtn\.addEventListener\('click', \(\) => \{[\s\S]*?\n\}\);/) || [''])[0];
+    ok('B4 拉黑这条动作路径会主动重绘成员列表（本地状态服务器不广播，不重绘就一直不出现）',
+      /blockedPeers\.add\(who\)/.test(blockHandler) && /renderMembers\(lastMembers\)/.test(blockHandler),
+      `handlerLen=${blockHandler.length}`);
+    /* ② 房间作废要把挂着的"待回落朗读账"一起销掉。
+     *   每笔账都配了一根 20s 的客户端保险丝，而它只认"账在不在"、不认"房间在不在"——
+     *   所以不销账的后果是：人已经退回加入页，20 秒后 AI 在首页把死房间里那条答案念出来。 */
+    vm.runInContext('myRoom = "123456"; pendingServerTts.set(Date.now(), "死房间里的一条答案");', ctx);
+    emit('room-not-found', { roomNumber: '123456' });
+    ok('B4 ★ 房间作废时挂着的回落朗读账被清空（否则 20s 保险丝会在加入页朗读死房间的答案）',
+      vm.runInContext('pendingServerTts.size', ctx) === 0);
+    /* ③ 每路音量那本 localStorage 账要有上限：键是 socket.id，而 socket.id 每次连接都换，
+     *   所以它天然只会攒"再也不会被读到的条目"——原来那句注释甚至声称"换场会还认得"（过期声明）。 */
+    vm.runInContext('for (let i = 0; i < 80; i++) rememberVolume("peer" + i, 0.5);', ctx);
+    ok('B4 音量账有上限（键是每次连接都换的 socket.id，不剪就只涨不清）',
+      vm.runInContext('Object.keys(storedVolumes()).length', ctx) <= 60,
+      `条数=${vm.runInContext('Object.keys(storedVolumes()).length', ctx)}`);
+    /* ④ 结构红线：不许再有"写了没人读"的存储键。
+     *   `sfuLastRoom` 就是这么活下来的——一行 setItem，全仓库零个读者；
+     *   它真正的问题是**看起来像**一个机制（下一个人会以为死房号被记住了，于是去依赖它）。
+     *   ▸ 判据跑在**剥掉块注释**的源码上：我在原地留的那段教训注释里就写着这个键名，
+     *     不剥注释的话这条红线会被自己的教训判红（坑 103 那条"注释也会打脸断言"的第三次应验）。 */
+    ok('B4 结构红线：client.js 的代码里不许出现只写不读的 sfuLastRoom（本轮清掉的死键）',
+      !/sfuLastRoom/.test(clientSrc.replace(/\/\*[\s\S]*?\*\//g, '')));
+  }
   /* ---- ★ 2026-10-02 首页 hero 化（第 35 步 + style.css 第 28 节）----
    * ▎这一屏改的是"用户第一眼"，所以断言盯三件最容易坏的事：
    *   ① **id 契约**：打字机与胶囊是新东西，但 pjEnterBtn/pjFxBtn 这些老 id 一旦被"顺手改名"，
@@ -3995,6 +4044,71 @@ const emit = (ev, payload) => {
       ok('52 ★ 结构红线：HTML 注释里不许出现 CSS 的收尾序列（写它=忘了闭合，整段页面会被吞进注释）',
         badClose === 0, `${bodies.length} 条注释里 ${badClose} 条含那个序列`);
     }
+  }
+
+  /* ★ 2026-10-10（B4「只有正向没有反向」审计）两张新账 + 三条结构红线。
+   * ▎为什么这一批要写成红线而不是"我记得删了"：本轮改的四处撤销（发言账/数据通道订阅/
+   *   房间录制会话/登录票）全都长在**同一条形状**上——正向写得很完整，反向只在"用户主动取消"
+   *   那一条路径上做了，其余三条路径（断开/换 producer/房间销毁）各漏各的。
+   *   这类缺陷的症状永远是"某个人莫名算不进比例""频道早关了台账还在"，而它**不报错**，
+   *   只有把"必须有人删这一行"变成机器判据，下一个新调用点才会被拦下来（坑 40：纪律会被忘掉）。 */
+  {
+    const Talk = require(path.join(__dirname, '..', 'sfu', 'talk.js'));
+    /* ① 分母只算在场的人：幽灵条目（已离开却没被清掉的 id）不许稀释剩下所有人的占比。
+     *    这正是这条链原来的坏法——talk 表 5 条而成员 3 人时，在场三人各 20% 会被报成 12%。 */
+    const t1 = Talk.talkShares(new Map([['a', 60], ['b', 60], ['c', 60], ['ghost1', 60], ['ghost2', 60]]), ['a', 'b', 'c']);
+    ok('B4 发言占比：分母只算在场成员（幽灵条目不许把每个人的占比稀释下去）',
+      t1.length === 3 && t1.every((r) => r.share === 33), JSON.stringify(t1));
+    /* ② 没说过话的人在场上 ⇒ 仍然要出现一条 0（前端按人画格子；漏了这个人就是"名单上没他"）。 */
+    const t2 = Talk.talkShares(new Map([['a', 30]]), ['a', 'b']);
+    ok('B4 发言占比：在场但没说话的人有一条 0，而不是从名单里消失',
+      t2.length === 2 && t2.some((r) => r.id === 'b' && r.share === 0), JSON.stringify(t2));
+    /* ③ 没人说话 / 账本为空 / 账本不是 Map ⇒ 全 0，**不许出 NaN**。
+     *    NaN 进了 room-talk-stats 会一路画成一条宽度 NaN 的进度条（CSS 静默丢掉样式，界面表现为"格子塌了"）。 */
+    ok('B4 发言占比：total=0 与空账本都给全 0（NaN 进广播会把成员行的占比条整个弄塌）',
+      Talk.talkShares(new Map(), ['a', 'b']).every((r) => r.share === 0)
+      && Talk.talkShares(null, ['a']).every((r) => r.share === 0)
+      && Talk.talkShares({}, ['a']).every((r) => r.share === 0));
+    /* ④ 排序稳定 + 不改动入参：同一份账本两次调用必须给同样顺序（服务器"有变化才广播"
+     *    靠的是 JSON 比对；顺序漂一次就多发一整轮广播，而面板会以为"有人在说话"）。 */
+    const src = new Map([['a', 5], ['b', 40], ['c', 40]]);
+    const kBefore = [...src.keys()].join(',');
+    const r1 = Talk.talkShares(src, ['a', 'b', 'c']);
+    const r2 = Talk.talkShares(src, ['a', 'b', 'c']);
+    ok('B4 发言占比：同输入同输出（顺序漂 = 广播多一轮）且不写回账本',
+      JSON.stringify(r1) === JSON.stringify(r2) && [...src.keys()].join(',') === kBefore && src.get('a') === 5,
+      JSON.stringify(r1));
+    /* ⑤ 负数与脏值按 0 处理：AudioLevelObserver 偶发给负秒数（时钟回拨/进程重启）时，
+     *    一个负的条目会把总数压小、让别人占比超过 100%。 */
+    const t5 = Talk.talkShares(new Map([['a', -100], ['b', 50], ['c', NaN]]), ['a', 'b', 'c']);
+    ok('B4 发言占比：负值/NaN 当 0（否则总时长被压小、别人占比会超过 100%）',
+      t5.find((r) => r.id === 'b').share === 100 && t5.find((r) => r.id === 'a').share === 0
+      && t5.find((r) => r.id === 'c').share === 0, JSON.stringify(t5));
+  }
+  {
+    const srvB4Raw = fs.readFileSync(path.join(__dirname, '..', 'sfu', 'server.js'), 'utf8');
+    /* ▎判据跑在**剥掉块注释**的源码上，理由与 CSS 那组同一条（本轮第一次跑就撞上）：
+     *   我在 destroyRoom 里留着"这里原来是裸 remoteCtl.delete"的历史说明，
+     *   而未剥注释的版本把那句**注释**读成了一次调用 ⇒ 一条正确的代码被判红。
+     *   反过来也一样成立：被注释掉的清理调用不该算"写了"（坑 76：机制在、从不生效）。
+     *   留着历史说明的注释是资产，不该被断言惩罚——所以要惩罚的是代码，不是文字。 */
+    const srvB4 = srvB4Raw.replace(/\/\*[\s\S]*?\*\//g, '');
+    /* ① destroyRoom 必须走两个收口函数，而不是裸 delete 那张表。
+     *    ▸ 现存三条路径都先经过 disconnect 的 clearRemoteCtl，所以这**不是一条活缺陷**（我先证伪过）；
+     *      但它值一条红线：将来谁加第四条销毁路径（比如管理员强制散会），
+     *      裸 delete 会留下 ffmpeg 孤儿进程与 recordSessions 幽灵条目，而界面看起来"房间没了"。 */
+    const dz = (srvB4.match(/function destroyRoom[\s\S]*?\n}/) || [''])[0];
+    ok('B4 结构红线：destroyRoom 里必须调 stopRoomRecordings + clearRemoteCtl（不许裸删 remoteCtl）',
+      /stopRoomRecordings\(/.test(dz) && /clearRemoteCtl\(/.test(dz) && !/remoteCtl\.delete\(/.test(dz),
+      `dzLen=${dz.length}`);
+    /* ② 发言账本要有"删掉这个人"那一步：room.talk 原先只有正向（每 400ms 攒秒数），
+     *    没有任何删除路径 ⇒ 离开的人永久留在分母里，留下的人占比一起被压低。 */
+    ok('B4 结构红线：成员断开时删自己的发言条目（只有攒账没有销账 = 幽灵把所有人的占比稀释）',
+      /room\.talk\.delete\(socket\.id\)/.test(srvB4));
+    /* ③ 断线要真的 close 数据通道订阅：原先只 clear 本地 Map，mediasoup 侧的 Consumer 没人关——
+     *    长跑里每次重连都在服务端漏一个对象，而症状要等房间卡死才看得见。 */
+    ok('B4 结构红线：断线清理里对每条 dataConsumer 真的调用 close()（不是只把台账清空）',
+      /dataConsumers\.values\(\)\)[\s\S]{0,120}?\.close\(\)/.test(srvB4));
   }
 
   /* ★ 2026-10-09 这里本来要放一条全仓红线："模板字符串内部的注释不许出现反引号"。

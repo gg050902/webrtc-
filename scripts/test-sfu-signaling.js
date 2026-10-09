@@ -589,10 +589,58 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
 
   // --- D+1⑥：close-data-producer → 广播 data-producer-closed ---
   const hDpClosedP = waitEvent(H.s, 'data-producer-closed');
+  /* ★ 2026-10-10（B4「只有正向没有反向」审计）先抓一张"关闭之前"的台账快照。
+   *   ▎为什么这件事要断言而不是只修：H 订阅了 F 的频道之后，服务器的 `H.dataConsumers`
+   *     从来没有 delete 过（Transport 一关 mediasoup 会级联关闭消费者，但**台账不会变短**），
+   *     于是"谁订阅了什么"这张表越长越假。修法是把"退订"补成真正的撤销，
+   *     而修法要能被验证，就得先把条数交出来（/api/rooms 的 `dataConsumerCount`）。
+   *   ▸ 这里**自带**一个取快照的小助手，不复用下面 700 多行处的 `httpReq`：
+   *     它是块级 const，在本行还没声明 → TDZ 直接 ReferenceError（本文件 1131 行旁已记过一次同族坑）。 */
+  const snapRooms = () => new Promise((resolve, reject) => {
+    const rq = require('http').get({
+      host: '127.0.0.1', port: PORT, path: '/api/rooms',
+      headers: { Authorization: 'Bearer ' + adminToken },
+    }, (r) => {
+      let b = '';
+      r.on('data', (c) => (b += c));
+      /* 非 200 时把状态码与响应开头一起报出来：只丢一句 JSON.parse 的错，
+       * 红话会写成"Unexpected token '<'"这种谁都不知道是 401 还是 500 的形式（坑 66 同一条：
+       * 静默/含混的失败形态最费下一次排查）。 */
+      r.on('end', () => {
+        if (r.statusCode !== 200) {
+          /* 把 401 页里那句"为什么"抠出来：它分两种——"缺少或无效的管理员 token"（票不在册）
+           * 与"当前账号不是管理员（role=...）"（在册但角色不对），两种的排查方向完全不同。 */
+          const why = (b.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').match(/(当前账号不是管理员[^。]*|缺少或无效的管理员 token)/) || [])[1] || b.slice(0, 50);
+          return reject(new Error(`/api/rooms ${r.statusCode}：${why}（我发的 token 前缀=${String(adminToken).slice(0, 6)} 长度 ${(adminToken || '').length}）`));
+        }
+        try { resolve(JSON.parse(b)); } catch (e) { reject(new Error(`/api/rooms 200 但读不出 JSON：${e.message}`)); }
+      });
+    });
+    rq.on('error', reject);
+  });
+  const rowOf = (snap, id) => {
+    for (const r of (snap && snap.rooms) || []) {
+      const m = (r.members || []).find((x) => x.id === id);
+      if (m) return m;
+    }
+    return null;
+  };
+  const hBefore = rowOf(await snapRooms(), H.id);
+  ok('B4 台账看得见：H 订阅之后 dataConsumerCount=1（这条数是这次新暴露的）',
+     !!hBefore && hBefore.dataConsumerCount === 1, JSON.stringify(hBefore || {}));
   await request(F.s, 'close-data-producer', { dataProducerId: produceDataAck.data.dataProducerId });
   const hDpClosed = await hDpClosedP;
   ok('D+1 close-data-producer → data-producer-closed 广播',
      hDpClosed.dataProducerId === produceDataAck.data.dataProducerId && hDpClosed.from === F.id);
+  /* 轮询到台账空为止（≤4s）：读一个异步收敛的数用固定睡眠会偶发红（坑 96/120）。 */
+  let hAfter = null;
+  for (let i = 0; i < 20; i++) {
+    hAfter = rowOf(await snapRooms(), H.id);
+    if (hAfter && hAfter.dataConsumerCount === 0) break;
+    await sleep(200);
+  }
+  ok('B4 反向配对：频道关掉之后，订阅者的台账条目**真的没了**（不是只发了一条广播）',
+     !!hAfter && hAfter.dataConsumerCount === 0, JSON.stringify(hAfter || {}));
 
   // --- D+1⑦：聊天信令透传 msgId（双发去重的前 half）---
   const hChatP = waitEvent(H.s, 'chat-message');
@@ -1142,6 +1190,14 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
      && /^sfu_ai_asr_rms_gap_max_ms \d+$/m.test(met.text)
      && /^sfu_ai_asr_rms_bytes_max \d+$/m.test(met.text)
      && /^# HELP sfu_ai_asr_rms_first_ms/m.test(met.text));
+  /* ★ 2026-10-10（B4 正向/反向配对审计）登录票在册数。
+   *   ▎为什么这一格必须有：`authTokens` 是**进程级、跨连接**的内存，而它过去只有"懒删"
+   *     （auth-verify 命中过期才删）——一个登录过就不再回来的客户端会留下一条永久条目，
+   *     并且它在 /api/rooms / room-state 这些房间投影里**完全看不见**。
+   *     没有这个数，"清扫器有没有真的在跑"就只能靠读代码推断（读代码得到的是"改了"，不是"发生了"——坑 76）。
+   *   ▸ 锚行首（坑 74/144）：HELP 那句里含 "in memory"，未锚定的读数会把说明文字当成值。 */
+  ok('2026-10-10 /metrics 有登录票在册数（sfu_auth_tokens）',
+     /^sfu_auth_tokens \d+$/m.test(met.text) && /^# HELP sfu_auth_tokens/m.test(met.text));
   /* ▎这里自带一个取行助手，不复用下面 900 多行的 numOf：那个是**块级 const**，
    *   在本行还没声明 → TDZ 直接 ReferenceError（坑 69 的同族：位置错了它不报语义错，只炸运行顺序）。 */
   const numOfCap = (txt, key) => {
@@ -1669,6 +1725,14 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   }
 
   // --- ★ 09-19h：G6 安全加固（滑动续期 / 聊天限流 / 过期路径）---
+  /* ★ 2026-10-10（B4）在册登录票数的读票器——G6 的清扫器断言与第 52 步的正/反向配对断言共用它。
+   *   ▎为什么写在最外层而不是各写一份：两处读的是同一格 /metrics，抄两份就会有一份漂掉
+   *     读数语义（-1 = 读不到），而"读不到"被当成 0 时告警就永远不响（坑 71/74 同一条）。 */
+  const tokGauge = async () => {
+    const body = (await httpReq('GET', `http://localhost:${PORT}/metrics`)).text;
+    const m = /^sfu_auth_tokens (\d+)$/m.exec(body);
+    return m ? Number(m[1]) : -1;
+  };
   let g6Tok = null;
   try { g6Tok = (await request(A.s, 'auth-login', { username: 'g6user', password: 'secret6' })).data.token; }
   catch (e) { /* 还没注册 */ }
@@ -1719,7 +1783,23 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
     const LO = await client('LO');
     const loUser = 'legacy_h';                       // 临时库里的管理员（口令见 preSeedLegacyUser）
     const loPw = ['L', 'e', 'g', 'a', 'c', 'y', '#', '2', '0', '2', '6'].join('');
+    /* ★ 2026-10-10（B4）把"退出登录"从"过不了门禁"升级成"内存在册数掉下来"。
+     *   ▎401 只证明**校验**判了它死刑；这一格证明的是**记账**真的少了那一条。
+     *     两者可以分开坏：写一句"标记 revoked=true 而 Map 里仍然留着它"，门禁照样 401、
+     *     内存却一直在涨——而后者才是长跑里那个没人看得见的病（它不在任何房间投影里）。
+     *   ▸ 用**差值**不用绝对值：这个套件里别处也登录，绝对数取决于执行顺序（坑 53：判"够不够"要尺度无关）。
+     *   ▸ 先断"读数成立"再看差值：拿不到那一行时 -1 会让"+1"变成"0"，红话说不清（坑 65）。 */
+    const tokBefore = await tokGauge();
+    ok('B4 前提：/metrics 读得到在册票数（读不到时下面两条差值毫无意义）', tokBefore >= 0, `tokBefore=${tokBefore}`);
     const loTok = (await request(LO.s, 'auth-login', { username: loUser, password: loPw })).data.token;
+    /* ▸ 为什么这里用 `>=+1` 而不是 `===+1`：短 TTL 模式（AUTH_TTL_MS<=5000，G6 那条过期路径要跑）下
+     *   清扫器可能正好在两次读数之间收走别的过期票，`===` 会红成"会移动的假红"（坑 80/87）。
+     *   而这条判据要抓的变异是**登录没记账**——那种情况下读数最多等于 tokBefore，`>=+1` 照样红。
+     *   反向那条用 `<=tokBefore`：要抓的是**退出没删账**（读数会是 tokBefore+1），
+     *   而清扫器多删几条是正常行为，不该被这条判据算成缺陷。**方向不同，钳位方向就不同**。 */
+    const tokAfterLogin = await tokGauge();
+    ok('B4 正向：一次登录让在册数至少 +1（证明 gauge 读的就是那个 Map，不是另算一份）',
+      tokAfterLogin >= tokBefore + 1, `before=${tokBefore} after=${tokAfterLogin}`);
     ok('10-09 第 52 步 前提：第二次登录拿到的是**另一张**票（同账号多票并存，退出只退自己这张）',
       !!loTok && loTok !== adminToken);
     ok('10-09 第 52 步 这张新票能过 admin 门禁（/metrics 200）',
@@ -1807,6 +1887,13 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
       !!(await tryReq(B2.s, 'auth-verify', { username: loUser, token: loTok })).error);
     ok('10-09 第 52 步 反向对照：别人的票一张没被牵连（套件用的 admin token 仍然 200）',
       (await getCode('/api/rooms', { Authorization: 'Bearer ' + adminToken })) === 200);
+    /* ★ 2026-10-10（B4）反向配对的"内存那一半"：在册数必须掉回登录前（或更低，见上面那段钳位说明）。
+     *   ▸ 401 只证明**校验**判了它死刑；这一格证明的是**记账**真的少了那一条。
+     *     两者可以分开坏：标一个 revoked=true 而 Map 里仍然留着它，门禁照样 401、内存一直在涨——
+     *     而后者才是长跑里那个没人看得见的病（它不在任何房间投影里）。 */
+    const tokAfterOut = await tokGauge();
+    ok('B4 反向配对 ★ 带票退出之后在册票数不再高于登录前（票从内存里真的消失了，不只是"过不了门禁"）',
+      tokAfterOut <= tokBefore, `before=${tokBefore} after=${tokAfterOut}`);
     B2.s.off('chat-message', onChat3);
     try { LO.s.close(); ATK.s.close(); B2.s.close(); } catch (e) { /* ignore */ }
   }
