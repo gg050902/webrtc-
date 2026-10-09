@@ -259,22 +259,38 @@ function makeXlsx(opts) {
 ${shared.map((s) => `<si><t>${s.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</t></si>`).join('')}
 </sst>`;
 
+  /* ★ 2026-10-10（C5）`money:true` 才加的两种格式：**百分比与货币**。
+   *   ▸ 为什么要单独一个开关：默认那份夹具（不带 money）的**表/格数量被 test-fileview 逐条钉着**，
+   *     顺手往默认里加两格会让一批断言红——而那些断言测的是别的东西（一条断言只问一个问题）。
+   *   ▸ 为什么这一类值得单独有夹具：`0.00%` 存的是 0.25，Excel 上显示 **25.00%**；
+   *     `¥#,##0.00` 存 1234.5，显示 **¥1,234.50**。10-09 那轮 J2 就是从"真文件里有、我夹具里没有"
+   *     掉出这两条缺陷的（坑 130）——夹具里没有的形状，断言就钉不住，回扫也必须能自己凑出一份来量。 */
+  const moneyFmt = o.money
+    ? '<numFmt numFmtId="167" formatCode="0.00%"/><numFmt numFmtId="168" formatCode="&quot;¥&quot;#,##0.00"/>'
+    : '';
+  const moneyXf = o.money
+    ? '<xf numFmtId="167" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/><xf numFmtId="168" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>'
+    : '';
+  const moneyRow = o.money
+    ? '<row r="7"><c r="A7" t="s"><v>1</v></c><c r="B7" s="4"><v>0.25</v></c><c r="C7" s="5"><v>1234.5</v></c></row>'
+    : '';
+
   const styles = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 <numFmts count="2">
 <numFmt numFmtId="164" formatCode="yyyy\\-mm\\-dd"/>
 <numFmt numFmtId="165" formatCode="#,##0.00"/>
 <numFmt numFmtId="166" formatCode='yyyy"年"m"月"'/>
-</numFmts>
+${moneyFmt}</numFmts>
 <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
 <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
 <borders count="1"><border/></borders>
-<cellXfs count="4">
+<cellXfs count="${o.money ? 6 : 4}">
 <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
 <xf numFmtId="164" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>
 <xf numFmtId="165" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>
 <xf numFmtId="166" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>
-</cellXfs>
+${moneyXf}</cellXfs>
 </styleSheet>`;
 
   /* 第 1 行表头（共享字符串）；第 2 行：字符串 / 小数 / 日期序列号(s=1) / 千分位(s=2) / 公式结果串 / 错误值 / 布尔
@@ -288,7 +304,7 @@ ${shared.map((s) => `<si><t>${s.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</t
 <row r="4"><c r="B4" t="inlineStr"><is><t>行内字符串</t></is></c></row>
 <row r="5"><c r="A5" t="s"><v>1</v></c><c r="B5"><f>B2*2</f><v>2469</v></c><c r="C5" s="3"><v>45122</v></c></row>
 <row r="6"><c r="A6"><f>SUM(B2:B5)</f></c></row>
-</sheetData>
+${moneyRow}</sheetData>
 </worksheet>`;
 
   const sheet2 = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

@@ -25,6 +25,8 @@ const fs = require('fs');
 const path = require('path');
 const { Cdp } = require(path.join(__dirname, '..', 'agent', 'cdp.js'));
 const FX = require('./ooxml-fixture.js');
+/* ★ 2026-10-10（C5）形状类别清单与分类判据（与 npm run review:office 同一份，坑 47）。 */
+const Shapes = require('./office-shapes.js');
 
 const BASE = process.env.CHECK_URL || 'http://localhost:3001/';
 const URL_ = BASE + (BASE.includes('?') ? '&' : '?') + 'nosw=1';
@@ -76,6 +78,34 @@ function b64Inject(name, buf, mime) {
  * ▸ 为什么不用 openFileByName()：生产的用户路径是"点行"，而这一件事做**两半**——
  *   打开 + 把视角广播给全房间。测试直接调内层函数就把第二半从被测范围里擦掉了，
  *   于是"别人不跟"这种最要命的坏法永远测不到（坑 63：测试的触发条件本身也要被验证）。 */
+/* ★ 2026-10-10（C5）"这份文件在界面上到底走到哪一步"的**唯一**判据。
+ *   ▸ 为什么提到模块作用域共用：批量那一处原来是 `chars > 40`——一条**尺度相关**的判据
+ *     （两页的 PPT 只有 39 个非空白字，被报成"白屏"；见 pptx-notes 那次红，坑 53/91）。
+ *     单文件那一处（REAL_OFFICE_FILE）用的是同一个数，还少写了一个反斜杠——
+ *     `/\s+/` 在模板串里掉成一个反斜杠就变成"剥掉字母 s"，字数一直虚高、从不报白屏。
+ *     同一个判据两份副本，一份尺度相关、一份算错，各自都"绿"（坑 47 + 坑 82）。
+ *   ▸ 现在判的是结构信号：**有内容**（fv-doc/fv-slide/table/img/pdf 框架，且不在转圈）
+ *     或**明确说不行**（fv-unsupported）。字数只当观察值打印，不再当判据。
+ *   ▸ STAGE_FN 是一段"页面里的函数文本"，轮询与红场取证都拼它——一个概念一个来源。 */
+const STAGE_FN = `function(){
+  const s = document.getElementById('filesStage');
+  /* 非空白字符数用 ch.trim() 数，不写反斜杠 s：这段要交给浏览器执行，
+   *   少一个反斜杠就变成 /s+/g（剥掉的是字母 s 而不是空白）。 */
+  const t = s.textContent || '';
+  let n = 0;
+  for (const ch of t) { if (ch.trim()) n++; }
+  return { chars: n,
+    content: !!s.querySelector('.fv-doc, .fv-slide, table, img, iframe.files-pdf')
+      && !s.querySelector('.files-busy'),
+    unsupported: !!s.querySelector('.fv-unsupported'),
+    busy: !!s.querySelector('.files-busy'),
+    empty: !!s.querySelector('.files-empty'),
+    legacy: !!s.querySelector('.fv-legacy-note'),
+    tables: s.querySelectorAll('table').length };
+}`;
+/** 轮询用的条件式：还没走到终态时返回空串（falsy），until 才继续等。 */
+const STAGE_STATE = `(function(){ const x = (${STAGE_FN})(); return (x.content || x.unsupported) ? x : ''; })()`;
+
 function clickRowSrc(name) {
   return `(function(){
     const rows = Array.prototype.slice.call(document.querySelectorAll('.file-row'));
@@ -506,41 +536,46 @@ require('./inject-check.js').assertCompiles(__filename, { HIT_TEST });
           await ev(A, clickRowSrc(nm));
           /* ★ 轮询条件必须 = 断言条件（坑 120 第三次应验，还是栽在"读早了"上）：
            *   第一版这里"立刻返回一个对象"，读到的是 showStageBusy 那行占位文字
-           *   （十几个字符），于是报成像"这份真文件抽不出文字"——而真相是量具读早了。 */
-          const obs = await until(A, `(function(){
-            const s = document.getElementById('filesStage');
-            const o = { chars: (s.textContent || '').replace(/\s+/g,'').length,
-              unsupported: !!s.querySelector('.fv-unsupported'),
-              legacy: !!s.querySelector('.fv-legacy-note'),
-              tables: s.querySelectorAll('table').length };
-            return (o.chars > 40 || o.unsupported) ? o : '';
-          })()`, 25000);
+           *   （十几个字符），于是报成像"这份真文件抽不出文字"——而真相是量具读早了。
+           *   ▸ 2026-10-10（C5）改用共用的 STAGE_STATE（结构判据）。顺手记一条真实的漂移证据：
+           *     这一处原先写的是 `replace(/\\s+/g,'')` 少反斜杠的那一份副本，在模板串里变成
+           *     `/s+/g` ——**剥掉的是字母 s 而不是空白**，于是它的字数一直虚高、从不报白屏。
+           *     同一个判据两份副本，一份尺度相关、一份算错，各自都"绿"（坑 47 + 坑 53）。 */
+          const obs = await until(A, STAGE_STATE, 25000);
           console.log(`  OBSERVE 用户真文件（只报结构）：${JSON.stringify(obs)} · 源 ${(buf.length / 1024).toFixed(0)}KB`);
           ok('用真文件（REAL_OFFICE_FILE）至少走到"有内容"或"明确说不行"之一（不许白屏）',
-            !!obs && (obs.chars > 40 || obs.unsupported === true), JSON.stringify(obs));
+            !!obs && (obs.content === true || obs.unsupported === true), JSON.stringify(obs));
         }
 
-        /* ★ 2026-10-09（L2 的自走版）：`REAL_OFFICE_DIR=<目录>` 把**一整个文件夹**里的 Office 文件
-         *   逐个推过同一条浏览器链路。
+        /* ★ 2026-10-09（L2 的自走版）→ 2026-10-10（C5）改成**按形状类别**取样。
          *   ▎为什么值得加：`review:office` 那台回扫跑在 Node 里，而"发出去的那几行代码"在浏览器
          *     那一轨可能一次都没走过（坑 118 就是栽在这条缝上）；一份一份指文件又太累，
          *     累的工具不会被用。
-         *   ▎判据的形状（三条都是被坑咬过之后写的）：
+         *   ▎C5 换掉的是取样方式：上一版"取目录里前 8 份"，而"8 份都渲染出来了"这句话
+         *     覆盖面全看目录里恰好有什么——本机 docx 占九成时，旧版 .ppt、xlsx 的百分比格式、
+         *     pptx 备注页、坏 ZIP 可能一份都没进来，报告读起来却同样是"通过"。
+         *     **样本很多 ≠ 形状都到了**（判据与清单在 scripts/office-shapes.js，与回扫共用一份）。
+         *   ▎判据的形状（四条都是被坑咬过之后写的）：
          *     ① **不断言内容**——别人文件夹里的句子明天就会变，写死就是假红制造机（坑 91）；
          *     ② 每一份只判"走到**有内容**或**明确说不行**"之一（白屏 = 真缺陷）；
-         *     ③ 目录里没有可扫的文件 ⇒ 报"没扫到"而不是"没问题"（坑 105：没证据 ≠ 通过）。
+         *     ③ 目录里没有可扫的文件 ⇒ 报"没扫到"而不是"没问题"（坑 105：没证据 ≠ 通过）；
+         *     ④ 某一类本机没有真文件 ⇒ 用仓库夹具顶一份，**并写明那是夹具不是用户文件**
+         *        （夹具只证明内核认得这个形状，不证明你那份没问题，坑 130）。
          *     文件名与字节数会打出来（那是要拿去加夹具的线索），**内容一个字节都不打**。 */
         const realDir = process.env.REAL_OFFICE_DIR;
         if (realDir && fs.existsSync(realDir)) {
           const OK_EXT = ['.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.rtf', '.md'];
+            /* .rtf/.md 留在候选里：它们会被 classify 判成 not-office、当"随手扫"的余量用，
+             *   删掉就等于**顺手缩小了浏览器那一轨的覆盖面**（上一版就在这两个扩展名上量过）。 */
           const cap = Math.max(1, Number(process.env.REAL_OFFICE_MAX) || 8);
+          const probeCap = Math.max(cap, Number(process.env.REAL_OFFICE_PROBE) || 200);
           const found = [];
           (function walk(d, depth) {
-            if (depth > 2 || found.length >= cap) return;
+            if (depth > 2 || found.length >= probeCap) return;
             let ents = [];
             try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
             for (const en of ents) {
-              if (found.length >= cap) return;
+              if (found.length >= probeCap) return;
               const fp = path.join(d, en.name);
               if (en.isDirectory()) { walk(fp, depth + 1); continue; }
               if (!OK_EXT.includes(path.extname(en.name).toLowerCase())) continue;
@@ -550,29 +585,74 @@ require('./inject-check.js').assertCompiles(__filename, { HIT_TEST });
               found.push(fp);
             }
           })(realDir, 0);
+          /* 按类别取样：九类各一份（真文件优先，缺的用夹具顶），剩余名额才给随手扫的 */
+          const sel = await Shapes.selectByCategory(found, {
+            probeMax: probeCap, extraMax: Math.max(cap, Shapes.CLASSES.length),
+          });
           const rows = [];
-          for (let i = 0; i < found.length; i++) {
-            const fp = found[i];
+          for (let i = 0; i < sel.queue.length; i++) {
+            const q = sel.queue[i];
             let buf;
-            try { buf = fs.readFileSync(fp); } catch (e) { continue; }
-            const nm = `真批量-${i + 1}${path.extname(fp).toLowerCase() || '.doc'}`;
-            await ev(A, b64Inject(nm, buf, 'application/octet-stream'));
-            await ev(A, clickRowSrc(nm));
-            const o = await until(A, `(function(){
-              const s = document.getElementById('filesStage');
-              const x = { chars: (s.textContent || '').replace(/\\s+/g,'').length,
-                unsupported: !!s.querySelector('.fv-unsupported'),
-                legacy: !!s.querySelector('.fv-legacy-note'),
-                tables: s.querySelectorAll('table').length };
-              return (x.chars > 40 || x.unsupported) ? x : '';
-            })()`, 25000) || { chars: 0, unsupported: false, legacy: false, tables: 0 };
-            rows.push({ name: path.basename(fp), ext: path.extname(fp).toLowerCase(),
+            try { buf = q.bytes ? Buffer.from(q.bytes) : fs.readFileSync(q.p); } catch (e) { continue; }
+            const ext = path.extname(q.name).toLowerCase() || '.doc';
+            const nm = `${q.fixture ? '夹具' : '真批量'}-${q.id}${ext}`;
+            const up = await ev(A, b64Inject(nm, buf, 'application/octet-stream'));
+            const clk = await ev(A, clickRowSrc(nm));
+            const pt0 = Date.now();
+            /* ★ 判据从"字符数 > 40"换成**结构信号**（这是今晚这条红的真正修法，改判据不是放水）：
+             *   ▸ 红的是 pptx-notes 那份夹具——它**渲染得好好的**（htmlLen=1355），
+             *     只是两页幻灯片的非空白字数是 **39**，正好压在我那条 `chars > 40` 下面，
+             *     于是轮询到超时、报成"白屏"。**绝对字数当"有没有内容"的判据天生尺度相关**：
+             *     两页的 PPT、一行字的表格、一页满图的扫描件都会撞线，而它们都不是白屏
+             *     （坑 53"判够不够格的量必须尺度无关"+ 坑 91"假要求的断言=假红制造机"）。
+             *   ▸ 现在问的是界面自己那几个状态类：有 `.fv-doc / .fv-slide / table / img / pdf 框架`
+             *     之一且没有转圈的 `.files-busy` = 有内容；有 `.fv-unsupported` = 明确说不行。
+             *     字数继续打印，但只当观察值，不再是判据。 */
+            let o = await until(A, STAGE_STATE, Number(process.env.REAL_OFFICE_WAIT || 25000));
+            const waited = Date.now() - pt0;
+            /* 没走到终态就**当场把现场打出来**，否则这条红只能靠猜（与 test:room-actions 那台 chatHas
+             *   同一个教训：报错要自己交代它看到了什么，坑 55/63 同一条）。
+             *   ▸ 顺带分开两种以前混在一起的情况：until() 超时返回 false = "根本没量到"（deadline:true），
+             *     与"量到 content=false"不是同一件事——旧写法 `|| {chars:0}` 把它们合成同一个数
+             *     （今晚那条红就是这么含糊的，最后查出来是判据而不是产品）。 */
+            if (!o || !o.content) {
+              /* 红场取证：**状态读法与轮询共用 STAGE_FN**（坑 120：轮询条件必须等于断言条件；
+               *   取证那一份如果另写一遍，读到 0 时你分不清是"内容没到"还是"我的式子读不到"）。
+               *   今晚这条红最后查出来就是这一类：判据自己错，而现场看起来像产品坏。 */
+              const dump = await ev(A, `(function(){
+                const s = document.getElementById('filesStage');
+                const rs = Array.prototype.slice.call(document.querySelectorAll('.file-row'))
+                  .map(function (r) { return r.getAttribute('data-name'); });
+                return Object.assign((${STAGE_FN})(), { htmlLen: (s.innerHTML || '').length,
+                  htmlTail: (s.innerHTML || '').slice(-220), rows: rs.slice(0, 26),
+                  doc: (document.getElementById('filesDocName') || {}).textContent || '' });
+              })()`);
+              o = Object.assign({ chars: 0, content: false, unsupported: false, legacy: false, tables: 0, deadline: !o }, (o || {}), { dump });
+            }
+            rows.push({ name: q.name, id: q.id, ext, fixture: !!q.fixture,
+              /* 上传后**服务器存的名字**与点的那一行不一致时，这两栏会直接说出是谁错了
+                 （以前我把 up/clk 的返回值全丢了——丢了返回值 = 红了只能猜，坑 63 同族） */
+              stored: up && up.names ? up.names[0] : '', clicked: !!(clk && clk.clicked), waitedMs: waited,
               kb: Math.round(buf.length / 1024), ...o });
           }
-          const blank = rows.filter((r) => r.chars <= 40 && r.unsupported !== true);
+          /* 白屏 = 真缺陷；但**故意坏的那一类例外**——它必须走到"明确说不行"（unsupported），
+           * 而它的 .fv-unsupported 是真的会出现，所以照常判；这里唯一的特例是别把它算进"内核坏了"。 */
+          const blank = rows.filter((r) => r.content !== true && r.unsupported !== true);
           const legacyN = rows.filter((r) => r.legacy).length;
-          console.log(`  OBSERVE 批量真文件（只报结构）：${rows.length} 份 · 旧版横幅 ${legacyN} 份 · `
-            + `白屏 ${blank.length} 份 · 明细 ${JSON.stringify(rows.map((r) => ({ f: r.name, e: r.ext, kb: r.kb, c: r.chars, t: r.tables, u: r.unsupported })))}`);
+          const realN = rows.filter((r) => !r.fixture).length;
+          const cov = Shapes.coverageLines(sel.counts, sel.usedFixture);
+          console.log(`  OBSERVE 批量真文件（只报结构）：${rows.length} 份（真文件 ${realN} · 夹具 ${rows.length - realN}）· `
+            + `旧版横幅 ${legacyN} 份 · 白屏 ${blank.length} 份 · 看了 ${sel.probed} 份的字节做分类`
+            + `${sel.skippedBig ? `（另有 ${sel.skippedBig} 份太大没读）` : ''}`);
+          console.log(`  OBSERVE 明细 ${JSON.stringify(rows.map((r) => ({ f: r.name, k: r.id, x: r.ext, kb: r.kb, c: r.chars, t: r.tables, u: r.unsupported, fx: r.fixture, st: r.stored, cl: r.clicked, w: r.waitedMs })))}`);
+          /* 白屏的每一行都把现场摊开：存进来的名字 / 有没有点到那一行 / 舞台尾部 HTML */
+          for (const r of rows.filter((x) => x.content !== true && x.unsupported !== true)) {
+            console.log(`     ↳ 白屏现场 ${r.id}：stored=${JSON.stringify(r.stored)} clicked=${r.clicked} deadline=${r.deadline === true} `
+              + `waited=${r.waitedMs}ms 舞台 content=${r.dump && r.dump.content} chars=${r.dump && r.dump.chars} htmlLen=${r.dump && r.dump.htmlLen} doc=${JSON.stringify(r.dump && r.dump.doc)} 尾部=${JSON.stringify(r.dump && r.dump.htmlTail)}`);
+            console.log(`       清单里的行：${JSON.stringify((r.dump && r.dump.rows || []).slice(0, 26))}`);
+          }
+          console.log('  ── 类别覆盖（这一栏说明上面那句"没有白屏"适用于哪些形状）──');
+          for (const l of cov) console.log(`    ${l.mark} ${l.cn} —— ${l.text}`);
           if (!rows.length) {
             /* 不打"通过"——一条断言都没成立，只是没东西可量（坑 105）。 */
             console.log(`  SKIP   REAL_OFFICE_DIR 里没扫到可解析的 Office 文件（目录存在但没有 `
@@ -581,6 +661,11 @@ require('./inject-check.js').assertCompiles(__filename, { HIT_TEST });
             ok(`批量真文件（REAL_OFFICE_DIR）每一份都走到"有内容"或"明确说不行"（${rows.length} 份，一个都不许白屏）`,
               blank.length === 0, blank.length ? `白屏的：${JSON.stringify(blank)}` : `旧版横幅 ${legacyN} 份`);
           }
+          /* ❔ 只在"连仓库夹具都拿不出来"时出现 ⇒ 那是仓库缺件，该红（不是用户没文件）。
+           *   本机没有真文件只降到 ⚠️（夹具顶上），不红——但报告里必须看得见它只有夹具。 */
+          const skippedCov = cov.filter((l) => l.mark === '❔');
+          ok(`C5 类别覆盖：九类形状各至少一份（真文件或夹具），缺件才报 SKIP（当前 真文件 ${realN} · 夹具 ${rows.length - realN}）`,
+            skippedCov.length === 0, skippedCov.length ? '彻底没样本的类别：' + skippedCov.map((l) => l.cn).join(' / ') : '');
         }
       }
     }
