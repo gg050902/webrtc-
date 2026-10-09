@@ -4109,6 +4109,36 @@ const emit = (ev, payload) => {
      *    长跑里每次重连都在服务端漏一个对象，而症状要等房间卡死才看得见。 */
     ok('B4 结构红线：断线清理里对每条 dataConsumer 真的调用 close()（不是只把台账清空）',
       /dataConsumers\.values\(\)\)[\s\S]{0,120}?\.close\(\)/.test(srvB4));
+    /* ★ 2026-10-10（坑 145）一条只花三行的红线，防的是"占位符当凭据"这类**排查起来最贵**的错：
+     *   我新写的快照助手把 Authorization 的值写成 `'***' + token`（记事过程里带出来的占位串），
+     *   于是 /api/rooms 连续四轮 401，而四轮里我依次怀疑的是"票被删/TTL 被改短/请求写法/端口上有旧实例"——
+     *   **全都错**，而且每一步看起来都有道理。
+     *   ▸ 判据落地前先量了误伤面（坑 141 那条纪律）：全仓 scripts/ 与 agent/ 里 Authorization
+     *     一共 19 处，值**全部**以 "Bearer " 开头 ⇒ 这条可以做成硬红线，不会拦任何人。
+     *   ▸ 只查"以 Bearer 开头"，不查"等于某个变量"：后者会把合法写法管太死，太严的判据会被下一个人删掉。 */
+    {
+      const authFiles = ['scripts', 'agent'].flatMap((d) => {
+        try {
+          return fs.readdirSync(path.join(__dirname, '..', d))
+            .filter((f) => f.endsWith('.js'))
+            .map((f) => [d + '/' + f, fs.readFileSync(path.join(__dirname, '..', d, f), 'utf8')]);
+        } catch (e) { return []; }
+      });
+      const bads = [];
+      let seen = 0;
+      for (const [rel, src] of authFiles) {
+        /* 只认"值以引号/反引号开头"的那些：判据自己的源码里也写着 `Authorization:\s*(...`，
+         * 若不排除，它会匹配到自己（下一行不是引号 ⇒ 跳过）。这属于坑 103 那一族——
+         * 一条红线如果读得到"它自己的定义"，它就会把自己判成违规，而下一个人删的是红线不是代码。 */
+        for (const m of src.matchAll(/Authorization:\s*(['"`])([^'"`]*)/g)) {
+          seen++;
+          const v = m[2];
+          if (!v.startsWith('Bearer ')) bads.push(`${rel}: ${v.slice(0, 40)}`);
+        }
+      }
+      ok(`B4 结构红线：测试与代理里的 Authorization 值必须以 "Bearer " 开头（扫到 ${seen} 处，占位串会伪装成凭据）`,
+        seen >= 15 && bads.length === 0, bads.join(' | '));
+    }
   }
 
   /* ★ 2026-10-09 这里本来要放一条全仓红线："模板字符串内部的注释不许出现反引号"。
