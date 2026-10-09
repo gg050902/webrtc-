@@ -1176,6 +1176,22 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('2026-10-09 /metrics 有增益触发账，且 /api/rooms 的 collab 同源（一处算、两处读）',
      /^sfu_ai_asr_gain_applied_total \d+$/m.test(met.text)
      && /^# HELP sfu_ai_asr_gain_applied_total/m.test(met.text));
+  /* ★ 2026-10-10（C2）"尾巴抢跑"的两本账：放行 / 仍等封口。
+   *   ▸ 两条都判**存在**而不是数值：这条机制只在静音确认且 worker 空闲时才放行，
+   *     断言数字就是看运气（而"0"恰恰是要能读出来的合法形态——0 与"没接线"必须分得开，
+   *     所以 /api/rooms 的 collab.tailRush 与 /metrics 同源这一条也要钉住）。
+   *   ▸ 锚行首：# HELP 那句里同样出现这两个名字（坑 74 第三次应验就够教训了）。 */
+  ok('2026-10-10 /metrics 有"尾巴抢跑"两本账（放行 / 仍等封口），行首锚定不被 HELP 行骗',
+     /^sfu_ai_asr_tail_rush_total \d+$/m.test(met.text)
+     && /^sfu_ai_asr_tail_hold_total \d+$/m.test(met.text)
+     && /^# HELP sfu_ai_asr_tail_rush_total/m.test(met.text));
+  /* snapRooms 是**异步**的：必须先 await 再把布尔交给 ok()。
+     写成 `ok(name, await (async()=>…)())` 看着对，但 Promise 是 truthy——
+     判据再假也绿（坑 110 那一族"永真断言"的异步版，本轮我自己差点写进去）。 */
+  const cTail = ((await snapRooms()) || {}).collab || {};
+  ok('2026-10-10 /api/rooms 的 collab.tailRush 与 /metrics 同源（{released,held} 两个键都在）',
+     !!cTail.tailRush && Number.isFinite(cTail.tailRush.released) && Number.isFinite(cTail.tailRush.held),
+     JSON.stringify(cTail.tailRush || {}));
   /* ★ 2026-10-10（B1 / H2）RMS 行的**到达节奏**三格。
    *   ▎为什么这三行值得进回归：它们把"第一行 RMS 什么时候到 / 行与行最大空档 / 单次事件多大"
    *     从一句我记着的口头结论（"~4KB 成块 ⇒ 首行约 5s"）变成每次开会都在更新的事实。

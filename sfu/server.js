@@ -1448,6 +1448,7 @@ async function snapshotRooms() {
          面板上"转写引擎"那一格讲的是"谁在转写"，这一格讲的是"转写得并行吗"。 */
       seg: COLLAB.seg,
       refine: COLLAB.refine,   // ★ 2026-10-07 整句重转 {n, fixed, ms, skipped}——"改没改这句话"数得出来
+      tailRush: COLLAB.tailRush,   // ★ 2026-10-10 C2 尾巴抢跑 {released, held}（与 /metrics 同一个数）
       /* ★ H5b：让路判据用的那条线本身也要能被外部读到（面板/复盘/watch 都靠它判断
          "多人房里重转到底还有多少在做"，而不是猜）。放在 collab 里而不是单独一路，
          是因为它与 refine 四格是同一件事的四个面（坑 47：一个概念一个来源）。 */
@@ -1496,6 +1497,13 @@ const COLLAB = {
    *   ▸ `skipped` 为什么必须单独一本账：让路策略最容易坏在"其实一直在让路、于是从来没重转过"，
    *     而那看起来与"重转在做但都没被采用"一模一样。只有前两本数分不开这两种病（坑 76）。 */
   refine: { n: 0, fixed: 0, ms: 0, skipped: 0 },
+  /* ★ 2026-10-10 C2「尾巴抢跑放行」的触发账（`ASR_TAIL_RUSH=1` 才有意义）。
+   *   released = 严格判据还欠一段、但抢跑已吃满 ⇒ **提前定稿**的句子数（省下的那 ~1s 就记在这）；
+   *   held     = 还欠着、照旧按住的句子数（走老路径，只是慢一点）。
+   *   ▸ 为什么必须两本一起数：只有 released 无从判断"快了多少"，
+   *     只有 held 则分不清"开关没开"与"抢跑从来没吃满过"（坑 76）。
+   *   ▸ 判据接法：`review:meeting` 与 `/metrics` 都读它，改动前后同一台量具对比。 */
+  tailRush: { released: 0, held: 0 },
   /* ★ 2026-10-09 模型输入峰值增益的触发计数。
    *   ▎为什么单列一本：10-05 那把"按实测峰值提增益"的刀上线时，**没有任何一处能证明它跑过**，
    *     于是"安静麦克风被救回来"这件事只能靠人对着字幕感觉。而 COLLAB.input.voiced
@@ -1741,6 +1749,16 @@ function buildMetrics(snap) {
   L.push('# HELP sfu_ai_asr_engine_busy In-flight ASR engine jobs right now (segment + refine share this counter).');
   L.push('# TYPE sfu_ai_asr_engine_busy gauge');
   L.push(`sfu_ai_asr_engine_busy ${asrEngineBusy}`);
+  /* ★ 2026-10-10 C2「尾巴抢跑放行」两本账：released = 提前定稿的句子数，
+   *   held = 严格判据还欠着、照旧按住的句子数。
+   *   ▸ 为什么两个都要打：只有 released 说不出"还有多少没抢到"，只有 held 看不出开关有没有生效；
+   *     而 `ASR_TAIL_RUSH=0` 时两条恒为 0——这正是"机制在但没跑"的可见形态（坑 76）。 */
+  L.push('# HELP sfu_ai_asr_tail_rush_total Finalizations released early because the flush snapshot already heard the whole in-flight segment (needs ASR_TAIL_RUSH=1).');
+  L.push('# TYPE sfu_ai_asr_tail_rush_total counter');
+  L.push(`sfu_ai_asr_tail_rush_total ${COLLAB.tailRush.released}`);
+  L.push('# HELP sfu_ai_asr_tail_hold_total Sentences still waiting for a sealed tail segment at finalize time.');
+  L.push('# TYPE sfu_ai_asr_tail_hold_total counter');
+  L.push(`sfu_ai_asr_tail_hold_total ${COLLAB.tailRush.held}`);
   /* ★ 2026-10-03 两组端到端延迟读数（字幕 / 播报），三行一组：
    *   avg 看整体体感、max 看最坏一次（"是不是偶尔卡很久"）、last 让 watch.js
    *   能在**不重启**的前提下发现"延迟刚刚变差了"。
@@ -3805,7 +3823,22 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
        *   两个生命周期不同步，硬塞进同一个对象就会在"转写失败但音频是真的"那条路上丢声。
        *   ▸ 上限：只留 ASR_REFINE_MAX_SEC 秒（默认 12s ≈ 384KB/人），超出就不再追加，
        *     定稿时改用"已经攒到的这一段"——**内存有界**是过夜长跑的硬要求（第 30 步的总纲）。 */
-      const uttAudio = new Map(); // memberId → { chunks: [Buffer], bytes: 0 }
+      const uttAudio = new Map(); // memberId → { chunks: [{k:段名, b:Buffer}], bytes: 0 }（★ 10-10：切片带段名，拼接前按段名排序）
+      /* ★ 2026-10-10 C2：`uttTake` = 每个**分段名**已经靠"抢跑"交进整句音频的字节数。
+       *   ▸ 为什么需要它：抢跑读的是同一段的一个**前缀切片**（delta），
+       *     封口段随后带着整段字节再来一次 → 不加记账就是同一段音频出现两遍
+       *     （10-05 那条"tail-*.wav 是前缀切片，留着会重复计入"的老账，只是这次真的留了）。
+       *   ▸ 所以封口段只补 `buf.slice(uttTake)`；水位随段消失一起剪掉（与 flushedBytes 同一处）。 */
+      const uttTake = new Map(); // baseName → 已计入整句音频的字节数
+      /* ★ 2026-10-10 C2：整句音频的两个字节账助手都在 sfu/ai/asr.js（纯函数、可穷举断言），这里只用。
+       *   ▸ 排序那一条是本次新增的**必要一步**：切片现在有两个入口（抢跑前缀 + 封口余量），
+       *     到达顺序不再等于时间顺序（seg-0008 的 delta 比 seg-0007 的封口余量早 ~150ms），
+       *     按 push 顺序拼就是"后半句排在前半句前面"的一句乱序话——而模型照样会自信地转出文字。
+       *     段名 seg-%04d.pcm 补零 ⇒ 字典序=时间序；同段多次抢跑靠稳定排序保持先后。判据写在 uttOrdered 上方。 */
+      const uttOrdered = Asr.uttOrdered;
+      /* "够不够两段"按段名去重数（uttSegmentKinds）：抢跑的前缀不许伪装成"多一段"，
+         否则 REFINE_MIN_CHUNKS 那条"本来只转过一次就别再转"的原意会失效，白多花一次推理。 */
+      const uttSegmentKinds = Asr.uttSegmentKinds;
       const dbg = (...a) => { if (process.env.ASR_DEBUG) console.log('[asr-dbg]', ...a); };
       /* ★ 2026-10-07 转写引擎链抽成**唯一一处**（原先内联在 handleSegment 里，
        *   而"整句重转"要同一条链再走一遍——两条链各写一份就是坑 47 等着漂移）。
@@ -3948,13 +3981,21 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
          *   于是把**已封口的整段 PCM** 原样留一份，定稿时整句重转一次。
          *   ▸ 只留 .pcm 封口段：抢跑的 tail-*.wav 是同一段的一个**前缀切片**，
          *     留着就会重复计入（拼出来的整句音频里同一段出现两遍）。
+         *   ▸ ★ 2026-10-10 C2 改口：抢跑的字节现在**确实**会计入整句音频（见 recordLoop 那块），
+         *     所以这里只补"抢跑没吃过的后半截"——`uttTake` 就是那笔水位账。
+         *     没有它，同一段会被计入两遍；有了它，"整句音频"在封口之前就已经完整了。
          *   ▸ 放在转写之前而不是之后：模型超时/判空/清洗丢弃的那些段，声音仍然是真的。 */
         if (ASR_REFINE_ON && full.endsWith('.pcm') && REFINE_MAX_BYTES > 0) {
           try {
             const ua = uttAudio.get(memberId) || { chunks: [], bytes: 0 };
-            const buf = fs.readFileSync(full);
-            if (ua.bytes + buf.length <= REFINE_MAX_BYTES) { ua.chunks.push(buf); ua.bytes += buf.length; }
-            else dbg(baseName, `整句音频到上限（${ua.bytes}B），本段不再留`);
+            const all = fs.readFileSync(full);
+            const skip = Math.min(uttTake.get(baseName) || 0, all.length);
+            const buf = skip > 0 ? all.subarray(skip) : all;
+            if (buf.length >= 3200) {
+              if (ua.bytes + buf.length <= REFINE_MAX_BYTES) { ua.chunks.push({ k: baseName, b: buf }); ua.bytes += buf.length; }
+              else dbg(baseName, `整句音频到上限（${ua.bytes}B），本段不再留`);
+            } else if (buf.length) dbg(baseName, `封口段只剩 ${buf.length}B（抢跑已吃过 ${skip}B），不再补`);
+            uttTake.set(baseName, all.length);
             uttAudio.set(memberId, ua);
           } catch (e) { /* 读不到就不重转，分段路径照常出字（fail-open） */ }
         }
@@ -4075,7 +4116,8 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
        *   ▸ 任何一路不顺（读盘/包装/模型空/异常）都返回 null 让调用方保留拼接结果——
        *     这条是**加分项**不是必经路径，坏了最多回到今天的行为，不能把人说的话弄丢。 */
       const refineUtterance = async (chunks) => {
-        const pcm = Buffer.concat(chunks);
+        /* ★ 2026-10-10：切片可能来自"抢跑前缀 + 封口余量"两种入口，顺序由段名定（见 uttOrdered） */
+        const pcm = Buffer.concat(uttOrdered(chunks).map((c) => (c && c.b) || c));
         if (pcm.length < 3200) return null;                 // 与 SEG_MIN_BYTES 同口径：太短不值得重转
         const tag = `utt-${memberId}-${Date.now()}`;
         const pcmPath = path.join(segDir, `${tag}.pcm`);
@@ -4121,29 +4163,84 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
        *     兜底不用新加超时：`UTTERANCE_MAX_AGE_MS`(6s) 与 `MAX_OPEN`(10s) 两把保险丝
        *     本来就在，段不再产出时它们照样会强制收口——**有界等待，不会饿死**（坑 90/108 同族：
        *     任何"等某个条件"的闸门都必须自己回答"等不到怎么办"）。 */
-      const pendingTailSegment = () => {
-        if (!lastVoiceTs) return false;                    // 没有 RMS 信源时不猜（走 gap 那条兜底路）
+      /* ★ 2026-10-10 C2「等尾段封口那 1s」——先量到它值多少，再决定怎么买（ASR_DEBUG 实测）：
+       *   成句时刻 `sinceVoice = 2607ms / 2731ms`，而静音判据只要 FLUSH_MS=1200ms
+       *   ⇒ 多出来的 ~1.4s 全花在**等含尾字的那一段被 ffmpeg 封口**。
+       *   抢跑（delta 快照）其实早在 1721ms 就把那段的字节送去转写过一次，但它的音频
+       *   **没有进 `uttAudio`**（下面那块只收 .pcm 封口段），于是整句重转仍然非等封口不可——
+       *   闸门也就松不了。所以这一刀是两个动作一起做的：
+       *     ① 抢跑读到的 delta 字节**也算进整句音频**（`uttTake` 记水位，封口段只补剩下的那一截，
+       *        否则同一段出现两遍 = 10-05 那条"前缀切片重复计入"的老账）；
+       *     ① 抢跑读到的 delta 字节**也算进整句音频**（`uttTake` 记水位，封口段只补剩下的那一截，
+       *        否则同一段出现两遍 = 10-05 那条"前缀切片重复计入"的老账）；
+       *     ② 闸门允许"抢跑已经把说话那段时间覆盖满"的那一段放行（`scanTailSegments` 的第二个结论），
+       *        并且**只在整句重转真的会跑**的时候放（调用方判：段数够、worker 不忙、句子不只叫了个名字）。
+       *   ▸ 开关 `ASR_TAIL_RUSH=0` 可整条退回"永远等封口"（默认**开**）。
+       *     ▎这个"默认开"是同场次 A/B 量出来的，不是推的（本机干净机器、qwen-local 就位后各跑一轮）：
+       *       关：定稿 2 条 · 说完→上字幕 3.3s / 3.1s · 应答 1 次
+       *       开：定稿 2 条 · 说完→上字幕 3.3s / **2.0s** · 应答 1 次 · 放行 1 次
+       *       ⇒ 第二句买回 **1.1s**，而定稿条数、应答次数、正解命中（含尾字「会」）三组一个都没变差
+       *       ——正是当初写死的三条红线。第一句两轮都还是 3.3s：它被 `segInFlight===0` 那道守卫挡着
+       *       （worker 正在转上一段），**不是**这条闸门的账，别把它记成"本次没效果"。 */
+      const TAIL_RUSH_ON = process.env.ASR_TAIL_RUSH !== '0';
+      /* ★ 2026-10-10 一次目录扫描给出**两个**结论，而不是每个成员各扫一遍：
+       *   这是同步系统调用，多人房里按人数翻倍（8 人 = 每秒 9 次 readdir）。
+       *   ▸ `pending` = 老判据（只看"有没有没被消费的段"）；关掉开关时走它，行为与今天一字不差。
+       *   ▸ `pendingRushed` = 还要再放过"抢跑已经把说话那段时间覆盖满"的段。
+       *     覆盖判据本体是 `Asr.tailCoveredByRush`（纯函数）：它把"段内第 N 字节 ≈ 哪个时刻"算清楚，
+       *     要求的是**覆盖到 lastVoiceTs + RMS 滞后**，而不是"读满当前文件"——
+       *     文件在换段前一直长（静音也在写，32000 字节/秒），拿文件末尾当要求会让判据永远差一截
+       *     ⇒ 机制一次都不触发（坑 76 的现场预演；我自己第一版就是这么写的）。
+       *   ▸ ★ 也**刻意不要求**"那次抢跑转出了字"（这是本轮两次被实测否掉的写法之一，
+       *     细节与数据都写在 Asr.tailCoveredByRush 的注释里）：分段边界上那段本来就常常整段无人声，
+       *     基线里**封口段自己**也交回 `text=""`，句尾那个字从来是靠"整句音频一次重转"救回来的。
+       *     所以放行条件的正确分解是：**音频齐了**（本函数）× **重转真的会跑**（调用方）
+       *     × **这句不只叫了个名字**（调用方）——三者各管一段，混成一个"看起来更安全"的大判据，
+       *     结果就是它一次都不生效。
+       *   ▸ ★ 为什么必须比 10-07 那次被否决的尝试窄（那次只看 `flushedBytes`）：
+       *     "扑过"不等于"覆盖到说话结束"（半截 delta 也会置水位），于是把**只含名字的碎片句**
+       *     提前定稿 → arm 了 6s 的分段续接窗 → 紧跟的一句无关话被当成"那半句的后半截"接了话。
+       *     这一版的三条收紧各有一条反向断言钉住（test:asr ⑮.2/⑮.3/⑮.10）。
+       *   ▸ 丢字风险说清楚：放行时那段还在被 ffmpeg 写着，我们只覆盖到"说话结束 + 1s 滞后"；
+       *     之后新写进来的字节按定义在静音区（静音由 lastVoiceTs+FLUSH_MS 证明），
+       *     而封口段随后照常转写并**把剩下的那一截补进 uttAudio**，所以既不丢字也不重复计入。 */
+      const scanTailSegments = () => {
+        const out = { pending: false, pendingRushed: false };
+        if (!lastVoiceTs) return out;                          // 没有 RMS 信源时不猜（走 gap 那条兜底路）
         try {
           for (const f of fs.readdirSync(segDir)) {
             if (!f.startsWith('seg-') || !f.endsWith('.pcm') || doneSet.has(f)) continue;
             const st = fs.statSync(path.join(segDir, f));
             /* 出生早于"最后有声 + RMS 行滞后"= 这一段的时间区间与刚才那句话重叠；
              * 太小（不足 0.1s）的碎屑不算尾巴，否则静音期的空段会把闸门永久按住。 */
-            /* ★ 这里**故意不看** flushedBytes（抢跑已经吃掉的字节）。试过：让"抢跑已经听过"
-             *   的段不再拦定稿，可以省回约 0.5 秒——真跑干净机器实测的结果是**回归**：
-             *     账本里只有一句「小明，帮我记一下明天下午三点的评审会。」，可 AI 却
-             *     先回了一句「嗯，我在听。」（那是"光叫名字"的短应答），随后又把
-             *     没叫它的那句闲聊「今天天气真不错，拍卖呀！」当成就跟在那声「嗯」后面的
-             *     **半句续接**接了话（trig 与闲聊句的定稿时刻对得上，是因果不是巧合）。
-             *   ▸ 机制：提前定稿 → 出现只含名字的碎片句 → armed 了 6s 的 `aiAskTailUntil`
-             *     → 下一句（这里是闲聊）被当成续接。省下的 0.5 秒买回的是用户明令禁止的插话。
-             *   ▸ 判据留在这里当路标：**动这条闸门必须同时看"会不会切出只含名字的碎片句"**，
-             *     而不是只看延迟数字（坑 109 同一条：为可读性/延迟动切句判据，必须先给
-             *     完整性与礼仪留下限）。 */
-            if (st.birthtimeMs > 0 && st.birthtimeMs <= lastVoiceTs + RMS_LAG_MS && st.size >= 3200) return true;
+            if (!(st.birthtimeMs > 0 && st.birthtimeMs <= lastVoiceTs + RMS_LAG_MS && st.size >= 3200)) continue;
+            out.pending = true;
+            /* ★ 判据本体在 Asr.tailCoveredByRush（纯函数、可穷举断言）：
+             *   它只回答"这段音频被听过多少"——"重转会不会真跑"是调用方的事。 */
+            if (Asr.tailCoveredByRush({
+              size: st.size, birthtimeMs: st.birthtimeMs, lastVoiceTs, rmsLagMs: RMS_LAG_MS,
+              rushedTo: flushedBytes.get(f) || 0,
+            })) continue;
+            out.pendingRushed = true;                          // 还有一段说话时间的字节没被听过 → 照旧按住
           }
         } catch (e) { /* 目录读不到 = 不阻塞定稿（fail-open） */ }
-        return false;
+        return out;
+      };
+      /* ★ 2026-10-10 C2 的后半个判据：**这一句真的会做整句重转吗**（与"音频齐了"各管一半）。
+       *   ▸ 为什么必须有它：提前定稿之后，句尾那个字的唯一来源就是整句重转
+       *     ——封口段自己也交回 `text=""`（基线实测），重转不跑就等于把"缺尾字的拼接结果"发出去，
+       *     那正是 10-07 那条红线（宁可用拼接结果，也不许丢字）反过来咬人的形态。
+       *   ▸ 三条各对应一个真实的"这次不会重转"：重转整条关着 / 攒到的音频段数不够（本来就没必要重转）
+       *     / worker 正忙别家（H5b 让路）。任何一条不满足 ⇒ 用严格判据，照旧等封口。
+       *   ▸ 最后那条 `isNameOnly` 守卫是 10-07 回归的直接对冲：只含名字的碎片句一旦提前定稿，
+       *     就 arm 了 6s 的分段续接窗，下一句无关的话会被当成"那半句的后半截"接了话
+       *     ——省 0.5 秒买回用户明令禁止的插话，上一次的账不能白记。 */
+      const refineWillRun = (mid, u) => {
+        if (!ASR_REFINE_ON || REFINE_MAX_BYTES <= 0) return false;
+        const ua = uttAudio.get(mid);
+        if (!ua || uttSegmentKinds(ua.chunks) < REFINE_MIN_CHUNKS) return false;
+        if (REFINE_YIELD_ABOVE >= 0 && asrEngineBusy > REFINE_YIELD_ABOVE) return false;
+        return !!(u && u.text) && !Asr.isNameOnly(normAsrText(u.text));
       };
       const finalizeUtterance = async (memberId, reason) => {
         const u = utterances.get(memberId);
@@ -4159,7 +4256,7 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
         const stitched = u.text.slice(0, 500);
         let text = stitched;
         let refined = null;
-        const canRefine = ASR_REFINE_ON && ua && ua.chunks.length >= REFINE_MIN_CHUNKS;
+        const canRefine = ASR_REFINE_ON && ua && uttSegmentKinds(ua.chunks) >= REFINE_MIN_CHUNKS;
         /* ★ 2026-10-07 H5b：worker 正在忙别家的段时**让路**（判据在发起之前读，await 之后读到的是自己）。
          *   ▸ `bench:asr-multi` 实测：4 路并发下开重转把分段 p95 从 1.40s 顶到 2.21s、
          *     8 路顶到 4.38s，吞吐只剩基线的 ~72% —— 重转与真话抢的是同一个串行 worker。
@@ -4401,6 +4498,21 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
                   const fd = fs.openSync(full, 'r');
                   try { fs.readSync(fd, buf, 0, len, flushedTo); } finally { fs.closeSync(fd); }
                   flushedBytes.set(newest, flushedTo + len);   // ★ 扑前即记（见上）
+                  /* ★ 2026-10-10 C2 ①：抢跑吃下的这段字节**同时计入整句音频**（另一半是
+                   *   `uttTake` 水位——封口段晚到时就只补余量，不会把同一段拼两遍）。
+                   *   ▸ 没有这一步，"整句重转"永远得等封口段才能拿到尾字音频，闸门也就松不开；
+                   *     有了这一步，被抢跑听满的那一段在定稿时刻音频已经是完整的。
+                   *   ▸ 只在重转开着时才攒（REFINE_MAX_BYTES=0 时不占内存——长跑老规矩）。 */
+                  if (ASR_REFINE_ON && REFINE_MAX_BYTES > 0) {
+                    const ua2 = uttAudio.get(memberId) || { chunks: [], bytes: 0 };
+                    /* 水位只在**真的推进去了**之后才记：到上限时不记，
+                       否则封口段会跳过一段"其实没进整句音频"的字节 = 凭空挖掉一块声音。 */
+                    if (ua2.bytes + len <= REFINE_MAX_BYTES) {
+                      ua2.chunks.push({ k: newest, b: buf }); ua2.bytes += len;
+                      uttTake.set(newest, flushedTo + len);
+                    }
+                    uttAudio.set(memberId, ua2);
+                  }
                   const tailName = `tail-${newest.replace(/\.pcm$/, '')}-${++tailSeq}.wav`;
                   const tailPath = path.join(segDir, tailName);
                   fs.writeFileSync(tailPath, Asr.pcmToWavBuffer(buf));
@@ -4426,11 +4538,14 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
           try {
             const now = Date.now();
             /* ★ 2026-10-07 每轮量一次"还有没有装着这句话尾巴的段没被消费"（判据见
-             *   pendingTailSegment 上方那段）。两处都要用：调试行要说清为什么慢一拍，
+             *   scanTailSegments 上方那段）。两处都要用：调试行要说清为什么慢一拍，
              *   成句闸要据此**先别定稿**。声明放在这里而不是循环体内——
              *   本轮我自己差点又写出 TDZ（调试行在声明之前引用它）。
-             *   ▸ 只在真有句子开着的时候才扫目录：这是同步系统调用，空转轮次不花这个钱。 */
-            const tailWaitSeg = utterances.size ? pendingTailSegment() : false;
+             *   ▸ 只在真有句子开着的时候才扫目录：这是同步系统调用，空转轮次不花这个钱。
+             *   ▸ ★ 2026-10-10 C2：一次扫描出**两个**结论（严格 / 允许抢跑放行），见函数上方。 */
+            const tailScan = utterances.size ? scanTailSegments()
+              : { pending: false, pendingRushed: false };
+            const tailWaitSeg = tailScan.pending;
             /* ★ 2026-10-05 成句闸的"为什么没开"证据（坑 76：机制要有触发证据）。
              *   ▎为什么现在必须补：e2e 连跑里 `成句：` 一条都没有、转写却一直在跑（41 段），
              *   于是"没定稿 / AI 不接话 / 喇叭不出声"四条全红，而只看这些红**分不出三种病**：
@@ -4443,8 +4558,11 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
               const firstU = utterances.size ? [...utterances.values()][0] : null;
               dbg(`成句闸 segInFlight=${segInFlight} tail=${tailPending()} 句子数=${utterances.size}`
                 /* ★ 2026-10-07 未消费的尾巴段（true = "这句话的音频还没喂完，先不定稿"）。
-                 *   没有这一格，"定稿为什么慢了一拍"就又是一次猜（坑 76）。 */
-                + ` 尾巴段未消费=${tailWaitSeg}`
+                 *   没有这一格，"定稿为什么慢了一拍"就又是一次猜（坑 76）。
+                 *   ★ 2026-10-10 C2 多打一个宽松判据：`尾巴段未消费=严格/宽松` ——
+                 *   只看一个数分不清"闸门在拦"与"抢跑已经把这条放走了"，
+                 *   而后者是本次新变量的触发证据（坑 76：机制在 ≠ 机制生效）。 */
+                + ` 尾巴段未消费=${tailScan.pending}${TAIL_RUSH_ON ? '/' + tailScan.pendingRushed : ''}`
                 + ` sinceVoice=${lastVoiceTs ? now - lastVoiceTs : -1}ms`
                 + ` sinceAppend=${firstU ? now - firstU.lastAt : -1}ms`
                 + ` sinceText=${firstU ? now - (firstU.textAt || firstU.lastAt) : -1}ms`
@@ -4508,13 +4626,34 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
                 const ageMs = now - (u.bornAt || now);
                 const maxAge = ageMs > UTTERANCE_MAX_AGE_MS;
                 /* ★ 2026-10-07 "静音确认"不再单独等于"可以定稿"：还得没有未消费的尾巴段
-                 *   （判据与为什么必须加，见 pendingTailSegment 上方那段——「评审会」丢掉「会」
+                 *   （判据与为什么必须加，见 scanTailSegments 上方那段——「评审会」丢掉「会」
                  *   就是这条漏口，而漏掉的尾巴还会跑到下一句的整句音频里）。 */
-                const silenceOk = silenceConfirmed && !tailWaitSeg;
+                /* ★ 2026-10-10 C2：这一句究竟按哪个判据按住。开关关着 = 与今天一字不差（`pending`）。
+                 *   开着时要过 `refineWillRun`：**音频覆盖满 + 这一句真的会做整句重转 + 不只叫了个名字**
+                 *   三者同时成立才允许不等封口（判据的分工写在那两个函数上方，各管一半别混成一个）。
+                 *   ▸ 其中"不只叫了个名字"就是 10-07 那次回归的对冲：只含名字的碎片句一旦提前定稿，
+                 *     就 arm 了 6s 的分段续接窗，下一句无关的话被当成"那半句的后半截"接了话
+                 *     （省 0.5 秒买回插话）。判据写成"先排除最坏形状"，而不是"平均更快"。 */
+                const tailHold = (TAIL_RUSH_ON && refineWillRun(mid, u))
+                  ? tailScan.pendingRushed : tailScan.pending;
+                const silenceOk = silenceConfirmed && !tailHold;
                 const due = maxAge || (rmsAlive
                   ? (silenceOk || idleTextMs > UTTERANCE_MAX_OPEN_MS)
                   : (now - u.lastAt > UTTERANCE_GAP_MS));
                 if (due) {
+                  /* ★ 2026-10-10 C2 触发计数（坑 76）：放行 / 仍然按住，两本账分开数，
+                   *   而且**只在真的要定稿时记**——否则一轮空转就把计数刷满了。
+                   *   ▸ released 恒 0 与"这个功能没跑"是同一件事，必须一眼能看出来。 */
+                  if (TAIL_RUSH_ON && tailScan.pending) {
+                    if (!tailHold) {
+                      COLLAB.tailRush.released += 1;
+                      dbg(`尾巴抢跑放行：${speakerName} 严格判据还欠一段，音频已覆盖满 → 提前定稿`);
+                      logEvent('info', 'asr-tail-rush', {
+                        roomNumber, member: memberId, chars: (u.text || '').length,
+                        sinceVoice: lastVoiceTs ? now - lastVoiceTs : -1,
+                      });
+                    } else COLLAB.tailRush.held += 1;
+                  }
                   /* 定稿原因只算一次，dbg 与 finalizeUtterance 共用（坑 47：
                      两处各判一遍，将来改一边就出现"日志说 silence、读数按别的算"） */
                   const reason = silenceOk ? 'silence' : (maxAge ? 'max-age' : (rmsAlive ? 'max-open' : 'gap'));
@@ -4581,6 +4720,9 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
              *   否则两张 Map 会随会议时长无限长（长跑纪律：内存是热窗口）。 */
             for (const k of [...flushedBytes.keys()]) if (!fs.existsSync(path.join(segDir, k))) flushedBytes.delete(k);
             for (const k of [...flushedOkTs.keys()]) if (!fs.existsSync(path.join(segDir, k))) flushedOkTs.delete(k);
+            /* ★ 2026-10-10 C2：`uttTake` 与上面两张水位表同生命周期（段文件没了就剪掉），
+             *   否则一夜下来它会随分段数无限增长（长跑纪律：内存是热窗口）。 */
+            for (const k of [...uttTake.keys()]) if (!fs.existsSync(path.join(segDir, k))) uttTake.delete(k);
           } catch (e) { /* 目录清理竞态 */ }
         }
         // 收尾：把最后一段（ffmpeg 已停、不再增长）也转出来——别丢最后半句话

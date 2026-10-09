@@ -1039,6 +1039,56 @@ function startsNewSentence(accRaw, segRaw) {
   return mergeTranscript(acc, seg) === `${acc} ${seg}`;
 }
 
+/* ★ 2026-10-10 C2「尾巴抢跑放行」的判据（纯函数，test:asr 逐条正反断言）。
+ *   ▎要回答的问题只有一个：**这段话说过之后，还有没有没被模型听过的字节？**
+ *   ▸ 为什么不能用"读满当前文件"来判（这是我第一版的错，靠反例抓回来）：
+ *     分段文件在 ffmpeg 换段之前**一直在长**（16k 单声道 16le = 32000 字节/秒），静音也在写。
+ *     拿文件末尾当要求 ⇒ 抢跑转完（0.4~2s）时文件又长了一截，条件永远差一点，
+ *     机制会安静地一次都不触发——正是坑 76 那一族"写了但从来没生效"。
+ *   ▸ 正确的物理判据：**覆盖到"说话结束的那一刻"就够了**。
+ *     段内第 N 字节对应时刻 ≈ birthtimeMs + N / 32000 秒 ⇒ 需要覆盖到的字节
+ *     = (lastVoiceTs + rmsLagMs − birthtimeMs) × 32。
+ *     `rmsLagMs`（生产传 RMS_LAG_MS=1000）是给"RMS 行比真实语音滞后"留的余量：
+ *     lastVoiceTs 是**低估**的说话结束时刻，所以这个 need 比实际需要更靠后 = 偏保守。
+ *   ▸ ★ 这里**刻意不要求"那次抢跑转出了字"**（我第二版这样写过，被一次实测否掉）：
+ *     分段边界上那 0.08~2s 的片段本来就常常整段无人声，实测基线与 A/B 两轮里
+ *     封口段与抢跑切片**都**交回 `text=""`，句尾那个「会」字从来不是这一段转出来的，
+ *     而是"整句音频一次重转"救回来的。所以放行的前提是**音频已经齐**（本函数），
+ *     "重转这一句会不会真跑"由调用方判（段数、worker 在途、句子不只叫了个名字）。
+ *   ▸ 时间对不上（birthtime=0 / 没有 RMS 信源）一律判"没覆盖"：宁可慢，不可丢。 */
+function tailCoveredByRush(o) {
+  const size = Number(o && o.size);
+  const born = Number(o && o.birthtimeMs);
+  const lastVoice = Number(o && o.lastVoiceTs);
+  const rushedTo = Number(o && o.rushedTo) || 0;
+  const lagMs = Number(o && o.rmsLagMs);
+  if (!(size > 0) || !(born > 0) || !(lastVoice > 0)) return false;
+  const lag = Number.isFinite(lagMs) && lagMs >= 0 ? lagMs : 0;
+  const needMs = lastVoice + lag - born;                       // 段内属于"说话及其滞后"的那一段时间
+  if (needMs <= 0) return true;                                // 整段都出生在说话结束之后 = 纯静音段
+  /* 和 size 取小也是**错的**：文件还没长到 need 时，"读满文件"并不等于"覆盖到说话结束"——
+     那段还没落盘的字节里恰恰可能藏着尾字，放行了就是 10-07 修掉的"丢尾"从新入口复发。 */
+  return rushedTo >= Math.ceil(needMs * 32);                   // 1ms × 32B/ms = 16kHz 单声道 s16le
+}
+
+/* ★ 2026-10-10 C2：整句音频的两个字节账助手（纯函数，test:asr 直接跑正反例）。
+ *   ▸ 为什么值得搬出来：`uttAudio` 的切片现在有两个入口（抢跑前缀 + 封口余量），
+ *     **到达顺序不再等于时间顺序**（seg-0008 的 delta 早于 seg-0007 的封口余量 ~150ms）。
+ *     直接按 push 顺序拼，模型听到的就是"后半句排在前半句前面"的一句乱序话，
+ *     而它照样会自信地转出文字——这类错不报错、只在字幕上看起来"怪"。
+ *   ▸ 段名是 `seg-%04d.pcm`（补零）⇒ 字典序 = 时间序；同一段多次抢跑靠稳定排序保持先后。 */
+function uttOrdered(chunks) {
+  return (chunks || []).slice().sort((a, b) => {
+    const ka = (a && a.k) || ''; const kb = (b && b.k) || '';
+    return ka < kb ? -1 : (ka > kb ? 1 : 0);
+  });
+}
+/* "够不够两段"按**段名去重**数：抢跑把同一段切成多条前缀，切片数会伪装成"多段"，
+ *   而 REFINE_MIN_CHUNKS 的原意是"只有一段的话分段路径本来就整段转写过一次，不必再来一次"。 */
+function uttSegmentKinds(chunks) {
+  return new Set((chunks || []).map((c) => (c && c.k) || '')).size;
+}
+
 module.exports = {
   probeWhisper,
   transcribeFile,
@@ -1051,6 +1101,9 @@ module.exports = {
   WAKE_AMBIG_RE,
   WAKE_ADDRESS_RE,
   startsNewSentence, // ★ 2026-10-06 夜二 上一句已说完 + 新段无归并关系 → 换句（不再粘成 blob）
+  tailCoveredByRush, // ★ 2026-10-10 C2 尾巴抢跑放行：抢跑是否已覆盖到"说话结束的那一刻"
+  uttOrdered,        // ★ 2026-10-10 C2 整句音频按段名排序（两个入口的切片到达顺序 ≠ 时间顺序）
+  uttSegmentKinds,   // ★ 2026-10-10 C2 按段名去重数段数（抢跑前缀不许伪装成"多一段"）
   wakeClause,       // ★ 2026-10-06 夜二 从合并字幕里取出"叫它的那一句"（收窄提问，不收窄账本）
   isFollowUp,
   isNameOnly,     // ★ 2026-10-04 光叫名字没说事（碎片唤醒不应答，但顺延追问窗口）

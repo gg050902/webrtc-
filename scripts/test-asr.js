@@ -1584,6 +1584,118 @@ function writeWav(file, samples) {
   }
 
 
+  /* ══ ⑮ ★ 2026-10-10（C2）"等尾段封口那 1s"：尾巴抢跑放行的判据 ══
+   * ▎要买回来的那一秒是量出来的（ASR_DEBUG 实测：静音判据只要 1.2s，实际定稿在 2.6~2.7s，
+   *   差值花在等含尾字的那一段被 ffmpeg 封口），而它上一次放松**买回过一次插话**（10-07 夜），
+   *   所以这一组的重点不是"能省多少"，而是**三条收紧是否真的在挡最坏形状**。
+   * ▸ 判据本体是纯函数 Asr.tailCoveredByRush；服务器那侧只做"取物理事实 + 喂判据"。 */
+  const rushCov = Asr.tailCoveredByRush;
+  /* 物理常数：16kHz 单声道 s16le = 32 字节/毫秒。下面用"段出生 1000ms、最后一次有声 3000ms、
+     RMS 滞后 1000ms"这一组数 ⇒ 需要覆盖到 (3000+1000-1000)=3000ms ⇒ 96000B。 */
+  const RUSH = { birthtimeMs: 1000, lastVoiceTs: 3000, rmsLagMs: 1000, okTs: 4100 };
+  ok('⑮.1 覆盖到"说话结束+滞后"⇒ 放行（这就是省下来的那 ~1s）',
+    rushCov({ ...RUSH, size: 160000, rushedTo: 96000 }) === true);
+  ok('⑮.2 反向对照：只吃过半截（32000B < 96000B）⇒ 照旧按住，绝不提前定稿',
+    rushCov({ ...RUSH, size: 160000, rushedTo: 32000 }) === false);
+  /* ★ 这条是本轮我自己写出来又被反例抓回去的错：第一版把要求写成 min(size, need)，
+     于是"文件还没长到 need"也算覆盖到位 —— 而没落盘的那段字节里恰恰可能藏着尾字，
+     放行了就是 10-07 修掉的"丢尾"从新入口复发。这条断言现在专门钉它。 */
+  ok('⑮.3 反向对照：文件还比"说话结束"短时，读满整个文件也**不算**覆盖到位（丢尾的老路）',
+    rushCov({ ...RUSH, size: 64000, rushedTo: 64000 }) === false);
+  ok('⑮.4 判据只看"音频覆盖到位"，**不要求那次抢跑转出字**（实测封口段自己也交回 text=""，\
+      句尾那个字从来是靠整句重转救的；把"转出字"当放行条件 ⇒ 机制一次都不生效）',
+    rushCov({ ...RUSH, size: 160000, rushedTo: 96000, okTs: 0 }) === true
+      && rushCov({ ...RUSH, size: 160000, rushedTo: 96000 }) === true);
+  ok('⑮.5 纯静音段（出生晚于说话结束）不需要抢跑也算覆盖——否则静音期会把闸门永久按住',
+    rushCov({ ...RUSH, birthtimeMs: 5000, size: 4000, rushedTo: 0 }) === true);
+  ok('⑮.6 时间取不到（birthtime=0 / 没有 RMS 信源）一律判"不覆盖"：宁可慢，不可丢',
+    rushCov({ ...RUSH, birthtimeMs: 0, size: 160000, rushedTo: 96000 }) === false
+      && rushCov({ ...RUSH, lastVoiceTs: 0, size: 160000, rushedTo: 96000 }) === false);
+  ok('⑮.7 缺字段/坏输入不抛错（判据在热路径上，异常会把成句块整个吞掉）',
+    rushCov(undefined) === false && rushCov({}) === false
+      && rushCov({ size: 'x', birthtimeMs: null, lastVoiceTs: NaN, rushedTo: undefined, okTs: undefined }) === false);
+
+  /* 整句音频的两个字节账助手（本次新增的行为面：切片有了第二个入口） */
+  ok('⑮.7b 乱序切片按**段名**排好再拼：抢跑前缀会早于上一段的封口余量到达（~150ms）',
+    Asr.uttOrdered([{ k: 'seg-0008.pcm', b: 1 }, { k: 'seg-0007.pcm', b: 2 }, { k: 'seg-0007.pcm', b: 3 }])
+      .map((c) => `${c.k}:${c.b}`).join(',') === 'seg-0007.pcm:2,seg-0007.pcm:3,seg-0008.pcm:1');
+  ok('⑮.7c 排序不许改动传进来的数组（那是 uttAudio 的账本本体，排错了下次重转就少字节）',
+    (() => {
+      const src = [{ k: 'seg-0002.pcm', b: 'a' }, { k: 'seg-0001.pcm', b: 'b' }];
+      return Asr.uttOrdered(src).map((c) => c.b).join('') === 'ba' && src.map((c) => c.b).join('') === 'ab';
+    })());
+  ok('⑮.7d 段数按段名去重：抢跑把一段切成三条前缀仍然只算一段（不白跑一次整句重转）',
+    Asr.uttSegmentKinds([{ k: 'seg-0001.pcm' }, { k: 'seg-0001.pcm' }, { k: 'seg-0001.pcm' }]) === 1
+      && Asr.uttSegmentKinds([{ k: 'seg-0001.pcm' }, { k: 'seg-0002.pcm' }]) === 2
+      && Asr.uttSegmentKinds(undefined) === 0);
+
+  /* ── 接线断言（坑 41/56：纯函数全绿不等于生产里跑到了） ── */
+  {
+    const srv = fs.readFileSync(path.join(__dirname, '..', 'sfu', 'server.js'), 'utf8');
+    const code = srv.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    ok('⑮.8 生产闸门真的调用了这个纯函数（不是测试里自嗨）',
+      /Asr\.tailCoveredByRush\(/.test(code) && /const scanTailSegments = \(\)/.test(code));
+    ok('⑮.9 旧那条"永远按住"的判据已经改名成一次扫描出两个结论（pending / pendingRushed）',
+      !/pendingTailSegment/.test(code) && /out\.pending = true/.test(code) && /out\.pendingRushed = true/.test(code));
+    /* ★ 10-07 那次回归的直接对冲：只含名字的碎片句一旦提前定稿 → arm 续接窗 → 下一句被接话。
+       而它只是"重转会不会真跑"的三个条件之一（另两条：重转整条关着 / worker 正忙别家）。 */
+    ok('⑮.10 放行前必须过 refineWillRun：重转开着 + 段数够 + worker 不忙 + 这句不只叫了个名字',
+      /const tailHold = \(TAIL_RUSH_ON && refineWillRun\(mid, u\)\)/.test(code)
+        && /if \(!ASR_REFINE_ON \|\| REFINE_MAX_BYTES <= 0\) return false/.test(code)
+        && /uttSegmentKinds\(ua\.chunks\) < REFINE_MIN_CHUNKS\) return false/.test(code)
+        && /asrEngineBusy > REFINE_YIELD_ABOVE\) return false/.test(code)
+        && /!Asr\.isNameOnly\(normAsrText\(u\.text\)\)/.test(code));
+    /* ★ 默认开是**同场次 A/B 量出来的**（本机干净机器、qwen-local 就位后各一轮）：
+       关 3.3s/3.1s → 开 3.3s/**2.0s**，而 定稿条数(2)、应答次数(1)、正解命中（含尾字「会」）一个都没变差
+       ——那三条就是动手前写死的红线。留着 `=0` 这条逃生舱，是因为"多人房里 worker 常年不空闲"
+       会让放行很少发生（那是安全侧的少，不是坏），下次要单独量这个变量时得能一键退回。 */
+    ok('⑮.11 开关默认开、且留 ASR_TAIL_RUSH=0 整条退回"永远等封口"',
+      /const TAIL_RUSH_ON = process\.env\.ASR_TAIL_RUSH !== '0'/.test(code));
+    ok('⑮.12 抢跑吃到的字节**也进整句音频**（不补这一半，闸门松不开、尾字也进不了重转）',
+      /ua2\.chunks\.push\(\{ k: newest, b: buf \}\)/.test(code) && /uttTake\.set\(newest, flushedTo \+ len\)/.test(code));
+    ok('⑮.13 封口段只补余量（skip=uttTake）：同一段被计入两遍就是"整句音频里出现两次"的老账',
+      /const skip = Math\.min\(uttTake\.get\(baseName\) \|\| 0, all\.length\)/.test(code)
+        && /all\.subarray\(skip\)/.test(code));
+    /* 判据本体在 asr.js（下面 ⑮.7b/⑮.7c 直接跑正反例）；这里只钉"生产用的是那一份"。 */
+    ok('⑮.14 生产拼整句音频前真的排序（两个入口的切片到达顺序 ≠ 时间顺序）',
+      /const uttOrdered = Asr\.uttOrdered;/.test(code)
+        && /Buffer\.concat\(uttOrdered\(chunks\)\.map/.test(code));
+    ok('⑮.15 "够不够两段"走 asr.js 那一个去重函数（判据不许在服务器里再抄一份）',
+      /const uttSegmentKinds = Asr\.uttSegmentKinds;/.test(code)
+        && /uttSegmentKinds\(ua\.chunks\) >= REFINE_MIN_CHUNKS/.test(code));
+    /* 坑 76：机制没有触发计数，就等于"看起来在跑、实际从未跑过"。 */
+    ok('⑮.16 两本触发账都接上了：released（提前定稿）与 held（照旧按住）',
+      /COLLAB\.tailRush\.released \+= 1/.test(code) && /COLLAB\.tailRush\.held \+= 1/.test(code)
+        && /tailRush: \{ released: 0, held: 0 \}/.test(code));
+    ok('⑮.17 /metrics 两行都在且**锚行首**读法可用（HELP 行含同名，坑 74）+ /api/rooms 同源一个数',
+      /L\.push\(`sfu_ai_asr_tail_rush_total \$\{COLLAB\.tailRush\.released\}`\)/.test(code)
+        && /L\.push\(`sfu_ai_asr_tail_hold_total \$\{COLLAB\.tailRush\.held\}`\)/.test(code)
+        && /tailRush: COLLAB\.tailRush/.test(code));
+    ok('⑮.18 uttTake 与另外两张水位表同生命周期剪枝（长跑不许只增不减）',
+      /for \(const k of \[\.\.\.uttTake\.keys\(\)\]\)/.test(code));
+    ok('⑮.19 放行时留一条结构化事件（事后要能回答"这一句为什么没等封口"）',
+      /logEvent\('info', 'asr-tail-rush'/.test(code));
+    /* ★ 这一条是本轮**被实测否掉的两个写法**之一留下的判据（另一条见 ⑮.4）：
+       我曾把"静音确认后从段首整段重读"当成解法，写之前用一个真 wav 量了四刀——
+       切掉 0.08s / 0.4s、以及"切掉再补 0.25s 假静音"，三种切片转写结果与整段**一字不差**
+       （`scripts/.tmp-tailpad.js`，量完即删）。所以"模型要的是段尾收尾点"这个假设是假的，
+       整段重读只会多空跑一次推理。判据反过来钉：**delta 路径不许被顺手改掉**。 */
+    ok('⑮.20 抢跑仍只读 delta（从水位起）：整段重读已被实测否决，空跑一次推理换不来字',
+      /fs\.readSync\(fd, buf, 0, len, flushedTo\)/.test(code)
+        && !/const readFrom =/.test(code) && !/uttDropSegment/.test(code));
+    ok('⑮.21 整句音频的字节账：抢跑推 {k,b} 并把水位记进 uttTake，封口段只补余量（不重不漏）',
+      /ua2\.chunks\.push\(\{ k: newest, b: buf \}\); ua2\.bytes \+= len;/.test(code)
+        && /uttTake\.set\(newest, flushedTo \+ len\)/.test(code)
+        && /const skip = Math\.min\(uttTake\.get\(baseName\) \|\| 0, all\.length\)/.test(code)
+        && /all\.subarray\(skip\)/.test(code));
+    ok('⑮.22 触发计数只在真的要定稿（due）时记，且放行/按住两本互斥（空转不许把计数刷满）',
+      /if \(due\) \{[\s\S]{0,400}TAIL_RUSH_ON && tailScan\.pending[\s\S]{0,120}!tailHold/.test(code)
+        && /COLLAB\.tailRush\.released \+= 1/.test(code) && /COLLAB\.tailRush\.held \+= 1/.test(code));
+    ok('⑮.23 到上限就不推水位（挖声音的老路）：ua2.bytes+len<=REFINE_MAX_BYTES 这一判据必须在',
+      /if \(ua2\.bytes \+ len <= REFINE_MAX_BYTES\) \{/.test(code));
+  }
+
+
   console.log(`\n结果: ${pass} 通过, ${fail} 失败, ${skip} 跳过`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error('异常:', e); process.exit(1); });

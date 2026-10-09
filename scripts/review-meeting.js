@@ -214,6 +214,12 @@ function analyzeRoom(caps, events) {
   const gaveUp = events.filter((e) => e.event === 'asr-recorder-gave-up');
   const respawn = events.filter((e) => e.event === 'asr-recorder-respawn');
   const crashRespawn = respawn.filter((e) => e.idle !== true);
+  /* ⑥c ★ 2026-10-10（C2）"这句话没等封口就定稿了"的放行记录。
+   *   ▸ 为什么值得单列：这条机制的两种失效形态（一次都不触发 / 触发了但把句子切坏）
+   *     在延迟数字上都看不出来——只看中位数会把"没跑"读成"跑了没效果"（坑 76）。
+   *     `sinceVoice` 是放行那一刻的**真实等待**，它和 silence 定稿的中位数一比，
+   *     省了多少秒是账，不是感觉。 */
+  const tailRush = events.filter((e) => e.event === 'asr-tail-rush');
 
   /* ⑥b ★ 2026-10-10 RMS 的**到达节奏**（把路线图 H2 那条口头结论变成每场都有的分布）。
    *   ▎为什么这件事属于复盘而不是自测：那条"`ametadata` 打到管道上按 ~4KB 成块交付 ⇒
@@ -366,6 +372,9 @@ function analyzeRoom(caps, events) {
     noise: noise.length, noiseExamples: noise.slice(0, 2).map((e) => String(e.text).slice(0, 40)),
     skipped: skipped.length, bands, aboveGateSkipped,
     gaveUp: gaveUp.length, respawn: respawn.length, crashRespawn: crashRespawn.length,
+    /* ★ 2026-10-10 C2：放行次数 + 放行那一刻的真实等待（毫秒） */
+    tailRel: tailRush.length,
+    tailRelVoice: tailRush.map((e) => Number(e.sinceVoice)).filter((x) => Number.isFinite(x) && x > 0),
     /* ★ 2026-10-10 H2 的四组分布（已在 ⑥b 解释过每个数答什么问题）。
      *   rmsN 是"有几代交出了 RMS 行"，rmsPipeN 是"其中有几个能算出管道耗时"——
      *   后者可能更小（老服务器没写 firstByteMs、或锚点还没扫到就退了），所以分开报、不硬凑。 */
@@ -465,6 +474,24 @@ function verdictLines(m) {
           : slow ? `音频进来后第一行仍要 >${T.rmsPipeWarnMs}ms ⇒ 冷启动宽限要核对`
             : hasPipe ? '逐行交付，H2 的"成块"假设在这一台上不成立（已结案）'
               : '逐行交付（这一版服务器还没交"管道"那一格，只看空档与单次字节）'));
+  }
+  /* ★ 2026-10-10（C2）尾巴抢跑：放行了几次、那几次实际等了多久。
+   *   ▸ 为什么 0 次要报 ❔ 而不是 ✅：这条开关默认**开**，所以"0 次"有两种完全不同的含义——
+   *     ① 那台服务器还没重启（新代码没生效）；② 多人房里 worker 常年不空闲，放行条件
+   *     （`refineWillRun`）判"这次不会重转"就照旧等封口。两种都不是"没问题"，
+   *     报成 ✅ 就等于下一次真出问题时没人起疑（坑 105：没证据既不许报通过也不许报失败）。 */
+  if (!m.tailRel) {
+    add('unknown', '尾巴抢跑',
+      '0 次提前定稿——开关默认开，所以这要么是"那台服务器还没重启（旧代码）"，'
+      + '要么是"worker 一直忙 ⇒ 放行条件判这次不会真做整句重转，照旧等封口"'
+      + (m.latN ? `；这场 silence 定稿的中位等待 ${fmtSec(quantile(m.lat, 0.5))} 就是它要买的那部分` : '；本场也没有可信延迟读数'));
+  } else {
+    const relMed = quantile(m.tailRelVoice.slice().sort((a, b) => a - b), 0.5);
+    const silMed = m.latN ? quantile(m.lat, 0.5) : null;
+    add('ok', '尾巴抢跑',
+      `提前定稿 ${m.tailRel} 次 · 放行时已等 中位 ${fmtSec(relMed)}`
+      + (silMed != null ? ` vs 全场 silence 中位 ${fmtSec(silMed)}（差值就是买回来的那部分）` : '')
+      + ` · 判据=音频覆盖到位 × 整句重转真的会跑 × 这句不只叫了个名字`);
   }
   /* ★ 2026-10-10（H8c）这个房间**分不分得开**——它是"要不要动阈值"的唯一正当依据。
    *   ▸ 有声占比（voiced/lines）接近 1 的两种读法必须分清，否则这一行会被误读：
@@ -732,6 +759,27 @@ function selftest() {
   ]);
   const deadLine = verdictLines(dead).find((l) => l.label === '听觉进程');
   ok('自检 G：听觉进程永久放弃要报 bad', deadLine.level === 'bad');
+  /* G3 ★ 2026-10-10 C2「尾巴抢跑」那行的三种形态各自要分得开。
+   *   ▸ 反向对照最重要：**0 次放行必须报 ❔ 而不是 ✅**——这条开关默认关，
+   *     "没跑"是它的常态，把它报成"没问题"就等于下一次真出问题时没人起疑（坑 105）。 */
+  const rushOn = analyzeRoom([cap(0, '一句足够长的正常字幕内容', { fin: 'silence', lat: 1500 })], [
+    { ts: new Date(t0).toISOString(), event: 'asr-tail-rush', member: 'm1', chars: 14, sinceVoice: 1580 },
+    { ts: new Date(t0 + 5000).toISOString(), event: 'asr-tail-rush', member: 'm1', chars: 12, sinceVoice: 1620 },
+  ]);
+  const rushLine = verdictLines(rushOn).find((l) => l.label === '尾巴抢跑');
+  ok('自检 G3：有放行记录时报数（次数 + 放行时已等的中位），且不冒充别的判据',
+    rushOn.tailRel === 2 && rushLine.level === 'ok' && /2 次/.test(rushLine.text) && /音频覆盖到位/.test(rushLine.text),
+    rushLine.text);
+  const rushOff = analyzeRoom([cap(0, '一句足够长的正常字幕内容', { fin: 'silence', lat: 1500 })], [
+    { ts: new Date(t0).toISOString(), event: 'asr-recorder-respawn', member: 'm1', code: 0, idle: true },
+  ]);
+  const rushOffLine = verdictLines(rushOff).find((l) => l.label === '尾巴抢跑');
+  ok('自检 G3b：0 次放行报 ❔ 并给出**两种**解释（没证据不许报通过，坑 105）',
+    rushOff.tailRel === 0 && rushOffLine.level === 'unknown'
+      && /还没重启/.test(rushOffLine.text) && /worker 一直忙/.test(rushOffLine.text),
+    rushOffLine.text);
+  ok('自检 G3c：放行那一刻的等待只数**正数**（sinceVoice=-1 是"当时没有 RMS 信源"，不是等了 -1ms）',
+    analyzeRoom([], [{ ts: new Date(t0).toISOString(), event: 'asr-tail-rush', member: 'm1', sinceVoice: -1 }]).tailRelVoice.length === 0);
   /* G2 ★ 2026-10-10 H2 的常驻哨兵本身要能红（这台仪表装上去那天起就该自检，
    *   否则"加了观测"与"观测在工作"是两件事——坑 107 那条自检纪律的又一次应用）。
    *   ▸ 四种形态各一条：逐行交付（ok）/ 管道成块（bad）/ 首行偏慢（warn）/ 没有样本（unknown）。
