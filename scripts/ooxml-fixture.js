@@ -194,6 +194,25 @@ function makeDocx(opts) {
   <w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>宽表头</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>竖</w:t></w:r></w:p></w:tc></w:tr>
   <w:tr><w:tc><w:p><w:r><w:t>横一</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>横二</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc></w:tr>
 </w:tbl>` : ''}
+  ${o.nested ? /* 表格里套表格，再套一层（真实 Word 论文/课设的常见形状：成绩表里的"备注"格放一张小表）。
+     内核的 docxBlocks 对 w:tbl 是递归的，但这条形状以前**只在脑子里成立过**——
+     夹具里没有它，所以"嵌套到底画不画得出来"从来没有证据（坑 130：自己写的夹具测的是记忆不是能力）。
+     外层单元格用 <w:sdt> 再包一层内表，顺手把"内容控件里嵌表"这条也一起钉住。 */ `
+<w:tbl>
+  <w:tr>
+    <w:tc><w:p><w:r><w:t>外层左</w:t></w:r></w:p></w:tc>
+    <w:tc>
+      <w:tbl>
+        <w:tr><w:tc><w:p><w:r><w:t>中层甲</w:t></w:r></w:p></w:tc>
+            <w:tc><w:sdt><w:sdtContent>
+              <w:tbl><w:tr><w:tc><w:p><w:r><w:t>最里层</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+            </w:sdtContent></w:sdt></w:tc></w:tr>
+        <w:tr><w:tc><w:p><w:r><w:t>中层乙</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>中层丙</w:t></w:r></w:p></w:tc></w:tr>
+      </w:tbl>
+    </w:tc>
+  </w:tr>
+  <w:tr><w:tc><w:p><w:r><w:t>外层下</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>&nbsp;</w:t></w:r></w:p></w:tc></w:tr>
+</w:tbl>` : ''}
 <w:p><w:hyperlink r:id="rId5"><w:r><w:t>外部链接</w:t></w:r></w:hyperlink></w:p>
 <w:p><w:hyperlink r:id="rId6"><w:r><w:t>内部锚点</w:t></w:r></w:hyperlink></w:p>
 ${o.noImage ? '' : `<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="图一" descr="示意图"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="1" name="图一" descr="示意图"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rId10"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>`}

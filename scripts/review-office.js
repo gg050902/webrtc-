@@ -92,6 +92,29 @@ async function selftest() {
     find(empty, 0, none);
     yes('空目录报"没有样本"而不是"没问题"（found=0 走 unknown 分支）', none.length === 0);
     fs.rmSync(empty, { recursive: true, force: true });
+
+    /* ★ 2026-10-10（B5）三件新事情各有自己的正/反向对照——
+     *   没有反向对照的仪表读数只是一个装饰（坑 115：一条常绿的断言可以保护一个错的期望）。 */
+    const nested = await FV.render('嵌套.docx', FX.makeDocx({ nested: true }), Z);
+    const nsh = shape(nested.html);
+    yes('B5 深度量具看得见真嵌套（表里套表再套表 ⇒ depth ≥ 3，且最里层那三个字在页面上）',
+      nsh.depth >= 3 && nsh.tables >= 4 && /最里层/.test(nested.html), JSON.stringify(nsh));
+    /* 反向对照：同一台量具量**没有**嵌套的那份必须读回 1。
+     * 没有这一条，depth 可能因为扫描正则写错而恒为 0/恒为很大，而"≥3"那条照样绿。 */
+    yes('B5 深度量具能读出 1（平铺的那份不许被读成嵌套；量具读不出 0 就不许报"在"）',
+      shape(await FV.render('一份真形状.docx', FX.makeDocx({}), Z).then((x) => x.html)).depth === 1,
+      String(shape(await FV.render('一份真形状.docx', FX.makeDocx({}), Z).then((x) => x.html)).depth));
+    /* 「以图为主」与「可疑」分栏：把同一句"文字极少"报成两个不同原因，
+     * 判错方向会让人去查一个没坏的内核容器（本轮真实回扫 11 份里 10 份是截图作业）。 */
+    yes('B5 分栏判据：有图而字少算"以图为主"，不进可疑那一栏（普查过：这批语料没有"字全在 DrawingML"那种）',
+      classifyThin({ textChars: 36, imgs: 25, placeholders: 0 }, 2058 * 1024) === 'image-led'
+      && classifyThin({ textChars: 6, imgs: 2, placeholders: 0 }, 133 * 1024) === 'image-led');
+    yes('B5 分栏判据：字少、一张图都没有、文件不小 ⇒ 才算可疑（这条反向不许一起松掉）',
+      classifyThin({ textChars: 36, imgs: 0, placeholders: 0 }, 2058 * 1024) === 'suspicious'
+      && classifyThin({ textChars: 5000, imgs: 0, placeholders: 0 }, 2058 * 1024) === 'ok');
+    yes('B5 抛错分类：截断的 ZIP 算"输入坏了"，不算内核 bug',
+      classifyErr('不是合法的 ZIP（找不到中央目录结尾记录）') === 'broken-input'
+      && classifyErr('Cannot read properties of undefined (reading "tag")') === 'kernel');
   } finally {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* 临时目录删不掉不影响结论 */ }
   }
@@ -122,6 +145,41 @@ function find(dir, depth, out) {
 }
 
 /* 只统计结构，不看内容 */
+/* ★ 2026-10-10（B5）表格嵌套深度：用**栈扫描**数"同时打开的 <table>"，而不是正则找
+ *   "td 里套 table"——内核把每张表包在 `<div class="fv-tblwrap">` 里，而**首行**的单元格
+ *   渲染成 `<th>`（Word 的表头行语义），所以"<td…><table"那种写法量不到真实的嵌套（我第一版就是）。
+ *   深度这件事值得单独量：它是"内层被整片丢掉"唯一的可见信号——
+ *   表数与格数在"只画外层"的实现下照样好看。 */
+function maxTableDepth(html) {
+  const re = /<(\/?)table\b/g;
+  let d = 0; let max = 0; let m;
+  while ((m = re.exec(html))) {
+    if (m[1]) { if (d > 0) d--; } else { d++; if (d > max) max = d; }
+  }
+  return max;
+}
+/* ★ 2026-10-10（B5）"文字极少"这一栏原来把两种完全不同的东西混在一起报，
+ *   而报的原因那句"可能是内核漏了某类容器"对**十一份里的十份都是错的**：
+ *   真实回扫里那 11 份字少的文件，几乎每一份都是 图=6~25 的截图作业（文件大是因为图片，不是因为文字）。
+ *   判据说错了比没有判据更糟——它会把人支去查一个不存在的地方（坑 105/125 同一条：
+ *   "这格式画不了"与"预算不够被裁"不许进同一个计数，这里同理）。 */
+function classifyThin(s, sizeBytes) {
+  if (!(s.textChars < 80 && sizeBytes > 20 * 1024)) return 'ok';
+  /* ▸ 为什么"有一张图"就够把它归到"以图为主"：这不是拍脑袋放宽，是**一次性普查给的依据**——
+     本机 77 份"渲染出来几乎没字"的真实 docx 里，"字全部住在 DrawingML/ SmartArt 而内核只看 w:t"
+     这种形状 = **0 份**；剩下的每一份都有嵌入图片（截图作业、扫描件）。
+     所以这批语料里，"字少 + 有图"的最省解释就是它本来就是图片，而不是内核漏了一类容器。
+     下次如果真人语料里出现"字少、一张图都没有、段落却很多"，那才是这条判据该红的时候。 */
+  if (s.imgs >= 1 || s.placeholders >= 1) return 'image-led';   // 以图为主：正常，这份文件本来就是图片
+  return 'suspicious';                                          // 字少、图也没有、文件不小：这才是要点开看的
+}
+/* 抛错也分两类：**输入本身坏了**（截断、加密、改名）与**内核抛错**（我们的 bug）。
+ * 混在一起的后果是"273 份里 1 份抛错"这句话读起来像内核有 1 个 bug，而实际是那份文件不是合法 ZIP。 */
+function classifyErr(msg) {
+  const m = String(msg || '');
+  return /不是合法的 ZIP|中央目录|加密|损坏|截断/.test(m) ? 'broken-input' : 'kernel';
+}
+
 function shape(html) {
   const strip = String(html).replace(/<[^>]*>/g, '');
   return {
@@ -131,6 +189,7 @@ function shape(html) {
     slides: (html.match(/class="fv-slide"/g) || []).length,
     placeholders: (html.match(/〔图片〕/g) || []).length,
     noteSkipped: /fv-note-imgs/.test(html),
+    depth: maxTableDepth(html),
     textChars: strip.replace(/\s+/g, '').length,
   };
 }
@@ -168,12 +227,22 @@ function shape(html) {
         legacy: m.legacy || '', via: m.via || '', unsupported: !!m.unsupported,
       });
     } catch (e) {
-      bad++;
+      /* 计数**不在这里做**：坏在哪一类要到报告时才判得清（classifyErr），
+       * 在这儿先 bad++ 再在报告里 bad++ 就是把同一个错数两遍（我第一版就是这样，
+       * 而"数两遍"比"少数一遍"更难发现——汇总那行看着完全正常）。 */
       rows.push({ label, ok: false, ms: Date.now() - t0, size: bytes.length, err: String((e && e.message) || e).slice(0, 130) });
     }
   }
+  let imageLed = 0;   // 以图为主（正常，不该和"可疑"混在一栏）
+  let inputBad = 0;   // 输入本身坏了（不是内核的 bug）
   for (const r of rows) {
-    if (!r.ok) { console.log(`  ❌ ${r.label}\n       抛错：${r.err}`); continue; }
+    if (!r.ok) {
+      const ec = classifyErr(r.err);
+      if (ec === 'broken-input') inputBad++; else bad++;
+      console.log(`  ${ec === 'broken-input' ? '⚠️' : '❌'} ${r.label}`);
+      console.log(`       ${ec === 'broken-input' ? '读不了这份文件（输入侧：损坏/截断/加密/改名）——界面会明说读不了' : '内核抛错（这才是要修的）：' + r.err}`);
+      continue;
+    }
     /* 旧格式抽不出文字时内核不抛错，但必须单列 —— 这正是用户会报的那种"看不了"，
        而这边一声不响就等于没有那一栏（坑 76：机制没触发时要能看见）。 */
     if (r.unsupported) {
@@ -185,13 +254,17 @@ function shape(html) {
     const s = r.s;
     console.log(`  ✅ [${r.kind}${r.legacy ? ":" + r.legacy + "/" + r.via : ""}] ${r.label}`);
     console.log(`       文件 ${(r.size / 1024).toFixed(0)}KB → HTML ${(r.html / 1048576).toFixed(2)}MB · ${r.ms}ms`
-      + ` · 页/段/行=${r.n} 表=${s.tables} 格=${s.cells} 图=${s.imgs}(占位 ${s.placeholders}${r.skipped ? ` · 被预算裁掉 ${r.skipped}` : ''})`
+      + ` · 页/段/行=${r.n} 表=${s.tables} 格=${s.cells} 嵌套深=${s.depth} 图=${s.imgs}(占位 ${s.placeholders}${r.skipped ? ` · 被预算裁掉 ${r.skipped}` : ''})`
       + ` · 提出文字 ${s.textChars} 字`);
-    /* "成功但几乎没有文字"是要人看的一栏：内核没抛错，可用户看到的是白页 */
-    if (s.textChars < 80 && r.size > 20 * 1024) { thin++; console.log(`       ⚠️ 抽出的文字极少（文件不小）——可能是内核漏了某类容器，值得点开看看`); }
+    /* "成功但几乎没有文字"是要人看的一栏：内核没抛错，可用户看到的是白页。
+     *   ▸ 但**图多的那份不算**（见 classifyThin 的注释）——报错了原因，人就照着错方向查。 */
+    const cls = classifyThin(s, r.size);
+    if (cls === 'image-led') { imageLed++; console.log('       ℹ️ 文字少但图多：这份本来就是截图/扫描件，不算可疑'); }
+    else if (cls === 'suspicious') { thin++; console.log('       ⚠️ 字少、图也少、文件不小——内核可能漏了某类容器，值得点开看看'); }
   }
-  const capped = found.length >= MAX_FILES ? `（已到上限 ${MAX_FILES} 份，还有更多没扫 —— 想看全用 --max 50）` : '';
-  console.log(`\n小结：${rows.length} 份 · 抛错 ${bad} · "文字极少/抽不出" ${thin} ${capped}`);
+  const capped = found.length >= MAX_FILES ? `（已到上限 ${MAX_FILES} 份，还有更多没扫 —— 想看全用 --max 调大）` : '';
+  console.log(`\n小结：${rows.length} 份 · 内核抛错 ${bad} · 输入坏了 ${inputBad} · `
+    + `"可疑(字少图也少/抽不出)" ${thin} · 以图为主 ${imageLed} ${capped}`);
   console.log('（这台仪表只报结构，不读内容。发现可疑的那一份，再单独拿它去加夹具 + 断言。）');
   process.exit(0);
 })().catch((e) => { console.error('回扫失败：', e && e.stack || e); process.exit(1); });

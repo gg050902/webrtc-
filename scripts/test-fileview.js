@@ -314,6 +314,7 @@ const ZLIB = { inflateRaw: (u) => new Uint8Array(zlib.inflateRawSync(Buffer.from
      *   或"日期变回数字"——正是本项目反复记的那类静默差异（坑 57/76 的运行时版）。 */
     const shapes = [
       ['docx 纵向合并 + 横向合并同表', 'docxToHtml', FX.makeDocx({ vMerge: true })],
+      ['docx 表里套表再套表（B5 新增形状）', 'docxToHtml', FX.makeDocx({ nested: true })],
       ['xlsx 公式带缓存值与不带缓存值', 'xlsxToHtml', FX.makeXlsx()],
       ['pptx 带备注页', 'pptxToHtml', FX.makePptx({ notes: true })],
       ['pptx 普通两页', 'pptxToHtml', FX.makePptx()],
@@ -336,6 +337,12 @@ const ZLIB = { inflateRaw: (u) => new Uint8Array(zlib.inflateRawSync(Buffer.from
     ok('★ 被合并的标签在浏览器那一轨也只出现一次（重影是用户一眼看得见的错）',
       (bvm.match(/负责人/g) || []).length === 1,
       `出现 ${(bvm.match(/负责人/g) || []).length} 次`);
+    /* ★ 2026-10-10（B5）嵌套表在浏览器那一轨的内容级正向对照——
+     *   两轨一致只说明"两边算出来一样"，两边一致地丢掉内层表时它照样绿。 */
+    const bnested = browserHtml['docx 表里套表再套表（B5 新增形状）'] || '';
+    ok('★ 浏览器那一轨也画得出最里层那张表（不是一致地只画了外层）',
+      bnested.indexOf('最里层') >= 0 && (bnested.match(/<table/g) || []).length >= 4,
+      `抓到 ${bnested.length} 字符 / ${(bnested.match(/<table/g) || []).length} 张表`);
 
     // 坏数据要"报错"，不要"永久转圈"——保险丝存在的意义就是这件事，而它必须可红
     const tBad = Date.now();
@@ -426,6 +433,38 @@ const ZLIB = { inflateRaw: (u) => new Uint8Array(zlib.inflateRawSync(Buffer.from
     ok('图片统计进 meta', r.meta.images === 1);
     ok('段落/表格计数进 meta（可观测：渲染了多少东西）', r.meta.paragraphs >= 6 && r.meta.tables === 1);
     ok('xml:space="preserve" 的尾部空格没丢', r.html.indexOf('尾部保留空格  <') >= 0 || r.html.indexOf('尾部保留空格  ') >= 0);
+
+    /* ★ 2026-10-10（B5）表里套表——"递归到底画得出来吗"以前只是我脑子里的事实。
+     *   ▎为什么值得单独钉：内核对 `w:tbl` 是递归的（`docxBlocks` 在单元格里遇到表会继续走
+     *     docxTable），这条形状**只要有人把那段递归改成"单元格只取文字"就静默失效**：
+     *     外层表照常画、格数照常、只有内层那几张表和它们里面的字没了——
+     *     而真实 Word 论文/课设里"格子里放一张小表"非常常见（成绩表备注栏、签名栏）。
+     *   ▸ 反向对照（没有它，"表数 ≥4"可能只是我把外层表数了两遍）：不开 nested 的那份必须是 1 张表。 */
+    {
+      const nb = FX.makeDocx({ nested: true });
+      const nr = await FV.docxToHtml(nb);
+      const base = await FV.docxToHtml(FX.makeDocx());
+      const depth = (() => {
+        const re = /<(\/?)table\b/g; let d = 0; let m = 0; let x;
+        while ((x = re.exec(nr.html))) { if (x[1]) { if (d > 0) d--; } else { d++; if (d > m) m = d; } }
+        return m;
+      })();
+      ok('B5 嵌套表的层数：外层 → 中层 → 最里层（深度 ≥ 3）',
+        nr.meta.tables >= 4 && depth >= 3, `tables=${nr.meta.tables} depth=${depth}`);
+      ok('B5 反向对照：不开嵌套的那份只有 1 张表（否则上面那条"≥4"数的是别的东西）',
+        base.meta.tables === 1, `tables=${base.meta.tables}`);
+      ['外层左', '中层甲', '最里层', '外层下'].forEach((t) => has(`B5 嵌套里每一层的文字都在页面上：${t}`, nr.html, t));
+      /* 最里层必须**在外层单元格内部**，不是在整张表后面——"掉到表格外面"是另一种实现错，
+       * 它同样能让"字都在"这条绿，而用户看到的是一张空格外 + 表下面一堆散字。 */
+      ok('B5 最里层那张表落在外层格子里，不是被甩到表外', (() => {
+        const iOut = nr.html.indexOf('外层左');
+        const iIn = nr.html.indexOf('最里层');
+        const iEnd = nr.html.indexOf('</table>');
+        return iOut > 0 && iIn > iOut && iIn < nr.html.lastIndexOf('</table>');
+      })(), '');
+      /* `<w:sdt>` 包着的内层表也要钻进去（内容控件是 Word 目录/控件的壳，壳里放表是常态） */
+      ok('B5 内容控件（w:sdt）里的嵌套表照样画出来', nr.html.indexOf('最里层') >= 0);
+    }
     ok('没有图片的 docx 不产 img', (await FV.docxToHtml(FX.makeDocx({ noImage: true }))).html.indexOf('fv-docimg') < 0);
     let msg = '';
     try { await FV.docxToHtml(Buffer.from('这不是 docx', 'utf8')); } catch (e) { msg = e.message; }
