@@ -1509,7 +1509,13 @@ const COLLAB = {
    *       lastPeakDb 正常但零转写            → 管线或模型的问题（这才该去查 sfu/ai）
    *   ▸ 这也是一个**产品级**诊断：值班的人问"他为什么没字幕"，答案可能只是"他麦克风没开"。 */
   input: { lastPeakDb: -99, lastVoiceTs: 0, zeroStreak: 0, quietSkipped: 0, voiced: 0,
-    voiceThr: -50, floorDb: null },   // ★ 2026-10-06 自适应"有声"判据当前用的哪条线、噪声底多少
+    voiceThr: -50, floorDb: null,   // ★ 2026-10-06 自适应"有声"判据当前用的哪条线、噪声底多少
+    /* ★ 2026-10-09 H2 的到达节奏（见听觉管线里 rmsSeen 那段注释）：
+     *   rmsFirstMs = 本代出生到第一条 RMS 行（**含"没人开口"那段**，不能单独当管道延迟读）；
+     *   rmsGapMaxMs = 相邻两行的最大空档；rmsBytesMax = 单次 stdout 事件最大字节；
+     *   rmsAfterByteMs = 第一条 RMS 行 − 第一个非空分段（= 管道自己的耗时，判 H2 用的就是它）。
+     *   全部 -1 = 还没发生（不是 0）。 */
+    rmsFirstMs: -1, rmsGapMaxMs: 0, rmsBytesMax: 0, rmsAfterByteMs: -1 },
   /* ★ 2026-10-03 字幕端到端延迟（"说完"→"定稿字幕广播出去"）。
    *   ▎为什么要量这一条而不是只量转写耗时：用户抱怨的"字幕很慢"其实包含三段
    *     ——静音判定的等待、模型转写、以及分段窗口本身的长度；而 `sfu_ai_asr_seconds_total`
@@ -1641,6 +1647,26 @@ function buildMetrics(snap) {
    *     = 那条 10-05 的救赎整条没跑（而它坏了不会有任何报错，只会让字幕继续糊）。 */
   help('sfu_ai_asr_gain_applied_total', 'counter', 'Segments whose model-input peak gain was raised (0 while voiced>0 = the quiet-mic gain path never ran)');
   L.push(`sfu_ai_asr_gain_applied_total ${COLLAB.gainApplied}`);
+  /* ★ 2026-10-09 H2：RMS 行的**到达节奏**——把一条挂在路线图两天的口头结论变成三个可对账的数。
+   *   ▎为什么值三条 gauge：静音判定与 ⏱ 读数全挂在 lastVoiceTs 上，而它只随 RMS 行更新。
+   *     于是"第一条 RMS 什么时候到 / 行与行之间最大空档 / 单次事件多少字节"决定了
+   *     冷启动宽限该给多长、以及"这条管道到底是逐行交付还是成块交付"。
+   *   ▸ rms_bytes_max ≈ 70 = 一行一块；≈ 4096 = 管道成块 ⇒ 这两个数长得很不一样，
+   *     而在此之前只有我记的一句"~4KB 成块"（今天用 wav 量是 70B/行、832ms 首行 —— 说明
+   *     那句话要么只适用于 RTP 输入、要么已被 10-05 的 direct=1 治掉，不能再靠记忆判断）。 */
+  help('sfu_ai_asr_rms_first_ms', 'gauge', 'Milliseconds from the listening-pipe start until the first RMS line arrived (-1 = none yet)');
+  L.push(`sfu_ai_asr_rms_first_ms ${COLLAB.input.rmsFirstMs}`);
+  help('sfu_ai_asr_rms_gap_max_ms', 'gauge', 'Largest gap between consecutive RMS lines on the metadata pipe (silence detection stalls show up here)');
+  L.push(`sfu_ai_asr_rms_gap_max_ms ${COLLAB.input.rmsGapMaxMs}`);
+  help('sfu_ai_asr_rms_bytes_max', 'gauge', 'Largest single stdout chunk from the metadata pipe (~70 = one line per event; ~4096 = pipe delivers in blocks)');
+  L.push(`sfu_ai_asr_rms_bytes_max ${COLLAB.input.rmsBytesMax}`);
+  /* ★ 2026-10-10 第四条：**把"等人开口"与"管道自己慢"分开**的那一格。
+   *   ▎为什么非加不可：第一版只有上面三条，而实测同一套代码里
+   *     `rms_first_ms` 出现过 **995**（那一代一出生就有人在说）也出现过 **20230**（那一代出生时没人说话）
+   *     ——同一个数字含义差 20 倍，谁拿它判"成块"都会被误导（我第一次就拿 20230 差点去修一个不存在的瓶颈）。
+   *     这条 = 第一条 RMS 行 − 第一个非空分段落盘，才是管道自己的耗时；-1 = 锚点还没扫到（轮询 ~1s 粒度，只判量级）。 */
+  help('sfu_ai_asr_rms_after_first_byte_ms', 'gauge', 'Milliseconds between the first non-empty segment on disk and the first RMS line (the pipe itself; -1 = anchor not observed yet)');
+  L.push(`sfu_ai_asr_rms_after_first_byte_ms ${COLLAB.input.rmsAfterByteMs}`);
   /* ★ 2026-10-06 自适应"有声"判据的两个数：阈值与噪声底。
    *   ▎为什么必须暴露：判据从"绝对 -50"改成"跟着这台机器的噪声底走"之后，
    *     如果不出数，"这个人被切句/被憋住"就又要靠读代码猜（坑 76：机制生效与否要看得见）。 */
@@ -3377,9 +3403,29 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
             deafCeil: numEnvOr(process.env.ASR_VOICE_DEAF_CEIL, -42),
           });
       let lastVoiceTs = 0;
-      /* ★ 2026-10-06 每代录音进程各自的 RMS 到达统计（lines=收到多少行 RMS、
-       *   voice=其中多少行过阈值）。进程静音退场会重生，所以这两个数也随重生归零。 */
-      const rmsSeen = { lines: 0, voice: 0, minDb: 0, maxDb: -999 };
+      /* ★ 2026-10-06 → 10-10 每代录音进程各自的 RMS 到达统计（lines=收到多少行、voice=过阈值多少行）。
+       *   ▸ 声明在 spawnRecorder **外面**是刻意的：`recordLoop` 的成句闸诊断行读的是闭包捕获的那一个对象，
+       *   写进 spawnRecorder 里面的话，重生之后 loop 手里那份永远是旧对象（静默读旧账，且不报错）——
+       *   所以这里是"跨代共享的一个对象 + 每代出生时 `resetRmsSeen()` 归零"，两个诉求同时满足。
+       *   ▸ 为什么"归零"这件事本身是个修复（10-10）：`maxGapMs` 算的是 `born - lastAt`，
+       *   两端都相对"当代出生"。原来从来没重置 ⇒ 重生后第一个间隔是**负数**（新生的 born 小、
+       *   上一代留下的 lastAt 大），于是"重生之后管道有没有立刻恢复"这件事永远进不了 maxGapMs——
+       *   而那正是 10-04g 端口撞号要看的形态。差值判据的两端必须同一个时间基准（坑 111 同族）。
+       *   ▸ 各字段各自回答一个问题（H2 的判据，别混用）：
+       *     firstAtMs    = 本代出生 → 第一条 RMS 行。**含"这一代出生时恰好没人说话"**，
+       *                    所以它不是管道延迟（实测：说话中的代 995ms，等开口的代 20230ms）。
+       *     firstByteAtMs= 本代出生 → 第一个**非空分段**落盘（= 音频真开始进来的锚点，recordLoop 里记）。
+       *     afterByteMs  = 上一条减上一条 = **管道自己的耗时**（判 H2 的那个；轮询粒度 ~1s，只判量级）。
+       *     maxGapMs     = 相邻两次带 RMS 的事件最大间隔（静音判定断供显在这里）
+       *     maxBytes     = 单次 stdout 事件最大字节（正常突发实测 2018B；判"成块"的线在 4096B） */
+      const rmsSeen = { lines: 0, voice: 0, minDb: 0, maxDb: -999,
+        events: 0, firstAtMs: -1, firstByteAtMs: -1, afterByteMs: -1,
+        maxGapMs: 0, maxBytes: 0, lastAt: 0 };
+      const resetRmsSeen = () => {
+        rmsSeen.lines = 0; rmsSeen.voice = 0; rmsSeen.minDb = 0; rmsSeen.maxDb = -999;
+        rmsSeen.events = 0; rmsSeen.firstAtMs = -1; rmsSeen.firstByteAtMs = -1;
+        rmsSeen.afterByteMs = -1; rmsSeen.maxGapMs = 0; rmsSeen.maxBytes = 0; rmsSeen.lastAt = 0;
+      };
       let flushDbgTs = 0;   // ★ 诊断日志节流（ASR_DEBUG 用）
       let gateDbgTs = 0;    // ★ 2026-10-05 成句闸状态行的节流（同上）
       /* ★ 2026-10-05 「delta 尾段快照」状态（旧"copy 全段"抢跑的重写，见下方 flush 块）。
@@ -3437,6 +3483,9 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
       const spawnRecorder = () => {
         const startIdx = nextSegIndex();
         recBornAt = Date.now();
+        /* ★ 2026-10-10 每一代出生时把到达统计归零（为什么必须归零、以及不归零时 `maxGapMs`
+         *   会算出负数间隔从而**永远记不到重生后的第一个间隔**，见 rmsSeen 的函数头注释）。 */
+        resetRmsSeen();
         /* ★ 2026-10-05 实修（latMs 恒 0 / 语句被半途定稿的根因）：ametadata 的 print 打到
          *   `file=-`（stdout 管道）时**默认带 32KB 块缓冲**——实测同一条 6s 音频：
          *   不带 direct 时 259 行 RMS 全在进程退出那一刻（5.61s）才到齐；带 `direct=1`
@@ -3502,6 +3551,31 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
         });
         curRec.stdout.on('data', (d) => {
           const matches = String(d).match(/RMS_level=(-?[\d.]+|-inf)/g);
+          /* H2 遥测先记**每一次** stdout 事件（包括不含 RMS 行的那种——"成块"的意思就是
+           *   一次事件里挤了很多行/很多字节，所以不能只数带 RMS 的那些）。 */
+          const born = Date.now() - recBornAt;
+          if (matches && matches.length) {
+            rmsSeen.events += 1;
+            if (rmsSeen.firstAtMs < 0) {
+              rmsSeen.firstAtMs = born;
+              /* 管道自己的耗时 = 第一条 RMS 行 − 第一个非空分段落盘。
+               * ▸ 锚点还没被轮询扫到（粒度 ~1s）时**保守取同一刻**：RMS 行本身就是
+               *   "音频已经在进来"的证据，所以真实锚点只会 ≤ 现在这一刻。
+               *   这样 afterByteMs 只会**低估**管道耗时、绝不虚报变慢——
+               *   反过来（记成 -1 或负数）会让"等流 14s"那种代被误读成"管道慢 14s"，
+               *   而这正是我第一版差点犯的错（实测同一代 firstMs=13957 而 firstByte=14159，
+               *   首行甚至比锚点早 202ms：轮询粒度造成的假象）。 */
+              if (rmsSeen.firstByteAtMs < 0) rmsSeen.firstByteAtMs = born;
+              rmsSeen.afterByteMs = Math.max(0, born - rmsSeen.firstByteAtMs);
+            }
+            if (rmsSeen.lastAt && born - rmsSeen.lastAt > rmsSeen.maxGapMs) rmsSeen.maxGapMs = born - rmsSeen.lastAt;
+            rmsSeen.lastAt = born;
+          }
+          if (d.length > rmsSeen.maxBytes) rmsSeen.maxBytes = d.length;
+          COLLAB.input.rmsFirstMs = rmsSeen.firstAtMs;
+          COLLAB.input.rmsGapMaxMs = rmsSeen.maxGapMs;
+          COLLAB.input.rmsBytesMax = rmsSeen.maxBytes;
+          COLLAB.input.rmsAfterByteMs = rmsSeen.afterByteMs;
           if (!matches || !matches.length) return;
           recCrashes = 0; // 又在收音频了 = 这条命是好的，崩溃预算重置
           /* ★ 2026-10-06 RMS 到达计数（查"真实会议延迟 3.9s vs 受控自测 1.4s"这条差）：
@@ -3527,6 +3601,25 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
           if (vd.voiced) { lastVoiceTs = Date.now(); rmsSeen.voice += 1; }
         });
         curRec.on('exit', (code) => {
+          /* ★ 2026-10-10 H2 结案：把 RMS 的**到达节奏**写进事件账本（每一代录音进程一条）。
+           *   ▎为什么光有 /metrics 那三条 gauge 不够：它们是"此刻最新一代"的瞬时值，进程一重生就归零，
+           *     而"成块交付"这件事要看的是**真实会议里的分布**——10-07 那条"~4KB 成块、首行约 5s"
+           *     之所以能挂在路线图上骗我三天，正是因为它只有记忆、没有账本（坑 76/133）。
+           *   ▸ 位置在**早退分支之前**：正常收尾（producer 关 / 房间销毁）也须留下这一行，
+           *     否则"用户说完话就散会"那一场永远不会有任何到达证据（坑 116：一条独立判据
+           *     不该共享别人的提前返回）。
+           *   ▸ 只在 lines>0 时报：0 行的那一代是"没人送音频"（静音退场），
+           *     那件事已经由 asr-recorder-respawn 的 idle 记了账，不重复报（噪音会淹没有效行）。 */
+          if (rmsSeen.lines) {
+            logEvent('info', 'asr-rms-arrival', {
+              roomNumber, member: memberId,
+              firstMs: rmsSeen.firstAtMs, firstByteMs: rmsSeen.firstByteAtMs,
+              afterByteMs: rmsSeen.afterByteMs,
+              gapMaxMs: rmsSeen.maxGapMs, bytesMax: rmsSeen.maxBytes,
+              lines: rmsSeen.lines, events: rmsSeen.events, voiced: rmsSeen.voice,
+              livedMs: Date.now() - recBornAt,
+            });
+          }
           if (!alive || !rooms.get(roomNumber)) { releaseAsrPipePort(port); return; } // 正常收尾（producer 关/房间销毁）
           const livedMs = Date.now() - recBornAt;
           const idleDeath = code === 0 && livedMs > 15000;   // 静音太久的正常退场
@@ -4154,6 +4247,25 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
       const recordLoop = async () => {
         await new Promise((r) => setTimeout(r, 300)); // 等首段产生
         while (alive && rooms.get(roomNumber)) {
+          /* ★ 2026-10-10（H2 的"锚点"）本代第一个**非空分段**落盘的时刻 = "音频真的开始进来了"。
+           *   ▎为什么需要它：`firstMs`（进程出生→第一条 RMS 行）混着两件事——
+           *     "这一代出生时恰好没人说话"与"管道把 metadata 压住了"。实测同一套代码里
+           *     有人说话的代是 995ms，而等开口的代是 **20230ms**：拿后者判"成块/延迟"会天天误报。
+           *     减掉这个锚点之后剩下的才是**管道自己的耗时**（`rmsAfterByteMs`）。
+           *   ▸ 只在还没找到锚点时扫目录（找到后这段代码永久不再执行 readdir），
+           *     所以常态开销是零；轮询粒度 ~1s，所以这个数只用来判"量级"（阈值 1.5s 起），
+           *     不用来做毫秒级结论。 */
+          if (rmsSeen.firstByteAtMs < 0) {
+            try {
+              for (const f of fs.readdirSync(segDir)) {
+                if (!f.startsWith('seg-') || !f.endsWith('.pcm')) continue;
+                if (fs.statSync(path.join(segDir, f)).size > 0) {
+                  rmsSeen.firstByteAtMs = Date.now() - recBornAt;
+                  break;
+                }
+              }
+            } catch (e) { /* 目录还没建出来（进程刚出生）：下一轮再看 */ }
+          }
           /* ══ ★ 2026-10-05 delta 尾段快照（"静音抢跑"的最终重写，必须排在成句闸**之前**）══
            * ▎顺序为什么动不得：静音确认时"扑尾巴"与"成句"会同时满足——
            *   若先成句，尾段文字就归并不到这句话里，一句被拆成两句、AI 答两次（老病从抢跑入口复发）。
@@ -4242,6 +4354,9 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
                 + ` sinceAppend=${firstU ? now - firstU.lastAt : -1}ms`
                 + ` sinceText=${firstU ? now - (firstU.textAt || firstU.lastAt) : -1}ms`
                 + ` rms=${rmsSeen.lines}行/${rmsSeen.voice}有声`
+                /* ★ 2026-10-09 H2：到达节奏与"多少行"一起打——只打行数分不清
+                   "信号稀"与"管道成块"（10-07 那条"~4KB 成块、首行 5s"就是靠这三个数证伪/证实的）。 */
+                + ` 到达[首行=${rmsSeen.firstAtMs}ms 空档=${rmsSeen.maxGapMs}ms 单次最大=${rmsSeen.maxBytes}B 首字节=${rmsSeen.firstByteAtMs}ms 管道=${rmsSeen.afterByteMs}ms]`
                 /* ★ 2026-10-06 把 RMS 的**实际区间**也打出来：2026-10-06 的浏览器长跑里
                    5838 行全判有声（silenceConfirmed 永不成立 ⇒ 每条都以 max-age 定稿、
                    ⏱ 恒为 0），而同一时刻 test:asr-live 走 RTP 那条却能正常 silence 定稿。

@@ -50,6 +50,18 @@ const T = {
    * "-62~-55 这一带被跳过"的条数就是**旧闸会误杀、新闸放行**的那部分人。 */
   gateOld: -55,
   gateNow: -62,
+  /* ★ 2026-10-10 H2（RMS 到达节奏）的三条线，各自答一个问题，不是一条"综合阈值"：
+   *   firstWarnMs = 进程出生到第一条 RMS 行的可接受上限（本机实测 995ms，宽限期给 8s）；
+   *   gapBadMs   = 相邻两行的最大空档——静音判定与 ⏱ 读数的锚就挂在这里；
+   *   blockBytes = 单次 stdout 事件的字节数，超过它才算"管道成块交付"（实测逐行是 70~960B）。
+   *   ▸ 为什么留成配置：ffmpeg 的构建/版本会改这个行为，换机器时这三个数要能当场改而不改代码。 */
+  rmsFirstWarnMs: Number(process.env.REVIEW_RMS_FIRST_MS) || 2000,
+  /* ★ 2026-10-10 判"管道慢"用的是这一条（第一个非空分段 → 第一条 RMS 行），不是上面那条 firstMs：
+   *   firstMs 里混着"这一代出生时恰好没人开口"那段等待，实测同一套代码里 995ms 与 20230ms 都出现过。 */
+  rmsPipeWarnMs: Number(process.env.REVIEW_RMS_PIPE_MS) || 1500,
+  rmsGapBadMs: Number(process.env.REVIEW_RMS_GAP_MS) || 5000,
+  rmsBlockBytes: Number(process.env.REVIEW_RMS_BLOCK_BYTES) || 4096,
+  minRmsSamples: 3,
 };
 
 /* ────────── 读账本 ────────── */
@@ -201,6 +213,30 @@ function analyzeRoom(caps, events) {
   const respawn = events.filter((e) => e.event === 'asr-recorder-respawn');
   const crashRespawn = respawn.filter((e) => e.idle !== true);
 
+  /* ⑥b ★ 2026-10-10 RMS 的**到达节奏**（把路线图 H2 那条口头结论变成每场都有的分布）。
+   *   ▎为什么这件事属于复盘而不是自测：那条"`ametadata` 打到管道上按 ~4KB 成块交付 ⇒
+   *     第一行 RMS 约 5s 才到"挂了三天，期间我拿它对生产阈值做过推断（冷启动宽限 8s 就是
+   *     为它写的）。受控自测一天只跑一次，而真会议室里那台 ffmpeg 是**另一批进程**——
+   *     只有记忆没有账本的结论，就没有任何人能复核它（坑 76/133：机制"在"不等于生效，
+   *     而"我记的那个数"连机制都算不上）。现在每一代录音进程留一行 `asr-rms-arrival`，
+   *     分布就直接长在报告里，下一次换 ffmpeg 版本/换机器会被这一行当场逮住。
+   *   ▸ 四个数各答一个问题，故意不合成一个"综合分数"：
+   *       firstMs     = 本代进程出生 → 第一条 RMS 行（**含"这一代出生时恰好没人说话"**，只当背景）
+   *       afterByteMs = 第一个非空分段落盘 → 第一条 RMS 行（= **管道自己的耗时**，判 H2 用它）
+   *       gapMaxMs    = 行与行之间的最大空档（静音判定与 ⏱ 读数的锚挂在这里）
+   *       bytesMax    = 单次 stdout 事件最大字节（实测**正常突发**到过 2018B —— 流刚开始时一挤几十行；所以判线画在 4KB）
+   *   ▸ 为什么必须有 afterByteMs 这个锚：实测同一套代码里 firstMs 出现过 995（一出生就有人在说）
+   *     也出现过 **20230**（那一代没人说话）——同一个名字差 20 倍。
+   *     我第一版就是拿着它差点去修"冷启动 20 秒"这个不存在的瓶颈（坑 75 的指标版：
+   *     一个指标如果不代表它名字所说的那件事，它就会把人引向错误的诊断）。 */
+  const rmsArr = events.filter((e) => e.event === 'asr-rms-arrival');
+  const rmsNums = (key) => rmsArr.map((e) => Number(e[key]))
+    .filter((v) => Number.isFinite(v) && v >= 0).sort((a, b) => a - b);
+  const rmsFirst = rmsNums('firstMs');
+  const rmsPipe = rmsNums('afterByteMs');
+  const rmsGap = rmsArr.map((e) => Number(e.gapMaxMs) || 0).sort((a, b) => a - b);
+  const rmsBytes = rmsArr.map((e) => Number(e.bytesMax) || 0).sort((a, b) => a - b);
+
   /* ⑦ 应答与播报 */
   const count = (name) => events.filter((e) => e.event === name).length;
   const ttsEvents = events.filter((e) => e.event === 'ai-tts');
@@ -286,6 +322,12 @@ function analyzeRoom(caps, events) {
     noise: noise.length, noiseExamples: noise.slice(0, 2).map((e) => String(e.text).slice(0, 40)),
     skipped: skipped.length, bands, aboveGateSkipped,
     gaveUp: gaveUp.length, respawn: respawn.length, crashRespawn: crashRespawn.length,
+    /* ★ 2026-10-10 H2 的四组分布（已在 ⑥b 解释过每个数答什么问题）。
+     *   rmsN 是"有几代交出了 RMS 行"，rmsPipeN 是"其中有几个能算出管道耗时"——
+     *   后者可能更小（老服务器没写 firstByteMs、或锚点还没扫到就退了），所以分开报、不硬凑。 */
+    rmsN: rmsFirst.length, rmsFirst, rmsPipe: rmsPipe, rmsPipeN: rmsPipe.length,
+    rmsGapMax: rmsGap[rmsGap.length - 1] || 0,
+    rmsBytesMax: rmsBytes[rmsBytes.length - 1] || 0,
     wake: count('asr-wake-answer'), wakeAck: count('ai-wake-ack'), nameOnly: count('ai-wake-name-only'),
     busyDrop: count('ai-answer-busy-drop'), dupDropped: count('asr-dup-dropped'), echoDropped: count('asr-ai-echo-dropped'),
     answerFailed: count('ai-answer-failed'),
@@ -345,6 +387,31 @@ function verdictLines(m) {
     m.noise ? `${m.noise} 条被生产判据认成噪声（例："${m.noiseExamples[0]}"）——它们进了账本就会被 AI 当成人说的话` : '0 条');
   add(m.gaveUp ? 'bad' : (m.crashRespawn > 3 ? 'warn' : 'ok'), '听觉进程',
     `自愈重启 ${m.respawn} 次（其中崩溃 ${m.crashRespawn}）· **永久放弃 ${m.gaveUp} 次**`);
+  /* ★ 2026-10-10 H2 结案后的常驻哨兵。三种病分开报，因为它们处方完全不同：
+   *   成块（bytes 大）⇒ 要动 stdout/缓冲；**管道慢**（afterByte 大）⇒ 要加宽限期；空档大 ⇒ 静音判定会卡。
+   *   ▸ 判"慢"用的是 afterByte（有音频进来了才交第一行要多久），**不是** firstMs——
+   *     firstMs 里混着"这一代出生时恰好没人说话"那段（实测 995ms 与 20230ms 都出现在同一套代码里），
+   *     拿它判冷启动 = 拿一个不代表它名字的指标做诊断（坑 75 的指标版）。
+   *   ▸ 没有样本**不许**报"没问题"（坑 105）：老服务器不写这行、或这场会没人送音频，
+   *     两者都该是 ❔ 而不是 ✅——否则这台仪表在最常见的形态下永远绿。 */
+  if (m.rmsN < T.minRmsSamples) {
+    add('unknown', 'RMS 到达',
+      `样本 ${m.rmsN} 代（<${T.minRmsSamples} 不下结论）——要么这场没人送音频，要么服务器还没写这行（重启 3001 才有）`);
+  } else {
+    const blk = m.rmsBytesMax >= T.rmsBlockBytes;
+    const hasPipe = m.rmsPipeN >= 1;
+    const slow = hasPipe && quantile(m.rmsPipe, 0.9) > T.rmsPipeWarnMs;
+    const gapBad = m.rmsGapMax > T.rmsGapBadMs;
+    add(gapBad ? 'bad' : (blk || slow) ? 'warn' : 'ok', 'RMS 到达',
+      `管道 中位 ${hasPipe ? fmtSec(quantile(m.rmsPipe, 0.5)) : '—'} / p90 ${hasPipe ? fmtSec(quantile(m.rmsPipe, 0.9)) : '—'}`
+      + `（第一个非空分段→第一条 RMS 行，n=${m.rmsPipeN}）· 行间隔最大 ${m.rmsGapMax}ms · 单次事件最大 ${m.rmsBytesMax}B · `
+      + `首行(含等人开口) 中位 ${fmtSec(quantile(m.rmsFirst, 0.5))}（n=${m.rmsN} 代）⇒ `
+      + (blk ? '**管道成块交付仍在**（H2 复现，要动 stdout 那条路）'
+        : gapBad ? '行与行之间出现长空档 ⇒ 静音判定会跟着卡（查 ffmpeg 是否还在收 RTP）'
+          : slow ? `音频进来后第一行仍要 >${T.rmsPipeWarnMs}ms ⇒ 冷启动宽限要核对`
+            : hasPipe ? '逐行交付，H2 的"成块"假设在这一台上不成立（已结案）'
+              : '逐行交付（这一版服务器还没交"管道"那一格，只看空档与单次字节）'));
+  }
   add('info', '能量闸',
     `跳过 ${m.skipped} 段：纯静音(<-70dB) ${m.bands.dead} · 噪声底 ${m.bands.floor} · `
     + `**旧闸会误杀的区间(-62~-55dB) ${m.bands.oldGateWouldKill}** · 更响 ${m.bands.loud}`);
@@ -574,6 +641,50 @@ function selftest() {
   ]);
   const deadLine = verdictLines(dead).find((l) => l.label === '听觉进程');
   ok('自检 G：听觉进程永久放弃要报 bad', deadLine.level === 'bad');
+  /* G2 ★ 2026-10-10 H2 的常驻哨兵本身要能红（这台仪表装上去那天起就该自检，
+   *   否则"加了观测"与"观测在工作"是两件事——坑 107 那条自检纪律的又一次应用）。
+   *   ▸ 四种形态各一条：逐行交付（ok）/ 管道成块（bad）/ 首行偏慢（warn）/ 没有样本（unknown）。
+   *   ▸ 前三条只差一个字段，所以它们同时也在钉"三个数各自只影响自己的判词"——
+   *     如果哪天 bytesMax 也能把结论拉成 bad 而 firstMs 不行，这里就会红。 */
+  const arr = (n, over) => Array.from({ length: n }, (_, i) => Object.assign(
+    { ts: new Date(t0 + i * 30000).toISOString(), event: 'asr-rms-arrival', member: 'm1',
+      firstMs: 995, firstByteMs: 900, afterByteMs: 95, gapMaxMs: 315, bytesMax: 959,
+      lines: 76, events: 20, voiced: 50, livedMs: 22000 }, over || {}));
+  const oneCap = [cap(0, '一句足够长的正常字幕内容', { fin: 'silence', lat: 1500 })];
+  const rmsOk = verdictLines(analyzeRoom(oneCap, arr(5))).find((l) => l.label === 'RMS 到达');
+  ok('自检 G2a：逐行交付（管道 95ms / 单次 959B）判 ok 并写明"成块假设不成立"',
+    rmsOk.level === 'ok' && /逐行交付/.test(rmsOk.text) && /n=5/.test(rmsOk.text), rmsOk.text);
+  const rmsBlk = verdictLines(analyzeRoom(oneCap, arr(5, { bytesMax: 8192 }))).find((l) => l.label === 'RMS 到达');
+  ok('自检 G2b：单次事件 ≥8KB ⇒ 报"成块交付仍在"（这条红就是 H2 复现的信号）',
+    rmsBlk.level === 'warn' || rmsBlk.level === 'bad', rmsBlk.text);
+  /* ★ 反例（10-10 真 RTP 实测逼出来的）：单次事件 2018B 是**正常形态**——流刚开始那一刻
+   *   一挤就是几十行。判线若画在 2KB，每场会都会红一次，而误报的告警等于没有告警（坑 67/82）。 */
+  const rmsBurst = verdictLines(analyzeRoom(oneCap, arr(5, { bytesMax: 2018 }))).find((l) => l.label === 'RMS 到达');
+  ok('自检 G2b2：2018B 是实测到过的正常突发，不许被判成"成块交付"',
+    rmsBurst.level === 'ok' && !/成块交付仍在/.test(rmsBurst.text), rmsBurst.text);
+  /* ★ G2c 钉的是"判慢用哪个数"：afterByte 大才叫管道慢；firstMs 大只说明那一代没人开口。
+   *   没有这条反例，下一个人很自然会拿 firstMs 判（它名字就叫"首行"），
+   *   于是每次安静的会都报一条 warn —— 误报的告警等于没有告警。 */
+  const rmsPipeSlow = verdictLines(analyzeRoom(oneCap, arr(5, { afterByteMs: 4200, firstMs: 4300 })))
+    .find((l) => l.label === 'RMS 到达');
+  ok('自检 G2c：音频进来后第一行仍要 4.2s ⇒ 判 warn（冷启动宽限要核对）',
+    rmsPipeSlow.level === 'warn' && /4\.20s/.test(rmsPipeSlow.text) && /宽限/.test(rmsPipeSlow.text), rmsPipeSlow.text);
+  const rmsIdle = verdictLines(analyzeRoom(oneCap, arr(5, { firstMs: 20230, firstByteMs: -1, afterByteMs: -1 })))
+    .find((l) => l.label === 'RMS 到达');
+  ok('自检 G2c2：firstMs=20230 但没有"非空分段"锚点 ⇒ 不许判管道慢，也不许凭空造数（等开口的代）',
+    rmsIdle.level === 'ok' && /—/.test(rmsIdle.text) && /20\.2s|20230/.test(rmsIdle.text), rmsIdle.text);
+  const rmsGap = verdictLines(analyzeRoom(oneCap, arr(5, { gapMaxMs: 9000 }))).find((l) => l.label === 'RMS 到达');
+  ok('自检 G2d：行间隔最大 9s 判 bad（静音判定会卡在这里）',
+    rmsGap.level === 'bad' && /长空档/.test(rmsGap.text), rmsGap.text);
+  const rmsNone = verdictLines(analyzeRoom(oneCap, [])).find((l) => l.label === 'RMS 到达');
+  ok('自检 G2e：没有样本时报 ❔ 并说清两种可能，不许冒充"没问题"（坑 105）',
+    rmsNone.level === 'unknown' && /重启 3001/.test(rmsNone.text), rmsNone.text);
+  /* ★ G2f 这台仪表认识的那个事件名，必须和生产写出来的**同一个**（坑 47 的事件名版）：
+   *   两边名字漂了，报告就永远"样本不足"，而它看起来像在正常工作。 */
+  const srvSrcRms = require('fs').readFileSync(path.join(__dirname, '..', 'sfu', 'server.js'), 'utf8');
+  ok(/logEvent\('info', 'asr-rms-arrival'/.test(srvSrcRms)
+    && /firstMs: rmsSeen\.firstAtMs, firstByteMs: rmsSeen\.firstByteAtMs/.test(srvSrcRms),
+    '自检 G2f：服务器真的写 asr-rms-arrival，且字段名与复盘读的一致');
   /* 这条是**报告自己抓出来的**：第一版把计数当数组打（`${m.crashRespawn.length}`），
    * 于是每一场会都印"其中崩溃 undefined"——一个 undefined 混进结论，读者只会整行都不再信。
    * 判据：结论文本里不许出现 undefined / NaN / [object。 */

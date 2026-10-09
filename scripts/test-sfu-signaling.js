@@ -1128,6 +1128,20 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('2026-10-09 /metrics 有增益触发账，且 /api/rooms 的 collab 同源（一处算、两处读）',
      /^sfu_ai_asr_gain_applied_total \d+$/m.test(met.text)
      && /^# HELP sfu_ai_asr_gain_applied_total/m.test(met.text));
+  /* ★ 2026-10-10（B1 / H2）RMS 行的**到达节奏**三格。
+   *   ▎为什么这三行值得进回归：它们把"第一行 RMS 什么时候到 / 行与行最大空档 / 单次事件多大"
+   *     从一句我记着的口头结论（"~4KB 成块 ⇒ 首行约 5s"）变成每次开会都在更新的事实。
+   *     本机真 RTP 实测：首行 995ms、空档 ≤315ms、单次 ≤959B ⇒ **逐行交付**，那条假设结案。
+   *   ▸ 判"存在"而不是判"数值"：没有真音频时 first_ms 恒为 -1，断言数字就会变成看运气。
+   *   ▸ **锚行首 + 锚行尾**（坑 74）：HELP 那句里写着 "…arrived (-1 = none yet)"，
+   *     未锚定的 `key -1` 形态会把说明文字读成一个数——10-10 在 watch.js 里就是真的坏过一次。
+   *   ▸ 负数也要能读出来：`\d+` 那种写法配 `-1` 永远不匹配，于是"值没发"与"值是 -1"分不开（坑 54 家族）。 */
+  ok('2026-10-10 /metrics 有 RMS 到达节奏四格（首行/管道/空档/单次字节），且允许 -1 这种负读数',
+     /^sfu_ai_asr_rms_first_ms -?\d+$/m.test(met.text)
+     && /^sfu_ai_asr_rms_after_first_byte_ms -?\d+$/m.test(met.text)
+     && /^sfu_ai_asr_rms_gap_max_ms \d+$/m.test(met.text)
+     && /^sfu_ai_asr_rms_bytes_max \d+$/m.test(met.text)
+     && /^# HELP sfu_ai_asr_rms_first_ms/m.test(met.text));
   /* ▎这里自带一个取行助手，不复用下面 900 多行的 numOf：那个是**块级 const**，
    *   在本行还没声明 → TDZ 直接 ReferenceError（坑 69 的同族：位置错了它不报语义错，只炸运行顺序）。 */
   const numOfCap = (txt, key) => {

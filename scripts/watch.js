@@ -122,26 +122,45 @@ function diagnoseNetAccess(netCheck, prev, now) {
 function diagnoseVoiceAndCollab(metricsText, collab, prev, state) {
   const out = [];
   if (!metricsText) return out;
+  /* ★ 2026-10-10（B4 审计的第一条产出）：所有"从 /metrics 取一个数"的正则**一律锚行首 + 锚行尾**。
+   *   ▎为什么这不是洁癖：Prometheus 文本的 `# HELP <名字> <说明>` 行里就含"名字 空格 数字"——
+   *     而 `sfu_ai_asr_primary_ready` 的说明恰好写着 **"1 when the configured primary ASR engine..."**。
+   *     未锚定的 `flagOf()` 于是**永远读到 1**（HELP 行先匹配上），于是 10-03 精心写的
+   *     "预热期分诊"整条失效：主引擎明明还没起来，watch 却认定"起来了却不用"，
+   *     开机第二轮就报 asr-engine-retreat（该沉默时刷屏）；同一未锚定写法还让 counterOf 可能
+   *     把说明里的数字当成计数。**告警工具的失效方式恰好就是它要防的那种失效**（静默/误报）。
+   *   ▸ 测试为什么没抓到：test-watch 的合成文本只写样本行、不写 HELP 行（坑 83——
+   *     假环境缺一种形态，那条分支就永久不测）。这次给合成文本补上 HELP/TYPE 行，
+   *     并把"锚定"本身变成一条能红的断言。 */
+  const valRe = (key) => new RegExp('^' + String(key).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    + '(?:\\{[^}]*\\})? (-?\\d+(?:\\.\\d+)?|NaN|-?Inf)$', 'm');
+  /* 带符号/小数的读数（-1 = 还没发生、NaN = 样本不足），并**区分"读不到"与"读到 0"**（坑 71）。 */
+  const numOf = (key) => {
+    const m = valRe(key).exec(metricsText);
+    if (!m) return null;
+    const v = Number(m[1]);
+    return Number.isFinite(v) ? v : null;
+  };
   const counterOf = (key) => {
-    const m = new RegExp(key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ' (\\d+)').exec(metricsText);
+    const m = valRe(key).exec(metricsText);
     return m ? Number(m[1]) : 0;
   };
   const delta = (key) => { const v = counterOf(key); const d = v - (prev[key] || 0); prev[key] = v; return d; };
   const labelsOf = (base) => [...new Set(
-    (metricsText.match(new RegExp(base + '\\{[^}]+\\}', 'g')) || [])
+    (metricsText.match(new RegExp('(?:^|\\n)' + base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\{[^}]+\\}', 'g')) || [])
       .map((s) => /="([^"]*)"/.exec(s)).filter(Boolean).map((m) => m[1]),
   )];
-  /* 带 label 的 gauge 取值（kind="avg" 这一类）：counterOf 的 `key 数字` 形态匹配不到它们。 */
+  /* 带 label 的 gauge 取值（kind="avg" 这一类）。 */
   const gaugeOf = (base, kind) => {
-    const m = new RegExp(base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      + '\\{kind="' + kind + '"\\} (\\d+)').exec(metricsText);
+    const m = new RegExp('^' + base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      + '\\{kind="' + kind + '"\\} (-?\\d+(?:\\.\\d+)?)$', 'm').exec(metricsText);
     return m ? Number(m[1]) : 0;
   };
   /* 布尔开关取值：**区分"这行不存在"与"这行是 0"**。
    * ▎反例就是这条规则自己：若把"老服务器没有 primary_ready 这一行"当成 0（=没就位），
    *   兜底告警就会在老服务器上**永远不响**——那正是我们一路在防的"静默失效"。 */
   const flagOf = (key) => {
-    const m = new RegExp(key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ' (\\d+)').exec(metricsText);
+    const m = valRe(key).exec(metricsText);
     return m ? Number(m[1]) === 1 : null;
   };
 
@@ -286,6 +305,47 @@ function diagnoseVoiceAndCollab(metricsText, collab, prev, state) {
     }
   } else if (winMs !== 0) {
     state.unprompted = 0;   // 对话模式 / 老服务器没有这几行：不下结论，也不留着旧账
+  }
+
+  /* ⑦ ★ 2026-10-10（B1 / H2）RMS 行的**到达节奏**——把一条挂在路线图上三天的口头结论
+   *   （"ametadata 打到管道上按 ~4KB 成块交付 ⇒ 第一行 RMS 约 5s 才到"）变成会自己喊的哨兵。
+   *   ▸ 为什么值得常驻：静音判定（`silenceConfirmed`）与 ⏱ 延迟读数全挂在 `lastVoiceTs` 上，
+   *     而它**只随 RMS 行更新**。所以"行到不到"不是观测细节，它决定了字幕是 1.5s 定稿
+   *     还是 10s 保险丝定稿（= 用户嘴里的"字幕慢 / 三句话粘成一句"）。
+   *   ▸ 三个数分开判，因为处方完全不同：
+   *       首行慢 → 加冷启动宽限 / 查 ffmpeg 出生；
+   *       空档大 → 查是不是**没 RTP 了**（成员静音、producer 关闭）而不是管道堵了；
+   *       单次事件 ≥4KB → 才是"成块交付"这个假设本身（实测**正常突发**到过 2018B：流刚开始时一挤几十行，
+ *     所以线画在 4KB——误报的告警等于没有告警，坑 67/82）。
+   *   ▸ **老服务器没有这三行 ⇒ 一个都不报**（numOf 返回 null；"读不到"≠"读到 0"，坑 71）。
+   *     而 `first_ms = -1` 是"这条管线还没收到任何 RMS 行"，不是"0ms 就到"——那是
+   *     `Number('-1') || 默认值` 那一类会把负数当真的写法（坑 54），所以这里显式判 > 0。 */
+  const FIRST_WARN = Math.max(500, Number(process.env.WATCH_RMS_PIPE_MS) || 1500);
+  const GAP_WARN = Math.max(1000, Number(process.env.WATCH_RMS_GAP_MS) || 5000);
+  const BLOCK_BYTES = Math.max(512, Number(process.env.WATCH_RMS_BLOCK_BYTES) || 4096);
+  const rmsPipe = numOf('sfu_ai_asr_rms_after_first_byte_ms');
+  const rmsGap = numOf('sfu_ai_asr_rms_gap_max_ms');
+  const rmsBytes = numOf('sfu_ai_asr_rms_bytes_max');
+  /* ▸ 为什么这条判的是 after_first_byte 而不是 first：`sfu_ai_asr_rms_first_ms` 是
+   *   "本代进程出生 → 第一条 RMS 行"，里面**混着"这一代出生时恰好没人开口"**——
+   *   实测同一套代码里 995ms（一出生就有人在说）与 20230ms（安静）都出现过。
+   *   拿它做告警 = 每次安静的会都喊一次，而误报的告警等于没有告警（坑 67/82 同一条）。
+   *   after_first_byte 的锚是"第一个非空分段落盘"，它成立的前提就是**音频已经进来了**。 */
+  if (rmsPipe !== null && rmsPipe > FIRST_WARN) {
+    out.push({ key: 'rms-first-slow', text: `音频已经落盘之后，第一条 RMS 行还过了 ${rmsPipe}ms 才到`
+      + `（> ${FIRST_WARN}ms）——这段时间里"有没有人在说话"没有任何信源，定稿只能靠保险丝`
+      + '，字幕延迟与 ⏱ 读数会一起变差。查：这台机器的 ffmpeg 构建是否带 direct=1、CPU 是否被别的进程占满' });
+  }
+  if (rmsGap !== null && rmsGap > GAP_WARN) {
+    out.push({ key: 'rms-gap-stall', text: `RMS 行之间出现过 ${rmsGap}ms 的空档（> ${GAP_WARN}ms）`
+      + '：静音判定与 ⏱ 读数都挂在这条线上，空档期内这句话会被 10s 保险丝切而非静音确认。'
+      + '先分清两种病——**没人送 RTP**（成员静音 / producer 关闭，看有没有"静音退场"日志）'
+      + '与**送来了但 metadata 没出来**（那才要动管道）' });
+  }
+  if (rmsBytes !== null && rmsBytes >= BLOCK_BYTES) {
+    out.push({ key: 'rms-blocked', text: `stdout 单次事件最大 ${rmsBytes}B（≥ ${BLOCK_BYTES}B）`
+      + ' ⇒ RMS 是**成块交付**的（H2 那条假设在这台机器上复现了）：行与行之间不再均匀，'
+      + '静音判定会先卡后泄。处方是给 metadata 输出换 direct/无缓冲写法，不是调阈值' });
   }
   return out;
 }

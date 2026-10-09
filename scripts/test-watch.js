@@ -24,7 +24,7 @@ function ok(cond, msg) {
   else { issues++; console.log(`  ❌ FAIL  ${msg}`); }
 }
 
-const m = (segs, rejected = 0, issued = 0, applied = 0, capLat = null, primaryReady = undefined, speakLat = null, restarts = null) => {
+const m = (segs, rejected = 0, issued = 0, applied = 0, capLat = null, primaryReady = undefined, speakLat = null, restarts = null, rms = null, withHelp = true) => {
   const lines = [];
   for (const [eng, n] of Object.entries(segs)) lines.push(`sfu_ai_asr_segments_total{engine="${eng}"} ${n}`);
   lines.push(`sfu_board_records_total{op="rejected"} ${rejected}`);
@@ -48,6 +48,23 @@ const m = (segs, rejected = 0, issued = 0, applied = 0, capLat = null, primaryRe
    * ▎为什么要专门测这第三种：诊断如果把"读不到这行"当成 0（没就位），
    *   兜底告警在老服务器上就永远不响——"读不到"和"读到 0"是两件事。 */
   if (primaryReady !== undefined) lines.push(`sfu_ai_asr_primary_ready ${primaryReady ? 1 : 0}`);
+  /* ★ 2026-10-10 RMS 到达节奏的三条 gauge（H2 结案后的常驻哨兵）。
+   *   `first: -1` 的语义是"这一代管线还没收到任何 RMS 行"，**不是**"0ms 就到了"。
+   *   不传 rms = 模拟老服务器根本没有这三行。 */
+  if (rms) lines.push(
+    `sfu_ai_asr_rms_first_ms ${rms.first}`,
+    `sfu_ai_asr_rms_after_first_byte_ms ${rms.pipe === undefined ? -1 : rms.pipe}`,
+    `sfu_ai_asr_rms_gap_max_ms ${rms.gap}`,
+    `sfu_ai_asr_rms_bytes_max ${rms.bytes}`);
+  /* ★ 合成文本里**也要有元数据行**，否则"未锚定的正则把 HELP 里的数字读成读数"这一整类缺陷
+   *   在这里结构上不可能被测到（坑 83：假环境缺一种形态 ⇒ 那条分支永久不测）。
+   *   真服务器的 HELP 恰好写着 "sfu_ai_asr_primary_ready 1 when the configured primary ASR
+   *   engine can take work now" —— 含"名字 空格 1"，未锚定就永远判"已就位"（坑 74 在 watch 里复发）。 */
+  if (withHelp) lines.unshift(
+    '# HELP sfu_ai_asr_primary_ready 1 when the configured primary ASR engine can take work now (local worker loaded / cloud key present)',
+    '# TYPE sfu_ai_asr_primary_ready gauge',
+    '# HELP sfu_ai_asr_rms_first_ms Milliseconds from the listening-pipe start until the first RMS line arrived (-1 = none yet)',
+    '# TYPE sfu_ai_asr_rms_first_ms gauge');
   return lines.join('\n');
 };
 const run = (metrics, collab, prev, state) => diagnoseVoiceAndCollab(metrics, collab, prev, state);
@@ -348,6 +365,106 @@ console.log('\n=== H6 跨网退化告警（只在变差时报 / 首轮不下结�
     '接线：返回的每条告警真的进了 alert()（算出来丢掉 = 这条告警永远不响）');
   ok(/diagnoseNetAccess\([^,]+,\s*netState\b/.test(src),
     '接线：跨轮传的是模块级 netState，不是每轮新建的对象（新建 ⇒ 永远"第一观测" ⇒ 永不报）');
+}
+
+/* ══ 2026-10-10 B1：RMS 到达节奏（H2 结案后的常驻哨兵）+ "锚定"这件事本身 ══
+ * ▸ 这组告警的失效方式是"永远不响"或"每次开机都响"，两种都不会让任何功能测试变红；
+ *   而把它们逼出来的其实是一处**写法**——未锚行的正则在 Prometheus 文本上会把
+ *   HELP 行里的数字读成读数（坑 74 在 watch.js 里原样复发，见 valRe 的注释）。 */
+{
+  /* ① 锚定的行为版判据（不是"正则长什么样"）：兜底在干活 + 主引擎**确实还没就位**，
+     而 HELP 行里写着 "sfu_ai_asr_primary_ready 1 when …" —— 未锚定的 flagOf 会把它读成"已就位"，
+     于是预热期被报成"起来了却不用"（该沉默的时候刷屏）。
+     ▸ 为什么不用静态断言代替：静态断言只钉写法，钉不住语义。 */
+  const st1 = fresh();
+  const fbFalse = m({ '常驻': 2 }, 0, 0, 0, null, false);
+  const q1a = run(fbFalse, { asrEngine: 'qwen-local' }, st1.counters, st1);
+  const q1b = run(m({ '常驻': 4 }, 0, 0, 0, null, false), { asrEngine: 'qwen-local' }, st1.counters, st1);
+  ok(!has(q1a, 'asr-engine-fallback') && !has(q1b, 'asr-engine-fallback'),
+    'HELP 行不许被读成读数：主引擎未就位时走兜底是预热期（该沉默）',
+    q1a.concat(q1b).map((a) => a.key).join(','));
+  /* ② 反向对照：把真读数（=1，已就位）一起挡掉就不是"锚定"而是"闭嘴"。
+     没有这一条，把 flagOf 改成永远返回 null 也能让上面那条全绿（永真判据=没判据，坑 115）。 */
+  const st2 = fresh();
+  run(m({ '常驻': 2 }, 0, 0, 0, null, true), { asrEngine: 'qwen-local' }, st2.counters, st2);
+  const q2b = run(m({ '常驻': 4 }, 0, 0, 0, null, true), { asrEngine: 'qwen-local' }, st2.counters, st2);
+  ok(has(q2b, 'asr-engine-fallback'),
+    '反向对照：已就位却全是兜底干活 ⇒ 第二轮真报退化（锚的是 HELP 行，不是真读数）',
+    q2b.map((a) => a.key).join(','));
+
+  const cap = { n: 6, avg: 1500, max: 2000 };
+  const eng = { asrEngine: 'qwen-local' };
+  const txt = (arr, key) => (arr.find((a) => a.key === key) || {}).text || '';
+  /* 四个字段各答一个问题（缺 pipe = 老服务器只交 firstMs 那种形态）：
+     first = 本代出生→第一条 RMS 行（**含等人开口**，不能拿来判管道慢）
+     pipe  = 第一个非空分段→第一条 RMS 行（管道自己的耗时，判慢用它）
+     gap   = 行与行最大空档；bytes = 单次事件最大字节（判成块用它） */
+  const R = (o) => Object.assign({ first: 995, pipe: 95, gap: 315, bytes: 959 }, o || {});
+
+  /* ③ 管道自己慢 ⇒ 报，且文案里必须带那个实测数 */
+  const r1 = run(m({}, 0, 0, 0, cap, true, null, null, R({ pipe: 4200 })), eng, {}, fresh());
+  ok(has(r1, 'rms-first-slow'), '音频已落盘而第一行 RMS 还要 4.2s ⇒ 报 rms-first-slow', r1.map((a) => a.key).join(','));
+  ok(/4200ms/.test(txt(r1, 'rms-first-slow')),
+    '告警要说出**实测那个数**（只说"偏慢"等于让人再去查一遍）', txt(r1, 'rms-first-slow').slice(0, 60));
+  /* ③b ★ 这条是"判慢用哪个数"的反例：firstMs 很大但管道很快 = 那一代只是没人说话。
+     没有它，下一个人自然会去判 first（它名字就叫"首行"），于是每场安静的会都喊一次。 */
+  const r1b = run(m({}, 0, 0, 0, cap, true, null, null, R({ first: 20230, pipe: 120 })), eng, {}, fresh());
+  ok(!has(r1b, 'rms-first-slow'),
+    '反向对照：firstMs=20230 而管道只花 120ms ⇒ 不许报（那是"没人开口"，不是管道慢）',
+    r1b.map((a) => a.key).join(','));
+
+  /* ④ 空档过大是另一种病：管道正常就不该报管道 */
+  const r2 = run(m({}, 0, 0, 0, cap, true, null, null, R({ gap: 9000 })), eng, {}, fresh());
+  ok(has(r2, 'rms-gap-stall') && !has(r2, 'rms-first-slow'),
+    '行间隔 9s ⇒ 只报 gap-stall', r2.map((a) => a.key).join(','));
+  ok(/没人送 RTP/.test(txt(r2, 'rms-gap-stall')),
+    'gap-stall 文案要给出两种病的分诊（没 RTP vs 管道堵），处方完全不同', txt(r2, 'rms-gap-stall').slice(0, 60));
+
+  /* ⑤ 成块交付（H2 那条假设）：判线落在**那条假设自己声称的数**（~4KB）上。
+     ▸ 为什么不是 2KB：10-10 真 RTP 实测里 `单次最大=2018B` 出现过（≈30 行挤在一次 stdout 事件的**突发**，
+       发生在流刚开始那一刻），把线画在 2KB 就会把正常突发天天报成故障——
+       误报的告警等于没有告警（坑 67/82 同一条）。 */
+  const r3 = run(m({}, 0, 0, 0, cap, true, null, null, R({ bytes: 8192 })), eng, {}, fresh());
+  ok(has(r3, 'rms-blocked'), '单次事件 8192B ⇒ 报"成块交付在这一台上复现了"', r3.map((a) => a.key).join(','));
+  const r3b = run(m({}, 0, 0, 0, cap, true, null, null, R({ bytes: 2018 })), eng, {}, fresh());
+  ok(!has(r3b, 'rms-blocked'),
+    '反例：2018B 是**实测到过的正常突发**（流开始时一挤就是几十行），不许报成故障',
+    r3b.map((a) => a.key).join(','));
+  const r4 = run(m({}, 0, 0, 0, cap, true, null, null, R()), eng, {}, fresh());
+  ok(!has(r4, 'rms-blocked') && !has(r4, 'rms-first-slow') && !has(r4, 'rms-gap-stall'),
+    '本机实测读数（管道 95ms / 空档 315ms / 单次 959B）一条都不报 ⇒ 逐行交付，H2 结案',
+    r4.map((a) => a.key).join(','));
+
+  /* ⑥ -1 = "还没发生"，不是 0（坑 54 那一族：负数/falsy 被当成数；这里锚点没扫到也不许判慢） */
+  const r5 = run(m({}, 0, 0, 0, cap, true, null, null, R({ first: -1, pipe: -1, gap: 0, bytes: 0 })), eng, {}, fresh());
+  ok(!has(r5, 'rms-first-slow'), 'first/pipe=-1（管线刚出生或还没落盘）不许报');
+
+  /* ⑦ 老服务器只交 firstMs 那一格、没有 afterByte ⇒ 判慢这条路整体沉默（不拿错数硬判） */
+  const r7 = run(m({}, 0, 0, 0, cap, true, null, null, { first: 20230, gap: 315, bytes: 959 }), eng, {}, fresh());
+  ok(!has(r7, 'rms-first-slow') && has(r7, 'asr-engine-fallback') === false,
+    '没有 pipe 那一格时不许凭 firstMs 造一条"慢"（读不到 ≠ 读到 0，坑 71）', r7.map((a) => a.key).join(','));
+
+  /* ⑧ 老服务器根本没有这几行 ⇒ 整体沉默且不抛错 */
+  const r6 = run(m({}, 0, 0, 0, cap, true), eng, {}, fresh());
+  ok(!has(r6, 'rms-first-slow') && !has(r6, 'rms-gap-stall') && !has(r6, 'rms-blocked'),
+    '没有这三行时一条都不报（老服务器兼容），也不许凭空造一条');
+
+  /* ⑨ 接线（坑 41/56：纯函数全绿 ≠ 生产里真会响）——扫两个文件自己的源码 */
+  const fs2 = require('fs');
+  const path2 = require('path');
+  const strip = (x) => x.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const wSrc = strip(fs2.readFileSync(path2.join(__dirname, 'watch.js'), 'utf8'));
+  const sSrc = strip(fs2.readFileSync(path2.join(__dirname, '..', 'sfu', 'server.js'), 'utf8'));
+  ok(/numOf\('sfu_ai_asr_rms_after_first_byte_ms'\)/.test(wSrc) && /numOf\('sfu_ai_asr_rms_bytes_max'\)/.test(wSrc),
+    '接线：watch 真的取这几行（不接就永远不会报，而上面每条断言依然全绿）');
+  ok(/for \(const a of diagnoseVoiceAndCollab\([^)]*\)[^)]*\)[\s\S]{0,120}alert\(a\.key, a\.text\)/.test(wSrc),
+    '接线：diagnoseVoiceAndCollab 的返回真的进了 alert()');
+  ok(/L\.push\(`sfu_ai_asr_rms_after_first_byte_ms/.test(sSrc) && /L\.push\(`sfu_ai_asr_rms_bytes_max/.test(sSrc),
+    '接线：服务器真的发了这两行（取值与产出两处都要在，缺一处就是永远沉默）');
+  ok(/const valRe = \(key\) => new RegExp\('\^'/.test(wSrc)
+    && /const counterOf = \(key\) => \{\s*const m = valRe\(key\)/.test(wSrc)
+    && /const flagOf = \(key\) => \{\s*const m = valRe\(key\)/.test(wSrc),
+    '锚定：取数一律走 valRe（行首锚）——counterOf/flagOf 都不再自己拼未锚正则（坑 74 的 watch 版）');
 }
 
 console.log(`\n结果: ${checks - issues}/${checks} 通过，${issues} 失败`);

@@ -56,6 +56,7 @@
     "test:review": "node scripts/review-meeting.js --selftest",
     "bench:asr": "node scripts/bench-asr-accuracy.js",
     "bench:asr-golden": "node scripts/bench-asr-golden.js",
+    "bench:voice-floor": "node scripts/bench-voice-floor.js",
     "bench:asr-multi": "node scripts/bench-asr-multi.js",
     "bench:innerhtml": "node scripts/bench-innerhtml.js",
     "test:qwen": "node scripts/test-qwen.js",
