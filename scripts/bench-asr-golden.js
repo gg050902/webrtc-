@@ -225,7 +225,7 @@ async function makeEngine(name) {
 (async () => {
   selfCheck();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'asr-golden-'));
-  const result = { ts: Date.now(), gain: GAIN, levels: LEVELS, foldDigits: false, engines: {}, note: '' };
+  const result = { ts: Date.now(), gain: GAIN, levels: LEVELS, foldDigits: false, textMode: 'cleaned', engines: {}, note: '' };
   try {
     const gold = await loadOrSynthesize(dir);
     result.source = gold.source;
@@ -278,28 +278,38 @@ async function makeEngine(name) {
           let ms = 0;
           for (const r of rows) {
             const t0 = Date.now();
-            let text = '';
-            try { text = String(await eng.run(r.wav) || ''); } catch (e) { text = ''; }
+            let raw = '';
+            try { raw = String(await eng.run(r.wav) || ''); } catch (e) { raw = ''; }
             ms += Date.now() - t0;
-            hyps.push({ ...r, hyp: text, ms: Date.now() - t0 });
+            /* ★ 2026-10-10 量具要量**用户看到的那份文本**，不是模型刚吐出来的那份。
+             *   ▎为什么这条是量具保真度而不是"顺手多加一步"：生产的每一段/每一次整句重转
+             *     都要过 `Asr.cleanTranscript`（判噪、擦提示词回显、折句尾回声、纠正别字）
+             *     才落账本与上屏。这一版之前直接打的是模型原始输出 ⇒
+             *     任何**文本侧**的改进（今天的 foldTailEcho 就是第一个）在这张表上都是零分收益，
+             *     而"改了没变化"会把人引向"那不如去换模型"——错的方向。
+             *   ▸ 两列都留：raw = 模型原样（换引擎/换音频条件时看它），cleaned = 落账那份。
+             *     两者不同时，表里就说出"清洗买到了几个百分点"。 */
+            hyps.push({ ...r, hyp: Asr.cleanTranscript(raw), raw, ms: Date.now() - t0 });
           }
           const c = Acc.corpus(hyps.map((h) => ({ ref: h.text, hyp: h.hyp })));
           /* 第二个口径只在**读数真的不同时**才印：默认不折算「十号 vs 10号」判错，
              那是"下游字面匹配会不会踩"的口径；折算之后是"人听懂了没有"的口径。
              两个都想知道，但不许把其中一个偷偷当成结论（坑 47：分开命名，不是合并）。 */
           const cf = Acc.corpus(hyps.map((h) => ({ ref: h.text, hyp: h.hyp })), { foldDigits: true });
+          const craw = Acc.corpus(hyps.map((h) => ({ ref: h.text, hyp: h.raw == null ? h.hyp : h.raw })));
           c.samples_ms = ms;
           result.engines[name] = result.engines[name] || { label: eng.label, levels: {} };
           const medPeak = (arr) => (arr.length ? arr.slice().sort((x, y) => x - y)[Math.floor(arr.length / 2)] : null);
           result.engines[name].levels[level] = {
             micro: c.microCer, macro: c.macroCer, exact: c.exact, usable: c.usable,
+            microRaw: craw.microCer, macroRaw: craw.macroCer,   // 模型原样那一份（清洗前的对照）
             comparable: c.comparable, sub: c.sub, ins: c.ins, del: c.del,
             /* 把"这一档模型实际吃到的音量"一起存盘：CER 的变化只有在输入音量也记下来之后
                才可归因——否则下次看到"far 档变准了"，分不清是换了引擎还是增益钳位挪过。 */
             peakRawMed: medPeak(rows.map((r) => r.peakRaw).filter(Number.isFinite)),
             peakModelMed: medPeak(rows.map((r) => r.peakModel).filter(Number.isFinite)),
             gainedCount: rows.filter((r) => r.gainDb > 0).length,
-            detail: hyps.map((h) => ({ id: h.id, ref: h.text, hyp: h.hyp, ms: h.ms })),
+            detail: hyps.map((h) => ({ id: h.id, ref: h.text, hyp: h.hyp, raw: h.raw, ms: h.ms })),
           };
           /* 电平两格必须印出来：这一档"模型实际吃到的音量"才是准确率差别的解释变量，
              只报"CER 高了"而不报"输入是 -36 dBFS 的耳语"，下一步就会去错改模型。 */
@@ -310,6 +320,14 @@ async function makeEngine(name) {
             + ` → 模型输入中位 ${modelPeaks.length ? med(modelPeaks).toFixed(1) : '—'} dBFS`
             + `，其中 ${rows.filter((r) => r.gainDb > 0).length} 句被提过增益`);
           console.log('  ' + Acc.line(`${name}/${level}`, c, gold.source === 'human' ? '真人场' : '合成场'));
+          /* ★ 清洗那一层买到多少，单独印一行（与"模型原样"同一份样本，只差过没过 cleanTranscript）。
+           *   ▸ 为什么必须印出来而不是偷偷合到主数字里：主数字是"用户看到的那份文本"的准确率，
+           *     而这行才说明**文本清洗**这条链值几个百分点——两者混成一个数，
+           *     下次就不会有人知道该去修模型还是修清洗（第 37 步"拆分才是可操作信息"的同一条）。 */
+          if (Math.abs((craw.microCer ?? 0) - (c.microCer ?? 0)) > 0.0005) {
+            console.log(`      模型原样 micro ${Acc.pct(craw.microCer)} → 落账（过生产清洗）micro ${Acc.pct(c.microCer)}`
+              + `（清洗这一层买到 ${(Math.abs(craw.microCer - c.microCer) * 100).toFixed(1)} 个百分点）`);
+          }
           if (Math.abs((cf.microCer ?? 0) - (c.microCer ?? 0)) > 0.0005) {
             console.log(`      数字写法折算后 micro ${Acc.pct(cf.microCer)}（差 ${(Math.abs((c.microCer - cf.microCer)) * 100).toFixed(1)} 个百分点）`
               + ` —— 说明有句子的"错"主要是「十号 vs 10号」这类写法差异：人听懂了，字面匹配会踩`);
@@ -367,6 +385,15 @@ async function makeEngine(name) {
     /* 与上一次对照（改动前后必须有同一把尺的两次读数，否则"变好了"是感觉） */    if (COMPARE && fs.existsSync(COMPARE)) {
       const prev = JSON.parse(fs.readFileSync(COMPARE, 'utf8'));
       console.log('\n与上次对照（micro CER，百分点）：');
+      /* ★ 口径不同的两次读数**不许直接相减**（与 `accuracy.diff` 遇 foldDigits 不同就拒比是同一条纪律）。
+       *   ▸ 为什么专门加这一段：量具从"打分模型原样"改成"打分账本里那份（过了 cleanTranscript）"，
+       *     拿新读数去比旧基线，会把"量具换了口径"算成"产品变准了"——
+       *     这种错最贵，因为它带着一个真实的差值（坑 47/53 的量具版）。 */
+      const modeOf = (o) => (o && o.textMode) || 'raw';
+      if (modeOf(prev) !== modeOf(result)) {
+        console.log(`  ⚠️ 基线是「${modeOf(prev)}」口径、本次是「${modeOf(result)}」口径 —— 下面的差值**混着量具自身的改动**，`);
+        console.log('     不能读成产品变好/变坏。要真比较：要么用同一口径重跑基线，要么只看本次表内"清洗买到几个点"那一行。');
+      }
       for (const [name, cur] of Object.entries(result.engines)) {
         const p = prev.engines && prev.engines[name];
         if (!p || !p.levels) { console.log(`  ${name}：上次没测到，跳过`); continue; }

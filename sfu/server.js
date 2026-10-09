@@ -1647,6 +1647,12 @@ function buildMetrics(snap) {
    *     = 那条 10-05 的救赎整条没跑（而它坏了不会有任何报错，只会让字幕继续糊）。 */
   help('sfu_ai_asr_gain_applied_total', 'counter', 'Segments whose model-input peak gain was raised (0 while voiced>0 = the quiet-mic gain path never ran)');
   L.push(`sfu_ai_asr_gain_applied_total ${COLLAB.gainApplied}`);
+  /* ★ 2026-10-10（B3-①）句尾"回声短句"折叠的触发账（同上一条纪律：机制跑没跑要查得到）。
+   *   ▎为什么单独一条：这条判据是**删字**的那一类（虽然被删的那一份在紧邻前文里还在），
+   *   所以它比"加东西"的机制更需要可核对的运行证据——
+   *   上线却一次没跑 = 白改；跑了很多而字幕没见变干净 = 判据吃错了对象。两种都能从这里看出来。 */
+  help('sfu_ai_asr_tail_echo_fold_total', 'counter', 'Transcripts whose sentence-final echo was folded away by Asr.foldTailEcho (0 for a whole meeting = the rule never fired)');
+  L.push(`sfu_ai_asr_tail_echo_fold_total ${Asr.tailEchoFoldCount()}`);
   /* ★ 2026-10-09 H2：RMS 行的**到达节奏**——把一条挂在路线图两天的口头结论变成三个可对账的数。
    *   ▎为什么值三条 gauge：静音判定与 ⏱ 读数全挂在 lastVoiceTs 上，而它只随 RMS 行更新。
    *     于是"第一条 RMS 什么时候到 / 行与行之间最大空档 / 单次事件多少字节"决定了

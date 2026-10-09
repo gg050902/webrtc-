@@ -231,12 +231,22 @@ function foldTailEcho(text) {
   const strip = (s) => s.replace(/[。！？!?，,、；;：:\s]/g, '');
   const echo = strip(last);
   const before = strip(prev);
-  if (echo.length < 2 || echo.length > 16) return raw;
+  if (echo.length < 3 || echo.length > 16) return raw;
+  /* ▸ 为什么下限是 **3 字**而不是 2：两字复读在中文里太常见，而且多是刻意的
+   *   ——「同意。同意。」「好的。好的。」「行吧。行吧。」把这类折掉就是改脏用户的话；
+   *   而三字以上的"紧跟句末标点的复读"（「先降下来。降下来。」）几乎没有正常读法。
+   *   这一档是拿真实账本定的：真人 1196 句里 2 字回声只有 1 例（模型复读人名），
+   *   3 字以上是零——宁可少修，不可丢字（坑 109 同一条不对称）。 */
   if (before.length <= echo.length) return raw;          // 相等 = 强调，不动（见上）
   if (!before.endsWith(echo)) return raw;
   /* 折叠：丢掉最后一个回声段，并保证前一句的句末标点还在 */
   return parts.slice(0, -1).join('').trim();
 }
+
+/* ★ 2026-10-10（B3-①）句尾回声折叠的**触发计数**：机制"到底跑没跑"必须是查得到的事实，
+ *   不是"我写了所以它在跑"（坑 76）。经 /metrics 的 `sfu_ai_asr_tail_echo_fold_total`
+ *   交出去，与 `gain_applied_total` 同一条纪律。 */
+let tailEchoFolds = 0;
 
 function cleanTranscript(raw) {
   let t = String(raw || '').replace(/\s+/g, ' ').trim();
@@ -258,8 +268,16 @@ function cleanTranscript(raw) {
   t = fixDomainHomophones(t);
   /* ★ 2026-10-10（B3-①）句尾回声折叠。**放在这里而不是放在定稿/重转那两处**：
    *   分段转写、整句重转、以及 review:meeting 的回扫走的都是这一个入口——
-   *   写在调用方就会漏掉一条路（坑 47；而"漏一条路"的症状正是"有时糊有时不糊"）。 */
-  t = foldTailEcho(t);
+   *   写在调用方就会漏掉一条路（坑 47；而"漏一条路"的症状正是"有时糊有时不糊"）。
+   *   ▸ 带**触发计数**（tailEchoFolds）：一条"上线了但没人能证明它跑过"的机制，
+   *     等于一颗不知道会不会响的警报（坑 76；10-05 那条安静麦克风增益就是靠
+   *     `gain_applied_total` 才第一次有了"它到底跑没跑"的凭据）。 */
+  const foldedEcho = foldTailEcho(t);
+  if (foldedEcho !== t) {
+    tailEchoFolds += 1;
+    if (process.env.ASR_DEBUG) console.log(`[asr-echo] 折掉句尾回声（累计 ${tailEchoFolds}）：…${t.slice(-14)} → …${foldedEcho.slice(-14)}`);
+  }
+  t = foldedEcho;
   // 擦干净后只剩标点/单字 → 当作没有内容（唤醒与账本都不需要这种条目）
   if (t.replace(/[\s，,。.、！!？?：:;；…~\-]/g, '').length < 2) return '';
   return t;
@@ -1039,6 +1057,7 @@ module.exports = {
   assertRunner,
   cleanTranscript,   // ★ 2026-10-02 静音幻觉清洗（纯函数，test:asr 逐条断言）
   foldTailEcho,      // ★ 2026-10-10 句尾回声折叠（B3-①；cleanTranscript 里已生效，导出是为了单测与真实账本回扫）
+  tailEchoFoldCount: () => tailEchoFolds,   // ★ 触发计数（/metrics 的 tail_echo_fold_total 用它）
   fixDomainHomophones, // ★ 2026-10-05 夜三 会议动作词别字（既要→纪要，只在贴动作词时改）
   noiseRiffReason,   // ★ 2026-10-05 夜二 同音字免疫的噪声 riff 判据（返回命中理由或 ''）
   isFragmentOf,      // ★ 2026-10-03 分段碎片的"同一句话"判据（方向性 bigram 覆盖）

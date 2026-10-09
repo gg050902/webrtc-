@@ -1514,6 +1514,76 @@ function writeWav(file, samples) {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* 清理无所谓 */ }
 
 
+  /* ══ ⑭ ★ 2026-10-10（B3-①）句尾"回声短句"折叠 ══
+   * ▎由来不是想象：真人金标准表（bench:asr-golden 的 far 档）转出
+   *   「服务器起负载了，把 GPU 显存先降下来。降下来。」——模型把刚说完的尾巴又说了一遍。
+   * ▎这条判属"保内容"那一类（被丢的那一份在紧邻的前一份里原样还在），
+   *   所以可以比同音字纠正更主动；但"两个相等短句"（强调）与"没有标点的叠词"
+   *   （非常非常）**有意不折**——那些是人在说话，不是模型在复读。 */
+  const foldEcho = Asr.foldTailEcho;
+  ok('⑭.1 真缺陷形状：句末标点之后复读前一句的尾巴 ⇒ 折掉那一份',
+    foldEcho('服务器起负载了，把 GPU 显存先降下来。降下来。') === '服务器起负载了，把 GPU 显存先降下来。');
+  ok('⑭.2 回声段自带不了尾标点时也折（模型常常最后那个句号都吐丢）',
+    foldEcho('把这条记录一下。记录一下') === '把这条记录一下。');
+  /* 四条反例——每条都对应一种**真人会这么说**的形状，误折就是把用户的话改脏（坑 109）。
+   *   ▸ 名字要写准：⑭.3 不折的原因是"回声段只有 2 字"（两字复读多是刻意强调），
+   *     不是"前后相等"——两条不同的判据，各有自己的断言（⑭.3 与 ⑭.3b）。 */
+  ok('⑭.3 反例：两字回声不折（「我同意。同意。」是人在强调，不是模型复读）',
+    foldEcho('我同意。同意。') === '我同意。同意。');
+  ok('⑭.3c 反例：等长的两个短句不折（「没问题。没问题。」是人在重复，判据要求前一句严格更长）',
+    foldEcho('没问题。没问题。') === '没问题。没问题。');
+  ok('⑭.4 反例：没有句末标点分隔的叠词一律不动（"非常非常"是合法中文）',
+    foldEcho('这件事非常重要非常。') === '这件事非常重要非常。');
+  ok('⑭.5 反例：回声段不是前一句的尾巴时不许折（那是两句不相干的话）',
+    foldEcho('把白板打开。字幕关掉。') === '把白板打开。字幕关掉。');
+  ok('⑭.6 反例：只有一句、没有"前一句"可比 ⇒ 原样返回（不许把整条吃掉）',
+    foldEcho('降下来。') === '降下来。');
+  /* 接线：判据写在 cleanTranscript 里，而不是散在定稿/重转两个调用点后面（坑 47）。
+   * ▸ ★ 这条一开始写成了"源码里出现 foldTailEcho(t)"，结果**变异没红**：
+   *   把 `t = foldedEcho` 那行删掉（算了不用），源码里那句调用还在、断言照样绿——
+   *   这正是坑 41/56 的形状："模块写对了、调用方没接上"。
+   *   所以这里改成**走真实入口的行为断言**（cleanTranscript 端到端），
+   *   结构断言只作为第二条补充，且必须钉"结果被赋回 t"。 */
+  ok('⑭.7 接线：走真实入口 cleanTranscript 也会折掉句尾回声（不是只测那个纯函数）',
+    Asr.cleanTranscript('服务器起负载了，把 GPU 显存先降下来。降下来。') === '服务器起负载了，把 GPU 显存先降下来。',
+    Asr.cleanTranscript('服务器起负载了，把 GPU 显存先降下来。降下来。'));
+  const asrSrcFold = fs.readFileSync(path.join(__dirname, '..', 'sfu', 'ai', 'asr.js'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  ok('⑭.7b 接线（结构）：折叠的结果被赋回 t（"算了不用"这种半接线要能红）',
+    /function cleanTranscript[\s\S]{0,1600}=\s*foldedEcho;/.test(asrSrcFold));
+  /* ★ 真实语料回扫（坑 107 那条纪律第二次用）：改"从自然语言里删东西"的判据，
+   *   验收必须包含一次真人账本回扫，并且**上限按占比**写、不写逐句清单
+   *   ——逐句清单会在用户说出新句子那天变红，那是假红制造机。
+   *   ▸ 装上去那晚的基线：1196 句真人转写命中 1 句（0.08%），而那一句本身就是模型复读
+   *     「小明你好,小明。小明。」⇒ 命中稀少但非零，正是想要的形态。 */
+  {
+    const capDir = path.join(__dirname, '..', 'sfu', 'captions');
+    let spoken = 0; const folded = [];
+    if (fs.existsSync(capDir)) {
+      for (const f of fs.readdirSync(capDir)) {
+        if (!f.endsWith('.jsonl')) continue;
+        for (const line of fs.readFileSync(path.join(capDir, f), 'utf8').split(/\r?\n/)) {
+          let e; try { e = JSON.parse(line); } catch (err) { continue; }
+          if (!e || e.asr !== true || !e.text) continue;   // 只数麦克风真转写（坑 107 的口径）
+          spoken++;
+          const out = foldEcho(e.text);
+          if (out !== e.text) folded.push({ before: e.text, after: out });
+        }
+      }
+    }
+    if (spoken < 50) {
+      ok('⑭.8 真人账本回扫：样本不足（<50 句人话）时不下结论，只说明为什么', true, `人话 ${spoken} 句`);
+    } else {
+      const rate = folded.length / spoken;
+      ok('⑭.8 真实账本回扫：被折叠的占比 ≤2%（超过就是判据在吃真话）',
+        rate <= 0.02, `${folded.length}/${spoken} = ${(rate * 100).toFixed(2)}%`
+        + (folded.length ? ` · 例：${folded[0].before}` : ''));
+      ok('⑭.9 折叠是"保内容"的：每一句折叠后仍非空，且必须是原句的前缀',
+        folded.every((x) => x.after && x.before.startsWith(x.after)), JSON.stringify(folded.slice(0, 2)));
+    }
+  }
+
+
   console.log(`\n结果: ${pass} 通过, ${fail} 失败, ${skip} 跳过`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error('异常:', e); process.exit(1); });
