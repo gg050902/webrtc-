@@ -102,11 +102,17 @@ def one_pass(dt_name):
     import torch
     from qwen_tts import Qwen3TTSModel
     dtype = getattr(torch, dt_name)
+    # ★ 2026-10-03d 设备可选：默认自动（有 CUDA 用 GPU——worker 的同款逻辑，量出来的
+    #   才是"上线后真实发生的"）；BENCH_TTS_DEVICE=cpu 可强制回 CPU 对比。
+    dev = (os.environ.get("BENCH_TTS_DEVICE") or "").strip().lower()
+    if dev not in ("cpu", "cuda"):
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
     t0 = time.time()
-    model = Qwen3TTSModel.from_pretrained(MODEL, dtype=dtype, device_map="cpu")
-    log(kind="load", dtype=dt_name, secs=round(time.time() - t0, 1), repeats=REPEATS)
-    torch.set_num_threads(os.cpu_count() or 8)
-    log(kind="threads", set_to=torch.get_num_threads(), cpu=os.cpu_count())
+    model = Qwen3TTSModel.from_pretrained(MODEL, dtype=dtype, device_map=dev)
+    log(kind="load", dtype=dt_name, device=dev, secs=round(time.time() - t0, 1), repeats=REPEATS)
+    if dev == "cpu":
+        torch.set_num_threads(os.cpu_count() or 8)
+    log(kind="threads", set_to=torch.get_num_threads(), cpu=os.cpu_count(), device=dev)
     for name, txt in TEXTS.items():
         cell(model, "seq", "%s/%s" % (dt_name, name), lambda t=txt: synth(model, t), chars=len(txt))
     for name in ("med36", "long70"):

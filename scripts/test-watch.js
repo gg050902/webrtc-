@@ -11,16 +11,26 @@ const { diagnoseVoiceAndCollab } = require('./watch.js');
 
 let checks = 0;
 let issues = 0;
+/* 坑 110 的常驻守卫：**这个文件的约定是 ok(条件, 名字)**，与 test-asr / test-sfu-signaling
+ *   那两个文件（ok(名字, 条件)）**正好相反**——而我自己照"顺手的那个"复制过一次，
+ *   结果 9 条断言全绿而一条都没测（条件位上永远是一句中文，truthy）。
+ *   这里不重构签名（那要动几十条历史断言），只做一件事：**顺序写反就当场红**。 */
+const { guard: guardOk } = require('./assert-order-guard.js');
 function ok(cond, msg) {
+  const bad = guardOk('cond-first', cond, msg);
+  if (bad) { checks++; issues++; console.log(`  ❌ FAIL  ${String(msg).slice(0, 60)}  · 参数顺序守卫：${bad}`); return; }
   checks++;
   if (cond) console.log(`  PASS  ${msg}`);
   else { issues++; console.log(`  ❌ FAIL  ${msg}`); }
 }
 
-const m = (segs, rejected = 0, issued = 0, applied = 0, capLat = null, primaryReady = undefined, speakLat = null) => {
+const m = (segs, rejected = 0, issued = 0, applied = 0, capLat = null, primaryReady = undefined, speakLat = null, restarts = null) => {
   const lines = [];
   for (const [eng, n] of Object.entries(segs)) lines.push(`sfu_ai_asr_segments_total{engine="${eng}"} ${n}`);
   lines.push(`sfu_board_records_total{op="rejected"} ${rejected}`);
+  /* ★ 2026-10-05 与 server 的 /metrics 保持同名同形（这条文件的老规矩：
+   *   任何一处改了另一边没跟上，测试就会"绿着什么都不验"）。 */
+  if (restarts !== null) lines.push(`sfu_ai_asr_worker_restarts_total ${restarts}`);
   if (issued) lines.push(`sfu_room_control_total{action="board-open"} ${issued}`);
   if (applied) lines.push(`sfu_room_control_applied_total{action="board-open"} ${applied}`);
   /* ★ 2026-10-03 两条端到端延迟各三项 gauge：{n, avg, max} 或 null（= 这条还没量到过）
@@ -115,6 +125,24 @@ console.log('\n--- watch：语音与协作退化诊断（纯函数，合成输�
   ok(o2.length === 0, '计数没再涨就不重复报（基线是差值不是绝对值）');
 }
 
+/* ④b 本地 Qwen ASR worker 因"单次推理超预算"被换过进程（坑 89 的自愈路径）。
+ *   ▎为什么单独钉四组：这条告警存在的**全部理由**是"那条重启路径至今没被真实触发过"
+ *     （坑 76：没有触发证据就不能声称已验证）。所以既要能报，更要**在没发生时闭嘴**——
+ *     一条会误报的告警等于没有告警，只会训练值班的人忽略它。 */
+{
+  const st = fresh();
+  const o1 = run(m({}, 0, 0, 0, null, undefined, null, 1), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(has(o1, 'asr-worker-restart'), '重启计数 0→1 → 报一条（模型真卡过，自愈接住了、字幕没丢）');
+  const o2 = run(m({}, 0, 0, 0, null, undefined, null, 1), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(o2.length === 0, '同一批重启不重复报（差值口径，不是绝对值）');
+  const st3 = fresh();
+  const o3 = run(m({}, 0, 0, 0, null, undefined, null, 0), { asrEngine: 'qwen-local' }, st3.counters, st3);
+  ok(!has(o3, 'asr-worker-restart'), '计数一直是 0 → 不报（这正是"自愈还没被用到"的诚实状态）');
+  const st4 = fresh();
+  const o4 = run(m({}, 0), { asrEngine: 'qwen-local' }, st4.counters, st4);
+  ok(!has(o4, 'asr-worker-restart'), '老服务器根本没有这一行 → 不报也不炸（读不到 ≠ 读到 0，坑 71）');
+}
+
 /* ⑤ 房间动作"说了没做"：同样要连续两轮（回执是异步的，单轮可能只是还没到） */
 {
   const st = fresh();
@@ -186,6 +214,140 @@ console.log('\n--- watch：语音与协作退化诊断（纯函数，合成输�
   ok(run('', null, st.counters, st).length === 0, 'metrics 为空 → 返回空数组不抛错');
   ok(run(m({ 'qwen-local': 1 }), null, st.counters, st).length === 0, 'collab 缺失（老服务器）→ 不猜引擎、不报');
   ok(run(m({ 'qwen-local': 1 }), { asrEngine: 'none' }, st.counters, st).length === 0, '引擎=none → 不做引擎判定（没配就不该报）');
+}
+
+/* ⑨ ★ 2026-10-06 夜二「没人叫它，它却开口了」——这条产品规矩的生产端哨兵。
+ *   ▎判据不是"有 follow-up 就报"：合法形态（被 2s 分段切断的半句）每次前面必有一次
+ *     name-only，所以违规量 = tail − nameOnly；而且只在**纯唤醒模式**下判。
+ *     一条"看见 X 就报"的规则会把用户自己选的对话模式报成故障，误报到第三次就没人看告警了。 */
+{
+  const via = (wake, tail, nameOnly) => m({ 'qwen-local': 1 }) + '\n' + [
+    `sfu_ai_answer_via_total{via="wake"} ${wake}`,
+    `sfu_ai_answer_via_total{via="follow-up"} ${tail}`,
+    `sfu_ai_answer_throttled_total{reason="name-only"} ${nameOnly}`,
+  ].join('\n');
+  const PURE = { asrEngine: 'qwen-local', aiChatWindowMs: 0 };
+
+  const st1 = fresh();
+  const o1 = run(via(2, 5, 0), PURE, st1.counters, st1);
+  ok(has(o1, 'ai-unprompted'), '纯唤醒模式下 5 次免唤醒续答、0 次只叫名字 → 报 ai-unprompted',
+    JSON.stringify(o1.map((x) => x.key)));
+  ok(/aiChatWindowSec/.test((o1[0] || {}).text || '') && /唤醒表/.test((o1[0] || {}).text || ''),
+    '告警文案要指路（把三条回归源列出来，而不是只喊一句"有问题"）');
+
+  const st2 = fresh();
+  const o2 = run(via(3, 1, 1), PURE, st2.counters, st2);
+  ok(o2.length === 0, '合法形态不报：分段半句的续答（tail 1）恰好对应一次只叫名字的唤醒（name-only 1）',
+    JSON.stringify(o2.map((x) => x.key)));
+
+  const st3 = fresh();
+  const o3 = run(via(3, 9, 0), { asrEngine: 'qwen-local', aiChatWindowMs: 20000 }, st3.counters, st3);
+  ok(o3.length === 0 && st3.unprompted === 0,
+    '用户自己开了对话模式（aiChatWindowMs>0）时**整体沉默**——那是他选的形态不是故障',
+    JSON.stringify({ keys: o3.map((x) => x.key), acc: st3.unprompted }));
+
+  const st4 = fresh();
+  const o4 = run(m({ 'qwen-local': 2 }), { asrEngine: 'qwen-local', aiChatWindowMs: 0 }, st4.counters, st4);
+  ok(o4.length === 0 && st4.unprompted === undefined,
+    '老服务器根本没有这几行 → 不报也不猜（"读不到" ≠ "读到 0"，坑 71/74 同一条纪律）',
+    JSON.stringify(o4.map((x) => x.key)));
+
+  /* HELP 行陷阱：Prometheus 的帮助文本里就含 `via="wake"` 这个字面量，
+     正则不锚行首会把文档读成一个样本值——这个坑本项目踩过一次（坑 74），这里钉住。 */
+  const st5 = fresh();
+  const o5 = run(m({ 'qwen-local': 2 }) + '\n# HELP sfu_ai_answer_via_total counter Replies grouped by trigger: via="wake" (name called) / via="follow-up" x 99',
+    PURE, st5.counters, st5);
+  ok(o5.length === 0, '# HELP 行里含 via="wake" 与数字，也不能被当成样本（正则锚行首）',
+    JSON.stringify(o5.map((x) => x.key)));
+
+  /* 累计口径：单轮超出 1 次先记账不报，第二轮再超才报（避免一次同音误听就打断人） */
+  const st6 = fresh();
+  const r1 = run(via(1, 1, 0), PURE, st6.counters, st6);
+  const r2 = run(via(1, 2, 0), PURE, st6.counters, st6);
+  ok(!has(r1, 'ai-unprompted') && has(r2, 'ai-unprompted'),
+    '超出量按轮累计：1 次不报、累计到 2 次才报（误报的代价是以后没人看告警）',
+    JSON.stringify({ r1: r1.map((x) => x.key), r2: r2.map((x) => x.key) }));
+}
+
+/* === ★ 2026-10-07 H6：跨网能力退化要能**常驻喊人**（判据在服务器，值守只读结论）===
+ *   ▎为什么要这一组：`nets.diagnose()` 的结论以前只出现在两个地方——启动日志（滚过去就没了）
+ *     与邀请面板（得有人正好点开）。而跨网失效的方式恰好是**沉默**的：服务器自己一切正常、
+ *     网页也打得开，只有"外面的人"进不来，而他是唯一会来报告的人（坑 36 的形态）。
+ *   ▎三条纪律各有一条断言：①只在"变差"时报 ②第一观测不下结论 ③恢复要说出来。
+ *     少了 ① 就是天天误报（家里/办公室内网部署本来就该是 lan-only），
+ *     少了 ② 就是每次值班启动都叫一次——两者都是"以后没人看告警"的前奏。
+ *   ▸ ★ 写这一组时我自己踩了**坑 110**：本文件的助手是 `ok(条件, 名字)`，
+ *     而 test-asr / test-sfu-signaling 是 `ok(名字, 条件)`。我照熟的那个顺序粘过来，
+ *     于是 9 条断言的**条件位上全是那句中文说明（truthy）** ⇒ 9 条全绿而一条都没测。
+ *     露馅的方式正是那条坑写的：输出里名字变成了 `PASS true`。逐条换序后重跑才算数。 */
+const { diagnoseNetAccess, NET_RANK } = require('./watch.js');
+console.log('\n=== H6 跨网退化告警（只在变差时报 / 首轮不下结论 / 恢复要说话）===');
+{
+  const nc = (level, extra) => ({
+    level, headline: ` headline:${level}`,
+    items: [{ state: 'bad', label: '媒体地址', detail: '只在局域网可达', fix: 'npm run start:lan' },
+      ...(extra || [])],
+    canCrossNetNow: level === 'public' || level === 'tailscale',
+  });
+
+  ok(NET_RANK['localhost-only'] < NET_RANK['lan-only']
+    && NET_RANK['lan-only'] < NET_RANK['tailscale'] && NET_RANK['tailscale'] < NET_RANK['public'],
+    '秩的方向：localhost-only < lan-only < tailscale < public（写反会让"变好"报警、"变差"沉默）');
+
+  const s0 = { level: null };
+  const a0 = diagnoseNetAccess(nc('lan-only'), s0, 1);
+  ok(a0.length === 0 && s0.level === 'lan-only',
+    '② 第一观测**不报**（每次值班启动都叫一次 = 噪音），但要把这一轮记进账', `记账后 level=${s0.level}`);
+
+  const a1 = diagnoseNetAccess(nc('localhost-only'), s0, 2);
+  ok(a1.length === 1 && a1[0].key === 'net-downgrade'
+    && /lan-only → localhost-only/.test(a1[0].text) && /npm run start:lan/.test(a1[0].text),
+    '① 变差才报：lan-only → localhost-only 报一条，且带上不合格项与可复制的建议',
+    a1.map((x) => x.key).join(','));
+
+  const before = s0.level;
+  const a2 = diagnoseNetAccess(nc('public'), s0, 3);
+  ok(a2.length === 0 && before === 'localhost-only' && s0.level === 'public',
+    '③ 恢复不算告警（只在控制台说一句），但记账必须跟着变', `before=${before} now=${s0.level}`);
+
+  const s1 = { level: null };
+  diagnoseNetAccess(nc('tailscale'), s1, 1);
+  const repeats = [0, 1, 2, 3, 4].reduce((n, i) => n + diagnoseNetAccess(nc('tailscale'), s1, 2 + i).length, 0);
+  ok(repeats === 0, '形态没变就**永不重复报**（同一天一直 lan-only，不该每次值班都喊一次）', `五轮累计报了 ${repeats} 条`);
+
+  ok(diagnoseNetAccess(null, { level: null }, 1).length === 0
+    && diagnoseNetAccess(undefined, { level: null }, 1).length === 0
+    && diagnoseNetAccess({ level: '火星-only' }, { level: null }, 1).length === 0,
+    '老服务器 / 读不到 config.json / 认不出的 level：不下结论也不抛错（"读不到"≠"坏了"，坑 71）');
+
+  const s2 = { level: null };
+  diagnoseNetAccess(nc('public'), s2, 1);
+  diagnoseNetAccess(null, s2, 2);
+  ok(s2.level === 'public',
+    '读不到时**不许把上一轮记账冲掉**（否则恢复过后再降级会被当成"第一观测"而永久沉默）', `now=${s2.level}`);
+
+  /* 配置漂移单独一条：自愈把 level 保住了，但用户的配置文件仍然是错的（下次换网卡就要黑屏）。 */
+  const s3 = { level: null };
+  diagnoseNetAccess(nc('lan-only'), s3, 1);
+  const a3 = diagnoseNetAccess(nc('lan-only', [
+    { state: 'bad', label: '配置核对', detail: '写的 192.168.1.9 已不是本机任何网卡的地址', fix: 'npm run start:lan' },
+  ]), s3, 2);
+  ok(a3.length === 1 && a3[0].key === 'net-config-drift' && /自愈/.test(a3[0].text),
+    '配置漂移单独报：level 没变也要说（自愈只保这次运行，不等于配置是对的）',
+    a3.map((x) => x.key).join(','));
+
+  /* ★ 接线（坑 41/56：纯函数全绿 ≠ 调用方接上了）。这一组扫的是 watch.js 自己的源码：
+     · tick() 里真的 fetch 了 /config.json（不接就永远不会报，而 51 条断言依然全绿）；
+     · 返回值真的进了 alert()（算出来却丢掉 = 白算）；
+     · 跨轮状态用的是**同一个对象**（每轮新建 `{level:null}` 会让"第一观测不报"永远成立 ⇒ 告警永不响）。 */
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'watch.js'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');   // 注释里的例子不算"写了"（坑 76）
+  ok(/diagnoseNetAccess\(/.test(src) && /config\.json/.test(src),
+    '接线：tick() 真的读 /config.json 并把结论交给 diagnoseNetAccess（纯函数绿不代表接上了）');
+  ok(/for \(const a of diagnoseNetAccess\([^)]*\)[^)]*\)[\s\S]{0,80}alert\(a\.key, a\.text\)/.test(src),
+    '接线：返回的每条告警真的进了 alert()（算出来丢掉 = 这条告警永远不响）');
+  ok(/diagnoseNetAccess\([^,]+,\s*netState\b/.test(src),
+    '接线：跨轮传的是模块级 netState，不是每轮新建的对象（新建 ⇒ 永远"第一观测" ⇒ 永不报）');
 }
 
 console.log(`\n结果: ${checks - issues}/${checks} 通过，${issues} 失败`);

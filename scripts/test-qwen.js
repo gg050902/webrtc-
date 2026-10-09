@@ -10,7 +10,13 @@ const path = require('path');
 const QwenAsr = require('../sfu/ai/asr_qwen.js');
 
 let pass = 0, fail = 0, skip = 0;
-const ok = (name, cond) => { if (cond) { pass++; console.log(`  PASS  ${name}`); } else { fail++; console.log(`  FAIL  ${name}`); } };
+// 坑 110 的常驻守卫：本文件约定 ok(名字, 条件)
+const { guard: guardOk } = require('./assert-order-guard.js');
+const ok = (name, cond) => {
+  const bad = guardOk('name-first', name, cond);
+  if (bad) { fail++; console.log(`  FAIL  ${String(name).slice(0, 60)}  · 参数顺序守卫：${bad}`); return; }
+  if (cond) { pass++; console.log(`  PASS  ${name}`); } else { fail++; console.log(`  FAIL  ${name}`); }
+};
 const skipped = (name, why) => { skip++; console.log(`  SKIP  ${name}（${why}）`); };
 
 function silentWav() {
@@ -93,12 +99,15 @@ function silentWav() {
   }
 
   console.log('\n=== ④ 本地引擎轨（Qwen/Qwen3-ASR-0.6B 已下载到 models/ 才跑）===');
-  const localModelDir = path.join(__dirname, '..', 'models', 'qwen3-asr-0.6b');
-  if (!fs.existsSync(localModelDir)) {
+  /* ★ 2026-10-09 路径不再在本文件里拼：判据搬进 asr_qwen_local.resolveModelDir()
+     （原来 server.js / bench-asr-multi / 这里各写一份 "models/qwen3-asr-0.6b"，
+      少跳一级就静默不可用——10-02d 那次"代码写了但从来没生效"的根因就是它）。 */
+  const LocalAsr = require('../sfu/ai/asr_qwen_local.js');
+  const localModelDir = LocalAsr.resolveModelDir();
+  if (!localModelDir || !fs.existsSync(localModelDir)) {
     skipped('本地 Qwen3-ASR 转写', 'models/qwen3-asr-0.6b 不存在（先跑 modelscope 下载）');
   } else {
     process.env.QWEN_ASR_MODEL = localModelDir;
-    const LocalAsr = require('../sfu/ai/asr_qwen_local.js');
     const t0 = Date.now();
     // 先合成一句真语音（有 key 走 DashScope 太绕，直接用 TTS worker 的同款 ps 脚本太长——
     // 这里用 test-asr 同款：SAPI 16k wav）

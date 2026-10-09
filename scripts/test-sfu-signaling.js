@@ -40,7 +40,17 @@ const os = require('os');
 const fsClean = require('fs');
 const TEST_DB_FILE = nodePath.join(os.tmpdir(), `sfu-test-sig-${process.pid}-${Date.now()}.db`);
 const TEST_LEGACY_USERS = nodePath.join(os.tmpdir(), `sfu-test-sig-legacy-${process.pid}.json`); // 故意不存在
+/* ★ 2026-10-07 第 51 步：共享文件的临时目录（FILES_DIR 是 sfu/files.js 加载时读一次的 const，
+ *   所以必须在 spawn 的 env 里给子进程，改本进程的 process.env 对子进程也生效——两条都写上更稳）。 */
+const TEST_FILES_DIR = nodePath.join(os.tmpdir(), `sfu-test-files-${process.pid}-${Date.now()}`);
+/* ★ 2026-10-09 真人语音金标准也走临时目录（同一条隔离纪律）：
+ *   回归会真上传一段录音并转码落盘，指到真实 sfu/voice-golden/ 就等于
+ *   把"开发者自己的语音档案"当成测试垃圾来回制造。收尾还会自证真实目录没被建出来。 */
+const TEST_GOLDEN_DIR = nodePath.join(os.tmpdir(), `sfu-test-golden-${process.pid}-${Date.now()}`);
+process.env.FILES_DIR = TEST_FILES_DIR;
 function cleanupTestDb() {
+  try { fsClean.rmSync(TEST_FILES_DIR, { force: true, recursive: true, maxRetries: 8, retryDelay: 150 }); }
+  catch (e) { /* 删不掉不影响断言 */ }
   for (const f of [TEST_DB_FILE, TEST_DB_FILE + '-wal', TEST_DB_FILE + '-shm']) {
     // ▎为什么要 maxRetries：Windows 上服务器子进程刚被 kill、句柄还没释放时删文件会 EBUSY，
     //   单次 rmSync 会静默失败（留下垃圾）。给几秒线性退避重试，才真的"跑完删干净"。
@@ -136,7 +146,7 @@ async function ensureServer() {
     console.log(`\n❌ ${PORT} 端口已有别的服务器在跑 —— 本脚本无法保证测试的确定性，拒绝继续。\n`);
     console.log('   为什么必须拒绝：本脚本需要"它自己起的、用临时库的"那个服务器——');
     console.log('     · 预置的 legacy_h 是临时库第一个账号 → 自动是管理员 → HTTP 门禁断言才成立；');
-    console.log('     · 若端口上是用**正式库**的服务器（正式库已有管理员 Guoge），');
+    console.log('     · 若端口上是用**正式库**的服务器（正式库里已有真实管理员账号），');
     console.log('       本脚本注册的测试账号只是普通用户 → /api/rooms、/metrics 会因 401 而"假失败"；');
     console.log('     · 更隐蔽的是：那种情况下测试其实**验的不是本脚本的服务器**，通过也不作数。');
     console.log(`   修法（任选）：先关掉占用 ${PORT} 的进程再重跑，或用别的端口跑 —— `);
@@ -152,7 +162,14 @@ async function ensureServer() {
       SFU_NO_HTTPS: '1',                   // ★ 09-30：不启 HTTPS（3443 被占不该拖垮测试）
       AI_OP_STEP_MS: '20',
       AI_FORCE_MOCK: '1',
+      /* ★ 2026-10-06 「说了没做」看门狗的预算：默认 4s 是给真人开会用的（要给慢页面留时间），
+       *   回归里等不起。压到 1.2s 只影响**这一组断言的速度**，不影响它测的东西。 */
+      ROOM_CONTROL_ACK_MS: '1200',
       DB_FILE: TEST_DB_FILE,               // ★ 任务 3：账号写进临时库，不碰真实数据
+      /* ★ 2026-10-07 第 51 步：共享文件也走临时目录——上传/删除断言会真写盘，
+       *   指着真实 sfu/files/ 跑一次就把开发者的会议材料混进测试产物里了（同一条隔离纪律）。 */
+      FILES_DIR: TEST_FILES_DIR,
+      GOLDEN_DIR: TEST_GOLDEN_DIR,         // ★ 2026-10-09 金标准录音写临时目录（同一条隔离纪律）
       USERS_FILE_LEGACY: TEST_LEGACY_USERS, // ★ 指向不存在的路径 → 绝不迁移/改名真实 users.json
       AUTH_LOCK_MS: '2000',                 // ★ G6-③：短锁窗口（15min→2s）让"锁定/解锁"可实测
       AUTH_PASSWORD_MINLEN: '6',            // ★ G6-③：测试用 6 位下限（默认 8）——历史测试密码不必全改
@@ -171,7 +188,14 @@ async function ensureServer() {
 function stopServer() { if (serverProc) { try { serverProc.kill(); } catch (e) { /* ignore */ } serverProc = null; } }
 
 let pass = 0, fail = 0;
-const ok = (n, c) => { if (c) { pass++; console.log('  PASS  ' + n); } else { fail++; console.log('  FAIL  ' + n); } };
+/* 坑 110 的常驻守卫：本文件约定 ok(名字, 条件)。顺序写反时**条件位是一句中文（truthy）**，
+ *   断言会永远绿——所以这里让它当场红，而不是留下一句 `PASS true` 等人自己看出来。 */
+const { guard: guardOk } = require('./assert-order-guard.js');
+const ok = (n, c, d) => {
+  const bad = guardOk('name-first', n, c);
+  if (bad) { fail++; console.log(`  FAIL  ${String(n).slice(0, 60)}  · 参数顺序守卫：${bad}`); return; }
+  if (c) { pass++; console.log('  PASS  ' + n); } else { fail++; console.log(`  FAIL  ${n}${d ? '  · ' + d : ''}`); }
+};
 
 function client(name) {
   return new Promise((resolve, reject) => {
@@ -747,6 +771,326 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   const capNoRoom = await httpReq('GET', `http://localhost:${PORT}/api/captions`);
   ok('09-17e GET 缺 room 参数被拒（400）', capNoRoom.code === 400);
 
+  /* ═══════════════════════════════════════════════════════════════
+   * ★ 2026-10-07 第 51 步：会议共享文件（上传 / 列表 / 下载 / 门禁 / 同步 / 删除 / 可观测）
+   *
+   * ▎这一段**自建房间与客户端**，不复用上面那个 ROOM：
+   *   删除权限要按"房主 / 上传者本人 / 其他人"三档验，而那需要我确定知道谁是房主——
+   *   复用别人建好的房间，角色是猜出来的，断言就成了"我以为我站在哪个状态上"（坑 55）。
+   * ▎每条断言都先注册监听再触发（坑 3），并且"广播到了"与"应答对了"分开断（坑 56/61）。
+   * ═══════════════════════════════════════════════════════════════ */
+  const FA = await client('FA');   // 房主 + 上传者
+  const FB = await client('FB');   // 普通成员（收广播、验权限）
+  const frA = await request(FA.s, 'create-room', {});
+  const FROOM = frA.data.roomNumber;
+  const FTOK_A = frA.data.roomToken;
+  const frB = await request(FB.s, 'join-room', { roomNumber: FROOM });
+  const FTOK_B = frB.data.roomToken;
+  ok('51 自建房间成功且两端都拿到了房间令牌', !!FROOM && !!FTOK_A && !!FTOK_B);
+
+  /* 原始字节上传（body 就是文件本身，元数据在头里）——httpReq 只会发 JSON，所以单独一个助手 */
+  const rawUpload = (room, token, name, body, opts) => new Promise((resolve, reject) => {
+    const buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
+    const o = opts || {};
+    const rq = http.request({
+      hostname: 'localhost', port: PORT, path: `/api/files?room=${encodeURIComponent(room)}`, method: 'POST',
+      headers: Object.assign({
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(o.declaredLength !== undefined ? o.declaredLength : buf.length),
+        'X-Room-Token': token || '',
+        'X-File-Name': encodeURIComponent(name),
+        'X-Uploader-Name': encodeURIComponent('测试小张'),
+        'X-Uploader-Id': o.byId || FA.id,
+      }, o.headers || {}),
+    }, (r) => {
+      const chunks = [];
+      r.on('data', (c) => chunks.push(c));
+      r.on('end', () => resolve({ code: r.statusCode, text: Buffer.concat(chunks).toString('utf8'), headers: r.headers }));
+    });
+    rq.on('error', (e) => (o.tolerateError ? resolve({ code: 0, text: String(e.code || e.message), headers: {} }) : reject(e)));
+    rq.write(buf);
+    rq.end();
+  });
+  const getFile = (room, token, name) => new Promise((resolve, reject) => {
+    const rq = http.request({
+      hostname: 'localhost', port: PORT,
+      path: `/files/${encodeURIComponent(room)}/${encodeURIComponent(name)}`, method: 'GET',
+      headers: token ? { 'X-Room-Token': token } : {},
+    }, (r) => {
+      const chunks = [];
+      r.on('data', (c) => chunks.push(c));
+      r.on('end', () => resolve({ code: r.statusCode, body: Buffer.concat(chunks), headers: r.headers }));
+    });
+    rq.on('error', reject);
+    rq.end();
+  });
+
+  // ① 上传（监听先注册，再触发——坑 3）
+  const fUpdatesB = [];
+  FB.s.on('files-updated', (m) => fUpdatesB.push(m));
+  const fViewsB = [];
+  FB.s.on('files-view-state', (m) => fViewsB.push(m));
+  const MD_BODY = '# 标题\n\n- 甲\n- 乙\n';
+  const upMd = await rawUpload(FROOM, FTOK_A, '评审会材料.md', MD_BODY);
+  ok('51 上传 .md 成功（200 + ok:true + 返回条目）',
+    upMd.code === 200 && JSON.parse(upMd.text).ok === true, upMd.text.slice(0, 160));
+  const upName = (JSON.parse(upMd.text || '{}').file || {}).name;
+  ok('51 中文名原样保住（HTTP 头只走 ASCII，靠 encodeURIComponent 传）', upName === '评审会材料.md', String(upName));
+  await sleep(400);
+  ok('51 ★ 上传后全房收到 files-updated（不是只有上传者自己知道）',
+    fUpdatesB.some((m) => m.change === 'add' && Array.isArray(m.files) && m.files.some((f) => f.name === '评审会材料.md')),
+    JSON.stringify(fUpdatesB.map((m) => m.change)));
+
+  // ② 列表
+  const listRes = await httpReq('GET', `http://localhost:${PORT}/api/files?room=${FROOM}`, null, true, { 'X-Room-Token': FTOK_B });
+  ok('51 GET /api/files 凭房间令牌可列出（含大小与上传者昵称）', (() => {
+    if (listRes.code !== 200) return false;
+    const j = JSON.parse(listRes.text);
+    const f = (j.files || []).find((x) => x.name === '评审会材料.md');
+    return !!f && f.size === Buffer.byteLength(MD_BODY) && f.byName === '测试小张';
+  })(), listRes.text.slice(0, 200));
+  ok('51 列表里带配额（前端要据此显示"还能传多大"）', (() => {
+    const j = JSON.parse(listRes.text || '{}');
+    return !!(j.limits && j.limits.maxFileBytes > 0 && j.limits.maxCount > 0 && j.limits.maxRoomBytes > 0);
+  })());
+
+  // ③ 门禁：没有令牌 / 跨房令牌 / 路径穿越 / 非法房间号
+  const noTok = await httpReq('GET', `http://localhost:${PORT}/api/files?room=${FROOM}`, null, true);
+  ok('51 没有房间令牌 → 401（内容类接口不裸奔）', noTok.code === 401);
+  const FX = await client('FX');
+  const otherRoom = await request(FX.s, 'create-room', {});
+  const cross = await httpReq('GET', `http://localhost:${PORT}/api/files?room=${FROOM}`, null, true, { 'X-Room-Token': otherRoom.data.roomToken });
+  ok('51 ★ 拿别的房间的令牌读这个房间 → 401（跨房必须拒）', cross.code === 401);
+  const trav = await httpReq('GET', `http://localhost:${PORT}/files/${FROOM}/${encodeURIComponent('../../package.json')}`, null, true, { 'X-Room-Token': FTOK_A });
+  ok('51 路径穿越（../../package.json）被拒，且绝不吐出仓库文件',
+    (trav.code === 403 || trav.code === 404) && trav.text.indexOf('mediasoup') < 0 && trav.text.indexOf('scripts') < 0);
+  /* ★ 非法房间号这一条我第一版写错了，而错的是**断言**不是代码：
+   *   我期望 400，实际拿到 401。因为门禁**刻意排在格式校验之前**——
+   *   "没权限的人不该通过『房间号格式对不对』来判断信息"（handleApiCaptions 里写着同一条）。
+   *   所以正确写法是分两档断言：带房间令牌 → 401（令牌不是这个房的）；
+   *   带管理员令牌 → 400（admin 跨房放行，于是走到格式校验）。
+   *   ▎判据：一条红要先问"是代码错还是我对期望的理解错"，别急着改代码（坑 80/110）。 */
+  const badRoom = await httpReq('GET', `http://localhost:${PORT}/api/files?room=../../etc`, null, true, { 'X-Room-Token': FTOK_A });
+  ok('51 非法房间号 + 房间令牌 → 401（门禁在格式校验之前，不给"号对不对"的反馈）', badRoom.code === 401, String(badRoom.code));
+  const badRoomAdm = await httpReq('GET', `http://localhost:${PORT}/api/files?room=../../etc`);
+  ok('51 非法房间号 + 管理员令牌 → 400（走到格式校验这一层）', badRoomAdm.code === 400, String(badRoomAdm.code));
+  const okRoomAdm = await httpReq('GET', `http://localhost:${PORT}/api/files?room=${FROOM}`);
+  ok('51 管理员不受房间限制（跨房巡检用），能读到这个房间的清单', okRoomAdm.code === 200
+    && JSON.parse(okRoomAdm.text).files.some((f) => f.name === '评审会材料.md'));
+
+  // ④ 下载与下发策略（这一组是**安全判据**，不是功能判据）
+  const dl = await getFile(FROOM, FTOK_B, '评审会材料.md');
+  ok('51 下载拿到的字节与上传时逐字一致', dl.code === 200 && dl.body.toString('utf8') === MD_BODY);
+  ok('51 ★ .md 强制下载（attachment）——用户文件里的标签不该在我们的源里跑起来',
+    /^attachment/.test(String(dl.headers['content-disposition'] || '')), String(dl.headers['content-disposition']));
+  ok('51 .md 的 Content-Type 不是 text/html', String(dl.headers['content-type'] || '').indexOf('text/html') < 0);
+  ok('51 带 nosniff（不许浏览器猜类型）', dl.headers['x-content-type-options'] === 'nosniff');
+  const upSvg = await rawUpload(FROOM, FTOK_A, 'logo.svg', '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
+  const dlSvg = await getFile(FROOM, FTOK_A, 'logo.svg');
+  ok('51 ★ .svg 也强制下载 + octet-stream（SVG 里能带 script，同源内联 = 存储型 XSS）',
+    upSvg.code === 200 && /^attachment/.test(String(dlSvg.headers['content-disposition'] || ''))
+    && String(dlSvg.headers['content-type'] || '').indexOf('svg') < 0);
+  const upPdf = await rawUpload(FROOM, FTOK_A, '报告.pdf', Buffer.concat([Buffer.from('%PDF-1.4\n'), Buffer.alloc(64, 32)]));
+  const dlPdf = await getFile(FROOM, FTOK_A, '报告.pdf');
+  ok('51 .pdf 内联 + application/pdf（浏览器内置阅读器要用真实 MIME）',
+    upPdf.code === 200 && /^inline/.test(String(dlPdf.headers['content-disposition'] || ''))
+    && String(dlPdf.headers['content-type']) === 'application/pdf');
+  const upExe = await rawUpload(FROOM, FTOK_A, 'evil.exe', Buffer.from('MZ\x90\x00'));
+  ok('51 可执行体被拒（400，而不是"收下但不给下"）', upExe.code === 400, `${upExe.code} ${upExe.text.slice(0, 120)}`);
+  const upNoRoom = await rawUpload('999999', FTOK_A, 'x.md', 'x');
+  ok('51 房间不存在时上传被拒（令牌还有效、会已经散了 → 401/409 都行，别静默收下）',
+    upNoRoom.code === 409 || upNoRoom.code === 401, `${upNoRoom.code} ${upNoRoom.text.slice(0, 100)}`);
+
+  // ⑤ 晚进房的人要能拿到清单（files-state 单播给他自己）
+  const FC = await client('FC');
+  const fStateC = [];
+  FC.s.on('files-state', (m) => fStateC.push(m));
+  await request(FC.s, 'join-room', { roomNumber: FROOM });
+  await sleep(500);
+  ok('51 ★ 晚进房的人收到 files-state（否则他打开面板是空的，只会以为功能坏了）',
+    fStateC.length >= 1 && fStateC[0].files.some((f) => f.name === '评审会材料.md'),
+    JSON.stringify((fStateC[0] || {}).files || []).slice(0, 160));
+  ok('51 files-state 里也带配额（新人不必再拉一次 /api/files）',
+    !!(fStateC[0] && fStateC[0].limits && fStateC[0].limits.maxFileBytes > 0));
+
+  // ⑥ 同步视角：换文件/翻页是离散事件，必须**立刻**广播；完全相同的状态不重复广播
+  FA.s.emit('files-view', { name: '评审会材料.md', page: 1, scroll: 0, zoom: 1 });
+  await sleep(400);
+  ok('51 files-view 广播成 files-view-state（跟随主讲的数据源）',
+    fViewsB.length >= 1 && fViewsB[fViewsB.length - 1].view.name === '评审会材料.md'
+    && String(fViewsB[fViewsB.length - 1].view.byName || '').length > 0,
+    JSON.stringify(fViewsB.map((m) => m.view && m.view.name)));
+  const viewsAfterSame = fViewsB.length;
+  FA.s.emit('files-view', { name: '评审会材料.md', page: 1, scroll: 0, zoom: 1 });
+  await sleep(300);
+  ok('51 ★ 完全相同的状态不重复广播（有变化才发，与 net-levels/talk-stats 同一条纪律）',
+    fViewsB.length === viewsAfterSame, `${viewsAfterSame} → ${fViewsB.length}`);
+  FA.s.emit('files-view', { name: '评审会材料.md', page: 7, scroll: 0.5, zoom: 1 });
+  await sleep(300);
+  ok('51 翻页立刻广播（离散事件不受滚动节流影响）',
+    fViewsB.length > viewsAfterSame && fViewsB[fViewsB.length - 1].view.page === 7);
+  ok('51 滚动位置按 0~1 的比例传（像素值在别人的窗口高度上会滚过头）',
+    fViewsB[fViewsB.length - 1].view.scroll === 0.5);
+  FA.s.emit('files-view', { name: '评审会材料.md', page: 1, scroll: 99, zoom: 999 });
+  await sleep(300);
+  ok('51 畸形载荷被钳制（scroll≤1、zoom≤5），不是原样转发给全房',
+    fViewsB[fViewsB.length - 1].view.scroll === 1 && fViewsB[fViewsB.length - 1].view.zoom === 5);
+  FA.s.emit('files-view', { name: null });
+  await sleep(300);
+  ok('51 关掉文件时视角清空（view=null 也要广播，否则跟随的人停在最后一份上）',
+    fViewsB[fViewsB.length - 1].view === null);
+
+  // ⑦ 删除权限的三档
+  const delByOther = await request(FB.s, 'files-delete', { name: '评审会材料.md' })
+    .then(() => ({ ok: true })).catch((e) => ({ ok: false, msg: e.message }));
+  ok('51 ★ 既不是房主也不是上传者 → 删除被拒（并说清谁能删）',
+    delByOther.ok === false && /房主|管理员|本人/.test(String(delByOther.msg || '')), String(delByOther.msg));
+  const listStill = await httpReq('GET', `http://localhost:${PORT}/api/files?room=${FROOM}`, null, true, { 'X-Room-Token': FTOK_B });
+  ok('51 被拒的删除没有把文件删掉', JSON.parse(listStill.text).files.some((f) => f.name === '评审会材料.md'));
+  /* ★ 先把全房视角指到 logo.svg，再删它——这样"删掉正在看的那一份会清空视角"才是**真的被测到**。
+   *   第一版我在这里写了 `|| true` 兜底（因为当时视角指的是 .md），
+   *   那是一条永远不会红的断言（坑 65/95：假绿比假红危险）。改成先制造前提再断言。 */
+  FA.s.emit('files-view', { name: 'logo.svg', page: 1, scroll: 0, zoom: 1 });
+  await sleep(350);
+  const viewsBeforeDel = fViewsB.length;
+  const delByOwner = await request(FA.s, 'files-delete', { name: 'logo.svg' });
+  ok('51 上传者本人（同时也是房主）可以删', delByOwner.data.ok === true);
+  await sleep(400);
+  ok('51 ★ 删掉"全房正在看的那一份"时服务器清空视角并广播（否则跟随的人盯着空白）',
+    fViewsB.length > viewsBeforeDel && fViewsB[fViewsB.length - 1].view === null,
+    JSON.stringify(fViewsB.slice(viewsBeforeDel).map((m) => m.view)));
+  const goneDl = await getFile(FROOM, FTOK_A, 'logo.svg');
+  ok('51 删掉之后下载是 404（不是 403、也不是 200 空文件）', goneDl.code === 404);
+  ok('51 删除也广播了 files-updated（change=remove）',
+    fUpdatesB.some((m) => m.change === 'remove' && m.name === 'logo.svg'));
+  const delMissing = await request(FA.s, 'files-delete', { name: '从来没有过.pdf' })
+    .then(() => ({ ok: true })).catch((e) => ({ ok: false, msg: e.message }));
+  ok('51 删不存在的文件给明确错误（不是静默成功）',
+    delMissing.ok === false && /不在本场会议/.test(String(delMissing.msg || '')));
+  const listBySignal = await request(FA.s, 'files-list', {});
+  ok('51 files-list 信令与 HTTP 列表同源（同一条判据、同一个下界）',
+    listBySignal.data.files.length === JSON.parse((await httpReq('GET', `http://localhost:${PORT}/api/files?room=${FROOM}`, null, true, { 'X-Room-Token': FTOK_A })).text).files.length);
+
+  // ⑧ 可观测面：面板快照与 /metrics 都要有这本账
+  const snapF = JSON.parse((await httpReq('GET', `http://localhost:${PORT}/api/rooms`)).text);
+  const fRoomSnap = (snapF.rooms || []).find((r) => r.roomNumber === FROOM);
+  ok('51 /api/rooms 的房间快照带 filesCount/filesBytes',
+    !!fRoomSnap && typeof fRoomSnap.filesCount === 'number' && fRoomSnap.filesCount >= 2
+    && typeof fRoomSnap.filesBytes === 'number' && fRoomSnap.filesBytes > 0,
+    JSON.stringify(fRoomSnap && { c: fRoomSnap.filesCount, b: fRoomSnap.filesBytes }));
+  const listNow = JSON.parse((await httpReq('GET', `http://localhost:${PORT}/api/files?room=${FROOM}`, null, true, { 'X-Room-Token': FTOK_A })).text);
+  ok('51 快照里的 files 计数与 HTTP 列表同源（面板和前端看到的必须一样多）',
+    !!fRoomSnap && fRoomSnap.filesCount === listNow.files.length,
+    `快照 ${fRoomSnap && fRoomSnap.filesCount} vs 列表 ${listNow.files.length}`);
+  const metF = await httpReq('GET', `http://localhost:${PORT}/metrics`);
+  ok('51 /metrics 有共享文件的四本账（upload/delete/view/rejected）',
+    /sfu_files_events_total\{kind="upload"\} \d+/.test(metF.text)
+    && /sfu_files_events_total\{kind="delete"\} \d+/.test(metF.text)
+    && /sfu_files_events_total\{kind="view"\} \d+/.test(metF.text)
+    && /sfu_files_events_total\{kind="rejected"\} \d+/.test(metF.text));
+  ok('51 /metrics 有按房间的存量 gauge（巡检要知道哪场会快满了）',
+    new RegExp(`sfu_files_count\\{room="${FROOM}"\\} \\d+`).test(metF.text)
+    && new RegExp(`sfu_files_bytes\\{room="${FROOM}"\\} \\d+`).test(metF.text));
+  ok('51 ★ upload 计数真的在涨（不是模板里写死的 0——坑 76：机制要有触发证据）',
+    Number((/sfu_files_events_total\{kind="upload"\} (\d+)/.exec(metF.text) || [0, 0])[1]) >= 3
+    && Number((/sfu_files_events_total\{kind="rejected"\} (\d+)/.exec(metF.text) || [0, 0])[1]) >= 1);
+  ok('51 快照里不含任何人的房间令牌（显式投影，别顺手把 token 带出去）',
+    JSON.stringify(fRoomSnap).indexOf(String(FTOK_A)) < 0 && JSON.stringify(fRoomSnap).indexOf('roomToken') < 0);
+
+  // 清理（这一段自建的连接全部请出去，别把房间留给后面的断言当噪声）
+  for (const c of [FA, FB, FC, FX]) { try { c.s.disconnect(); } catch (e) { /* ignore */ } }
+  await sleep(300);
+
+  /* ══ ★ 2026-10-09 真人语音金标准（/golden 录制页的后端）══
+   * ▎这组断言保护的是两件事：**门禁**（它会往服务器写文件）与**隔离**
+   *   （回归绝不把录音写进真实的 sfu/voice-golden/——同一条纪律曾经因为
+   *    账号测试直接写 users.json 而攒下 61 个垃圾账号）。
+   * ▎raw POST 自己拼：httpReq 只会发 JSON，而这里要传的是音频字节。 */
+  const rawPost = (url, buf, headers, noAuth) => new Promise((resolve, reject) => {
+    const m = String(url).match(/^http:\/\/([^:/]+):(\d+)(\/[^?]*)?(\?.*)?$/);
+    if (!m) return reject(new Error('bad url: ' + url));
+    const rq = http.request({
+      hostname: m[1], port: m[2], path: m[3] || '/', method: 'POST',
+      headers: {
+        'Content-Length': buf.length,
+        ...(!noAuth && adminToken ? { Authorization: 'Bearer ' + adminToken } : {}),
+        ...(headers || {}),
+      },
+    }, (r) => { let b = ''; r.on('data', (c) => (b += c)); r.on('end', () => resolve({ code: r.statusCode, text: b })); });
+    rq.on('error', reject);
+    rq.end(buf);
+  });
+  // 现场拼一段 0.4s 的 16k 单声道正弦 WAV（比依赖 TTS 稳，也和"真人"无关——这里测的是接口）
+  const mkWav = (ms, amp) => {
+    const n = Math.round(16 * ms);
+    const pcm = Buffer.alloc(n * 2);
+    for (let i = 0; i < n; i++) pcm.writeInt16LE(Math.round(amp * Math.sin(i / 6)), i * 2);
+    const h = Buffer.alloc(44);
+    h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVE', 8);
+    h.write('fmt ', 12); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22);
+    h.writeUInt32LE(16000, 24); h.writeUInt32LE(32000, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34);
+    h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
+    return Buffer.concat([h, pcm]);
+  };
+  const GOLDEN_HDR = (id, text, dist) => ({
+    'Content-Type': 'audio/wav', 'x-golden-id': id,
+    'x-golden-text': encodeURIComponent(text), 'x-golden-dist': dist || 'near',
+  });
+  const gDirReal = nodePath.join(__dirname, '..', 'sfu', 'voice-golden');
+  /* 无 token 那一趟必须显式 `noAuth=true`：httpReq 默认**自带管理员 token**
+   * （09-24 那次因为这件事把"游客视角"整组掩盖过一轮，同一个形状别再来一次）。 */
+  const gList0 = await httpReq('GET', `http://localhost:${PORT}/api/golden`, null, true);
+  ok('10-09 GET /api/golden 无 token → 401（它会往服务器写录音，比读纪要更严：甲类·工具）', gList0.code === 401);
+  const gList = await httpReq('GET', `http://localhost:${PORT}/api/golden`);
+  const gm = JSON.parse(gList.text || '{}');
+  ok('10-09 GET /api/golden 带 token 给出句子清单与闸门阈值（前端不许抄第二份清单）',
+    gList.code === 200 && Array.isArray(gm.sentences) && gm.sentences.length >= 8
+      && Array.isArray(gm.distances) && Number.isFinite(gm.gateDb));
+  /* ffmpeg 是启动时**异步探测**的（2.5s 预算 + 失败重试），回归跑得比它快时会拿到 503。
+     这不该被读成"接口坏了"——先轮询到它就位（轮询条件 = 断言条件本身，坑 120 第七次应验）。 */
+  let ffmpegReady = false;
+  for (let i = 0; i < 20 && !ffmpegReady; i++) {
+    const one = JSON.parse((await httpReq('GET', `http://localhost:${PORT}/api/golden`)).text || '{}');
+    ffmpegReady = !!one.ffmpeg;
+    if (!ffmpegReady) await new Promise((r) => setTimeout(r, 400));
+  }
+  ok('10-09 服务器的 ffmpeg 探测在回归窗口内收敛（转码没有它就不能把录音变成金标准）', ffmpegReady);
+  const gPost = await rawPost(`http://localhost:${PORT}/api/golden`, mkWav(400, 9000), GOLDEN_HDR('near-91', '小明，帮我记一下明天下午三点的评审会。'));
+  const gj = JSON.parse(gPost.text || '{}');
+  ok('10-09 POST 一条录音 → 转成 16k 单声道 WAV 并记账，回包里带实测峰值',
+    gPost.code === 200 && gj.ok === true && Number.isFinite(gj.peakDb)
+      && fsClean.existsSync(nodePath.join(TEST_GOLDEN_DIR, gj.wav)));
+  ok('10-09 峰值读数用的是生产能量闸那一个函数（当场告诉用户"这句会不会被当静音删"）',
+    typeof gj.warn === 'string' && (gj.peakDb < gm.gateDb ? gj.warn.includes('闸门') : gj.warn === ''));
+  const gList2 = JSON.parse((await httpReq('GET', `http://localhost:${PORT}/api/golden`)).text || '{}');
+  ok('10-09 列表里出现这条（id / 文本 / 距离档都存对了）',
+    (gList2.items || []).some((r) => r.id === 'near-91' && r.text.includes('评审会') && r.dist === 'near'));
+  await rawPost(`http://localhost:${PORT}/api/golden`, mkWav(300, 300), GOLDEN_HDR('near-91', '小明，帮我记一下明天下午三点的评审会。'));
+  const gList3 = JSON.parse((await httpReq('GET', `http://localhost:${PORT}/api/golden`)).text || '{}');
+  ok('10-09 同 id 重录只留最后一次（账本是 append-only，读取侧必须去重，否则 CER 会被旧条目重复计入）',
+    (gList3.items || []).filter((r) => r.id === 'near-91').length === 1);
+  const gBad = await rawPost(`http://localhost:${PORT}/api/golden`, mkWav(100, 500), GOLDEN_HDR('../../evil', '穿越测试'));
+  ok('10-09 id 带路径穿越 → 400 且没有写到目录外（白名单形状而不是黑名单字符串）',
+    gBad.code === 400 && !fsClean.existsSync(nodePath.join(TEST_GOLDEN_DIR, '..', 'evil.wav')));
+  const gNoText = await rawPost(`http://localhost:${PORT}/api/golden`, mkWav(100, 500),
+    { 'Content-Type': 'audio/wav', 'x-golden-id': 'near-92' });
+  ok('10-09 缺期望文本 → 400（没有标准答案的录音进不了 CER 表，留着只会误导）', gNoText.code === 400);
+  const gEmpty = await rawPost(`http://localhost:${PORT}/api/golden`, Buffer.alloc(0), GOLDEN_HDR('near-93', '空body'));
+  ok('10-09 0 字节（麦克风权限被拒时就是这个形状）→ 400 且说清原因',
+    gEmpty.code === 400 && /0 字节|麦克风/.test(gEmpty.text));
+  /* ★ 2026-10-09 判据换了形状：原先写"真实目录**没被创建**"，可用户录完真人语音之后
+   *   这个目录本来就该在——那条于是变成"永真分支"（gDirExistedBefore ? true : ...），
+   *   什么都没证（坑 115：断言正确地保护了一个错误的期望）。
+   *   真问题一直是"这次回归有没有把测试录音混进用户的真实语料里"（CER 表会被污染），
+   *   所以判据按**我这批 id** 查：账本里不许有它们，磁盘上也不许有它们的 wav。
+   *   ▸ 这样也与"别人正在往真实目录里录新句子"不冲突（那是并行会话的正当写入，不该报红）。 */
+  const gRealManifest = fsClean.existsSync(nodePath.join(gDirReal, 'manifest.jsonl'))
+    ? fsClean.readFileSync(nodePath.join(gDirReal, 'manifest.jsonl'), 'utf8') : '';
+  const leakedIds = ['near-91', 'near-92', 'near-93'].filter((id) =>
+    gRealManifest.includes(`"id":"${id}"`) || fsClean.existsSync(nodePath.join(gDirReal, 'wav', `${id}.wav`)));
+  ok('10-09 ★ 隔离自证：这批测试 id 一个都没落进真实 sfu/voice-golden/（真人语料不许被回归污染）',
+    leakedIds.length === 0, `泄漏：${leakedIds.join(', ') || '无'}`);
+
   // --- ★ 09-18：/metrics Prometheus 文本格式（G7 可观测性，零依赖）---
   const met = await httpReq('GET', `http://localhost:${PORT}/metrics`);
   ok('09-18 /metrics 返回 Prometheus 文本（含 rooms/members 与 bytes 计数）',
@@ -777,6 +1121,13 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
      && /sfu_ai_speech_latency_ms\{kind="avg"\} \d+/.test(met.text)
      && /sfu_ai_speech_latency_ms\{kind="max"\} \d+/.test(met.text)
      && /sfu_ai_speech_latency_ms\{kind="last"\} \d+/.test(met.text));
+  /* ★ 2026-10-09 安静麦克风的峰值增益：这条机制 10-05 上线时**没有任何一处能证明它跑过**，
+   *   于是"坐得远的人字幕变清楚了"这件事只能靠体感。现在它有一本触发账——
+   *   分母用已有的 input_voiced_total（过了能量闸的段数），分子恒 0 而分母在涨
+   *   = 那条救赎整条没生效（坑 76）。**锚行首**：# HELP 那句里也含 "gain_applied_total"（坑 74）。 */
+  ok('2026-10-09 /metrics 有增益触发账，且 /api/rooms 的 collab 同源（一处算、两处读）',
+     /^sfu_ai_asr_gain_applied_total \d+$/m.test(met.text)
+     && /^# HELP sfu_ai_asr_gain_applied_total/m.test(met.text));
   /* ▎这里自带一个取行助手，不复用下面 900 多行的 numOf：那个是**块级 const**，
    *   在本行还没声明 → TDZ 直接 ReferenceError（坑 69 的同族：位置错了它不报语义错，只炸运行顺序）。 */
   const numOfCap = (txt, key) => {
@@ -789,6 +1140,20 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
      && typeof snapCap.collab.capLat.max === 'number'
      && snapCap.collab.capLat.n === numOfCap(met.text, 'sfu_ai_asr_caption_latency_ms_count_total')
      && snapCap.collab.capLat.max === numOfCap(met.text, 'sfu_ai_asr_caption_latency_ms{kind="max"}'));
+  /* ★ 2026-10-04 转写并发的三条触发证据（坑 76：机制"在"不等于机制"生效"）。
+   *   ▎这里只断"三条都在、且面板与 metrics 同源"，**不断 peak≥2**：
+   *     GPU 上单段 0.3~0.6s、分段窗口 2s，很可能永远撞不到并发——
+   *     那是事实，不是缺陷。把"peak 必须 ≥2"写成断言，只会逼人去做无意义的加压。
+   *     真正的价值在于：以后谁再问"并发到底有没有用"，看这三个数就有答案，
+   *     而不是像这次一样靠读代码推断（读代码得出的结论是"改了"，不是"发生了"）。 */
+  ok('2026-10-04 /metrics 有转写并发的触发证据（launched / inflight_peak / blocked）',
+     /sfu_ai_asr_segments_launched_total \d+/.test(met.text)
+     && /sfu_ai_asr_segments_inflight_peak \d+/.test(met.text)
+     && /sfu_ai_asr_segments_blocked_ticks_total \d+/.test(met.text));
+  ok('2026-10-04 /api/rooms 的 collab.seg 与 /metrics 同源（并发证据不另算一份）',
+     !!snapCap.collab && !!snapCap.collab.seg
+     && snapCap.collab.seg.launched === numOfCap(met.text, 'sfu_ai_asr_segments_launched_total')
+     && snapCap.collab.seg.peak === numOfCap(met.text, 'sfu_ai_asr_segments_inflight_peak'));
   // ★ 09-24 AI 用量可观测：调用次数/错误数/tokens/估算花费在同一份 metrics 面上
   ok('09-24 /metrics 含 AI 用量指标（调用/错误/tokens/花费 四组齐备）',
      met.text.includes('sfu_ai_llm_enabled') && met.text.includes('sfu_ai_llm_calls_total')
@@ -842,6 +1207,22 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('09-24 ai-ask 广播带 ai 元信息（前端据此画 LLM/Mock 徽标与 token 用量）',
      !!aiMsg && !!aiMsg.ai && typeof aiMsg.ai.mock === 'boolean' && typeof aiMsg.ai.tokens === 'number');
   ok('09-24 流式 ai-stream 到达接收端（打字机的数据源）', aiStreamDeltas.length > 0);
+  /* ★ 2026-10-06 夜二「不叫它就不开口」的**可观测面**：两本账 + 一个模式事实。
+   * ▎行为本身由 test:asr-live 钉（真音频里放一句没叫它的闲聊，断它没被接）；这里钉的是
+   *   "告警工具读得到这些数"——判据再对，指标少发一行，watch 那条哨兵就**永远不响**
+   *   （坑 56 的指标版 / 坑 83：测不到不等于通过）。
+   * ▸ 正则一律锚行首：Prometheus 的 # HELP 行里也含 `via="wake"` 字面量（坑 74 原样复发过一次）。 */
+  {
+    const viaWake = /^sfu_ai_answer_via_total\{via="wake"\} \d+$/m.test(met.text);
+    const viaTail = /^sfu_ai_answer_via_total\{via="follow-up"\} \d+$/m.test(met.text);
+    ok('2026-10-06 /metrics 有 answer_via 两本账（被叫才答 / 免唤醒续答）', viaWake && viaTail,
+      `wake=${viaWake} follow-up=${viaTail}`);
+    const roomsRes = await httpReq('GET', `http://localhost:${PORT}/api/rooms`);
+    const roomsJson = JSON.parse(roomsRes.text || '{}');
+    ok('2026-10-06 /api/rooms 交出 collab.aiChatWindowMs（默认 0=纯唤醒；对话模式是用户自己开的，告警要分得清）',
+      typeof roomsJson.collab?.aiChatWindowMs === 'number',
+      `aiChatWindowMs=${roomsJson.collab?.aiChatWindowMs}`);
+  }
   let aiErr = null;
   try { await request(A.s, 'ai-ask', { question: '' }); } catch (e) { aiErr = e.message; }
   ok('09-19 ai-ask 空问题被拒（错误路径正确）', !!aiErr);
@@ -872,7 +1253,10 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   ok('2026-10-02 「打开白板」→ 全房间都收到 room-control(board-open)（不是只回一句话）',
      rcA.length === 1 && rcA[0].action === 'board-open' && rcB.length === 1 && rcB[0].action === 'board-open');
   ok('2026-10-02 动作型意图的答案明确说"做了"（可验证，不写"你可以点击按钮"）',
-     !!rcMsg && /白板/.test(rcMsg.text) && /打开/.test(rcMsg.text));
+     !!rcMsg && /白板/.test(rcMsg.text) && /打开/.test(rcMsg.text),
+     // 不带这句原文，红了只能靠猜：抓到的是哪条 ai-bot 消息？（入会致辞/主动提醒也是 from='ai-bot'，
+     //   与 test:asr-live 那条"计数把致辞算成应答"同族——先让报错自己交代它抓到了什么）
+     `抓到：${rcMsg ? JSON.stringify(String(rcMsg.text).slice(0, 70)) : '（9s 内没有任何 ai-bot 消息）'}`);
   const rcT1 = Date.now();
   const rcCloseP = new Promise((resolve) => {
     const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcT1) { A.s.off('chat-message', h); resolve(m); } };
@@ -923,6 +1307,141 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   await sleep(400);
   ok('2026-10-02 「开启实时字幕」→ captions-on（字幕这条 AI 的"耳朵"也能被语音指令开关）',
      rcA.length === 1 && rcA[0].action === 'captions-on');
+  /* ★ 2026-10-05 同音字容错（问题⑤"操控不灵"的现实主因，soak 实测抓出）：
+   *   真人语音经 ASR 后会出同音错字——soak 实测把「切到演讲者视图」转写成
+   *   「切导演讲 《文者试图》」，旧规则要求"演讲者"连续出现 → 整条指令哑火，
+   *   用户只得到一句漂亮话（"它答应了，什么都没做"）。
+   *   修法 = 高置信同音替换（试图→视图 / 字母→字幕……，**只用于匹配**）+ 双关键词组合判决。
+   * ▎断言直接用**那次实测的转写原文**，不构造"理想同音字"——
+   *   防"测的是我想象中的错法"（坑 63：触发条件本身也要被验证）。 */
+  const rcT5 = Date.now();
+  const rcSpkP = new Promise((resolve) => {
+    const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcT5) { A.s.off('chat-message', h); resolve(m); } };
+    A.s.on('chat-message', h);
+  });
+  rcA.length = 0;
+  await request(A.s, 'ai-ask', { question: '小明 切导演讲 《文者试图》' });
+  await Promise.race([rcSpkP, sleep(9000).then(() => null)]);
+  await sleep(400);
+  ok('2026-10-05 soak 实测的错字转写「切导演讲/文者试图」仍识别成 view-speaker（同音容错）',
+     rcA.length === 1 && rcA[0].action === 'view-speaker');
+  const rcT6 = Date.now();
+  const rcCapHP = new Promise((resolve) => {
+    const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcT6) { A.s.off('chat-message', h); resolve(m); } };
+    A.s.on('chat-message', h);
+  });
+  rcA.length = 0;
+  await request(A.s, 'ai-ask', { question: '把字母打开' });
+  await Promise.race([rcCapHP, sleep(9000).then(() => null)]);
+  await sleep(400);
+  ok('2026-10-05 「字母」同音成「字幕」也要认，且"把 X 打开"语序不掉（镜像动词表）',
+     rcA.length === 1 && rcA[0].action === 'captions-on');
+  /* 反面：同音替换不能把正常聊天变成指令——「试图」单独出现 ≠ 要看视图。
+   *   误触发比漏触发更糟：用户随口一句聊天，全房画面突然切走。 */
+  const rcT7 = Date.now();
+  const rcNegP = new Promise((resolve) => {
+    const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcT7) { A.s.off('chat-message', h); resolve(m); } };
+    A.s.on('chat-message', h);
+  });
+  rcA.length = 0;
+  await request(A.s, 'ai-ask', { question: '我试图说服大家接受这个方案' });
+  await Promise.race([rcNegP, sleep(9000).then(() => null)]);
+  await sleep(400);
+  ok('2026-10-05 反面：「我试图说服大家」不触发任何房间动作（同音容错不制造误触发）',
+     rcA.length === 0);
+  /* ★ 2026-10-06 组合指令：一句话两件事 → **两条 room-control 都要发出去**，
+   *   而且回的那句话要把**两件事各自交代一遍**（以前只拼第一条的 done 句，
+   *   第二件"怎么用"只字未提 = 同一份信息只给一半，坑 56 的形状）。
+   * ▸ 断言按"事件到了几条"写，不按回复措辞写；回复只断"两件都被点到"。 */
+  const rcTMulti = Date.now();
+  const rcMultiP = new Promise((resolve) => {
+    const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcTMulti) { A.s.off('chat-message', h); resolve(m); } };
+    A.s.on('chat-message', h);
+  });
+  rcA.length = 0; rcB.length = 0;
+  await request(A.s, 'ai-ask', { question: '把白板打开，顺便把字幕也开一下' });
+  const multiMsg = await Promise.race([rcMultiP, sleep(9000).then(() => null)]);
+  await sleep(400);
+  const multiActs = rcA.map((p) => p.action);
+  ok('2026-10-06 「把白板打开，顺便把字幕也开一下」→ 两条动作各自广播到全房（不是只做第一件）',
+     multiActs.includes('board-open') && multiActs.includes('captions-on') && rcB.length >= 2,
+     `A 收到 ${JSON.stringify(multiActs)} · B 收到 ${rcB.length} 条`);
+  ok('2026-10-06 组合指令的回复把两件事都交代了（白板 + 字幕，不只拼第一条的提示）',
+     !!multiMsg && /白板/.test(multiMsg.text) && /字幕/.test(multiMsg.text),
+     multiMsg ? String(multiMsg.text).slice(0, 80) : '没抓到应答消息');
+
+  /* ★ 2026-10-07 第 51 步：AI 开共享文件面板——**端到端**（一句话 → 事件真的到了两个客户端）。
+   *   ▎为什么不满足于纯函数电池：电池绿只证明"读对了 id"，不证明"客户端收到了"。
+   *     中间还隔着服务器广播与客户端那张表（坑 106 的第③步：泛化不能只在纯函数里绿）。 */
+  const rcTf = Date.now();
+  const rcFilesP = new Promise((resolve) => {
+    const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcTf) { A.s.off('chat-message', h); resolve(m); } };
+    A.s.on('chat-message', h);
+  });
+  rcA.length = 0; rcB.length = 0;
+  await request(A.s, 'ai-ask', { question: '把共享文件打开' });
+  const filesMsg = await Promise.race([rcFilesP, sleep(9000).then(() => null)]);
+  await sleep(400);
+  const fileActs = rcA.map((p) => p.action);
+  ok('2026-10-07 「把共享文件打开」→ 全房收到 room-control(files-open)（两个客户端都收到）',
+     fileActs.includes('files-open') && rcB.some((p) => p.action === 'files-open'),
+     `A=${JSON.stringify(fileActs)} B=${JSON.stringify(rcB.map((p) => p.action))}`);
+  ok('2026-10-07 回话里点到"共享文件"（用户要知道它到底做了什么）',
+     !!filesMsg && /共享文件|文件面板/.test(String(filesMsg.text)),
+     filesMsg ? String(filesMsg.text).slice(0, 90) : '没抓到应答');
+  /* 反面：**「把文件发我」是点对点传输，AI 没那个身份** → 一条 room-control 都不许发，
+     且要拒得清楚。这一条同时钉住"越界表被收窄后没有把该拒的放过来"。 */
+  const rcTf2 = Date.now();
+  const rcDenyP = new Promise((resolve) => {
+    const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcTf2) { A.s.off('chat-message', h); resolve(m); } };
+    A.s.on('chat-message', h);
+  });
+  rcA.length = 0;
+  await request(A.s, 'ai-ask', { question: '把那份文件发我' });
+  const denyMsg = await Promise.race([rcDenyP, sleep(9000).then(() => null)]);
+  await sleep(300);
+  ok('2026-10-07 反面：「把文件发我」不触发任何房间动作（点对点传输 AI 办不到，拒清楚）',
+     rcA.length === 0, JSON.stringify(rcA.map((p) => p.action)));
+
+  /* ★ 2026-10-05b 第二轮 soak 真转写又抓到两个新变体（同音容错第二批）：
+   *   「切导演讲」——"切到"同音成"切导"，且"视图"被整个吞（lookahead 双关键词缺第二个词）；
+   *   「把白榜关」——榜 bǎng / 板 bǎn 同音，后面还跟着一长串无关词。
+   * 断言仍用**第二次 soak 的转写原文**（同 rcT5 纪律：别测想象中的错法，坑 63）。 */
+  const rcT8 = Date.now();
+  const rcSpk2P = new Promise((resolve) => {
+    const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcT8) { A.s.off('chat-message', h); resolve(m); } };
+    A.s.on('chat-message', h);
+  });
+  rcA.length = 0;
+  await request(A.s, 'ai-ask', { question: '小明 切导演讲 广州' });
+  await Promise.race([rcSpk2P, sleep(9000).then(() => null)]);
+  await sleep(400);
+  ok('2026-10-05b 「切导演讲」（切到同音 + "视图"被吞）仍识别成 view-speaker',
+     rcA.length === 1 && rcA[0].action === 'view-speaker');
+  /* 反面（本轮新分支专属）：光说"演讲"没有切换动作词 = 不触发——
+   *   判据是"动作短语"（切到/切换到 + 演讲），不是"两个词共现"。 */
+  const rcT9 = Date.now();
+  const rcNeg2P = new Promise((resolve) => {
+    const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcT9) { A.s.off('chat-message', h); resolve(m); } };
+    A.s.on('chat-message', h);
+  });
+  rcA.length = 0;
+  await request(A.s, 'ai-ask', { question: '我明天要去参加一个演讲比赛' });
+  await Promise.race([rcNeg2P, sleep(9000).then(() => null)]);
+  await sleep(400);
+  ok('2026-10-05b 反面：只有"演讲"没有切换动词 → 不触发 view-speaker（新分支不放开共现）',
+     rcA.length === 0);
+  const rcT10 = Date.now();
+  const rcClose2P = new Promise((resolve) => {
+    const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcT10) { A.s.off('chat-message', h); resolve(m); } };
+    A.s.on('chat-message', h);
+  });
+  rcA.length = 0;
+  await request(A.s, 'ai-ask', { question: '小明 把白榜关 请点赞 订阅 转发 打赏 打赏' });
+  await Promise.race([rcClose2P, sleep(9000).then(() => null)]);
+  await sleep(400);
+  ok('2026-10-05b 「把白榜关」（榜/板同音 + 尾随无关词）仍识别成 board-close',
+     rcA.length === 1 && rcA[0].action === 'board-close');
 
   /* ★ 2026-10-03 白板持久化：笔迹实时仍走 SCTP，服务器只收"画完的一笔"，
    *   于是**晚进房的人与刷新的人都能看到别人画的东西**（过去是空白画布）。
@@ -998,6 +1517,39 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
        numOf(met2.text, 'sfu_room_control_applied_total{action="board-close"}'));
   ok('2026-10-03 白名单外的 action 进不了指标（防客户端打爆标签基数）',
      met3.text.includes('sfu_room_control_applied_total') && !met3.text.includes(evil));
+  /* ★ 2026-10-06 「说了没做」要**当场自己发现并说出来**（问题⑤"操控实体还是实现的不行"的最后一公里）。
+   *   ▎为什么这两条值这个价：用户嘴里的"不行"其实有两种——
+   *     ① 那句话没被识别成动作（上面几组电池已钉住）；
+   *     ② 识别了、也广播了，但**页面没执行**（旧版页面 / SW 缓存了老 client.js /
+   *       服务器那张表与本表漂了个分支）。第二种以前只有 watch.js 事后从 /metrics 的
+   *       "发出数 vs 执行数"差值里看得见，而开会的人当场看到的只是"它没反应"。
+   *   ▸ A 相（没人回执 → 必须响）：这个测试文件里的客户端都是裸 socket，不执行界面，
+   *     所以看门狗到点就该在全房补一句 ⚠️ —— 这条断言验的是"告警真的会响"。
+   *   ▸ B 相（有一个人回执 → 不许响）：房间级共享状态一个人做了就是做了，不需要人人回执；
+   *     而**误报的告警比没有告警更糟**（坑 67：一个经常乱响的警报，下次真出事也没人信），
+   *     所以两相都要断，只断 A 相会养出一条"逢动作就瞎报"的实现也照样绿。
+   *   ▸ 判据按**动作名**过滤而不是"收到过 ⚠️"：上面每一条动作断言都各自欠一条告警，
+   *     不指名就会把邻居的告警读成自己的证据（坑 44/72 同族）。 */
+  const noopSeen = [];
+  A.s.on('chat-message', (m) => {
+    if (m && m.from === 'ai-bot' && /^⚠️ 我发出了/.test(String(m.text || ''))) noopSeen.push(String(m.text));
+  });
+  await request(A.s, 'ai-ask', { question: '把白板清空' });   // 无人回执
+  await sleep(2200);                                          // ROOM_CONTROL_ACK_MS=1200 + 余量
+  ok('2026-10-06 「说了没做」当场说话：没有客户端回执时，AI 在全房明说这条没生效',
+     noopSeen.some((t) => /清空白板/.test(t)), `实收告警：${noopSeen.join(' | ') || '（一条都没有）'}`);
+  rcA.length = 0;
+  /* 回执要在**收到 room-control 的那一刻**发出去，不能等 ai-ask 的 ack 回来再发：
+   * 广播发生在 aiBrain 里面，比应答的往返更早，等 await  resolve 完再补发就可能
+   * 已经过了 1.2s 的看门狗预算（坑 61 的镜像：这回不是"读要晚一拍"，是"答要赶在狗之前"）。 */
+  RC.s.on('room-control', (p) => {
+    if (p && p.action === 'board-undo') RC.s.emit('room-control-ack', { action: 'board-undo', ok: true });
+  });
+  await request(A.s, 'ai-ask', { question: '撤销刚才那一笔' }); // → board-undo，且 RC 当场回执
+  await sleep(2200);
+  ok('2026-10-06 反面：只要有一个客户端回执，就不许当着全房说"没人执行"（误报比沉默更糟）',
+     rcA.some((p) => p.action === 'board-undo') && !noopSeen.some((t) => /撤销白板最近一笔/.test(t)),
+     `实收告警：${noopSeen.filter((t) => /撤销/.test(t)).join(' | ') || '无'}`);
   /* ★ 2026-10-03 第 38 步：播报延迟上报信令。断言形状照抄上面那组"计数器真的在动"——
    *   ▎因为这条最容易坏的地方正是"客户端发了、服务器没数"（坑 41：有状态被写入的功能，
    *     必须有一条"写进去没有"的断言，只测纯函数会全绿）。
@@ -1140,6 +1692,111 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
     ok('09-19h G6 过期路径（默认 24h TTL 跳过实测——AUTH_TTL_MS=2000 启动可验）', true);
   }
 
+  /* --- ★ 2026-10-09 第 52 步：退出登录（服务器那半边）---
+   * ▎用户报的是"没有退出登录的效果"。客户端清 localStorage 只是其中一半：
+   *   聊天广播的署名来自**服务器 socket 上的身份**（server.js 的 chat-message 用 socket.displayName），
+   *   成员列表的 role 也来自服务器投影。所以"退出"必须在服务器上是一次**身份撤销**，
+   *   否则别人看到的还是那个名字，而本人界面已经写着"游客"——两边各说各话。
+   * ▎三条各自独立的判据（缺一条就留一个洞）：
+   *   ① 票作废：拿这张票再过 admin 门禁要 401；
+   *   ② 只作废自己那张：拿**别人的** token 发 auth-logout 不许把它删掉（那是"踢人 DoS"）；
+   *   ③ 身份落回游客：广播署名与 role 投影一起退掉。 */
+  {
+    const LO = await client('LO');
+    const loUser = 'legacy_h';                       // 临时库里的管理员（口令见 preSeedLegacyUser）
+    const loPw = ['L', 'e', 'g', 'a', 'c', 'y', '#', '2', '0', '2', '6'].join('');
+    const loTok = (await request(LO.s, 'auth-login', { username: loUser, password: loPw })).data.token;
+    ok('10-09 第 52 步 前提：第二次登录拿到的是**另一张**票（同账号多票并存，退出只退自己这张）',
+      !!loTok && loTok !== adminToken);
+    ok('10-09 第 52 步 这张新票能过 admin 门禁（/metrics 200）',
+      (await getCode('/metrics', { Authorization: 'Bearer ' + loTok })) === 200);
+
+    // ② 反向对照：另一条连接拿别人的票发 auth-logout，不许把它删掉
+    //   ▸ 故意用**没登录过**的第三条连接：一次 login 都不多花——登录有 20 次/分的 IP 限流，
+    //     这个套件本身已经用了 17 处，再往中间塞三四条就是在制造"会移动的假红"（坑 91/106 同一条）。
+    const ATK = await client('ATK');
+    // request() 对 {error} 应答是 **reject**（不是返回 {error}），所以"期待被拒"的调用必须包起来
+    const tryReq = async (s, ev, p) => {
+      try { return await request(s, ev, p); } catch (e) { return { error: e.message }; }
+    };
+    const stolen = await tryReq(ATK.s, 'auth-logout', { token: loTok });
+    ok('10-09 第 52 步 ★ auth-logout 不许作废别人的票（否则"退出"就成了把管理员踢下线的 DoS 入口）',
+      !!stolen.error && (await getCode('/metrics', { Authorization: 'Bearer ' + loTok })) === 200,
+      JSON.stringify({ err: stolen.error, code: await getCode('/metrics', { Authorization: 'Bearer ' + loTok }) }));
+    // 被拒的那条请求**无副作用**：上面那条"票仍然 200"就是它的证据（不额外花一次登录去查昵称）。
+
+    // ③ 身份撤销要在**广播**里看得见：退出前带昵称、退出后不带（观众 B2 读的是别人屏幕）
+    const B2 = await client('B2');
+    await request(LO.s, 'join-room', { roomNumber: ROOM });
+    const b2join = await request(B2.s, 'join-room', { roomNumber: ROOM });
+    await sleep(150);
+    const seen3 = [];
+    const onChat3 = (p) => { if ((p.text || '').startsWith('lo49')) seen3.push(p); };
+    B2.s.on('chat-message', onChat3);
+    // chat-message 是**不带 ack** 的广播（服务器那侧签名里就没有 callback），
+    //   所以这里必须裸 emit——用 request() 等一个永远不会来的应答 = 整条套件挂死（本轮踩过一次）。
+    const say = async (tag, id) => { LO.s.emit('chat-message', { text: `lo49-${tag}`, msgId: id }); await sleep(160); };
+    await say('登录时', 'lo49a');
+    const withName = seen3.find((p) => p.text === 'lo49-登录时');
+    ok('10-09 第 52 步 前提：观众在房里且广播到得了（否则下面的"署名没了"只是没收到）',
+      !b2join.error && (b2join.data || {}).roomNumber === ROOM && !!withName,
+      JSON.stringify({ join: b2join && b2join.data, got: seen3.length }));
+    ok('10-09 第 52 步 对照的"上半"：登录态下广播带昵称（缺这一格，下面两条"没昵称"毫无信息量）',
+      !!(withName && withName.name), JSON.stringify(withName && withName.name));
+
+    // 先走"不带票"的退出：它只退**这条连接**的身份，票本身还活着——这件事必须说清，
+    // 否则"退出登录"到底废了什么没人知道。
+    const outLocal = await request(LO.s, 'auth-logout', {});
+    ok('10-09 第 52 步 不带票的退出也有明确应答（客户端永远带票，但这条路径要成立：无副作用地退回游客）',
+      !outLocal.error && outLocal.data && outLocal.data.ok === true);
+    await say('本地退出后', 'lo49b');
+    const afterLocal = seen3.find((p) => p.text === 'lo49-本地退出后');
+    ok('10-09 第 52 步 ★ 退出后广播不再带昵称（服务器身份真的被撤销——"退出的效果"落在别人的屏幕上）',
+      !!afterLocal && afterLocal.name === undefined, JSON.stringify(afterLocal && afterLocal.name));
+    ok('10-09 第 52 步 不带票的退出不废票：那张票还能过门禁（"退出这条连接"≠"注销这张票"，界面上不许混说）',
+      (await getCode('/metrics', { Authorization: 'Bearer ' + loTok })) === 200);
+
+    // 重新绑定走 auth-verify（它和登录一样调 bindIdentity），省一次登录配额。
+    const rebind = await tryReq(LO.s, 'auth-verify', { username: loUser, token: loTok });
+    ok('10-09 第 52 步 前提：verify 把身份绑回来了（这是"刷新页面自动恢复登录"那条老路）',
+      !rebind.error && !!(rebind.data && rebind.data.user), JSON.stringify(rebind.error || 'ok'));
+    await say('重新绑定后', 'lo49c');
+    const rebound = seen3.find((p) => p.text === 'lo49-重新绑定后');
+    ok('10-09 第 52 步 重新绑定后广播又带回昵称（没有这一格，下面那条"续期失败"红得说不清是谁的错）',
+      !!(rebound && rebound.name), JSON.stringify(rebound && rebound.name));
+
+    /* ★ 配对的那半边：续期判失败也必须撤身份。
+     *   否则客户端按新逻辑退回游客显示，服务器还按老身份放行录制与删除——
+     *   "我退出了却还能录像"这种不一致没人能一眼看出来。 */
+    const badRefresh = await tryReq(LO.s, 'auth-refresh', { username: loUser, token: 'not-a-real-ticket' });
+    await say('续期失败后', 'lo49d');
+    const afterBad = seen3.find((p) => p.text === 'lo49-续期失败后');
+    ok('10-09 第 52 步 ★ auth-refresh 判失败 → 服务器同时撤销这条连接的身份（两边不许各说各话）',
+      !!badRefresh.error && !!afterBad && afterBad.name === undefined,
+      JSON.stringify({ err: badRefresh.error, name: afterBad && afterBad.name }));
+
+    // ① 带票退出：这张票必须立刻过不了 admin 门禁。
+    //   ▸ 先 verify 把身份绑回来——上一 step 的续期失败已经把 socket.username 清成 null 了，
+    //     而"这张票不是你的"守卫正是按 username 判的（顺序错了会拿到一条**正确的拒绝**，
+    //     看起来却像功能坏了：断言要站在它依赖的那个状态上，坑 55 同一条）。
+    const halfOut = await tryReq(LO.s, 'auth-logout', { token: loTok });
+    ok('10-09 第 52 步 身份已经没了的连接再拿票来退 → 明确拒绝而不是"成功却什么都没做"',
+      !!halfOut.error && (await getCode('/metrics', { Authorization: 'Bearer ' + loTok })) === 200,
+      JSON.stringify(halfOut));
+    await tryReq(LO.s, 'auth-verify', { username: loUser, token: loTok });
+    const outAck = await tryReq(LO.s, 'auth-logout', { token: loTok });
+    ok('10-09 第 52 步 auth-logout（带自己的票）有明确应答',
+      !outAck.error && outAck.data && outAck.data.ok === true, JSON.stringify(outAck));
+    ok('10-09 第 52 步 ★ 带票退出后这张票立刻过不了门禁（401）——作废的是票，不只是这条连接',
+      (await getCode('/metrics', { Authorization: 'Bearer ' + loTok })) === 401);
+    ok('10-09 第 52 步 ★ 作废的票连 auth-verify 都过不了（否则刷新页面就"自己又回来了"）',
+      !!(await tryReq(B2.s, 'auth-verify', { username: loUser, token: loTok })).error);
+    ok('10-09 第 52 步 反向对照：别人的票一张没被牵连（套件用的 admin token 仍然 200）',
+      (await getCode('/api/rooms', { Authorization: 'Bearer ' + adminToken })) === 200);
+    B2.s.off('chat-message', onChat3);
+    try { LO.s.close(); ATK.s.close(); B2.s.close(); } catch (e) { /* ignore */ }
+  }
+
   // --- ★ 09-26：头像系统（注册带 avatar → 全链路贯通）---
   let avTok = null;
   try { await request(A.s, 'auth-register', { username: 'avuser', password: 'secret9', displayName: '头像哥', avatar: 'av-03' }); } catch (e) { /* 复跑已注册 */ }
@@ -1158,14 +1815,28 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
   // ai-state 状态机：ask 应触发 thinking→speaking（监听持久收集）
   try { await request(A.s, 'ai-join', {}); } catch (e) { /* 已在场 */ }
   const aiStatesSeen = [];
-  let aiStateLast = null;
-  A.s.on('ai-state', (p) => { aiStatesSeen.push(p.state); aiStateLast = p; });
+  const aiSpeaking = [];            // ★ 本轮所有 speaking 帧（不再只留"最后一帧"）
+  A.s.on('ai-state', (p) => {
+    aiStatesSeen.push(p.state);
+    if (p.state === 'speaking') aiSpeaking.push(p);
+  });
   try { await request(A.s, 'ai-ask', { question: '头像测试' }); } catch (e) {}
-  await sleep(600);
+  /* ★ 2026-10-03e→h 这条断言改了两次，两次都还在红，第二次才看清根因不在"等多久"：
+   *   · 第一次：固定 sleep(600) —— 真 LLM 要 2~5s，只看得到 thinking，于是"有时绿有时红"。
+   *   · 第二次：改轮询"最后一帧是不是 speaking" —— 但 speaking 之后服务器一定会补 idle，
+   *     而 `request()` 的 ack 可能**比这两帧都晚**（本房间看板里字幕多，检索慢），
+   *     等开始轮询时末帧早已是 idle。实测帧序列：
+   *       [thinking×5, speaking, idle×3]  ← speaking 真的来过，"末帧"却是 idle。
+   *   ▸ 正解：**别问"现在是什么状态"，要问"这一轮里出现过 speaking 没有"**。
+   *     与坑 44 同一条纪律——等的是"事件发生过"，就该把它收进数组，而不是盯一个会被
+   *     后到的帧覆盖掉的变量。这样也不依赖任何时长，快网慢网都成立。 */
+  const speakDeadline = Date.now() + 8000;
+  while (Date.now() < speakDeadline && !aiSpeaking.length) await sleep(200);
   ok('09-26 ai-ask 驱动头像状态机（出现 thinking 或 speaking）',
      aiStatesSeen.includes('thinking') || aiStatesSeen.includes('speaking'));
   ok('09-26b bot 改名「AI 小明」且 speaking 帧带全文（前端逐字字幕的数据源）',
-     !!aiStateLast && aiStateLast.state === 'speaking' && typeof aiStateLast.text === 'string' && aiStateLast.text.length > 0);
+     aiSpeaking.length > 0 && typeof aiSpeaking[0].text === 'string' && aiSpeaking[0].text.length > 0,
+     `speaking 帧 ${aiSpeaking.length} 条，首条 ${aiSpeaking[0] ? aiSpeaking[0].text.length : 0} 字`);
 
 
   // --- ★ 09-19f：SFU 深造（多 Worker 池 + ping 探活）---

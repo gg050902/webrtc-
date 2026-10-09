@@ -35,7 +35,7 @@ function handleLine(chunk) {
     if (!line) continue;
     let msg = null;
     try { msg = JSON.parse(line); } catch (e) { continue; }
-    if (msg.ready) { state.ready = true; state.crashStreak = 0; continue; }
+    if (msg.ready) { state.ready = true; state.crashStreak = 0; state.device = String(msg.device || 'cpu'); continue; }
     if (msg.fatal) { state.lastError = msg.fatal; failPending('fatal'); continue; }
     const p = state.pending.get(msg.id);
     if (!p) continue;
@@ -145,4 +145,5 @@ module.exports = {
   kill,
   get alive() { return !state.dead && !!state.child && state.ready; },
   get lastError() { return state.lastError; },
+  get device() { return state.device || 'cpu'; },   // ★ 2026-10-03d GPU/CPU 说实话（启动日志用）
 };

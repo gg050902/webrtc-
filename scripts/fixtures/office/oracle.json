@@ -1,0 +1,522 @@
+{
+ "generatedBy": "scripts/office-oracle.py",
+ "marks": {
+  "textbox": "文本框里的字",
+  "fieldResult": "域结果三三七",
+  "fldSimple": "单域结果九〇九",
+  "math": "伽马除以贝塔",
+  "instr": "PAGE",
+  "linkText": "评审报告外链",
+  "header": "页眉：公司内部资料",
+  "direct": "直接写numPr的段落"
+ },
+ "docx": {
+  "paras": [
+   {
+    "text_len": 8,
+    "head": "项目",
+    "style": "Heading 1",
+    "style_id": "Heading1",
+    "num_direct": false,
+    "num_by_style": false
+   },
+   {
+    "text_len": 19,
+    "head": "正常",
+    "style": "Normal",
+    "style_id": "Normal",
+    "num_direct": false,
+    "num_by_style": false
+   },
+   {
+    "text_len": 41,
+    "head": "第二",
+    "style": "Normal",
+    "style_id": "Normal",
+    "num_direct": false,
+    "num_by_style": false
+   },
+   {
+    "text_len": 7,
+    "head": "二级",
+    "style": "Heading 2",
+    "style_id": "Heading2",
+    "num_direct": false,
+    "num_by_style": false
+   },
+   {
+    "text_len": 7,
+    "head": "三级",
+    "style": "Heading 3",
+    "style_id": "Heading3",
+    "num_direct": false,
+    "num_by_style": false
+   },
+   {
+    "text_len": 5,
+    "head": "第一",
+    "style": "List Number",
+    "style_id": "ListNumber",
+    "num_direct": false,
+    "num_by_style": true
+   },
+   {
+    "text_len": 5,
+    "head": "第二",
+    "style": "List Number",
+    "style_id": "ListNumber",
+    "num_direct": false,
+    "num_by_style": true
+   },
+   {
+    "text_len": 5,
+    "head": "第三",
+    "style": "List Number",
+    "style_id": "ListNumber",
+    "num_direct": false,
+    "num_by_style": true
+   },
+   {
+    "text_len": 3,
+    "head": "要点",
+    "style": "List Bullet",
+    "style_id": "ListBullet",
+    "num_direct": false,
+    "num_by_style": true
+   },
+   {
+    "text_len": 3,
+    "head": "要点",
+    "style": "List Bullet",
+    "style_id": "ListBullet",
+    "num_direct": false,
+    "num_by_style": true
+   },
+   {
+    "text_len": 11,
+    "head": "直接",
+    "style": "Normal",
+    "style_id": "Normal",
+    "num_direct": true,
+    "num_by_style": false
+   },
+   {
+    "text_len": 0,
+    "head": "",
+    "style": "Normal",
+    "style_id": "Normal",
+    "num_direct": false,
+    "num_by_style": false
+   },
+   {
+    "text_len": 6,
+    "head": "评审",
+    "style": "Normal",
+    "style_id": "Normal",
+    "num_direct": false,
+    "num_by_style": false
+   },
+   {
+    "text_len": 0,
+    "head": "",
+    "style": "Normal",
+    "style_id": "Normal",
+    "num_direct": false,
+    "num_by_style": false
+   },
+   {
+    "text_len": 15,
+    "head": "带软",
+    "style": "Normal",
+    "style_id": "Normal",
+    "num_direct": false,
+    "num_by_style": false
+   },
+   {
+    "text_len": 7,
+    "head": "引用",
+    "style": "Quote",
+    "style_id": "Quote",
+    "num_direct": false,
+    "num_by_style": false
+   },
+   {
+    "text_len": 0,
+    "head": "",
+    "style": "Normal",
+    "style_id": "Normal",
+    "num_direct": false,
+    "num_by_style": false
+   },
+   {
+    "text_len": 6,
+    "head": "域结",
+    "style": "Normal",
+    "style_id": "Normal",
+    "num_direct": false,
+    "num_by_style": false
+   },
+   {
+    "text_len": 0,
+    "head": "",
+    "style": "Normal",
+    "style_id": "Normal",
+    "num_direct": false,
+    "num_by_style": false
+   },
+   {
+    "text_len": 3,
+    "head": "公式",
+    "style": "Normal",
+    "style_id": "Normal",
+    "num_direct": false,
+    "num_by_style": false
+   }
+  ],
+  "tables": [
+   {
+    "rows": 3,
+    "cols": 3,
+    "cell_lens": [
+     [
+      3,
+      2,
+      2
+     ],
+     [
+      2,
+      4,
+      3
+     ],
+     [
+      7,
+      7,
+      2
+     ]
+    ]
+   }
+  ],
+  "styles": [
+   "Heading 1",
+   "Heading 2",
+   "Heading 3",
+   "List Bullet",
+   "List Number",
+   "Normal",
+   "Quote"
+  ],
+  "images": 1,
+  "numberedByStyle": 5,
+  "numberedDirect": 1,
+  "links": 1,
+  "has_header": true,
+  "has_footer": true,
+  "page_breaks": 1,
+  "soft_breaks": 1,
+  "bold_runs": 1,
+  "italic_runs": 1,
+  "total_chars": 151,
+  "instr": [
+   "PAGE"
+  ],
+  "textbox_paras": 1,
+  "math_runs": 1,
+  "fld_simple": 1,
+  "styles_with_num": [
+   "ListBullet",
+   "ListBullet2",
+   "ListBullet3",
+   "ListNumber",
+   "ListNumber2",
+   "ListNumber3",
+   "Subtitle"
+  ],
+  "parts": [
+   "[Content_Types].xml",
+   "_rels/.rels",
+   "customXml/_rels/item1.xml.rels",
+   "customXml/item1.xml",
+   "customXml/itemProps1.xml",
+   "docProps/app.xml",
+   "docProps/core.xml",
+   "docProps/thumbnail.jpeg",
+   "word/_rels/document.xml.rels",
+   "word/document.xml",
+   "word/fontTable.xml",
+   "word/footer1.xml",
+   "word/header1.xml",
+   "word/media/image1.png",
+   "word/numbering.xml",
+   "word/settings.xml",
+   "word/styles.xml",
+   "word/stylesWithEffects.xml",
+   "word/theme/theme1.xml",
+   "word/webSettings.xml"
+  ]
+ },
+ "xlsx": {
+  "sheets": [
+   {
+    "cells": [
+     {
+      "r": 1,
+      "c": 1,
+      "len": 2,
+      "cached": "阶段",
+      "fmt": "General",
+      "k": "text"
+     },
+     {
+      "r": 1,
+      "c": 2,
+      "len": 2,
+      "cached": "任务",
+      "fmt": "General",
+      "k": "text"
+     },
+     {
+      "r": 1,
+      "c": 3,
+      "len": 2,
+      "cached": "日期",
+      "fmt": "General",
+      "k": "text"
+     },
+     {
+      "r": 1,
+      "c": 4,
+      "len": 2,
+      "cached": "工时",
+      "fmt": "General",
+      "k": "text"
+     },
+     {
+      "r": 2,
+      "c": 1,
+      "len": 3,
+      "cached": "第一章",
+      "fmt": "General",
+      "k": "text"
+     },
+     {
+      "r": 2,
+      "c": 2,
+      "len": 5,
+      "cached": "计算机网络",
+      "fmt": "General",
+      "k": "text"
+     },
+     {
+      "r": 2,
+      "c": 3,
+      "len": 10,
+      "cached": "2026-11-01",
+      "fmt": "General",
+      "k": "text"
+     },
+     {
+      "r": 2,
+      "c": 4,
+      "len": 1,
+      "cached": "6",
+      "fmt": "General",
+      "k": "number"
+     },
+     {
+      "r": 2,
+      "c": 5,
+      "len": 6,
+      "cached": null,
+      "fmt": "General",
+      "k": "formula"
+     },
+     {
+      "r": 3,
+      "c": 1,
+      "len": 3,
+      "cached": "第一章",
+      "fmt": "General",
+      "k": "text"
+     },
+     {
+      "r": 3,
+      "c": 2,
+      "len": 4,
+      "cached": "操作系统",
+      "fmt": "General",
+      "k": "text"
+     },
+     {
+      "r": 3,
+      "c": 3,
+      "len": 10,
+      "cached": "2026-11-08",
+      "fmt": "General",
+      "k": "text"
+     },
+     {
+      "r": 3,
+      "c": 4,
+      "len": 1,
+      "cached": "5",
+      "fmt": "General",
+      "k": "number"
+     },
+     {
+      "r": 4,
+      "c": 1,
+      "len": 3,
+      "cached": "第二章",
+      "fmt": "General",
+      "k": "text"
+     },
+     {
+      "r": 4,
+      "c": 2,
+      "len": 5,
+      "cached": "数据库设计",
+      "fmt": "General",
+      "k": "text"
+     },
+     {
+      "r": 4,
+      "c": 3,
+      "len": 10,
+      "cached": "2026-12-01",
+      "fmt": "General",
+      "k": "text"
+     },
+     {
+      "r": 4,
+      "c": 4,
+      "len": 1,
+      "cached": "8",
+      "fmt": "General",
+      "k": "number"
+     },
+     {
+      "r": 6,
+      "c": 1,
+      "len": 8,
+      "cached": "合并单元格的说明",
+      "fmt": "General",
+      "k": "text"
+     },
+     {
+      "r": 10,
+      "c": 4,
+      "len": 5,
+      "cached": "45570",
+      "fmt": "General",
+      "k": "number"
+     },
+     {
+      "r": 11,
+      "c": 3,
+      "len": 19,
+      "cached": "2024-10-05 00:00:00",
+      "fmt": "yyyy-mm-dd",
+      "k": "date"
+     },
+     {
+      "r": 11,
+      "c": 4,
+      "len": 4,
+      "cached": "0.25",
+      "fmt": "0.00%",
+      "k": "percent"
+     },
+     {
+      "r": 12,
+      "c": 2,
+      "len": 6,
+      "cached": "1234.5",
+      "fmt": "¥#,##0.00",
+      "k": "currency"
+     }
+    ]
+   },
+   {
+    "cells": []
+   }
+  ],
+  "total_chars": 69,
+  "merged": 1,
+  "formulas": [
+   {
+    "r": 2,
+    "c": 5,
+    "len": 6,
+    "cached": null,
+    "fmt": "General",
+    "k": "formula"
+   }
+  ],
+  "dates": [
+   {
+    "r": 11,
+    "c": 3,
+    "len": 19,
+    "cached": "2024-10-05 00:00:00",
+    "fmt": "yyyy-mm-dd",
+    "k": "date"
+   }
+  ],
+  "numbers": [
+   {
+    "r": 2,
+    "c": 4,
+    "len": 1,
+    "cached": "6",
+    "fmt": "General",
+    "k": "number"
+   },
+   {
+    "r": 3,
+    "c": 4,
+    "len": 1,
+    "cached": "5",
+    "fmt": "General",
+    "k": "number"
+   },
+   {
+    "r": 4,
+    "c": 4,
+    "len": 1,
+    "cached": "8",
+    "fmt": "General",
+    "k": "number"
+   },
+   {
+    "r": 10,
+    "c": 4,
+    "len": 5,
+    "cached": "45570",
+    "fmt": "General",
+    "k": "number"
+   }
+  ],
+  "percents": [
+   {
+    "r": 11,
+    "c": 4,
+    "len": 4,
+    "cached": "0.25",
+    "fmt": "0.00%",
+    "k": "percent"
+   }
+  ],
+  "currency": [
+   {
+    "r": 12,
+    "c": 2,
+    "len": 6,
+    "cached": "1234.5",
+    "fmt": "¥#,##0.00",
+    "k": "currency"
+   }
+  ],
+  "text_cells": 14,
+  "sheet_count": 2
+ }
+}

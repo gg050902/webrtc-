@@ -26,7 +26,11 @@ const NODE = process.execPath;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let pass = 0, fail = 0;
+// 坑 110 的常驻守卫：**本文件约定是 ok(条件, 名字)**（与多数文件相反），顺序写反就当场红
+const { guard: guardOk } = require('./assert-order-guard.js');
 const ok = (cond, title, extra) => {
+  const bad = guardOk('cond-first', cond, title);
+  if (bad) { fail++; console.log(`  FAIL  ${String(title).slice(0, 60)}  · 参数顺序守卫：${bad}`); return; }
   if (cond) { pass++; console.log(`  PASS  ${title}`); }
   else { fail++; console.log(`  FAIL  ${title}${extra ? '  ← ' + extra : ''}`); }
 };

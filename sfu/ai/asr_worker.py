@@ -44,7 +44,8 @@ def main():
         print(json.dumps({"fatal": "load_model: %s" % e}, ensure_ascii=False), flush=True)
         return 1
 
-    print(json.dumps({"ready": True, "model": args.model}, ensure_ascii=False), flush=True)
+    print(json.dumps({"ready": True, "model": args.model,
+                      "device": str(getattr(model, "device", "cpu"))}, ensure_ascii=False), flush=True)
 
     # ★ 2026-10-02：提示词由 Node 侧经 ASR_WORKER_PROMPT 下发（单一来源在 sfu/ai/asr.js）。
     #   原先这里自己写了一份同样的字符串——两处字面量迟早漂移（坑 47）。

@@ -9,7 +9,21 @@
   <link rel="manifest" href="manifest.webmanifest" />
   <meta name="theme-color" content="#14100a" />
   <title>會 · 智能多人视频会议（WebRTC SFU）</title>
-  <link rel="stylesheet" href="style.css?v=20261003b" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存（本次为字幕条手机换行 + .cap-lat / .msg-voice-lat） -->
+  <!-- ★ 2026-10-07 主题在**首屏之前**落地（必须早于样式表，也早于任何 JS 主包）。
+       ▎为什么写这么早：如果等 client.js 去读 localStorage，用户会先看到一帧深色
+       再闪成浅色——浅色主题的第一眼就是"这界面坏了一下"。这一段只有 6 行、
+       不依赖任何东西，是唯一值得内联进 head 的脚本。
+       ▸ 状态的唯一来源是 <html data-theme>（不是按钮文字，见坑 97），
+         所以这里只写属性；按钮的文案/图标由 client.js 按这个属性渲染。 -->
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('sfu-theme');
+        if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
+      } catch (e) { /* 隐私模式读不到 localStorage：按默认（水墨深色）走 */ }
+    })();
+  </script>
+  <link rel="stylesheet" href="style.css?v=20261007a" /><!-- 版本参数：改样式后顺手 bump，防吃旧缓存（本次为双主题 token + 字幕卡两行） -->
 </head>
 <body>
   <!-- ★ 09-24（第 33 步）安全上下文提示横幅 —— 只在 http + IP 访问时出现。
@@ -22,7 +36,7 @@
        ▎关闭状态存 localStorage（sfu_insecure_notice_dismissed），同一浏览器不再自动弹。 -->
   <div id="insecureBanner" class="insecure-banner hidden" role="alert" aria-live="polite">
     <div class="ib-head">
-      <span class="ib-icon">⚠️</span>
+      <span class="ib-icon"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4.2L2.8 20h18.4z"/><path d="M12 10v4.2M12 17.2h.01"/></svg></span>
       <span class="ib-title">摄像头 / 麦克风被浏览器禁用了</span>
     </div>
     <div class="ib-body">
@@ -71,21 +85,58 @@
        登录成功后昵称贯通成员列表/聊天气泡（见 client.js 第 2.5 步） -->
   <div id="authOverlay" class="auth-overlay">
     <div class="auth-card">
-      <div class="auth-caps">Simple Meeting over Mediasoup</div>
-      <div class="auth-title">简易腾讯会议</div>
+      <!-- 品牌头：印章 + 双语排版是这套界面的语言，可第一屏反而没有它。
+           别人打开链接看到的第一眼应该先是"这是个什么产品"，再才是"要我填什么"。 -->
+      <div class="auth-brand">
+        <span class="auth-seal" aria-hidden="true">會</span>
+        <div class="auth-brand-txt">
+          <div class="auth-caps">Simple Meeting over Mediasoup</div>
+          <div class="auth-title">云会议</div>
+        </div>
+      </div>
       <div class="auth-sub">登录后昵称会显示给全房间；也可以游客进入，随时可注册</div>
-      <input id="authUser" class="room-input auth-input" placeholder="用户名（2~16 位，中英文/数字/下划线）" maxlength="16" />
-      <input id="authPass" class="room-input auth-input" type="password" placeholder="密码（至少 6 位）" maxlength="32" />
-      <input id="authName" class="room-input auth-input" placeholder="昵称（可选，注册时保存）" maxlength="16" />
+      <!-- 输入框前缀挂线性图标：三行输入原先只靠 placeholder 区分，
+           而 placeholder 一输入就消失——图标才是那个"不会消失的说明"。
+           autocomplete 一并补上：浏览器密码管理器终于能认出这两栏各是干什么的。 -->
+      <div class="auth-field">
+        <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3.4"/><path d="M5.8 19.6c0-3.2 2.8-5.6 6.2-5.6s6.2 2.4 6.2 5.6"/></svg>
+        <input id="authUser" class="room-input auth-input" placeholder="用户名（2~16 位，中英文/数字/下划线）" maxlength="16" autocomplete="username" />
+      </div>
+      <div class="auth-field">
+        <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="10.5" width="14" height="9.5" rx="2.2"/><path d="M8.2 10.5V8a3.8 3.8 0 0 1 7.6 0v2.5"/><path d="M12 14v2.6"/></svg>
+        <input id="authPass" class="room-input auth-input" type="password" placeholder="密码（至少 6 位）" maxlength="32" autocomplete="current-password" />
+        <button id="authPassEye" class="auth-eye" type="button" title="显示 / 隐藏密码"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 12S6 6.5 12 6.5 21.5 12 21.5 12 18 17.5 12 17.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.6"/></svg><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4l16 16"/><path d="M9.6 6.9A9.6 9.6 0 0 1 12 6.5c6 0 9.5 5.5 9.5 5.5a17 17 0 0 1-3.2 3.8"/><path d="M6.3 8.4A16.7 16.7 0 0 0 2.5 12s3.5 5.5 9.5 5.5c1.3 0 2.4-.2 3.4-.6"/></svg></button>
+      </div>
+      <div class="auth-field">
+        <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M9 10h.01M15 10h.01M8.5 14.5a4.5 4.5 0 0 0 7 0"/></svg>
+        <input id="authName" class="room-input auth-input" placeholder="昵称（可选，注册时保存）" maxlength="16" />
+      </div>
       <!-- ★ 09-26 注册可选头像（apple-avatar 素材集：9 个中国传统色预设，点选高亮；JS 构建于 client.js） -->
       <div id="authAvatars" class="auth-avatars" title="选一个喜欢的头像（注册后保存）"></div>
       <div class="auth-btns">
         <button id="authLoginBtn" class="btn primary">登 录</button>
         <button id="authRegisterBtn" class="btn">注 册</button>
       </div>
-      <button id="authGuestBtn" class="auth-guest">游客进入（不登录）→</button>
-      <!-- ★ 09-30 借鉴 billd-desk：远程控制设备码直连入口（不用先开会） -->
-      <button id="authDeskBtn" class="auth-guest">🖥️ 用设备码远程控电脑 →</button>
+      <!-- 三个次要出口收成一行：它们和"登录/注册"不是一个层级，
+           各占一整行会把主操作稀释掉（第一眼看到四个同等分量的按钮 = 一个都没有） -->
+      <div class="auth-links">
+        <button id="authGuestBtn" class="auth-guest"><span>游客进入</span></button>
+        <span class="auth-or" aria-hidden="true">或</span>
+        <!-- ★ 09-30 借鉴 billd-desk：远程控制设备码直连入口（不用先开会） -->
+        <button id="authDeskBtn" class="auth-guest"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8.5 20h7M12 16v4"/></svg><span>用设备码控电脑</span></button>
+        <span class="auth-or" aria-hidden="true">或</span>
+        <!-- ★ 2026-10-09 忘记密码：这个项目**没有**邮件/短信找回（零依赖 + 本机部署），
+             所以这里不许做一个"重置链接已发送"的假样子——那是最坏的一种沉默。
+             点它把真实的两条路写在卡内提示区（同一个 showAuthMsg 通道，不新增浮层）。
+             ▸ 「游客进入（不登录）」缩短成「游客进入」：真浏览器量出加上第三颗之后
+               这一行换行了（1280 宽、卡片内宽约 340px），check:login 红在"三个出口同一行"。
+               括注那半句本来就在 .auth-sub 里写着（"也可以游客进入，随时可注册"），删了不丢信息。
+             ▸ 这条注释差点用 CSS 的写法收尾（一个斜杠加星号）——HTML 注释不认那个序列，
+               于是整张卡的后半段被吞进注释里：#authForgotBtn 与 #authMsg 双双消失、
+               页面后半屏几何全是 0，而 node --check 与冒烟一条都不会红。
+               抓到它的正是本文件那条"11 个 id 一个没丢"的 id 契约断言（真浏览器 + 契约 = 有效防线）。 -->
+        <button id="authForgotBtn" class="auth-guest"><span>忘记密码？</span></button>
+      </div>
       <div id="authMsg" class="auth-msg"></div>
     </div>
   </div>
@@ -200,14 +251,14 @@
 
     <header class="topbar">
       <div class="brand">
-        <span class="brand-logo" title="简易腾讯会议">會</span>
+        <span class="brand-logo" title="云会议">會</span>
         <div class="brand-text">
-          <div class="brand-name">简易腾讯会议</div>
+          <div class="brand-name">云会议</div>
           <div class="brand-sub">SFU · Mediasoup · 8 人</div>
         </div>
       </div>
       <div class="badges">
-        <span id="roomBadge" class="badge room hidden" title="点击复制邀请链接">房间号 ------</span>
+        <span id="roomBadge" class="badge room hidden" title="点击复制邀请链接，并展开「邀请入会」面板（局域网 / 跨网两条）">房间号 ------</span>
         <span id="memberCount" class="badge idle">1 人</span>
         <span id="connBadge" class="badge idle">未连接服务器</span>
         <!-- 网络质量徽标：SFU 版读 Transport 统计（client.js 第 13 步） -->
@@ -215,12 +266,119 @@
         <!-- ★ 09-13 可达性：到服务器的连接方式（host=直连 / srflx=STUN穿墙 / relay=TURN中继），
              让"网络可达性"这个硬边界看得见（client.js 第 13 步从 getStats 候选里读） -->
         <span id="connType" class="badge idle hidden">--</span>
+        <!-- ★ 2026-10-06 跨网邀请入口（G4 收口）：服务器装了 Tailscale（或明示 TS_IP）才下发 tsUrl，
+             没下发就**永远保持 hidden**——顶栏上不许出现一条点了打不开的链接（坑 82："过期声明比
+             缺失更糟"的链接版）。点它 = 复制"不在同一个网络里的人"能直接打开的那条地址。 -->
+        <button id="crossLinkBtn" class="badge idle hidden" type="button" title="复制跨网邀请链接（需对方也在同一张 Tailscale 里）">跨网链接</button>
+        <!-- ★ 2026-10-09 登录态第一次"看得见、也退得出去"（用户："没有退出登录的效果"）
+             ▎审计定位到的根因：登录卡的开合原先是**单向**的——全文件只有一个 hideAuth()，
+               没有任何路径能把卡再打开；而登录态散在 4 个落点（localStorage 的 wb_auth、
+               模块级昵称与头像、每小时一次的续期定时器），彼此没有一条统一的撤销路径。
+               所以缺的不是那颗按钮，是"登录这件事没有反面"。
+             ▎这颗徽标就是那个反面：未登录时它显示"未登录"，点开是账号面板（登录 / 退出 / 角色）。
+               文字只是状态的一个视图（坑 97），真状态在 myAuth，判据一律读变量。 -->
+        <button id="userChip" class="badge idle user-chip" type="button" aria-haspopup="dialog" aria-expanded="false"
+                title="账号：看我是谁、登录或退出"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3.4"/><path d="M5.8 19.6c0-3.2 2.8-5.6 6.2-5.6s6.2 2.4 6.2 5.6"/></svg><span id="userChipTxt">未登录</span></button>
+        <!-- ★ 2026-10-07 明暗切换（用户："背景色选明亮一点的，和现在两个版本"）。
+             两版主题：水墨（暖墨深底，默认）/ 宣纸（明亮浅底）。
+             图标走单色线性 SVG（09-19e 那条"去 emoji"纪律）；文案由 JS 按
+             <html data-theme> 渲染——**按钮文字不是状态**（坑 97），它只是状态的一个视图。 -->
+        <button id="themeBtn" class="badge idle theme-btn" type="button" aria-pressed="false" title="切换界面明暗：水墨（深）/ 宣纸（亮）">
+          <!-- 两颗图标都在 DOM 里，靠主题属性决定哪颗可见（不是 innerHTML 重建，
+               见坑 77：给一个已有节点换子内容，最容易顺手把图标抹掉） -->
+          <svg class="i i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.6v2.2M12 19.2v2.2M4.6 4.6l1.6 1.6M17.8 17.8l1.6 1.6M2.6 12h2.2M19.2 12h2.2M4.6 19.4l1.6-1.6M17.8 6.2l1.6-1.6"/></svg>
+          <svg class="i i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.4A8.4 8.4 0 0 1 9.6 4a8.4 8.4 0 1 0 10.4 10.4z"/></svg>
+          <span id="themeBtnTxt">宣纸</span>
+        </button>
         <!-- ★ G4 移动端（第 32 步）：成员/聊天侧栏的抽屉开关。
              桌面（>980px）布局里侧栏常驻显示，这个按钮由 CSS 隐藏；
              小屏时侧栏被移出画布，必须给它一个"拉出来"的入口。 -->
         <button id="sideBtn" class="btn mini side-btn" title="成员 / 聊天"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 4v16M13 5H4M13 12H4M13 19H4"/></svg><span>成员/聊天</span></button>
       </div>
     </header>
+
+    <!-- ★ 2026-10-09 账号面板（第 52 步）：登录态的反面终于有了落点。
+         ▎三块内容各自回答一个用户问过的问题：
+           ①「我是谁 / 我是什么角色」——房主（本房创建者）、平台管理员（库里 role=admin）、
+             成员（登录了）、未登录（游客）。这四档在服务器 roleOf() 里是四条不同的判定，
+             可界面上原先只有成员行里那颗小盾，**我自己是谁、我当前能不能踢人**说不清。
+           ②「退出登录」——两步确认（第一次点只是把按钮变成"确认退出？"，8 秒不点就复位）。
+             为什么不用系统弹窗：本项目 10-03 已把所有阻塞式提示换成页内反馈，
+             原生模态会把重连状态机冻在中间（冒烟有一条全文件结构红线盯着）。
+           ③「治理台」——只给平台管理员出现。它不新增任何能力，只是把已经存在的四个
+             管理员专属页面（观测面板 / 录像回放 / 真人金标准 / metrics）摆到看得见的位置：
+             普通成员直接敲这些地址拿到的是 401，而这个差别此前**只在文档里**。
+         ▎浮层纪律（坑 135）：内容会变长的 fixed 浮层必须有结构性上界，
+           否则窗口一矮，最后一行就掉到屏幕外且没有滚动条——所以 CSS 里
+           给它写了 max-height + overflow-y:auto + overscroll-behavior:contain。 -->
+    <div id="accountPanel" class="account-panel hidden" role="dialog" aria-modal="false" aria-label="账号">
+      <div class="account-head">
+        <span>账号</span>
+        <button id="accountClose" class="btn mini" type="button" title="关闭" aria-label="关闭账号面板"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </div>
+      <div class="account-who">
+        <div id="accountName" class="account-name">未登录</div>
+        <div id="accountRole" class="account-role">游客：昵称显示为"成员 xxxx"，随时可登录</div>
+      </div>
+      <div class="account-acts">
+        <button id="accountLoginBtn" class="btn mini" type="button">登录 / 注册</button>
+        <button id="accountLogoutBtn" class="btn mini danger" type="button">退出登录</button>
+      </div>
+      <div id="accountAdminBox" class="account-admin hidden">
+        <div class="account-admin-title">平台管理员的治理台</div>
+        <a class="account-link" href="/dashboard" target="_blank" rel="noopener">观测面板 · 各房间与链路健康</a>
+        <a class="account-link" href="/recordings.html" target="_blank" rel="noopener">录像回放 · 服务器侧录制产物</a>
+        <a class="account-link" href="/golden" target="_blank" rel="noopener">真人语音金标准 · 录 20 句喂准确率表</a>
+        <a class="account-link" href="/metrics" target="_blank" rel="noopener">metrics · Prometheus 文本</a>
+        <div class="account-note">这四页只认管理员 token，普通成员打开是 401——所以这个入口对你才是"实质区别"，普通成员看不到它。</div>
+      </div>
+      <div id="accountHint" class="account-note"></div>
+    </div>
+
+    <!-- ★ 2026-10-06 版本自检横幅（坑 40 的最后一块拼图）。
+         只在"页面实际加载到的资源版本 ≠ 服务器现在给的那份"时出现——
+         也就是开发中常说的"我改了，但你那边还是旧的"。
+         默认 hidden：宁可不提示，也不许在版本一致时弹一条让人去硬刷新的假警告。 -->
+    <div id="staleBuild" class="stale-build hidden" role="alert">
+      <span class="stale-ico" aria-hidden="true"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01M10.3 3.9 2.4 18a1.8 1.8 0 0 0 1.6 2.7h16a1.8 1.8 0 0 0 1.6-2.7L13.7 3.9a1.9 1.9 0 0 0-3.4 0Z"/></svg></span>
+      <span class="stale-text">这个页面跑的还是<strong>旧版代码</strong>——服务器已经更新过了。刷新一下就是最新版。</span>
+      <button id="staleReloadBtn" class="btn mini" type="button">用最新版打开</button>
+    </div>
+
+    <!-- ★ 2026-10-06 邀请面板：把"同一 WiFi"与"不在同一网络"两条链接摆在同一屏，
+         各自一个复制按钮。以前是"点房间号复制局域网那条、跨网那条写在流程日志里"——
+         翻日志才能拿到跨网地址，等于没有。没有跨网入口时这一行**写明没有**，不给假地址。 -->
+    <div id="invitePanel" class="invite-panel hidden" role="dialog" aria-modal="false" aria-label="邀请入会">
+      <div class="invite-head">
+        <span>邀请入会</span>
+        <button id="inviteClose" class="btn mini" type="button" title="关闭" aria-label="关闭邀请面板"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </div>
+      <div class="invite-row">
+        <div class="invite-row-t">同一个网络（WiFi / 有线）里的同事</div>
+        <div class="invite-row-b">
+          <code id="inviteLanUrl" class="invite-url">--</code>
+          <button id="inviteLanCopy" class="btn mini" type="button">复制</button>
+        </div>
+      </div>
+      <div class="invite-row">
+        <div class="invite-row-t">不在同一个网络（对方也要在同一张 Tailscale 里）</div>
+        <div class="invite-row-b">
+          <code id="inviteCrossUrl" class="invite-url">--</code>
+          <button id="inviteCrossCopy" class="btn mini hidden" type="button">复制</button>
+        </div>
+        <!-- ★ 顶栏那颗「跨网链接」按钮此刻的显隐，面板照实说一次：
+             浮层是从房间号徽标开出来的，用户的视线在这里，不该为了找另一颗按钮再扫一遍顶栏。
+             文案由 JS 按 crossLinkBtn 的真实 class 写（这里不写死"在哪"，否则按钮藏了这行还在骗人）。 -->
+        <div id="inviteCrossNote" class="invite-hint"></div>
+      </div>
+      <div id="inviteHint" class="invite-hint"></div>
+      <!-- ★ 2026-10-07 跨网自检（判据在服务器 sfu/nets.js 的 diagnose，这里只负责显示）。
+           ▎为什么值得占面板一格：用户在邀请别人时问的那句话永远是
+             "我朋友在外面，他现在能进来吗？不能的话我下一步敲什么？"
+             以前这件事的答案散在启动日志、doctor、部署手册三处，而人就在会议里。
+           ▸ 内容整块由 JS 生成（createElement + textContent），不拼用户可控的字符串。 -->
+      <div id="inviteNet" class="invite-net"></div>
+    </div>
 
     <!-- 舞台：房间卡（进房前）→ 视图切换 + 视频网格 + 底部控制坞 -->
     <main class="stage">
@@ -232,7 +390,7 @@
           <div class="room-hero-sub">创建一个新房间，或输入 6 位房间号加入（可带密码）</div>
           <div class="room-hero-actions">
             <div class="room-hero-create">
-              <button id="createBtn" class="btn primary btn-lg" disabled>🎬 创建房间</button>
+              <button id="createBtn" class="btn primary btn-lg" disabled><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3.2"/><path d="M12 9v6M9 12h6"/></svg><span>创建房间</span></button>
               <span class="room-sep">—— 或 ——</span>
             </div>
             <div class="room-hero-join">
@@ -247,12 +405,19 @@
       </div>
 
       <!-- ★ F1 升级（2026-09-12）：视图切换条 —— 宫格（所有人一样大）/ 演讲者（大画面 + 小格）。
-           双击任意画面可全屏；演讲者视图里每个画面左上角有 📌 钉选按钮。
+           双击任意画面可全屏；演讲者视图里每个画面左上角有钉选按钮。
            大画面的优先级：钉选的人 > 正在共享屏幕的人 > 正在说话的人 > 我自己（见 client.js 第 26 步） -->
       <div class="view-bar" id="viewBar">
-        <button id="viewGalleryBtn" class="view-btn active" title="宫格视图：所有人一样大">▦ 宫格</button>
-        <button id="viewSpeakerBtn" class="view-btn" title="演讲者视图：大画面跟随说话人/共享者">▢ 演讲者</button>
-        <span class="view-tip">双击画面全屏 · 演讲者视图可 📌 钉选</span>
+        <!-- ★ 2026-10-07：这两颗按钮原来的图标是 ▦ / ▢ 两个几何字符——
+             它们不是 emoji（不会被 check:icons 判红），但在不同字体里要么太细要么根本缺字，
+             正是用户说过两次的那类"low 爆的小图标"。换成与全站同一套 24 viewBox 单色线性图标。 -->
+        <button id="viewGalleryBtn" class="view-btn active" title="宫格视图：所有人一样大"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4.5" width="7" height="6.2" rx="1.4"/><rect x="13.5" y="4.5" width="7" height="6.2" rx="1.4"/><rect x="3.5" y="13.3" width="7" height="6.2" rx="1.4"/><rect x="13.5" y="13.3" width="7" height="6.2" rx="1.4"/></svg><span>宫格</span></button>
+        <button id="viewSpeakerBtn" class="view-btn" title="演讲者视图：大画面跟随说话人/共享者"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="11" rx="1.8"/><rect x="3" y="17.6" width="5.2" height="2.6" rx="1"/><rect x="9.8" y="17.6" width="5.2" height="2.6" rx="1"/></svg><span>演讲者</span></button>
+        <!-- ★ 2026-10-07 第 50 步：整条分段控件只有**一块**会滑的指示底片
+             （reactbits 的 animated tab indicator 语言，零依赖手写）。
+             原来每个按钮各自画一份选中态，切换时是"这边消失、那边突然出现"。 -->
+        <span class="seg-ink seg-ink--plate" aria-hidden="true"></span>
+        <span class="view-tip">双击画面全屏 · 演讲者视图可钉选</span>
       </div>
 
       <!-- 视频网格：自己的画面固定在第一格，其他人由 JS 动态插入 -->
@@ -266,26 +431,37 @@
       <!-- ★ 09-17 实时字幕条（第 29 步）：悬浮在网格与控制坞之间，显示"最近说话的人"的字幕；
            半透明 = 识别中的半句（interim，只本地跳动），实色 = 成稿（已广播全房）；
            ⌃ 历史抽屉 / ⬇ 导出整场字幕记录（txt）——这本账就是将来 AI 纪要/问答（C2）的输入 -->
+      <!-- ★ 2026-10-03 底部堆叠：字幕条 + 控制坞同属"屏幕下缘那一列"，
+           由这一个容器负责贴底与居中，两者不再各自写 bottom:xxpx 互相猜高度 -->
+      <div class="bottom-stack">
       <div id="captionBar" class="caption-bar hidden">
+        <!-- ★ 2026-10-07 整句行（第一行）：句子独占整条宽度、恒定预留两行高度。
+               原先 .caption-text 是 nowrap + ellipsis 的单行，且与八个控件挤在同一排 flex 里，
+               真实可用宽度只有一百多像素——"识别的长度太短了"的字面原因就是这里，
+               不是识别只出了那么几个字。两行高度写死是为了不让条高随句长抖（抖一下，
+               底下整列（.bottom-stack + 控制坞）就跟着挪一次，那就是"不丝滑"）。 -->
+        <div class="cap-line"><span id="captionText" class="caption-text"></span></div>
+        <!-- ★ 2026-10-07 控件行（第二行）：徽标与按钮从字幕那一排挪下来，把宽度让给正文。 -->
+        <div class="cap-tools">
         <button id="capHistoryBtn" class="btn mini" title="回看字幕历史（最近 100 条）">⌃ 历史</button>
         <!-- ★ 09-17c 自检徽标：把"为什么没字幕"摊开给用户看（安全上下文/权限/识别服务三段） -->
-        <span id="capStatus" class="cap-status" title="字幕自检：点击查看详细诊断">💬 未开启</span>
+        <span id="capStatus" class="cap-status" title="字幕自检：点击查看详细诊断"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12.5a7 7 0 0 1-7 6.8c-1 0-2-.2-2.8-.6L5.5 20l1.4-3.4A6.7 6.7 0 0 1 5 12.5a7 7 0 0 1 7-6.8 7 7 0 0 1 8 6.8z"/></svg><span id="capStatusTxt">未开启</span></span>
         <!-- ★ 2026-10-03 字幕延迟读数：服务器实测「说完→字幕上屏」多少秒（看不见就降不了）。
              定稿字幕才刷新，半句不刷；hover 看近若干句的均值与最慢值。 -->
-        <span id="capLat" class="cap-lat hidden" title="说完→字幕上屏的实测延迟">⏱ --</span>
-        <span id="captionText" class="caption-text"></span>
+        <span id="capLat" class="cap-lat hidden" title="说完→字幕上屏的实测延迟"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.4"/><path d="M12 7.4V12l3.2 2"/></svg><b id="capLatNum">--</b></span>
         <!-- ★ 09-17c 手动字幕兜底：浏览器云端识别不可用时，也能用打字的方式把内容发成字幕 -->
         <input id="capManualInput" class="cap-manual" maxlength="120"
                placeholder="识别不可用？在这里打字回车 = 手动字幕" />
         <button id="capManualSend" class="btn mini" title="把输入框内容作为一条字幕广播给全房">发送</button>
-        <button id="capExportBtn" class="btn mini" title="导出字幕记录（txt，含时间戳与说话人）">⬇ 记录</button>
+        <button id="capExportBtn" class="btn mini" title="导出字幕记录（txt，含时间戳与说话人）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5h7l5 5v12H6z"/><path d="M13 3.5V9h5M9 13h6M9 16.5h6"/></svg><span>记录</span></button>
         <!-- ★ 09-24 AI 会议助理：「📝 纪要」一键把字幕账本交给 LLM 出结构化纪要
              （要点/待办/结论），产物落在服务器 /minutes/<房间号>/ 下，气泡里可直接打开。 -->
-        <button id="capMinutesBtn" class="btn mini" title="由 AI 把这场会的字幕账本整理成 markdown 纪要（要点/待办/结论）">📝 纪要</button>
+        <button id="capMinutesBtn" class="btn mini" title="由 AI 把这场会的字幕账本整理成 markdown 纪要（要点/待办/结论）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l1.8 4.7 4.7 1.8-4.7 1.8L12 17l-1.8-4.7-4.7-1.8 4.7-1.8L12 4z"/><path d="M18.5 4v3M20 5.5h-3"/></svg><span>纪要</span></button>
         <!-- ★ 09-25 跨段归并：把按小时切开的分段纪要合成一份"这场会到底发生了什么"。
              值守挂一夜会产出 7~8 份分段纪要，但没有人会逐份去读——
              这个入口就是"早上只看一份"的答案（源文件不删，细节仍可回溯）。 -->
-        <button id="capMergeBtn" class="btn mini" title="把已有的多份分段纪要归并成一份总纪要（跨时段去重合并；源文件保留）">🗂 汇总</button>
+        <button id="capMergeBtn" class="btn mini" title="把已有的多份分段纪要归并成一份总纪要（跨时段去重合并；源文件保留）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l8 4-8 4-8-4z"/><path d="M4 12l8 4 8-4"/><path d="M4 16.5l8 4 8-4"/></svg><span>汇总</span></button>
+        </div><!-- /cap-tools -->
       </div>
 
       <!-- ★ 09-17c 字幕诊断卡：自检失败的每一条都给出"具体原因 + 怎么修"，
@@ -316,20 +492,27 @@
           <span id="capSentryStats" class="cap-h-sentry"
                 title="值守统计：时长 · 累计条数 · 识别器重启次数 · 已归档到服务器的条数"></span>
           <!-- ★ 09-18 值守日报（第 31 步，C1）：零 LLM 的结构化日报——时长/说话人占比/每小时分布 -->
-          <button id="capReportBtn" class="btn mini" title="生成值守日报（markdown：时长/说话人占比/每小时分布，零 LLM 本地统计）">📋 日报</button>
+          <button id="capReportBtn" class="btn mini" title="生成值守日报（markdown：时长/说话人占比/每小时分布，零 LLM 本地统计）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="4.5" width="12" height="16" rx="2.2"/><path d="M9.5 4.5V3.2h5v1.3M9.5 10h5M9.5 13.5h5M9.5 17h3"/></svg><span>日报</span></button>
           <button id="capHistoryCloseBtn" class="btn mini" title="收起">✕</button>
+        </div>
+        <!-- ★ 2026-10-04h 字幕搜索：长会里"刚才谁说了什么"一框直达（纯前端过滤本地账本） -->
+        <div class="cap-h-searchrow">
+          <input id="capSearchInput" class="cap-h-search" type="text"
+                 placeholder="搜字幕：关键词或人名…" autocomplete="off" />
+          <span id="capSearchCount" class="cap-h-searchcount hidden"></span>
         </div>
         <div id="capHistoryList" class="cap-h-list"></div>
       </div>
 
       <!-- 控制坞：底部悬浮的玻璃胶囊（离开/共享/协助/静音/摄像头/设备/录制/举手/回应） -->
       <div class="controls">
+        <div class="ctl-row ctl-row-meet">
         <button id="leaveBtn" class="btn danger" disabled><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 12H5M8.5 8.5L5 12l3.5 3.5"/><path d="M13 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/></svg><span>离开房间</span></button>
         <span class="ctl-sep" aria-hidden="true"></span>
         <button id="shareBtn" class="btn" disabled><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8.5 20h7M12 16v4"/></svg><span>共享屏幕</span></button>
         <!-- ★ 远程协助（A1）：允许远程协助开关（被控端用）。
              只在"正在共享屏幕"时出现；打开 = 页面切到工作台模式（见 workbenchArea） -->
-        <button id="assistBtn" class="btn assist hidden" disabled>🖱️ 允许远程协助</button>
+        <button id="assistBtn" class="btn assist hidden" disabled><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 3.5l7 16.5 2.1-6.9L21 11 5 3.5z"/></svg><span>允许远程协助</span></button>
         <button id="muteBtn" class="btn" disabled><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg><span>静音</span></button>
         <button id="camBtn" class="btn" disabled><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10.5l5-3v9l-5-3"/></svg><span>关摄像头</span></button>
         <!-- ★ D3 升级：设备切换（enumerateDevices + replaceTrack，不用重连） -->
@@ -337,21 +520,27 @@
         <select id="micSelect" class="dev-select" disabled title="切换麦克风（replaceTrack，不重连）"></select>
         <!-- ★ D5 升级：录制（MediaRecorder 录"合成的会议画面 + 混合音频"） -->
         <button id="recordBtn" class="btn" disabled><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="5.5"/></svg><span>录制会议</span></button>
+        </div><!-- /ctl-row 会议控制 -->
+        <div class="ctl-row ctl-row-collab">
         <!-- ★ 09-13 F4：举手（member-state 带 hand 字段，全房成员列表显示 ✋） -->
         <button id="handBtn" class="btn" disabled title="举手让大家看见你要发言"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 12.5V6a1.3 1.3 0 0 1 2.6 0V11M10.6 11V4.8a1.3 1.3 0 0 1 2.6 0V11M13.2 11V6a1.3 1.3 0 0 1 2.6 0v6.8M15.8 12.8l1.6-2c.9-1.1 2.5.1 1.7 1.3L15.4 16.4c-1.1 1.7-2.4 2.6-4.4 2.6-2.6 0-3.6-1.5-3.6-3.4v-3.4"/></svg><span>举手</span></button>
         <!-- ★ 09-15 F7：独立协作白板（第三条 SCTP 频道 'board'，全场共享一块画布） -->
         <button id="boardBtn" class="btn" disabled title="打开全场共享白板（人人可画）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20l4.2-1.1L20 7.1a1.8 1.8 0 0 0-2.6-2.6L5.1 15.8 4 20z"/></svg><span>白板</span></button>
+        <!-- ★ 2026-10-07 第 51 步：共享文件浏览（全房间同时看同一份文档）
+             PDF / Word(docx) / Excel(xlsx) / PPT(pptx) / Markdown / CSV / 图片 / 文本
+             ——除 PDF 与图片用浏览器原生能力外，其余全部由 fileview.js **自己解析**（零依赖）。 -->
+        <button id="filesBtn" class="btn" disabled title="共享文件：上传后全房间同时看到同一份文档（PDF/Word/Excel/PPT/Markdown/图片）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3.5H7.5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V8z"/><path d="M14 3.5V8h4.5"/><path d="M9 13h6M9 16.5h4"/></svg><span>文件</span></button>
         <!-- ★ 09-19 AI Bot 参会者（C 档）：邀请 AI 助理入会——成员列表出现 🤖 行，
              它通过服务端音频管线"听"全场，聊天里 @ai 提问（零依赖 Mock/DeepSeek 双轨） -->
         <button id="aiBtn" class="btn" disabled title="邀请 AI 助理入会（能听全场，聊天里 @ai 提问）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="8.5" width="14" height="9.5" rx="3"/><circle cx="9.5" cy="13.2" r="1" fill="currentColor" stroke="none"/><circle cx="14.5" cy="13.2" r="1" fill="currentColor" stroke="none"/><path d="M12 8.5V5.5M9 5.5h6"/></svg><span>AI 助理</span></button>
         <!-- ★ 09-19g C1 AI 远程操作员：AI 走与人类完全相同的授权卡与输入门禁 -->
-        <button id="aiOpBtn" class="btn" disabled title="AI 远程操作员：在被控端授权后自动执行演示操作（计算器 7×8）">🛰️ AI 操作</button>
+        <button id="aiOpBtn" class="btn" disabled title="AI 远程操作员：在被控端授权后自动执行演示操作（计算器 7×8）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.2 2.8L6 13.4h4.6L9.8 21.2 17.4 10h-4.8z"/></svg><span>AI 操作</span></button>
         <!-- ★ 09-25 AI 语音播报（浏览器原生 speechSynthesis，零依赖）：
              让 AI 说的话"能被听见"——它不再只是一个聊天框里的机器人，
              而是真的会开口提醒（"这条行动项还没有负责人"）。
              默认**关**：默认出声会惊吓用户；这是刻意留给用户主动开启的能力。
              同时也是一条无障碍通道（视觉不便者不必读聊天）。 -->
-        <button id="aiVoiceBtn" class="btn" disabled title="AI 语音播报（默认关）：开启后 AI 说的话会用浏览器语音念出来">🔈 AI 语音</button>
+        <button id="aiVoiceBtn" class="btn tgl" disabled title="AI 语音播报（默认关）：开启后 AI 说的话会用浏览器语音念出来"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 9.5h3L11.5 6v12l-4-3.5h-3z"/><path d="M15 9.6a3.5 3.5 0 0 1 0 4.8M17.7 7a7.2 7.2 0 0 1 0 10"/></svg><span>AI 语音</span></button>
         <!-- ★ 09-14 F6：滤镜与虚拟背景（canvas 逐帧处理 + replaceTrack，纯前端零依赖） -->
         <button id="fxBtn" class="btn" disabled title="滤镜/磨皮/虚拟背景（绿幕抠像，经 replaceTrack 上行）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l1.8 4.7 4.7 1.8-4.7 1.8L12 17l-1.8-4.7-4.7-1.8 4.7-1.8L12 4z"/><path d="M18.5 4v3M20 5.5h-3"/></svg><span>滤镜</span></button>
         <!-- ★ 09-17 实时字幕（第 29 步，AI 线 L1）：Web Speech API 识别自己的麦克风，成稿经 SCTP 广播全房 -->
@@ -372,7 +561,9 @@
           <button class="react-btn" data-emoji="👏" title="鼓掌">👏</button>
           <button class="react-btn" data-emoji="🤔" title="想想">🤔</button>
         </div>
+        </div><!-- /ctl-row 协作与 AI -->
       </div>
+      </div><!-- /bottom-stack -->
 
       <!-- ★ 09-15 F7：全场共享白板覆盖层（月白底 + 深色笔；事件经 'board' SCTP 频道同步） -->
       <div id="boardOverlay" class="board-overlay hidden">
@@ -382,11 +573,87 @@
           <span class="board-bar">
             <span id="boardColors" class="board-colors"></span>
             <button id="boardUndoBtn" class="btn mini" title="撤销我的最后一笔">↶</button>
-            <button id="boardClearBtn" class="btn mini" title="清空整块白板（全房同步）">🗑</button>
+            <button id="boardClearBtn" class="btn mini" title="清空整块白板（全房同步）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 15.5l7-7 6 6-4.5 4.5H8z"/><path d="M11 8.5l4.5 4.5M4.5 20h15"/></svg><span>清空</span></button>
+            <button id="boardPngBtn" class="btn mini" title="把这块白板导出成 PNG 图片（含房间号与时间）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v10M8 10.5l4 4 4-4"/><path d="M5 19.5h14"/></svg><span>导出</span></button>
             <button id="boardCloseBtn" class="btn mini" title="关闭白板">✕</button>
           </span>
         </div>
         <canvas id="boardCanvas" class="board-canvas"></canvas>
+      </div>
+
+      <!-- ★ 2026-10-07 第 51 步：共享文件面板（左边清单 + 右边阅读器）
+           ▎层叠与白板同一条规矩（坑 80/114）：z-index 4 = 盖住画面格，但**不盖**底部那一列
+             （字幕条 + 控制坞），bottom 让出 --stack-h 的真实高度（client.js 第 45 步量的）。
+           ▎与白板互斥：两块都是"接管舞台"的覆盖层，同时开只会互相压住，
+             所以开一个就关另一个（见 client.js 的 setFilesOpen / setBoardOpen）。 -->
+      <div id="filesOverlay" class="files-overlay hidden">
+        <div class="files-head">
+          <span class="files-title">共享文件</span>
+          <span class="files-caps">Everyone reads the same page</span>
+          <span id="filesWho" class="files-who hidden" title="现在全房间跟着谁在看"></span>
+          <span class="files-bar">
+            <button id="filesFollowBtn" class="btn mini" title="跟随主讲：别人换文件/翻页/滚动时，你这边自动跟上。关掉之后解耦是双向的——你不跟别人，你翻你的也不带动别人；重新打开会跳回当前主讲那一份。">
+              <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h11M4 12h11M4 18h7"/><path d="M18.5 9.5l2.5 2.5-2.5 2.5"/></svg><span id="filesFollowTxt">跟随主讲</span>
+            </button>
+            <button id="filesUploadBtn" class="btn mini" title="上传文件到本场会议（全房间立刻可见）">
+              <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V5M8 9l4-4 4 4"/><path d="M5 19.5h14"/></svg><span>上传</span>
+            </button>
+            <button id="filesRefreshBtn" class="btn mini icon-only" title="重新拉一次清单">
+              <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.5 12a7.5 7.5 0 1 1-2.4-5.5"/><path d="M19.8 4.8v4.4h-4.4"/></svg>
+            </button>
+            <button id="filesCloseBtn" class="btn mini icon-only" title="关闭（Esc）">
+              <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
+            </button>
+          </span>
+        </div>
+
+        <div class="files-body">
+          <!-- 左：清单 -->
+          <aside class="files-side">
+            <div id="filesList" class="files-list" tabindex="0" aria-label="共享文件清单"></div>
+            <div id="filesDropHint" class="files-drophint">把文件拖到这里也能上传</div>
+          </aside>
+          <!-- 右：阅读器 -->
+          <section class="files-main">
+            <div class="files-toolbar">
+              <span id="filesDocName" class="files-docname">还没有打开文件</span>
+              <span id="filesDocKind" class="files-dockind hidden"></span>
+              <span class="files-tb-spacer"></span>
+              <button id="filesPrevBtn" class="btn mini icon-only hidden" title="上一页">
+                <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.5 5.5L8 12l6.5 6.5"/></svg>
+              </button>
+              <span id="filesPageInfo" class="files-page hidden">第 1 页</span>
+              <button id="filesNextBtn" class="btn mini icon-only hidden" title="下一页">
+                <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 5.5L16 12l-6.5 6.5"/></svg>
+              </button>
+              <button id="filesZoomOutBtn" class="btn mini icon-only hidden" title="缩小">
+                <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><path d="M6 12h12"/></svg>
+              </button>
+              <span id="filesZoomVal" class="files-zoom hidden">100%</span>
+              <button id="filesZoomInBtn" class="btn mini icon-only hidden" title="放大">
+                <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><path d="M12 6v12M6 12h12"/></svg>
+              </button>
+              <button id="filesDlBtn" class="btn mini hidden" title="下载原文件">
+                <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4.5v11M8 11.5l4 4 4-4"/><path d="M5 19.5h14"/></svg><span>下载</span>
+              </button>
+            </div>
+            <div id="filesStage" class="files-stage">
+              <div class="files-empty">
+                <p class="files-empty-t">这场会还没有打开任何文件</p>
+                <p class="files-empty-d">从左边选一份，或点「上传」把材料放进来。<br>
+                  支持 PDF、Word(.docx)、Excel(.xlsx)、PPT(.pptx)、Markdown、CSV、图片与纯文本。</p>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div class="files-foot">
+          <span id="filesHint" class="files-hint">文件只属于**这场会**：房间结束后一并清掉，不是网盘。</span>
+          <span id="filesQuota" class="files-quota"></span>
+        </div>
+        <input type="file" id="filesPick" class="hidden" multiple
+               accept=".pdf,.docx,.xlsx,.pptx,.md,.markdown,.txt,.csv,.tsv,.json,.png,.jpg,.jpeg,.gif,.webp,.bmp,.svg,.log,.xml,.yaml,.yml" />
+        <div id="filesDropVeil" class="files-dropveil hidden">松手就上传到这场会议</div>
       </div>
 
       <!-- ★ 09-14 F6：滤镜与虚拟背景浮层（预览页 pjFxBtn 与会内 fxBtn 共用；纯 canvas 管线 + replaceTrack）。
@@ -414,8 +681,8 @@
           <div class="fx-label">虚拟背景（色键抠像）</div>
           <label class="fx-check"><input type="checkbox" id="fxChromaChk" /> 开启抠像（坐在纯色幕布/墙前效果最佳）</label>
           <div id="fxKeys" class="fx-chips">
-            <button class="fx-chip active" data-key="green" title="键色=绿">🟩 绿幕</button>
-            <button class="fx-chip" data-key="blue" title="键色=蓝">🟦 蓝幕</button>
+            <button class="fx-chip active" data-key="green" title="键色=绿"><i class="sw sw-green"></i><span>绿幕</span></button>
+            <button class="fx-chip" data-key="blue" title="键色=蓝"><i class="sw sw-blue"></i><span>蓝幕</span></button>
           </div>
           <div class="fx-label">阈值 <span class="fx-val" id="fxChromaTolVal">60</span></div>
           <input type="range" id="fxChromaTol" min="20" max="140" value="60" title="色距小于阈值判为背景；边缘自动羽化" />
@@ -424,12 +691,12 @@
             <button class="fx-chip active" data-bg="ink">墨色</button>
             <button class="fx-chip" data-bg="silk">绢色</button>
             <button class="fx-chip" data-bg="gold">鎏金</button>
-            <button class="fx-chip" data-bg="image">🖼️ 图片</button>
+            <button class="fx-chip" data-bg="image"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="M4 17l5-4.5 4 3.5 3-2.5 4 3.5"/></svg><span>图片</span></button>
           </div>
           <input type="file" id="fxBgFile" accept="image/*" class="hidden" />
         </div>
         <div class="fx-foot">
-          <span id="fxCost" class="fx-cost" title="每帧处理耗时（EMA 平滑）：GPU 滤镜应 <2ms，CPU 抠像 +2~5ms">⚙️ -- ms/帧</span>
+          <span id="fxCost" class="fx-cost" title="每帧处理耗时（EMA 平滑）：GPU 滤镜应 <2ms，CPU 抠像 +2~5ms">-- ms/帧</span>
           <span class="fx-tip">画面经 canvas 处理后 replaceTrack 上行 —— 观众看到的与你一致</span>
         </div>
       </div>
@@ -439,16 +706,16 @@
            盖满全屏 —— 里面的 iframe(workbench.html) 就是被共享出去的"可被遥控桌面"。 -->
       <div id="workbenchArea" class="workbench-area hidden">
         <div class="wb-toolbar">
-          <span id="wbStatus">✅ 远程协助已开启，等待成员请求控制…</span>
+          <span id="wbStatus"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 3.5l7 16.5 2.1-6.9L21 11 5 3.5z"/></svg><span>远程协助已开启，等待成员请求控制…</span></span>
           <!-- ★ A6：限时授权的倒计时（授权中才显示，被控端随时知道还剩多久） -->
-          <span id="wbCountdown" class="wb-countdown hidden">⏳ --</span>
+          <span id="wbCountdown" class="wb-countdown hidden"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.4"/><path d="M12 7.4V12l3.2 2"/></svg><b>--</b></span>
           <span class="wb-toolbar-btns">
             <!-- 收回控制：正在被控时显示，结束当前控制但保持工作台 -->
             <button id="wbReclaimBtn" class="btn danger hidden">收回控制</button>
             <!-- ★ A3：把被控端本机剪贴板内容发给控制端（反向剪贴板同步；正向是控制端 Ctrl+V） -->
-            <button id="wbClipBtn" class="btn">📋 剪贴板发给控制端</button>
+            <button id="wbClipBtn" class="btn"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8.5 12.5l5.5-5.5a3 3 0 0 1 4.2 4.2l-7.5 7.5a5 5 0 0 1-7.1-7.1L11 4.2"/></svg><span>剪贴板发给控制端</span></button>
             <!-- ★ A6：审计日志（谁在何时点了什么，被控端本地记录，可导出） -->
-            <button id="wbAuditBtn" class="btn">📜 审计日志</button>
+            <button id="wbAuditBtn" class="btn"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5h7l5 5v12H6z"/><path d="M13 3.5V9h5M9 13h6M9 16.5h6"/></svg><span>审计日志</span></button>
             <!-- 关闭远程协助：收起工作台回到会议视图（共享继续） -->
             <button id="wbAssistOffBtn" class="btn">关闭远程协助</button>
             <!-- 停止共享：与主控制坞「停止共享」等效（这里不离手就能点） -->
@@ -467,12 +734,14 @@
             只新增 .side-tab / .side-view 这层壳，client.js 与冒烟测试无需改契约。 -->
     <aside class="sidebar">
       <div class="side-tabs" role="tablist">
-        <button class="side-tab active" data-side="members" role="tab" aria-selected="true">👥 成员</button>
+        <!-- ★ 2026-10-07 第 50 步：滑动下划线（原来每颗 tab 自己画一条 ::after，切换时是跳变） -->
+        <span class="seg-ink seg-ink--line" aria-hidden="true"></span>
+        <button class="side-tab active" data-side="members" role="tab" aria-selected="true"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0"/><path d="M16 5.6a3.2 3.2 0 0 1 0 5.5M17.5 19a5.4 5.4 0 0 0-2.2-4.3"/></svg><span>成员</span></button>
         <button class="side-tab" data-side="board" role="tab" aria-selected="false">
-          🧠 看板<span id="boardNum" class="side-num hidden">0</span>
+          <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2.4"/><path d="M8 9h8M8 13h5M8 17h3"/></svg><span>看板</span><span id="boardNum" class="side-num hidden">0</span>
         </button>
         <button class="side-tab" data-side="chat" role="tab" aria-selected="false">
-          💬 聊天<span id="chatUnread" class="side-num unread hidden">0</span>
+          <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12.5a7 7 0 0 1-7 6.8c-1 0-2-.2-2.8-.6L5.5 20l1.4-3.4A6.7 6.7 0 0 1 5 12.5a7 7 0 0 1 7-6.8 7 7 0 0 1 8 6.8z"/></svg><span>聊天</span><span id="chatUnread" class="side-num unread hidden">0</span>
         </button>
       </div>
 
@@ -481,7 +750,7 @@
         <div class="side-view active" data-side="members">
           <div class="member-panel">
             <div class="member-title">
-              <span>👥 成员 <span id="memberNum">1</span></span>
+              <span><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.2"/><path d="M3.6 19.4c0-3 2.4-5.2 5.4-5.2s5.4 2.2 5.4 5.2"/><path d="M15.6 5.4a3 3 0 0 1 0 5.4M17.4 19.4c0-2.2-.7-3.9-2-5"/></svg><span>成员</span> <span id="memberNum">1</span></span>
               <span id="ownerTag" class="role-tag hidden"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 17.5h15L18 9l-3.8 3.2L12 6l-2.2 6.2L6 9l-1.5 8.5z"/></svg>你是房主</span>
             </div>
             <div id="memberList" class="member-list"></div>
@@ -489,7 +758,7 @@
                  因为被控端代理必须是**本地程序**（浏览器的安全沙箱不允许网页驱动真实鼠标键盘），
                  用户得在自己电脑的终端跑一行命令 —— 那就把这行命令准备好，一键复制。 -->
             <div id="agentHint" class="agent-hint hidden">
-              <div class="ah-title">🖥️ 想让别人操作这台电脑？</div>
+              <div class="ah-title">想让别人操作这台电脑？</div>
               <div class="ah-body">在本机终端运行下面这行命令，房间里就会出现一台「可被控的电脑」：</div>
               <code id="agentCmd" class="ah-cmd">node agent/index.js --room ------</code>
               <div class="ah-actions">
@@ -507,15 +776,15 @@
         <div class="side-view" data-side="board">
           <div class="board-panel">
             <div class="board-title">
-              <span>🧠 会议看板</span>
+              <span><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l1.8 4.7 4.7 1.8-4.7 1.8L12 17l-1.8-4.7-4.7-1.8 4.7-1.8L12 4z"/><path d="M18.5 4v3M20 5.5h-3"/></svg><span>会议看板</span></span>
               <span class="board-sub" id="boardSub">AI 边听边整理</span>
-              <button id="boardMinutesBtn" class="board-act" title="把当前看板与会议内容整理成一份 markdown 纪要（落盘服务器 /minutes/）">📝 出纪要</button>
+              <button id="boardMinutesBtn" class="board-act" title="把当前看板与会议内容整理成一份 markdown 纪要（落盘服务器 /minutes/）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5h7l5 5v12H6z"/><path d="M13 3.5V9h5M9 13h6M9 16.5h6"/></svg><span>出纪要</span></button>
             </div>
             <div class="board-body" id="boardBody">
               <div class="board-empty" id="boardEmpty">
                 看板会随会议内容自动生长<br>
-                <span class="be-row">🎯 决定 · ⚠️ 风险 · ✅ 行动项 · 💬 议题</span>
-                邀请 🤖 AI 助理入会并开启字幕，它就把会上说的这些话挑出来
+                <span class="be-row">决定 · 风险 · 行动项 · 议题</span>
+                邀请 AI 助理入会并开启字幕，它就把会上说的这些话挑出来
               </div>
               <div class="board-list" id="boardList"></div>
             </div>
@@ -525,7 +794,7 @@
         <!-- ── ③ 聊天 ── -->
         <div class="side-view" data-side="chat">
           <div class="chat-panel">
-            <div class="chat-title">💬 会议聊天 <span class="chat-via">经服务器转发</span></div>
+            <div class="chat-title"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12.5a7 7 0 0 1-7 6.8c-1 0-2-.2-2.8-.6L5.5 20l1.4-3.4A6.7 6.7 0 0 1 5 12.5a7 7 0 0 1 7-6.8 7 7 0 0 1 8 6.8z"/></svg><span>会议聊天</span> <span class="chat-via">经服务器转发</span></div>
             <div class="chat-messages" id="chatList"></div>
             <!-- ★ 09-25 快捷问法：把"AI 能干什么"从说明文字变成**可点的按钮**。
                  隐藏能力等于没有能力——用户不会去读文档，但会点按钮。
@@ -548,7 +817,7 @@
 
     <!-- 信令/媒体流程日志：跨在底部（看这里理解 SFU：Transport → Producer/Consumer） -->
     <section class="log-panel">
-      <div class="log-title" id="logTitle" title="点击折叠/展开日志">📋 流程日志（点击折叠）</div>
+      <div class="log-title" id="logTitle" title="点击折叠/展开日志"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5h7l5 5v12H6z"/><path d="M13 3.5V9h5M9 13h6M9 16.5h6"/></svg><span>流程日志（点击折叠）</span></div>
       <pre id="log"></pre>
     </section>
   </div>
@@ -565,7 +834,7 @@
       </select>
       <button id="remoteAllowBtn" class="btn primary">允许</button>
       <button id="remoteDenyBtn" class="btn danger">拒绝</button>
-      <button id="remoteBlockBtn" class="btn danger">🚫 不再允许 TA</button>
+      <button id="remoteBlockBtn" class="btn danger"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M6 6l12 12"/></svg><span>不再允许 TA</span></button>
     </div>
   </div>
 
@@ -581,7 +850,7 @@
   <!-- ★ A6 升级：被控端的审计日志面板（本地记录 + 导出） -->
   <div id="auditPanel" class="audit-panel hidden">
     <div class="audit-head">
-      <span>📜 控制操作审计日志（被控端本地记录，不落服务器）</span>
+      <span><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5h7l5 5v12H6z"/><path d="M13 3.5V9h5M9 13h6M9 16.5h6"/></svg><span>控制操作审计日志（被控端本地记录，不落服务器）</span></span>
       <span class="audit-btns">
         <button id="auditExportBtn" class="btn">导出 .txt</button>
         <button id="auditClearBtn" class="btn">清空</button>
@@ -607,15 +876,15 @@
        canvas 上不盖额外图层，坐标直接来自 canvas 自身的 boundingRect —— 少一层换算少一类偏差。 -->
   <section id="rdConsole" class="rd-console hidden">
     <header class="rd-bar">
-      <span class="rd-brand">🖥️ 远程桌面</span>
+      <span class="rd-brand"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8.5 20h7M12 16v4"/></svg><span>远程桌面</span></span>
       <button id="rdBack" class="btn rd-ibtn" title="后退">←</button>
       <button id="rdReload" class="btn rd-ibtn" title="刷新对方页面">⟳</button>
       <input id="rdUrl" class="rd-url" placeholder="输入网址后回车，例：bilibili.com" spellcheck="false" autocomplete="off">
       <button id="rdGo" class="btn rd-ibtn" title="打开网址">前往</button>
       <button id="rdMax" class="btn rd-ibtn" title="最大化对方浏览器窗口">⛶</button>
       <button id="rdFull" class="btn rd-ibtn" title="全屏 / 退出全屏（借鉴 billd-desk）">▣</button>
-      <button id="rdClipPush" class="btn rd-ibtn" title="把我的剪贴板推给对方（粘进对方网页）">📋</button>
-      <button id="rdClipPull" class="btn rd-ibtn" title="拉取对方网页剪贴板到我的剪贴板">📥</button>
+      <button id="rdClipPush" class="btn rd-ibtn" title="把我的剪贴板推给对方（粘进对方网页）"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8.5 12.5l5.5-5.5a3 3 0 0 1 4.2 4.2l-7.5 7.5a5 5 0 0 1-7.1-7.1L11 4.2"/></svg></button>
+      <button id="rdClipPull" class="btn rd-ibtn" title="拉取对方网页剪贴板到我的剪贴板"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 13.5V19h16v-5.5"/><path d="M12 4v9M8 9.5l4 4 4-4"/></svg></button>
       <!-- ★ 09-30 画质档（流畅/标准/高清/自动）：走 remote-input 的 {kind:'quality'} 老通道新语义 -->
       <span class="rd-q">
         <button id="rdQAuto" class="btn rd-ibtn is-on" title="自动：按实测帧率弱网降档">自动</button>
@@ -643,11 +912,17 @@
        控制端鼠标移动时，被控端这颗"假光标"跟着走——
        因为合成事件不会移动系统真实光标，必须自己画一颗给被控端看。
        pointer-events:none 保证它永远不挡真实点击。 -->
-  <div id="remoteCursor" class="remote-cursor hidden">🖱️</div>
+  <div id="remoteCursor" class="remote-cursor hidden"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 3.5l7 16.5 2.1-6.9L21 11 5 3.5z"/></svg></div>
 
   <!-- 顺序：socket.io → mediasoup-client（本地打包） → 我们的业务代码 -->
   <script src="vendor/socket.io.min.js"></script>
   <script src="vendor/mediasoup-client.js"></script>
+  <!-- ★ 2026-10-07 第 51 步：共享文件的渲染内核（自己读 ZIP + 自己解 XML，把
+       Word/Excel/PPT/Markdown/CSV 在浏览器里画出来，零依赖）。
+       ▎必须排在 client.js **之前**：client.js 顶层就可能引用 window.FV，
+         顺序反了就是"文件面板打开一片空白"这种最难查的静默失败（坑 69 同族）。
+       ▎?v= 由服务器按内容哈希自动改写（见 server.js 的 injectAssetVersions），不用手动 bump。 -->
+  <script src="fileview.js"></script>
   <script src="client.js"></script>
 </body>
 </html>

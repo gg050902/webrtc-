@@ -15,6 +15,11 @@ const net = require('net');
 
 const PORT = Number(process.env.TEST_ASR_PORT) || 3017;
 const SERVER_JS = path.join(__dirname, '..', 'sfu', 'server.js');
+/* ★ 2026-10-05 耐久模式（--soak）：同一条自测链路，把"一轮"变成"多轮 + 长间隔"——
+ *   服务器侧多跑一段"轮间静默 + 录音进程自愈"的相位（TEST_ASR_SOAK=1），
+ *   验证「放一段时间仍然能转写」而不是只验证"刚启动能转写"。
+ *   默认 6 轮 × 30s 间隔（第 3 轮后 60s，跨越静音退场边界），15 分钟超时。 */
+const SOAK = process.argv.includes('--soak');
 
 const ping = () => new Promise((resolve) => {
   const s = net.connect({ host: '127.0.0.1', port: PORT, timeout: 800 }, () => { s.destroy(); resolve(true); });
@@ -36,15 +41,18 @@ const ping = () => new Promise((resolve) => {
       PORT: String(PORT),      // 交给服务器（env 优先级高于 config.json 的 port）
       SFU_NO_HTTPS: '1',       // 不抢 3443——HTTPS 端口被占不该拖垮语音自测
       AI_OP_STEP_MS: '20',
+      ...(SOAK ? { TEST_ASR_SOAK: '1' } : {}),
     },
     stdio: 'inherit',
   });
 
   child.on('exit', (code) => process.exit(code || 0));
 
+  const timeoutMs = (SOAK ? 15 : 5) * 60 * 1000;
+  if (SOAK) console.log('🧪 [TEST_ASR] 耐久模式（TEST_ASR_SOAK=1）：多轮 + 轮间静默，预计 ~5 分钟');
   setTimeout(() => {
-    console.error('🧪 [TEST_ASR] 超时（5 分钟）——强杀并按失败退出');
+    console.error(`🧪 [TEST_ASR] 超时（${timeoutMs / 60000} 分钟）——强杀并按失败退出`);
     try { child.kill(); } catch (e) { /* 已退 */ }
     process.exit(1);
-  }, 5 * 60 * 1000).unref();
+  }, timeoutMs).unref();
 })();

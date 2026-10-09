@@ -66,17 +66,26 @@ const IMMUTABLE_ASSETS = [
 
 // ② 会变的资源：network-first，缓存仅作断网兜底（业务代码 / 样式 / 页面）
 //    这些也是"预热"一份，但只在网络不可用时才被读到
+//    ★ 2026-10-06 加 countup.js：新写的业务代码**必须**落进这一路。
+//      落到下面那条 cache-first 就等于把坑 40 重新挖一遍——改了不生效、
+//      而且 SW 只在自身字节变化时才重装，"记得加一下"这种纪律一定会被忘掉。
+//      （冒烟里有一条结构断言钉住这件事：sfu/public 下除 vendor 与 sw.js 之外的
+//        每个 .js 都必须出现在下面两个清单里。）
 const VOLATILE_ASSETS = [
   './',
   './index.html',
   './style.css',
   './client.js',
+  './countup.js',
+  // ★ 2026-10-07 第 51 步：共享文件的渲染内核（docx/xlsx/pptx/md/csv 全靠它）。
+  //   新写的业务 JS **必须**落进这一路，落到 cache-first 就等于把坑 40 重挖一遍。
+  './fileview.js',
   './workbench.html',
 ];
 
 // 用路径名判断一个请求属于哪一路（request.url 要看 pathname，不能直接字符串比）
 const VOLATILE_PATHS = new Set([
-  '/', '/index.html', '/style.css', '/client.js', '/workbench.html',
+  '/', '/index.html', '/style.css', '/client.js', '/countup.js', '/fileview.js', '/workbench.html',
 ]);
 
 /* ---- ① 安装：预热缓存 ----

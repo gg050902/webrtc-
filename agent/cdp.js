@@ -105,7 +105,15 @@ class Cdp {
    */
   constructor(opts = {}) {
     this.bin = opts.bin || findBrowserBin();
-    this.port = opts.port || 9333;
+    /* 默认端口仍可被环境变量 WB_CDP_PORT 覆盖（显式 opts.port 优先级最高）。
+     * ▎为什么要这个口子：13 条界面检查各自 `new Cdp({headless:true})` 都用默认 9333 +
+     *   同一个 profile 目录，`npm run check:all` 把它们串起来跑之后，
+     *   后一条会撞上"前一台刚 kill、9333 还在退场"的窗口——轻则拿到半死的靶子，
+     *   重则连到上一台没退干净的实例（check:pill 在全量跑里 5 条 hover 断言全 0.00 就是这个）。
+     * ▎不直接改默认值是因为真实使用里"端口"是给人的书签/脚本对齐用的（见坑 62 那条纪律：
+     *   安全线要宽、策略线另说）；包装层要错峰，走环境变量最省事也最不容易误伤别的调用方。
+     *   profile 目录按端口派生，所以换端口顺带把缓存/SW 也隔离了（坑 40）。 */
+    this.port = opts.port || Number(process.env.WB_CDP_PORT) || 9333;
     this.profile = opts.profile || path.join(os.tmpdir(), 'wb-remote-desktop-profile-' + this.port);
     /* ↑ profile 里带端口号不是随手加的：**Chromium 同一个 user-data-dir 不能被两个实例共用**
      *   （第二个实例会把参数交给已有实例然后自己退出，表现为"调试端口起不来"）。
@@ -133,14 +141,23 @@ class Cdp {
 
   /* ---- 底层：发一条 CDP 命令并等应答 ----
    * CDP 是"请求-应答"协议：每条命令带自增 id，应答带回同一个 id。
-   * 超时必须有——否则浏览器卡住会把整个 agent 拖死。 */
-  _send(ws, method, params = {}, timeoutMs = 10000) {
+   * 超时必须有——否则浏览器卡住会把整个 agent 拖死。
+   * ▎★ 2026-10-05：默认 10s 是给"真实使用"定的（机器卡住尽快报错、人工介入）。
+   *   但**回归测试跑在重负载机器上**时（多台无头浏览器 + Qwen worker 抢 CPU），
+   *   已两次实测到 10s 误伤：test:e2e-asr 第 1 跑死在 Runtime.evaluate、
+   *   第 2 跑死在 Page.getLayoutMetrics（都是机器忙、不是浏览器真卡死）。
+   *   给一个环境变量口子 WB_CDP_TIMEOUT，只在"调用方没显式传"时生效——
+   *   生产 agent 不设它、行为一字不变；测试进程设成 30s，把预算还给机器。
+   *   **只放宽预算、不做自动重试**：点击类命令非幂等，重试 = 双触发（纪律见 10-04b）。 */
+  _send(ws, method, params = {}, timeoutMs) {
+    const envT = Number(process.env.WB_CDP_TIMEOUT);
+    const budget = timeoutMs || (Number.isFinite(envT) && envT > 0 ? envT : 10000);
     return new Promise((resolve, reject) => {
       if (!ws || ws.readyState !== 1) return reject(new Error('CDP 连接不可用：' + method));
       const id = ++this._seq;
       const timer = setTimeout(() => {
         if (this._pending.has(id)) { this._pending.delete(id); reject(new Error(method + ' 超时')); }
-      }, timeoutMs);
+      }, budget);
       this._pending.set(id, {
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject: (e) => { clearTimeout(timer); reject(e); },
@@ -150,7 +167,11 @@ class Cdp {
     });
   }
 
-  _bind(ws) {
+  /* silent=true 用于"临时连接"（如 test:e2e-asr 的停摆探针开的新 tab）：
+   *   它的关闭不代表主连接断开——2026-10-05 实测踩过：探针收尾 ws.close() 触发了
+   *   主实例的 onclose，日志打出"⚠️ CDP 连接断开（浏览器窗口被关掉了？）"并误把
+   *   this._alive 置 false，把一次"页面停摆"的诊断现场污染成"浏览器没了"（红鲱鱼）。 */
+  _bind(ws, silent = false) {
     ws.onmessage = (ev) => {
       let msg;
       try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)); }
@@ -168,6 +189,7 @@ class Cdp {
       }
     };
     ws.onclose = () => {
+      if (silent) return;
       if (this._alive) { this.log('⚠️ CDP 连接断开（浏览器窗口被关掉了？）'); this._alive = false; }
     };
   }
@@ -241,14 +263,14 @@ class Cdp {
     return this;
   }
 
-  async _openWs(url) {
+  async _openWs(url, silent = false) {
     const ws = new WebSocket(url);
     await new Promise((res, rej) => {
       const t = setTimeout(() => rej(new Error('CDP WebSocket 连接超时')), 10000);
       ws.onopen = () => { clearTimeout(t); res(); };
       ws.onerror = () => { clearTimeout(t); rej(new Error('CDP WebSocket 连接失败')); };
     });
-    this._bind(ws);
+    this._bind(ws, silent);
     return ws;
   }
 
@@ -478,7 +500,28 @@ class Cdp {
     this.log(`🌐 远程导航 → ${u}`);
     const r = await this._send(this.pageWs, 'Page.navigate', { url: u });
     await sleep(200);
-    await this.refreshViewport();
+    /* ★ 2026-10-05：导航后"取视口度量"这一步允许重试一次，且两次都失败也不让导航整体抛错。
+     *   ▎为什么原先会红：Page.navigate 的应答只代表**导航已开始**，不代表已完成；
+     *   紧接着 200ms 发的 Page.getLayoutMetrics 正落在渲染进程"拆旧文档、装新文档"的
+     *   提交窗口里。机器被占满时（2026-10-05 实测：可用内存只剩 4.94GB，同一刻服务器正在
+     *   spawn AI 听觉管线的 ffmpeg）渲染进程整段不再回执，30s 预算原样烧光，
+     *   报的是 `Page.getLayoutMetrics 超时` —— 页面其实好好地在加载，测试却当场中止。
+     *   （run-13 死在 A、run-14 死在 B，同一个调用点，不是某一侧的问题。）
+     *   ▎为什么这里**可以**重试（与 10-04b「点击类命令绝不自动重试」并不矛盾）：
+     *   那条纪律的红线是**幂等性**，不是"超时了别管"。点击重发 = 双触发（建两个房、
+     *   进两次会）；而取一次布局度量是**纯读命令**，多发一次除了晚一点返回没有任何副作用。
+     *   ▎为什么第二次仍失败也不能抛错：this.viewport 在构造时已按启动窗口尺寸兜底，
+     *   而导航本身已经成功。宁可拿"差一个窗口装饰"的坐标基准继续跑，
+     *   也好过把一个正在正常加载的页面判成"导航失败"（假红）。 */
+    let viewportOk = false;
+    for (let i = 0; i < 2 && !viewportOk; i++) {
+      try { await this.refreshViewport(); viewportOk = true; }
+      catch (e) { if (i === 0) await sleep(1500); }
+    }
+    if (!viewportOk) {
+      this.log('⚠️ 视口度量两次没回执（渲染进程正忙），沿用启动尺寸 '
+        + this.viewport.width + '×' + this.viewport.height + '，导航本身已成功、不中止');
+    }
     return r;
   }
 
@@ -497,8 +540,16 @@ class Cdp {
   }
 
   /** 在页面里跑一段 JS（仅本机测试用；远程通道不暴露这个能力——那是巨大的安全洞） */
-  async evaluate(expression) {
-    const r = await this._send(this.pageWs, 'Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
+  /** 在页面里执行表达式并取值。
+   *  ▸ ★ 2026-10-04：第二个参数（超时）原先**根本不存在**——签名只收表达式，
+   *    于是调用方写的 `evaluate(PAGE_STATE, 5000)` 里那个 5000 被静默丢掉，
+   *    实际仍然按 _send 的 10s 默认走（坑 56 的形状：外层传了、内层没接）。
+   *    现在真的接上：慢机器上量界面要给足预算，量"页面是否已响应"要给短预算。 */
+  async evaluate(expression, timeoutMs) {
+    /* 不在这里写 10000 兜底：默认值只住在 _send 一处（那里含 WB_CDP_TIMEOUT 口子）——
+     * 两处各写一份默认值就是漂移的开始（坑 47：一个概念只能有一个来源）。 */
+    const r = await this._send(this.pageWs, 'Runtime.evaluate',
+      { expression, returnByValue: true, awaitPromise: true }, timeoutMs);
     if (r.exceptionDetails) throw new Error('页面脚本异常：' + (r.exceptionDetails.text || ''));
     return r.result ? r.result.value : undefined;
   }
@@ -529,8 +580,13 @@ class Cdp {
   }
 
   /* ---- 手动抓一帧（测试用；正常流走 screencast）---- */
-  async screenshot({ format = 'jpeg', quality = 60 } = {}) {
-    const r = await this._send(this.pageWs, 'Page.captureScreenshot', { format, quality, optimizeForSpeed: true });
+  async screenshot({ format = 'jpeg', quality = 60, clip = null } = {}) {
+    /* ★ 2026-10-06 clip（CSS 像素、视口坐标）：只截一小块，用来量"同一块地方两个时刻差多少"。
+     *   整页 PNG 两百多 KB，来回塞进页面解码两次太贵；裁到脸那一小块只有几 KB。
+     *   不传 clip 时行为与以前一字不差。 */
+    const params = { format, quality, optimizeForSpeed: true };
+    if (clip) params.clip = { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale: clip.scale == null ? 1 : clip.scale };
+    const r = await this._send(this.pageWs, 'Page.captureScreenshot', params);
     return Buffer.from(r.data, 'base64');
   }
 

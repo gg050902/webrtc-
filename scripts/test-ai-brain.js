@@ -310,6 +310,74 @@ const USE_LLM = require('../sfu/ai/provider').aiEnabled();
     assert(r.intent === 'minutes', '应命中 minutes 快捷路径');
   });
 
+  /* ══════════ 四b、对话轨（★ 2026-10-03f「永远回答会上提到了什么」的修复）══════════
+   * ▎真会议现场：成员说「小明，你怎么动不了？」，AI 答「会上就 ggg 问了一句'你怎么动不了'，
+   *   没别的了」。因为旧版只有 minutes/recap/operator/question 四类，这句落进 question，
+   *   而 question 的 prompt 写死"只能依据会议字幕"——检索头名就是他自己那句提问。
+   * ▎所以这一节测两件事：① 这类话要**分得出**（且不许吞掉真问会议内容的句子）；
+   *   ② 分出来之后走的那条路**不许再谎称有证据**。 */
+  await T('★ 在跟助理本人说话 → chat（旧版全部落进 question 才导致复述）', () => {
+    for (const s of ['小明，你怎么动不了？', '你是谁', '你能做什么', '你怎么不说话', '为什么不理我', '你好', '小明你在吗']) {
+      assert(B.classifyByRules(s) === 'chat', `"${s}" 应判为 chat，实际 ${B.classifyByRules(s)}`);
+    }
+  });
+  await T('★ 反例：问会议内容不许被 chat 吞掉（吞掉=答非所问，比复述更糟）', () => {
+    assert(B.classifyByRules('这个方案谁定的？') === 'question', '问会议里的事实应是 question');
+    assert(B.classifyByRules('这场会都定了什么') === 'question', '清单型提问应是 question');
+    assert(B.classifyByRules('刚才大家讨论到哪了') === 'recap', '回顾仍应是 recap');
+    assert(B.classifyByRules('帮我生成一份纪要') === 'minutes', '动作型优先级必须高于 chat');
+    assert(B.classifyByRules('你去他电脑上打开计算器') === 'operator', '操作型不能被寒暄抢走');
+  });
+  /* ★ 2026-10-06 **意图泛化电池**（坑 106 的第二处应用）：
+   *   ▎上面那几组句子都在规则表里"有对应分支"，所以它们绿只证明背得住题。
+   *     这一组是**从没进过规则表**的自然说法，首跑 20 句里 7 句落进 question——
+   *     最要命的全在 chat 那一类：「你能帮我做什么」「小明你在不在」「你现在在听吗」
+   *     「你怎么又没有声音了」被判成 question，而无 key（或 LLM 超时）时 question 的
+   *     prompt 写死"只依据会议记录回答" ⇒ 它就去检索会议内容答非所问，
+   *     正是用户报过的"他回复的永远是会上提到了什么"换个说法又复发一次。
+   *   ▸ 顺带钉住**代价不对称**：operator 的误判会把人推进授权链路，所以
+   *     「这个表要输入很多数据」这类**谈论**必须留在 question——宁可漏判也不误判。
+   *     「帮我输入验证码」今天落在 question，是有意的保守选择（有 key 时 LLM 仍会纠正）。 */
+  await T('★ 意图泛化：22 句从未进过规则表的说法', () => {
+    const GEN = [
+      ['你能帮我做什么', 'chat'], ['你有什么本事', 'chat'],
+      ['小明你在不在', 'chat'], ['你现在在听吗', 'chat'],
+      ['你怎么又没有声音了', 'chat'], ['听得见我说话吗', 'chat'],
+      ['听得到吗', 'chat'], ['你好呀', 'chat'], ['嗨', 'chat'],
+      ['把刚才聊的形成文字存档', 'minutes'], ['把这些要点写成一份纪要', 'minutes'],
+      ['把今天的内容整理成文档', 'minutes'], ['给我出个会议报告', 'minutes'],
+      ['你去他电脑上打开浏览器', 'operator'], ['在他电脑上输入一段文字', 'operator'],
+      ['帮我在对方电脑上点一下那个按钮', 'operator'],
+      ['这场会都定了什么？', 'question'], ['会上谁负责压测', 'question'],
+      ['谁说了什么', 'question'], ['这个方案为什么要这么定', 'question'],
+      // 谈论 ≠ 命令：误判 operator 要把人推进授权链路，代价比漏判高（见上注释）
+      ['这个表要输入很多数据', 'question'], ['把白板上的内容输入到文档里', 'question'],
+    ];
+    const bad = GEN.filter(([q, w]) => B.classifyByRules(q) !== w);
+    assert(bad.length === 0, '未命中：' + bad.map(([q, w]) => q + '→应' + w + '实得' + B.classifyByRules(q)).join('、'));
+  });
+  await T('★ 提问自身不算证据（isSelfEcho）', () => {
+    assert(B.isSelfEcho('小明，你怎么动不了？', '你怎么动不了') === true, '同一句应判为回声');
+    assert(B.isSelfEcho('会上定了下周三交付', '交付时间是什么时候？') === false, '话题相近不算回声');
+    assert(B.isSelfEcho('我们来讨论一下季度目标和交付节奏以及人员分工的安排', '小明') === false, '长度差太多不该算回声');
+  });
+  await T('对话轨：不谎称有证据 + 记忆真的写入（坑 41 的集成点断言）', async () => {
+    const brain = new B.RoomBrain();
+    const r = await brain.answerChat('小明，你是谁？', {});
+    assert(typeof r.text === 'string' && r.text.length > 4, '答案不该为空：' + r.text);
+    assert(Array.isArray(r.hits) && r.hits.length === 0, '对话轨没有检索证据，hits 必须是空数组');
+    assert(r.intent === 'chat', 'intent 应为 chat，实际 ' + r.intent);
+    assert(r.turns === 1, `answerChat 必须写一轮记忆（漏写=追问不失忆是假的），实际 turns=${r.turns}`);
+  });
+  if (!USE_LLM) {
+    await T('Mock 轨：抱怨没反应时给的是"下一步"，不是"我是 AI 语言模型"', async () => {
+      const brain = new B.RoomBrain();
+      const r = await brain.answerChat('你怎么没声音', {});
+      assert(/我在|开关|授权|浏览器朗读/.test(r.text), '应给出可执行的下一步，实际：' + r.text);
+      assert(!/作为.{0,6}(AI|人工智能|语言模型)/.test(r.text), '不许出现"作为一个 AI"式废话');
+    });
+  }
+
   /* ══════════ 五、行动项（宁可留空不可编造）══════════ */
   console.log('\n── 五、行动项结构化抽取 ──');
   await T('★ 规则版能抽到 owner/task/due 三个字段', () => {

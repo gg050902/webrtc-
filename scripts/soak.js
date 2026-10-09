@@ -2,8 +2,10 @@
 // ▎背景：C3-N1「过夜值守」把会议系统从"一小时的会"推向"挂一夜的服务"。
 //   前端那一半（字幕看门狗/溢出归档/值守统计）只能真浏览器过夜验证（0.2 节待验证清单），
 //   但**服务器这一半可以命令行自动验证**——本脚本就是干这个的：
-//   起一个真房间常驻连接，按设定时长持续制造三类流量（信令消息 / 字幕归档 POST /
-//   面板快照 GET），全程心跳采样内存，结束时出报告并对账"POST 的行数 == GET 回读的行数"。
+//   起一个真房间常驻连接，按设定时长持续制造四类流量（信令消息 / 字幕归档 POST /
+//   面板快照 GET / ★ 2026-10-08 I3 共享文件的完整生命周期），全程心跳采样内存，
+//   结束时出报告并对账"POST 的行数 == GET 回读的行数"、"脚本台账 == 服务器清单"、
+//   "房间销毁之后目录真的没了"。
 // ▎怎么用：
 //   npm run soak                      # 正经过夜：默认 7 小时，早上看报告
 //   npm run soak -- --minutes 2      # 压缩自测（几分钟验证链路全通）
@@ -23,11 +25,27 @@ const argOf = (name, dft) => {
   const i = args.indexOf(name);
   return i >= 0 && args[i + 1] ? args[i + 1] : dft;
 };
-const URL_BASE = argOf('--url', 'http://localhost:3001');
-const HOURS = parseFloat(argOf('--hours', '7'));
-const MINUTES = parseFloat(argOf('--minutes', '0'));
+// ★ 2026-10-03d env 兜底（SOAK_URL/SOAK_MINUTES/SOAK_HOURS）：包装脚本（run-soak-short）
+//   为了过安全扫描必须全字面量 spawn 参数，动态配置只能走环境变量。
+const URL_BASE = argOf('--url', '') || process.env.SOAK_URL || 'http://localhost:3001';
+const HOURS = parseFloat(argOf('--hours', '') || process.env.SOAK_HOURS || '7');
+const MINUTES = parseFloat(argOf('--minutes', '') || process.env.SOAK_MINUTES || '0');
 const RATE = Math.max(1, parseInt(argOf('--rate', '6'), 10)); // 每分钟模拟的字幕条数
 const DURATION_MS = Math.round((MINUTES > 0 ? MINUTES * 60000 : HOURS * 3600000));
+/* ★ 2026-10-08 I3「共享文件进长跑」
+ *   文件模块的失败方式和字幕一模一样是**静默**的：上传写进盘了但清单没更新、删掉了但文件还在、
+ *   视角广播不再发——这三种都不会让任何一次"点开看看"变红，只会在几天后表现为
+ *   "盘越堆越大 / 别人的面板里有两个同名文件 / 跟随主讲不动了"。
+ *   所以这里每分钟走一遍完整生命周期：上传 → 下载比字节 → 修剪最旧的 → 与服务器清单对账 → 报视角，
+ *   收尾再验一次"房间销毁之后目录真的没了"（这是唯一能证明"没在盘上堆垃圾"的判据）。
+ *   SOAK_FILES=0 关掉这一路；SOAK_FILE_EVERY_MS 管频率；SOAK_FILE_KEEP 管盘上最多留几份；
+ *   SOAK_CHECK_CLEANUP=0 跳过收尾的销毁对账（对账要等房间宽限期，默认多等 ≤100s）；
+ *   SOAK_FILES_DIR 必须与**那台服务器**的 FILES_DIR 一致，否则"目录没残留"查的是别处。 */
+const FILES_ON = process.env.SOAK_FILES !== '0';
+const FILE_EVERY_MS = Math.max(10000, Number(process.env.SOAK_FILE_EVERY_MS) || 60000);
+const FILE_KEEP = Math.max(1, Number(process.env.SOAK_FILE_KEEP) || 3);
+const CHECK_CLEANUP = FILES_ON && process.env.SOAK_CHECK_CLEANUP !== '0';
+const CLEANUP_WAIT_MS = Math.max(10000, Number(process.env.SOAK_CLEANUP_WAIT_MS) || 100000);
 // ★ 09-24 G8：归档/快照接口已加管理员门禁，不带 token 会一路 401（看着像"服务器坏了"）
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
 const AUTH_HEADERS = ADMIN_TOKEN ? { Authorization: `Bearer ${ADMIN_TOKEN}` } : {};
@@ -47,6 +65,18 @@ const state = {
    *   但趋势与超阈值次数是准的；要精确值请读 /metrics。这行注释就是为了别把它当精确值。 */
   capLatSamples: [],
   capLatOver: 0,
+  /* ★ 2026-10-08 I3 共享文件：fileLedger 是**脚本自己的台账**（文件名 → 上传时的字节数）。
+   *   对账比的是三份互不相认的证据："我以为我传了什么" ↔ "服务器说这间房里有什么" ↔
+   *   "我把文件下载回来实际是多少字节"。任何一份单独说谎都会被另外两份抓住。 */
+  fileUps: 0,           // 成功上传份数
+  fileDels: 0,          // 成功删除份数
+  fileLists: 0,         // 与服务器对账次数
+  fileMismatch: 0,      // 清单不一致的次数（>0 就是 FAIL 级问题）
+  fileBytes: 0,         // 最近一次服务器报的房间内总字节（收尾报告用）
+  fileUpdates: 0,       // 收到 files-updated 广播次数（"别人也知道清单变了"的证据）
+  fileViewsSent: 0,
+  fileViewStates: 0,    // 收到 files-view-state 广播次数（跟随链路的**正向对照**）
+  fileLedger: new Map(),
 };
 const CAP_LAT_WARN_MS = Math.max(1000, Number(process.env.SOAK_CAP_LAT_WARN_MS) || 6000);
 const LOG_DIR = path.join(__dirname, '..', 'sfu', 'logs');
@@ -69,6 +99,11 @@ const rss0 = process.memoryUsage().rss;
   const request = (ev, payload) => new Promise((resolve, reject) => {
     socket.emit(ev, payload, (resp) => (resp && resp.error ? reject(new Error(resp.error)) : resolve(resp)));
   });
+  /* ★ 2026-10-08 I3：文件链路的两个下行广播，监听器必须在 create-room 之前挂好（坑 3）。
+   *   这里只记账不判顺序——服务器那侧"有变化才广播 / 连续值节流"的规则由信令回归去断言，
+   *   长跑要回答的是另一个问题：**挂一夜之后这两条路还在通吗**。 */
+  socket.on('files-updated', () => { state.fileUpdates++; });
+  socket.on('files-view-state', () => { state.fileViewStates++; });
   socket.on('disconnect', (reason) => {
     state.reconnects++;
     heartbeat(`⚠️ 连接断开（${reason}），等待 socket.io 自动重连（第 ${state.reconnects} 次）`);
@@ -161,16 +196,112 @@ const rss0 = process.memoryUsage().rss;
   };
 
   const timers = [];
+  /* ── ★ 2026-10-08 I3：共享文件的每轮生命周期 ────────────────────────────
+   * ▎为什么"下载回来比字节"这一步值得花一次往返：上传成功只证明"服务器收下了"，
+   *   不证明"盘上那份是完整的"（磁盘满、句柄没关、分块拼错位都只会让**读**出问题），
+   *   而用户在会上真正踩到的是"点开变成半截/打不开"。 */
+  const LF = String.fromCharCode(10);
+  const fileBody = (n) => [
+    `# soak 耐久样本第 ${n} 份`,
+    '',
+    `生成于 ${new Date().toISOString()} —— 这一行存在的全部理由，是让"下载回来的字节与传上去的一模一样"这件事可校验。`,
+    '中文、标点、反引号 `x`、星号 **粗**、竖线 | 表格符都要原样回来（编码/截断/拼接错只会体现在字节上）。',
+    '',
+  ].join(LF);
+  const uploadOnce = async () => {
+    const n = state.fileUps + state.fileDels + 1;   // 计数含删除数：修剪过的名字不会互相撞成 "xx(1).md"
+    const name = `soak-${n}.md`;
+    const body = fileBody(n);
+    try {
+      const res = await fetch(`${URL_BASE}/api/files?room=${roomNumber}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          // 头只能安全携带 ASCII，中文必须 encodeURIComponent（服务器同侧解码，同一条规则两处都要守）
+          'X-File-Name': encodeURIComponent(name),
+          'X-Uploader-Name': encodeURIComponent('值守脚本'),
+          ...ROOM_HEADERS,
+        },
+        body,
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(`上传 HTTP ${res.status}：${j.error || ''}`);
+      state.fileUps++;
+      state.fileLedger.set(j.file.name, Buffer.byteLength(body));
+      const dl = await fetch(new URL(j.url, URL_BASE), { headers: ROOM_HEADERS });
+      if (!dl.ok) throw new Error(`下载 HTTP ${dl.status}（上传返回的 url 自己打不开）`);
+      const back = await dl.text();
+      if (back !== body) throw new Error(`下载与上传不一致：上传 ${body.length} 字 / 下载 ${back.length} 字`);
+      if (j.file.name !== name) heartbeat(`ℹ️ 文件名被清洗：传「${name}」存成「${j.file.name}」`);
+    } catch (err) {
+      state.errors++;
+      heartbeat(`❌ 文件链路失败：${err.message}`);
+    }
+  };
+  const trimOnce = async () => {
+    if (state.fileLedger.size <= FILE_KEEP) return;
+    const oldest = state.fileLedger.keys().next().value;
+    try {
+      await request('files-delete', { name: oldest });
+      state.fileLedger.delete(oldest);
+      state.fileDels++;
+    } catch (err) {
+      state.errors++;
+      heartbeat(`❌ 删除「${oldest}」失败：${err.message}`);
+    }
+  };
+  const reconcileFiles = async () => {
+    try {
+      const res = await fetch(`${URL_BASE}/api/files?room=${roomNumber}`, { headers: ROOM_HEADERS });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const j = await res.json();
+      state.fileLists++;
+      state.fileBytes = (j.files || []).reduce((a, f) => a + (Number(f.size) || 0), 0);
+      const srv = (j.files || []).map((f) => f.name).sort().join('|');
+      const mine = [...state.fileLedger.keys()].sort().join('|');
+      if (srv !== mine) {
+        state.fileMismatch++;
+        heartbeat(`❌ 文件清单对账不平：服务器「${srv || '空'}」↔ 脚本台账「${mine || '空'}」`);
+      }
+    } catch (err) {
+      state.errors++;
+      heartbeat(`❌ 文件清单读取失败：${err.message}`);
+    }
+  };
+  const fileTick = async () => {
+    if (!socket.connected) return;              // 断线重连期间跳过（重连本身就是被测能力之一）
+    await uploadOnce();
+    await trimOnce();
+    await reconcileFiles();
+    /* 视角上报：换页是**离散事件**（不受 120ms 节流），所以"发了 N 轮却一次广播都没收到"
+     * 就是跟随链路真断了。这条正向对照在收尾判分（坑 65/95：断言"没收到"之前先证明"发出去了"）。 */
+    const names = [...state.fileLedger.keys()];
+    if (names.length) {
+      state.fileViewsSent++;
+      socket.emit('files-view', {
+        name: names[names.length - 1],
+        page: (state.fileViewsSent % 5) + 1,
+        scroll: (state.fileViewsSent % 10) / 10,
+        zoom: 1,
+      });
+    }
+  };
   timers.push(setInterval(postOnce, 60000));   // 每分钟一批归档（真实前端约这个量级）
   timers.push(setInterval(healthOnce, 30000)); // 每 30s 面板快照（等价 dashboard 的轮询）
   const hbTimer = setInterval(() => {
     const mins = (Date.now() - state.start) / 60000;
     const mem = process.memoryUsage();
-    heartbeat(`🌙 心跳：已跑 ${mins.toFixed(1)} 分钟 · 信令消息 ${state.msgs} · 归档 ${state.archived} 条（${state.posts} 次 POST）· 健康检查 ${state.gets} 次 · 重连 ${state.reconnects} · 错误 ${state.errors} · rss ${(mem.rss / 1048576).toFixed(0)}MB（起点 ${(rss0 / 1048576).toFixed(0)}MB）`);
+    heartbeat(`🌙 心跳：已跑 ${mins.toFixed(1)} 分钟 · 信令消息 ${state.msgs} · 归档 ${state.archived} 条（${state.posts} 次 POST）· 文件 ${state.fileUps}↑/${state.fileDels}↓（在盘 ${state.fileLedger.size} 份）· 健康检查 ${state.gets} 次 · 重连 ${state.reconnects} · 错误 ${state.errors} · rss ${(mem.rss / 1048576).toFixed(0)}MB（起点 ${(rss0 / 1048576).toFixed(0)}MB）`);
   }, 10 * 60000);
   timers.push(hbTimer);
   postOnce(); // 启动立刻来一批，别让前 60 秒空转
   healthOnce();
+  if (FILES_ON) {
+    timers.push(setInterval(fileTick, FILE_EVERY_MS));
+    fileTick();      // 同样立刻来一轮：夜里第一件事是确认这条路今天也是通的
+  } else {
+    heartbeat('ℹ️ SOAK_FILES=0：本次不制造共享文件流量（收尾那一行会如实写"未跑"）');
+  }
 
   // 3) 信令消息流量：每 2s 一条聊天（广播回自己 = 信令全链路持续被验证）
   timers.push(setInterval(() => {
@@ -220,9 +351,71 @@ const rss0 = process.memoryUsage().rss;
       heartbeat('字幕延迟：本次未采到（本自测不推真音频；要量这条请开 AI 助理说真话，或跑 npm run test:asr-live）');
     }
     heartbeat(`健康检查 ${state.gets} 次 · 错误 ${state.errors} · rss ${(mem.rss / 1048576).toFixed(0)}MB（起点 ${(rss0 / 1048576).toFixed(0)}MB）`);
-    heartbeat(balanced && state.errors === 0 ? '✅ PASS（零错误且一条不丢）' : '❌ FAIL（存在错误或对账不平，见上）');
+    /* ── ★ 2026-10-08 I3：共享文件这一路的结论 ──────────────────────────────
+     * ▎判分用三件事，缺一件都会留下"绿但没测"的空间：
+     *   ① 清单对账不平（fileMismatch）——服务器与脚本台账说的是两句话；
+     *   ② 一次都没传成（fileUps=0）——这条路今晚根本没被走；
+     *   ③ 发了视角却一次广播都没收到（fileViewsSent>0 而 fileViewStates=0）——
+     *      这正是坑 65/95 说的"0 有两种含义"：既可能是"没人需要收到"，也可能是"链路死了"。
+     *      所以③只在**我方确实发出去了**的前提下才判红。 */
+    const filesRun = FILES_ON && state.fileUps > 0;
+    const viewDead = filesRun && state.fileViewsSent > 0 && state.fileViewStates === 0;
+    /* ★ 这条是今晚被自己的 A/B 逼出来的：**变异路径没被执行过的绿是假的**。
+     *   第一次拿"故意不删"去证红，结果它照样 PASS —— 因为上传数没超过 FILE_KEEP，
+     *   修剪那条分支一次都没走到。所以"删过没有"要自己说出来：
+     *   传得比保留数多却一个都没删 = 修剪从未执行 = 这一路今晚没被 exercising。 */
+    const neverTrimmed = filesRun && state.fileUps > FILE_KEEP && state.fileDels === 0;
+    const filesOk = !FILES_ON || (filesRun && state.fileMismatch === 0 && !viewDead && !neverTrimmed);
+    if (filesRun) {
+      heartbeat(`共享文件：上传 ${state.fileUps} 份 · 删除 ${state.fileDels} 份 · 对账 ${state.fileLists} 次（不平 ${state.fileMismatch}）`
+        + ` · 收尾在盘 ${state.fileLedger.size} 份 / ${(state.fileBytes / 1024).toFixed(1)} KB`
+        + ` · 清单广播 ${state.fileUpdates} 次 · 视角 ${state.fileViewsSent} 发 → ${state.fileViewStates} 收 ${viewDead ? '❌（一条都没回到房间）' : '✅'}`
+        + (neverTrimmed ? ` · ❌ 传了 ${state.fileUps} 份却一个都没删（保留上限 ${FILE_KEEP}）——修剪分支今晚没被执行过，这条绿不算数` : ''));
+    } else if (FILES_ON) {
+      heartbeat('共享文件：❌ 一次都没传成（见上面的错误行）——这条路今晚没有被 exercising');
+    } else {
+      heartbeat('共享文件：本次未跑（SOAK_FILES=0）');
+    }
     try { socket.disconnect(); } catch (e) { /* 已断则忽略 */ }
-    process.exit(balanced && state.errors === 0 ? 0 : 1);
+    /* 收尾对账②：房间销毁之后**盘上不该留垃圾**。
+     * ▎为什么这件事只能放在长跑结尾：上传/删除在信令回归里已经逐条验过，
+     *   但"最后一人离开 → 宽限期到点 → removeRoom 把整个目录删掉"这条链路要**真的等一次宽限**，
+     *   而它恰恰是日常最容易坏的一环（磁盘配额、Windows 文件占用、清理函数漏调用）。
+     *   只在能确定"服务器就在这台机器上"时才查目录，否则只按 HTTP 的 roomExists 判——
+     *   拿一个不存在的目录当证据，比不查更糟（它会造出一条永远绿的断言）。 */
+    let cleanupOk = true;
+    if (CHECK_CLEANUP) {
+      const t0 = Date.now();
+      let exists = true;
+      while (Date.now() - t0 < CLEANUP_WAIT_MS) {
+        await new Promise((r) => setTimeout(r, 3000));
+        try {
+          const res = await fetch(`${URL_BASE}/api/files?room=${roomNumber}`, { headers: ROOM_HEADERS });
+          const j = await res.json().catch(() => ({}));
+          exists = !!j.roomExists;
+          if (!exists) break;
+        } catch (e) { exists = true; break; }
+      }
+      const waited = ((Date.now() - t0) / 1000).toFixed(0);
+      const local = /localhost|127\.0\.0\.1/.test(URL_BASE);
+      /* 目录这条判据只有在"知道服务器把文件放哪儿"时才成立：
+       * 自测会另起一台服务器并指到临时目录，那台服务器的 FILES_DIR 必须原样传给我，
+       * 否则查的是仓库里那个真目录，"没残留"是白得的（坑 65：断言 0 之前先证明我看的是对的地方）。 */
+      const dir = path.join(process.env.SOAK_FILES_DIR || process.env.FILES_DIR
+        || path.join(__dirname, '..', 'sfu', 'files'), String(roomNumber));
+      const dirGone = !local || !fs.existsSync(path.dirname(dir)) ? null : !fs.existsSync(dir);
+      cleanupOk = !exists && dirGone !== false;
+      heartbeat(`房间销毁对账：等 ${waited}s → 房间里还有文件吗 ${exists ? '❌ 还在' : '✅ 已随房间销毁'}`
+        + (dirGone === null ? '（本机目录查不到：服务器不在本机或 FILES_DIR 自定义，只按 HTTP 判）'
+          : ` · 目录 ${dirGone ? '✅ 已删' : '❌ 残留在 ' + dir}`));
+      if (!cleanupOk) state.errors++;
+    }
+    /* 判词放在**所有对账之后**再打印：先说"PASS"再去发现销毁没清理干净，
+     * 早上起床看到的就是一句骗人的绿（坑 76 的报表版：结论必须站在全部证据之后）。 */
+    const allOk = balanced && state.errors === 0 && filesOk && cleanupOk;
+    heartbeat(allOk ? '✅ PASS（零错误 · 字幕一条不丢 · 文件清单对账一致 · 房间销毁没留垃圾）'
+      : '❌ FAIL（存在错误或对账不平，见上）');
+    process.exit(allOk ? 0 : 1);
   }
 })().catch((err) => {
   console.error(`soak 启动失败：${err.message}（服务器没起？先 npm run start:sfu）`);

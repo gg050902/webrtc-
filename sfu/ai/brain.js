@@ -546,15 +546,28 @@ class ConversationMemory {
  *   question  : 普通问答（走向量检索 + 生成）
  * 为什么"动作型"必须被单独分出来：见文件头 ③ —— 动作被误判成闲聊 = 用户以为做成了。
  */
-const INTENTS = ['minutes', 'recap', 'operator', 'question'];
+/* ★ 2026-10-03f 新增 chat 一类。
+ * ▎为什么非加不可（真会议实测）：成员说"小明，你怎么动不了？"，
+ *   旧版只有 minutes/recap/operator/question 四类，这句落进 question，
+ *   而 question 的 system prompt 写死了"回答**只能依据**会议字幕检索结果"——
+ *   于是检索到的最相关条目**就是他自己刚说的这一句**（已被 ASR 转成字幕进了账本），
+ *   模型老老实实把问题复述回来当答案：「会上就 ggg 问了一句'小明，你怎么动不了？'，没别的了」。
+ *   这不是模型笨，是**没有"成员在跟你本人说话"这一类**，全被塞进了"查会议"的框里。 */
+const INTENTS = ['minutes', 'recap', 'operator', 'chat', 'question'];
 
 // 规则兜底的同义表达（无 key 时用；也是 LLM 分类失败时的降级）——比老正则宽得多
 const INTENT_RULES = [
   // 操作型：动词宽一点没关系（"点一下"是口语的说法），但"帮我"必须和动作词同现，
   //   否则"帮我总结一下"会被误判成操作——那会把用户送进授权链路，代价比漏判高得多
-  { intent: 'operator', re: /(^|\s)(操作|打开|点击|双击|输入|帮我操作|远程控制|去我?电脑上|在(对方|他|她)电脑)|(点一下|点下|按一下|双击|单击|敲一下|把.{0,6}(打开|关掉|点上))/ },
-  { intent: 'minutes', re: /(纪要|会议记录|会议总结|总结一下|整理.*(聊|讨论|说)|整理成文|摘要|归档|记录成|会议报告|复盘文档)/ },
+  { intent: 'operator', re: /(^|\s)(操作|打开|点击|双击|输入|帮我操作|远程控制|在(对方|他|她)电脑)|(点一下|点下|按一下|敲一下|双击|单击|把.{0,6}(打开|关掉|点上)|去(我|你|他|她|对方)?电脑(上|里|面)?|(在|到)(我|你|他|她|对方|人家)(的)?电脑(上|里|面))/ },
+  { intent: 'minutes', re: /(纪要|会议记录|会议总结|总结一下|整理.*(聊|讨论|说)|整理成文|摘要|归档|存档|形成文字|写成.*(文|字|档)|记录成|会议报告|复盘文档)/ },
   { intent: 'recap', re: /(刚才|刚刚|之前|前面).{0,6}(说|讲|聊|讨论|提到|决定)/ },
+  /* chat = 句子的**主语是"你"**且在问助理自身的状态/身份/能力，或对助理打招呼。
+   * ▎为什么放在最后一条规则之前、question 兜底之前：前三条动作型优先级必须更高
+   *   （"你怎么把纪要生成一下"这种别扭说法该走 minutes，而不是被 chat 吞掉）。
+   * ▎为什么要求"你/小明"与状态词**同现**：光有"怎么/为什么"会误吞
+   *   「这个方案为什么这么定？」——那是在问会议内容，属于 question。 */
+  { intent: 'chat', re: /(你是谁|你叫什么|你叫啥|自我介绍|你(能|会)(帮我)?(做|干|帮)(什么|啥|哪些)|你都会(些)?(什么|啥)|你有(什么|哪些)(功能|能力|本事|用)|怎么(用|使用)你|帮助菜单)|(不理我|没人理|没反应|没声音|没有声音|又没声|听不见|(听得见|听得到)(我|你|吗|说话)|看不见你)|(你|小明|助理).{0,10}(在不在|在不|在吗|听着呢|在听吗|现在在听|听得到|听得见)|(你|小明).{0,8}(怎么(不动|动不了|没动|不动了|没反应|不说话|听不见|看不见|没声音|没有声音|又没|没声|卡|睡着)|为什么(不|没)(动|说话|回答|理|听|响)|是不是(坏|没开|聋|卡|死了))|(^(你好|您好|嗨|哈喽|hi|hello|在吗|测试一下)|谢谢|辛苦了|不错|真棒|厉害|晚安)/i },
 ];
 
 /** 规则分类（永远可用，无网络） */
@@ -578,7 +591,7 @@ async function classifyIntent(question, opts = {}) {
   // ★ 省钱的短路：规则**高置信度**命中动作型意图时，不必再花一次 LLM 调用。
   //   理由：动作型误判的代价极高（纪要没生成），而这两条规则的正则已经很明确；
   //   反过来，规则说"question"时并不可信（可能有规则没想到的说法）→ 才需要 LLM 兜。
-  if (ruleIntent === 'minutes' || ruleIntent === 'operator') {
+  if (ruleIntent === 'minutes' || ruleIntent === 'operator' || ruleIntent === 'chat') {
     return { intent: ruleIntent, mock: true, raw: 'rule-shortcut' };
   }
   if (!AI.aiEnabled()) return { intent: ruleIntent, mock: true, raw: 'rule' };
@@ -598,9 +611,12 @@ async function classifyIntent(question, opts = {}) {
         + 'minutes = 明确要求**产出一份文档/文件**（生成纪要、整理成文、归档、做成会议记录、导出报告）\n'
         + 'recap = 只要求**口头复述回顾**刚才讨论的内容，不要正式文档\n'
         + 'operator = 要 AI 去操作某台电脑（打开软件、点击、输入文字等）\n'
-        + 'question = 问一个**具体事实**：谁说了什么、什么时候、定了什么、会议多久、有多少人、闲聊等\n'
-        + '关键区分：**问"是什么/有哪些"→ question；说"给我一份/整理成文档"→ minutes。**\n'
-        + '例：「这场会都定了什么？」→ question（在问事实）；「帮我整理成会议纪要」→ minutes（要文件）。',
+        + 'chat = 成员在跟**助理本人**说话：寒暄、问你是谁/你能做什么、抱怨你没反应/听不见/不动、问你自己的状态\n'
+        + 'question = 问一个**具体事实**：谁说了什么、什么时候、定了什么、会议多久、有多少人\n'
+        + '关键区分一：**问"是什么/有哪些"→ question；说"给我一份/整理成文档"→ minutes。**\n'
+        + '关键区分二：**问题的主语是"你"且在说助理自己 → chat；主语是"会上/这件事"→ question。**\n'
+        + '例：「这场会都定了什么？」→ question；「帮我整理成会议纪要」→ minutes；\n'
+        + '「小明你怎么不动了？」→ chat（在说助理自己）；「这个方案谁定的？」→ question。',
     },
     { role: 'user', content: q },
   ], {
@@ -776,6 +792,20 @@ function buildEvidenceBlock(hits, opts = {}) {
  * 六、房间级智能体（把上面五件事装配起来）
  * ══════════════════════════════════════════════════════════════ */
 
+/* ★ 2026-10-03f 「提问自身不算证据」的判据（answer() 与单测共用同一份实现）。
+ *   归一化只去空白/标点/符号并转小写——中文没有词边界，靠"整串互相包含"判同文最稳，
+ *   这也和 Asr.isFragmentOf 那条思路同源（不同模块，各自不引依赖）。 */
+function normForEcho(s) {
+  return String(s || '').toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '').slice(0, 160);
+}
+function isSelfEcho(hitText, question) {
+  const a = normForEcho(hitText);
+  const b = normForEcho(question);
+  if (!a || !b) return false;
+  if (Math.abs(a.length - b.length) > 6) return false;   // 差得多 = 只是话题相近，不是同文
+  return a.includes(b) || b.includes(a);
+}
+
 /**
  * 每房间一个智能体 = 一份会话记忆 + 一个按需重建的检索器。
  * ▎为什么检索器要"按需重建"：字幕是**持续增长**的（会议在进行），
@@ -897,6 +927,14 @@ class RoomBrain {
       }
     }
 
+    /* ★ 2026-10-03f 把"提问本身"从证据里剔掉。
+     *   成员一开口，那句话先被 ASR 转成字幕进了账本；他再问 AI，AI 回头检索——
+     *   最相关的条目自然就是**他自己这一句**。旧版没这道过滤，于是
+     *   「你怎么动不了？」的证据就是「你怎么动不了？」，模型只能把问题复述回来当答案。
+     *   ▎判据刻意保守（归一化后互相包含 + 长度差很小）：只排"就是这一句"，
+     *   不排"话题相近"——话题相近正是我们要的召回，排掉它会把真证据一起滤没。 */
+    hits = hits.filter((h) => !isSelfEcho(h.text, q));
+
     const ev = buildEvidenceBlock(hits, { maxChars: opts.maxChars });
 
     const sys = [
@@ -968,10 +1006,86 @@ class RoomBrain {
       rewrites: rewriteInfo,
     };
   }
+
+  /**
+   * ★ 2026-10-03f 通用对话轨：成员在跟"小明"**这个人**说话，不是在查会议记录。
+   * ▎为什么必须与 answer() 分成两条路（真会议实测逼出来的）：
+   *   answer() 的 system 写死了"回答**只能依据**会议字幕检索结果"。
+   *   成员问「小明，你怎么动不了？」——这句本身已经过 ASR 进了字幕账本，
+   *   于是检索头名就是他自己这句话，模型只能答「会上就 ggg 问了一句'你怎么动不了'」。
+   *   换句说：**answer() 越诚实（不编造、只依据材料），这类问题就越像在敷衍。**
+   *   这不是模型能力问题，是路由缺失——所以补一条不依赖证据的对话轨。
+   * ▎仍然守双轨约定：无 key / 失败 → 规则兜底给**可执行的下一步**，不回"我是 AI 语言模型"。
+   * @param {string} question
+   * @param {Object} opts { onDelta, onPhase, contextLine }
+   */
+  async answerChat(question, opts = {}) {
+    const q = String(question || '').trim();
+    const phase = (p) => { try { if (opts.onPhase) opts.onPhase(p); } catch (e) { /* 阶段上报失败不影响回答 */ } };
+    phase('generating');   // 这一轨没有检索这一步，直接进"整理答案"
+    const messages = [{
+      role: 'system',
+      content: [
+        '你是会议 AI 助理"小明"，现在成员在跟**你本人**说话，不是在查会议记录。',
+        '直接接话、直接回答，一两句话，口语，不要列举腔，不要 markdown，',
+        '不要"根据会议记录""以下是"这类开场白，也不要连着道歉。',
+        '你能做的：回答本场会议内容（谁说了什么/定了什么/有哪些待办）、生成会议纪要、',
+        '  开关白板与字幕、切换宫格或演讲者布局、在被控端点「允许」之后操作那台电脑。',
+        '你做不到的：没被授权就动别人的电脑、看见会议之外的东西、改别人的设备设置。',
+        '如果对方在抱怨你没反应/没声音，先给**具体下一步**（该说什么、该点哪个按钮），',
+        '  并说明可能卡在哪一环（AI 语音开关、字幕开关、服务端语音是否在跑）。',
+        '绝不编造会议里没发生的事；不确定就说不确定。',
+        /* ★ 2026-10-09 与检索轨 answer() 的 systemExtra 同一个钩子：
+           这句答案会不会被念出口，是**调用方**（语音问答 vs @ai 打字）才知道的事实，
+           brain 不猜。两条轨都用同一个参数名，免得将来一侧改了另一侧不知道。 */
+        opts.systemExtra || '',
+        opts.contextLine || '',
+      ].filter(Boolean).join('\n'),
+    }];
+    for (const t of this.memory.recent(-1)) {
+      messages.push({ role: 'user', content: t.q });
+      messages.push({ role: 'assistant', content: t.a });
+    }
+    messages.push({ role: 'user', content: `成员说：${q}` });
+
+    /* 规则兜底（无 key 也能用）。四条都指向"下一步该做什么"，
+     *   而不是"我是一个 AI 语言模型"那种废话——用户抱怨没反应时，废话就是第二次没反应。 */
+    const mockAnswer = () => {
+      const n = normForEcho(q);
+      if (/你是谁|叫什么|自我介绍|多大|名字/.test(n)) {
+        return '我是小明，这场会的 AI 助理。能答会议内容、生成纪要、列待办和风险，授权之后还能操作被控那台电脑。';
+      }
+      if (/能做什么|会做什么|有什么功能|怎么用|帮助|能干啥/.test(n)) {
+        return '说"这场会定了什么"我翻字幕答你，说"生成纪要"我落一份 md，说"打开白板"我直接开；'
+          + '要我动你的电脑，得先在弹窗里点「允许」。';
+      }
+      if (/没反应|不动|不说话|没声音|听不见|听不到|没听到|卡住|睡着|为什么没/.test(n)) {
+        return '我在。三处可能：①「AI 语音」开关关着（只出字不出声）；②服务端语音合成失败，已自动回落浏览器朗读；'
+          + '③我按"查会议内容"答了一句你不满意——直接说"小明，你怎么不动了"这种话我现在会走对话这条路答你。';
+      }
+      if (/谢谢|辛苦|不错|真棒|厉害|晚安/.test(n)) return '不客气，随时叫我。';
+      return '我在听。你可以问我会上定了什么、让我生成纪要，或者点控制坞的「AI 操作」让我演示一次远程操作。';
+    };
+
+    const res = opts.onDelta
+      ? await AI.streamLLM(messages, { label: 'ai-chat', temperature: 0.7, timeoutMs: 15000, maxTokens: 200, mock: mockAnswer }, (d) => opts.onDelta(d))
+      : await AI.askLLM(messages, { label: 'ai-chat', temperature: 0.7, timeoutMs: 12000, maxTokens: 200, mock: mockAnswer });
+    phase('done');
+    this.memory.push(q, res.text);
+    return {
+      text: res.text, mock: res.mock, usage: res.usage, ms: res.ms, reason: res.reason,
+      /* 对话轨没有检索证据：hits 交空数组，前端据此**不显示"依据的几条原话"**。
+       *   留了假空证据栏就等于继续撒谎（坑 47 的诚实性那一半）。 */
+      hits: [], usedHits: 0, totalDocs: 0, allDocs: 0, scoped: false, turns: this.memory.length,
+      rewrites: null, intent: 'chat',
+    };
+  }
 }
 
 module.exports = {
   tokenize,
+  isSelfEcho,              // ★ 2026-10-03f：单测要能直接钉"提问自身不算证据"这条判据
+  normForEcho,
   expandQuerySynonyms,     // ★ 09-25：导出以便单测直接验证"查询扩展"这一步
   SYNONYM_GROUPS,
   /* 检索调参相关的常量也导出：单测要能断言"阈值的量级是合理的"，

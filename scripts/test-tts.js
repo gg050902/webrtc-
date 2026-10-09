@@ -6,7 +6,13 @@
 const Tts = require('../sfu/ai/tts');
 
 let pass = 0, fail = 0, skip = 0;
-const ok = (name, cond) => { if (cond) { pass++; console.log(`  PASS  ${name}`); } else { fail++; console.log(`  FAIL  ${name}`); } };
+// 坑 110 的常驻守卫：本文件约定 ok(名字, 条件)
+const { guard: guardOk } = require('./assert-order-guard.js');
+const ok = (name, cond) => {
+  const bad = guardOk('name-first', name, cond);
+  if (bad) { fail++; console.log(`  FAIL  ${String(name).slice(0, 60)}  · 参数顺序守卫：${bad}`); return; }
+  if (cond) { pass++; console.log(`  PASS  ${name}`); } else { fail++; console.log(`  FAIL  ${name}`); }
+};
 const skipped = (name, why) => { skip++; console.log(`  SKIP  ${name}（${why}）`); };
 
 console.log('\n=== ① Sec-MS-GEC 令牌：纯函数（固定时钟，结果必须确定）===');
@@ -26,7 +32,11 @@ console.log('\n=== ② 音频货架：putAudio/getAudio/sweepAudio ===');
   const id1 = Tts.putAudio(Buffer.from('mp3-1'));
   const id2 = Tts.putAudio(Buffer.from('mp3-2'));
   ok('putAudio 返回 32 位 hex id（不可枚举）', /^[a-f0-9]{32}$/.test(id1) && id1 !== id2);
-  ok('getAudio 按 id 取回同一段字节', Tts.getAudio(id1).toString() === 'mp3-1');
+  /* ★ 2026-10-03d 契约升级跟进：getAudio 自 Qwen 本地音色（wav）起返回 {buf, type}，
+   *   HTTP 层（/audio/:id）按 type 选 Content-Type——本测试还停在旧的纯 Buffer 契约上
+   *   （套件近期没人跑，红了也没人看见——这就是"全套盘点"要定期跑的理由）。 */
+  const e1 = Tts.getAudio(id1);
+  ok('getAudio 按 id 取回同一段字节（{buf,type} 契约）', !!e1 && e1.buf.toString() === 'mp3-1' && e1.type === 'mp3');
   ok('未知 id 取不到（返回 null）', Tts.getAudio('deadbeef'.repeat(4)) === null);
   ok('格式不合法的 id 取不到（白名单闸）', Tts.getAudio(id1 + '/../x') === null);
   Tts.putAudio(Buffer.alloc(1)); // 第 3 条

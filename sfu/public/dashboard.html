@@ -26,68 +26,120 @@
 <head>
   <meta charset="UTF-8" />
   <title>SFU 观测面板</title>
+  <meta name="theme-color" content="#14100a" />
+  <script>
+    /* ★ 2026-10-07 H4：首帧之前把主题贴上（与 index.html 同一段逻辑、同一个存储键）。
+     *   ▎为什么必须写在 <style> 之前的内联脚本：写在文件末尾的 JS 里会**先画一帧深色**
+     *     再翻浅色（闪一下），而面板是 2s 轮询反复重绘的页面，闪一下会被反复看见。
+     *   ▎为什么这里要复制一份而不是 import 一个共享脚本：这是个零依赖单文件页面，
+     *     为 4 行代码引一个额外请求不值；**键名与判据保持一致**由 check:theme 的
+     *     "面板页也跟随主题"那条断言钉住（做不到单一来源就用断言钉住，坑 91 的同一条做法）。 */
+    (function () {
+      try {
+        var t = localStorage.getItem('sfu-theme');
+        if (t === 'light') {
+          document.documentElement.setAttribute('data-theme', 'light');
+          var m = document.querySelector('meta[name="theme-color"]');
+          if (m) m.setAttribute('content', '#f4efe3');
+        }
+      } catch (e) { /* 隐私模式读不到：按默认（水墨深色）走 */ }
+    })();
+  </script>
   <style>
+    /* ★ 2026-10-07 H4：观测面板原来是**只有深色一套**的独立页面。
+     *   ▎为什么这算一个真缺陷而不是"还没做"：会议页顶栏那个开关会把主题存进
+     *     localStorage('sfu-theme')，用户选了「宣纸」之后点进 /dashboard 却是一整页黑；
+     *     而本页文字对比度全是按深色底定的（浅底上 #8a8070 一类只有 3.7:1）。
+     *     **同一个产品里两个页面各用一套配色 = 用户的选择不被尊重**
+     *     （界面在无声地说"那个开关只管首页"，与坑 82 的"过期声明"是同族）。
+     *   ▸ 颜色全部收进下面这组 token，浅色档只在 html[data-theme="light"] 里重定一档，
+     *     值按**最差的那块底**定（正文 ≥ 4.5；扫描在 scripts/check-theme.js 的 dashboard 一节）。
+     *   ▸ canvas 折线那几处颜色不在 CSS 里（JS 直接 fillStyle），所以 drawSpark() 改成
+     *     **运行时读同一批 token**——否则换了主题线条与轴标签还停在深色配比，
+     *     那是典型的"CSS 改了、画布没改"（坑 76：机制在 ≠ 生效）。 */
+    :root {
+      --bg0: var(--bg0); --bg1: var(--bg1); --bg2: var(--bg2);
+      --line: var(--line); --line-soft: var(--line-soft);
+      --fg: var(--fg); --fg-muted: var(--fg-muted); --fg-faint: var(--fg-faint);
+      --accent: var(--accent); --accent-strong: var(--accent-strong); --accent-soft: var(--accent-soft);
+      --ok: var(--ok); --ok-line: var(--ok-line);
+      --warn: var(--warn); --warn-fg: var(--warn-fg); --warn-soft: var(--warn-soft);
+      --danger: var(--danger); --grey: var(--grey);
+      --accent-on: var(--bg0);   /* 鎏金按钮上的字色（浅色档要反过来压深） */
+    }
+    html[data-theme="light"] {
+      --bg0: #f4efe3; --bg1: #fdfdf7; --bg2: #f1ead9;
+      --line: #ded3bc; --line-soft: #e7dfcc;
+      --fg: #241d12; --fg-muted: #4a4232; --fg-faint: #6b6250;
+      --accent: #7a5d10; --accent-strong: #654d0c; --accent-soft: #8a6a15;
+      --ok: #2f6b2a; --ok-line: #6f9e68;
+      --warn: #a02f36; --warn-fg: #7f2016; --warn-soft: #7a5d10;
+      --danger: #8f3a3a; --grey: #5d5340;
+      --accent-on: #fdfdf7;
+    }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: "Noto Serif SC", "Segoe UI", "PingFang SC", "Microsoft YaHei", serif;
-      background: linear-gradient(160deg, #14100a 0%, #1c1710 100%);
-      color: #ece5d8; min-height: 100vh; padding: 20px;
+      background: linear-gradient(160deg, var(--bg0) 0%, var(--bg1) 100%);
+      color: var(--fg); min-height: 100vh; padding: 20px;
     }
     h1 { font-size: 20px; display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
-    h1 .dot { width: 9px; height: 9px; border-radius: 50%; background: #9ecf7a; box-shadow: 0 0 8px #9ecf7a; }
-    .sub { color: #8a8070; font-size: 12px; margin-bottom: 18px; }
-    .sub b { color: #d8cdb8; }
+    h1 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+    .sub { color: var(--fg-faint); font-size: 12px; margin-bottom: 18px; }
+    .sub b { color: var(--fg-muted); }
 
     /* 概览行 */
     .overview { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
     .stat {
-      background: #1c1710; border: 1px solid #3a3226; border-radius: 12px;
+      background: var(--bg1); border: 1px solid var(--line); border-radius: 12px;
       padding: 12px 18px; min-width: 130px;
     }
-    .stat .num { font-size: 26px; font-weight: 700; color: #d8b36a; font-variant-numeric: tabular-nums; }
-    .stat .lbl { font-size: 12px; color: #8a8070; margin-top: 2px; }
+    .stat .num { font-size: 26px; font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+    .stat .lbl { font-size: 12px; color: var(--fg-faint); margin-top: 2px; }
 
     /* 房间卡 */
     .room-card {
-      background: #1c1710; border: 1px solid #3a3226; border-radius: 14px;
+      background: var(--bg1); border: 1px solid var(--line); border-radius: 14px;
       padding: 16px 18px; margin-bottom: 16px;
       box-shadow: 0 8px 24px rgba(0,0,0,.35);
     }
     .room-head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 12px; flex-wrap: wrap; }
     .room-head .rn { font-size: 17px; font-weight: 700; }
     .room-head .rn::before { content: "🎛️ "; }
-    .room-head .meta { font-size: 12px; color: #8a8070; }
+    .room-head .meta { font-size: 12px; color: var(--fg-faint); }
     .pill {
       font-size: 12px; padding: 3px 10px; border-radius: 99px;
-      background: #262017; border: 1px solid #3a3226; color: #d8cdb8;
+      background: var(--bg2); border: 1px solid var(--line); color: var(--fg-muted);
     }
-    .pill.green { color: #d8b36a; border-color: #2f9e5f; }
-    .pill.red   { color: #ff8f8f; border-color: #a04a4a; }
+    .pill.green { color: var(--accent); border-color: var(--ok-line); }
+    .pill.red   { color: var(--warn-fg); border-color: var(--danger); }
 
     table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 12px; }
-    th { text-align: left; color: #8a8070; font-weight: 500; font-size: 12px; padding: 5px 8px; border-bottom: 1px solid #3a3226; }
-    td { padding: 6px 8px; border-bottom: 1px solid #2a2318; font-variant-numeric: tabular-nums; }
+    th { text-align: left; color: var(--fg-faint); font-weight: 500; font-size: 12px; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+    td { padding: 6px 8px; border-bottom: 1px solid var(--line-soft); font-variant-numeric: tabular-nums; }
     tr:last-child td { border-bottom: none; }
 
-    .bar { position: relative; height: 8px; background: #14100a; border-radius: 5px; overflow: hidden; min-width: 90px; }
-    .bar i { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, #b8933f, #d8b36a); border-radius: 5px; }
+    .bar { position: relative; height: 8px; background: var(--bg0); border-radius: 5px; overflow: hidden; min-width: 90px; }
+    .bar i { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, var(--accent-strong), var(--accent)); border-radius: 5px; }
 
-    .score-10 { color: #d8b36a; } .score-mid { color: #ffcf6f; } .score-low { color: #ff8f8f; }
+    .score-10 { color: var(--accent); } .score-mid { color: var(--warn-soft); } .score-low { color: var(--warn-fg); }
 
-    canvas.spark { width: 100%; height: 64px; display: block; background: #14100a; border-radius: 8px; border: 1px solid #2a2318; }
+    canvas.spark { width: 100%; height: 64px; display: block; background: var(--bg0); border-radius: 8px; border: 1px solid var(--line-soft); }
 
-    .empty { color: #8a8070; font-size: 14px; text-align: center; padding: 60px 0; }
+    .empty { color: var(--fg-faint); font-size: 14px; text-align: center; padding: 60px 0; }
     .empty .big { font-size: 40px; margin-bottom: 10px; }
   </style>
 </head>
 <body>
   <h1><span class="dot"></span>SFU 实时观测面板</h1>
   <div class="sub">数据每 2 秒刷新一次，来自服务器 <b>GET /api/rooms</b> · 码率 = 两次采样字节差 ÷ 时间差（和浏览器 getStats 同一个算法）</div>
-  <div class="sub" style="margin-top:-14px"><a href="/recordings.html" style="color:#d8b36a">📼 录制回放</a> · <a href="/" style="color:#d8b36a">会议页</a> · <a href="/metrics" id="metricsLink" style="color:#d8b36a">/metrics</a></div>
+  <div class="sub" style="margin-top:-14px"><a href="/recordings.html" style="color:var(--accent)">📼 录制回放</a> · <a href="/" style="color:var(--accent)">会议页</a> · <a href="/metrics" id="metricsLink" style="color:var(--accent)">/metrics</a></div>
 
   <div class="overview" id="overview"></div>
-  <div id="rooms"><div class="empty"><div class="big">📡</div>还没有任何房间——先去 <a href="/" style="color:#d8b36a">会议页</a> 创建一个</div></div>
+  <div id="rooms"><div class="empty"><div class="big">📡</div>还没有任何房间——先去 <a href="/" style="color:var(--accent)">会议页</a> 创建一个</div></div>
 
+<script src="countup.js?v=20261006"></script><!-- ★ 数字滚动的纯算法（缓动/钳位/收尾），单测在 test:smoke 里穷举 -->
 <script>
 'use strict';
 /* ★ 09-24 G8：本页要调受保护接口，必须带管理员 token。
@@ -117,15 +169,15 @@ function showAuthGuide() {
     <div class="room-card" style="max-width:620px;margin:40px auto;text-align:center">
       <div style="font-size:40px;margin-bottom:10px">🔒</div>
       <div style="font-size:17px;font-weight:700;margin-bottom:8px">观测面板需要管理员身份</div>
-      <div style="color:#8a8070;font-size:13px;line-height:1.8">
+      <div style="color:var(--fg-faint);font-size:13px;line-height:1.8">
         这个面板会暴露全部房间的成员、每路媒体字节数与控制权关系，所以只对管理员开放。<br>
-        请先用<b style="color:#d8cdb8">管理员账号</b>登录，再回到本页。
+        请先用<b style="color:var(--fg-muted)">管理员账号</b>登录，再回到本页。
       </div>
       <div style="margin-top:18px">
-        <a href="/" style="display:inline-block;padding:9px 18px;border-radius:99px;background:#d8b36a;color:#14100a;text-decoration:none;font-weight:700">去登录 →</a>
-        <a href="/" style="display:inline-block;padding:9px 18px;color:#8a8070;text-decoration:none">回会议页</a>
+        <a href="/" style="display:inline-block;padding:9px 18px;border-radius:99px;background:var(--accent);color:var(--bg0);text-decoration:none;font-weight:700">去登录 →</a>
+        <a href="/" style="display:inline-block;padding:9px 18px;color:var(--fg-faint);text-decoration:none">回会议页</a>
       </div>
-      <div style="color:#6f6758;font-size:12px;margin-top:16px">
+      <div style="color:var(--grey);font-size:12px;margin-top:16px">
         还不是管理员？让管理员执行 <code>npm run admin:grant -- &lt;用户名&gt;</code>，然后重新登录。
       </div>
     </div>`;
@@ -168,6 +220,54 @@ async function poll() {
   render(data);
 }
 
+/* ★ 2026-10-06 数字滚动（reactbits 的 CountUp 零依赖移植）。
+ * ▎为什么值得给观测面板加：面板每 2s 整块重画，数字是"跳"过来的——
+ *   看趋势的人其实是在看"变了多少"，滚动 0.5s 让变化可见地发生，
+ *   比在两个静态数之间自己脑补差值友好（这也是这块面板的初衷：把内部状态摆出来）。
+ * ▎三个必须守住的细节：
+ *   ① **上一值存在 Map 里而不是 DOM 上**——render() 每次都重写 innerHTML，
+ *      写在元素上的话每 2 秒就被清空一次，于是每次轮询都从 0 滚一遍（那不是动效，是抽搐）；
+ *   ② 值没变就不动（绝大多数轮询什么都不变，界面必须安静）；
+ *   ③ prefers-reduced-motion 直接写终值（项目里的动效一律遵守这条，见 style.css 的降级层）。
+ *   单位与徽标（⏺、" / 拦 N"、尾部 s）都在 .cnt 之外，滚动只碰自己那个span（坑 77）。 */
+const COUNT_MOTION = !(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+const countLast = new Map();     // data-k -> 上一次显示的数值（DOM 会被整块重写，所以记在这儿）
+function fmtCount(v, dec) { return dec ? v.toFixed(dec) : String(Math.round(v)); }
+function countUp(el, key, to, dec) {
+  const prev = countLast.get(key);
+  countLast.set(key, to);
+  const from = Number.isFinite(prev) ? prev : to;   // 第一次出现：直接落终值，不从 0 骗人
+  if (!COUNT_MOTION || from === to) { el.textContent = fmtCount(to, dec); return; }
+  /* 立刻把起点写上。为什么这一行不能省：模板字符串里已经印了**新**值，
+   * 而第一帧 rAF 至少要到下一个刷新周期才跑——中间那一瞬页面显示的是终值，
+   * 于是"滚动"变成"闪一下终值再跳回起点再滚"。真浏览器检查就是这么抓到的：
+   * 连着两次 render(3)→render(7) 后同步读 DOM，读到的是 7（根本没滚过）。 */
+  el.textContent = fmtCount(from, dec);
+  /* 每一帧显示什么，交给 sfu/public/countup.js 里的纯函数 countStep（缓动、钳位、
+   * 收尾落终值这些判据都在那边被单测穷举过；这里只管 rAF 与 DOM）。 */
+  const dur = 520, t0 = performance.now();
+  const step = (now) => {
+    /* 目标已被下一轮轮询改写就立刻收手：这是"按代号作废"的廉价版（坑 68 同一条纪律，
+     * 否则两条 rAF 循环会抢同一个 span，最后停在一个既不是旧值也不是新值的数上）。 */
+    if (countLast.get(key) !== to) return;
+    const p = Math.min(1, (now - t0) / dur);
+    el.textContent = COUNTUP.countStep(from, to, p, dec);
+    if (p < 1) requestAnimationFrame(step);
+    else el.textContent = fmtCount(to, dec);        // 收尾必须正好是终值，不许停在 3.9 这种事
+  };
+  requestAnimationFrame(step);
+}
+function runCountUps() {
+  document.querySelectorAll('#overview .cnt[data-v]').forEach((el) => {
+    /* 判据用 countup.js 的 isNum，而不是 Number(el.dataset.v)：
+     *   data-v="" 时 Number('') 是 0，于是"没有数值"的那一格会被滚成一个理直气壮的 0。
+     *   （null/'' 蒙混过关这一课，是单测 countStep 时逼出来的，同一把尺子这里也要用。） */
+    if (!COUNTUP.isNum(el.dataset.v)) return;
+    const to = Number(el.dataset.v);
+    countUp(el, el.dataset.k || el.dataset.v, to, Number(el.dataset.dec || 0));
+  });
+}
+
 function render(data) {
   /* ① 概览行 */
   const totalMembers = data.rooms.reduce((a, r) => a + r.counts.members, 0);
@@ -182,7 +282,7 @@ function render(data) {
     ? asrEngines.map(([k, v]) => `${k} ${Math.round((v.sec / (v.n || 1)) * 10) / 10}s`).join(' · ')
     : '还没转写过';
   const asrColor = /whisper|CLI|常驻/i.test(asrEngines.map(([k]) => k).join(',')) && cb.asrEngine !== 'whisper'
-    ? 'color:#d3b877' : 'color:#9ecf7a';
+    ? 'color:var(--accent-soft)' : 'color:var(--ok)';
   const throttled = Object.values(cb.throttled || {}).reduce((a, n) => a + n, 0);
   const boardRejected = (cb.board && cb.board.rejected) || 0;
   /* ★ 2026-10-03 两条端到端延迟各占一格（字幕 / 播报），共用同一个算法与配色。
@@ -196,27 +296,35 @@ function render(data) {
     const avg = c && c.n ? c.sum / c.n : 0;
     return {
       txt: avg ? (avg / 1000).toFixed(1) : '--',
-      color: !avg ? 'color:#8a8070' : (avg <= 3000 ? 'color:#9ecf7a'
-        : (avg <= 6000 ? 'color:#d3b877' : 'color:#e0636f')),
+      /* v 是给"数字滚动"用的目标值：没有样本时给 null，渲染那一格就不带 data-v，
+       * 于是它安静地写 '--' 而不是从 0 滚到一个假数（坑 53/65 同一条：不许编数）。 */
+      v: avg ? +(avg / 1000).toFixed(1) : null,
+      color: !avg ? 'color:var(--fg-faint)' : (avg <= 3000 ? 'color:var(--ok)'
+        : (avg <= 6000 ? 'color:var(--accent-soft)' : 'color:var(--warn)')),
       max: ((c && c.max) / 1000 || 0).toFixed(1),
       n: (c && c.n) || 0,
     };
   };
   const capC = latCell(cb.capLat);
   const spkC = latCell(cb.speakLat);
+  /* ★ 2026-10-06 数字滚动（CountUp 的零依赖移植，见文件末尾的 countUp）。
+   *   数值一律放在 `<span class="cnt" data-v=…>` 里，而不是把数字直接写进 .num：
+   *   .num 上还挂着 ⏺ 徽标、"/ 拦 N"、单位 s 这些**不该被滚动**的邻居，
+   *   整格 textContent 一写就把它们擦了（坑 77 同款，这次提前躲开）。 */
   document.getElementById('overview').innerHTML = `
-    <div class="stat"><div class="num">${data.rooms.length}</div><div class="lbl">房间数</div></div>
-    <div class="stat"><div class="num">${totalMembers}</div><div class="lbl">参会人数</div></div>
-    <div class="stat"><div class="num">${totalProducers}</div><div class="lbl">上传媒体路数</div></div>
-    <div class="stat"><div class="num">${totalConsumers}</div><div class="lbl">转发中 Consumer</div></div>
+    <div class="stat"><div class="num"><span class="cnt" data-k="rooms" data-v="${data.rooms.length}">${data.rooms.length}</span></div><div class="lbl">房间数</div></div>
+    <div class="stat"><div class="num"><span class="cnt" data-k="members" data-v="${totalMembers}">${totalMembers}</span></div><div class="lbl">参会人数</div></div>
+    <div class="stat"><div class="num"><span class="cnt" data-k="producers" data-v="${totalProducers}">${totalProducers}</span></div><div class="lbl">上传媒体路数</div></div>
+    <div class="stat"><div class="num"><span class="cnt" data-k="consumers" data-v="${totalConsumers}">${totalConsumers}</span></div><div class="lbl">转发中 Consumer</div></div>
     <div class="stat"><div class="num">${data.worker.pid ?? '--'}</div><div class="lbl">mediasoup Worker PID</div></div>
-    <div class="stat"><div class="num" style="${data.recordingCount ? '' : 'color:#8a8070'}">⏺ ${data.recordingCount}</div><div class="lbl">服务器录制中（D+2）</div></div>
+    <div class="stat"><div class="num" style="${data.recordingCount ? '' : 'color:var(--fg-faint)'}">⏺ <span class="cnt" data-k="recording" data-v="${data.recordingCount}">${data.recordingCount}</span></div><div class="lbl">服务器录制中（D+2）</div></div>
     <div class="stat"><div class="num" style="font-size:20px">${cb.asrEngine || '--'}</div><div class="lbl">转写引擎 · ${asrTxt} <span style="${asrColor}">●</span></div></div>
-    <div class="stat"><div class="num" style="${capC.color}">${capC.txt}s</div><div class="lbl">说完→上字幕（均值 · 最慢 ${capC.max}s · ${capC.n} 句）</div></div>
-    <div class="stat"><div class="num" style="${spkC.color}">${spkC.txt}s</div><div class="lbl">看到答案→听到它开口（均值 · 最慢 ${spkC.max}s · ${spkC.n} 次）</div></div>
-    <div class="stat"><div class="num">${cb.answers || 0}<span style="font-size:14px;color:#8a8070"> / 拦 ${throttled}</span></div><div class="lbl">AI 应答次数（被闸拦下）</div></div>
-    <div class="stat"><div class="num">${Object.values(cb.roomControl || {}).reduce((a, n) => a + n, 0)}</div><div class="lbl">房间动作（AI 操作实体）</div></div>
-    <div class="stat"><div class="num" style="${boardRejected ? 'color:#e0636f' : ''}">${(cb.board && cb.board.stroke) || 0}<span style="font-size:14px;color:#8a8070"> / 拒 ${boardRejected}</span></div><div class="lbl">白板归档笔数（被拒）</div></div>`;
+    <div class="stat"><div class="num" style="${capC.color}">${capC.v === null ? '--' : `<span class="cnt" data-k="capLat" data-v="${capC.v}" data-dec="1">${capC.v.toFixed(1)}</span>`}s</div><div class="lbl">说完→上字幕（均值 · 最慢 ${capC.max}s · ${capC.n} 句）</div></div>
+    <div class="stat"><div class="num" style="${spkC.color}">${spkC.v === null ? '--' : `<span class="cnt" data-k="spkLat" data-v="${spkC.v}" data-dec="1">${spkC.v.toFixed(1)}</span>`}s</div><div class="lbl">看到答案→听到它开口（均值 · 最慢 ${spkC.max}s · ${spkC.n} 次）</div></div>
+    <div class="stat"><div class="num"><span class="cnt" data-k="answers" data-v="${cb.answers || 0}">${cb.answers || 0}</span><span style="font-size:14px;color:var(--fg-faint)"> / 拦 ${throttled}</span></div><div class="lbl">AI 应答次数（被闸拦下）</div></div>
+    <div class="stat"><div class="num"><span class="cnt" data-k="roomCtrl" data-v="${Object.values(cb.roomControl || {}).reduce((a, n) => a + n, 0)}">${Object.values(cb.roomControl || {}).reduce((a, n) => a + n, 0)}</span></div><div class="lbl">房间动作（AI 操作实体）</div></div>
+    <div class="stat"><div class="num" style="${boardRejected ? 'color:var(--warn)' : ''}"><span class="cnt" data-k="board" data-v="${(cb.board && cb.board.stroke) || 0}">${(cb.board && cb.board.stroke) || 0}</span><span style="font-size:14px;color:var(--fg-faint)"> / 拒 ${boardRejected}</span></div><div class="lbl">白板归档笔数（被拒）</div></div>`;
+  runCountUps();
 
   /* ② 房间卡 */
   const roomsEl = document.getElementById('rooms');
@@ -274,7 +382,7 @@ function render(data) {
       const scoreCls = md.score === null ? '' : md.score >= 8 ? 'score-10' : md.score >= 5 ? 'score-mid' : 'score-low';
       return `
       <tr>
-        <td>${md.kind === 'audio' ? '🎙️' : md.source === 'screen' ? '🖥️' : '🎥'} ${md.source}${md.recorded ? ' <span style="color:#e0636f">⏺</span>' : ''}</td>
+        <td>${md.kind === 'audio' ? '🎙️' : md.source === 'screen' ? '🖥️' : '🎥'} ${md.source}${md.recorded ? ' <span style="color:var(--warn)">⏺</span>' : ''}</td>
         <td>${md.owner}</td>
         <td>${md.byteCount === null ? '--' : fmtBytes(md.byteCount)}</td>
         <td>${kbpsText}</td>
@@ -298,7 +406,7 @@ function render(data) {
       </table>
       <table>
         <tr><th>媒体</th><th>归属</th><th>累计流量</th><th>码率</th><th>健康分</th><th>编码层数</th></tr>
-        ${mediaRows || '<tr><td colspan="6" style="color:#8a8070">（还没有媒体上传）</td></tr>'}
+        ${mediaRows || '<tr><td colspan="6" style="color:var(--fg-faint)">（还没有媒体上传）</td></tr>'}
       </table>
       <canvas class="spark" id="spark-${room.roomNumber}" width="800" height="64"></canvas>
       <div class="meta" style="margin-top:4px">房间总码率曲线（近 ${HISTORY_MAX} 次采样 · kbps）</div>`;
@@ -328,6 +436,16 @@ function drawSpark(id, bytesArr, now) {
   const ctx = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height;
   ctx.clearRect(0, 0, W, H);
+  /* ★ 2026-10-07 H4：canvas 不认 `var(--x)`——把 CSS 变量名直接写进 fillStyle 不会报错，
+   *   它只是**当成无效颜色退回黑色**，于是浅色档的轴标签变成黑字（勉强能看）、
+   *   深色档也悄悄用的是黑而不是那个茶灰。这种"不报错的错"只能靠读真实计算值避开。
+   *   ▸ 每次重绘都现读：面板 2s 刷一次，所以**换了主题不需要额外通知**，下一帧自然是新色。 */
+  const token = (n, dflt) => {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+    return v || dflt;
+  };
+  const C_FAINT = token('--fg-faint', '#8a8070');
+  const C_ACCENT = token('--accent', '#d8b36a');
 
   // 相邻两次采样做差 → 每个点的 kbps
   const points = [];
@@ -336,13 +454,13 @@ function drawSpark(id, bytesArr, now) {
     points.push(Math.max(0, (bytesArr[i] - bytesArr[i - 1]) * 8 / dt / 1000));
   }
   if (points.length < 2) {
-    ctx.fillStyle = '#8a8070';
+    ctx.fillStyle = C_FAINT;
     ctx.font = '12px sans-serif';
     ctx.fillText('正在积累采样点…', 12, H / 2);
     return;
   }
   const max = Math.max(...points, 1);
-  ctx.strokeStyle = '#d8b36a';
+  ctx.strokeStyle = C_ACCENT;
   ctx.lineWidth = 2;
   ctx.beginPath();
   points.forEach((p, i) => {
@@ -352,7 +470,7 @@ function drawSpark(id, bytesArr, now) {
   });
   ctx.stroke();
   // 当前值标在右上角
-  ctx.fillStyle = '#d8b36a';
+  ctx.fillStyle = C_ACCENT;
   ctx.font = '12px sans-serif';
   ctx.fillText(points[points.length - 1].toFixed(1) + ' kbps', W - 90, 16);
 }

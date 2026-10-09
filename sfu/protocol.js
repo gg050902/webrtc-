@@ -21,9 +21,19 @@ module.exports = {
   AUTH_REGISTER: 'auth-register', // C→S { username, password, displayName? } 应答 { user:{username,displayName}, token }
   AUTH_LOGIN: 'auth-login',       // C→S { username, password } 应答 { user, token }（错误统一"用户名或密码不对"）
   AUTH_VERIFY: 'auth-verify',     // C→S { username, token } 应答 { user }（localStorage 存档自动恢复登录态）
+  AUTH_REFRESH: 'auth-refresh',   // C→S { username, token } 应答 { expiresAt }｜error（前端每小时一次滑动续期）
+  /* ★ 2026-10-09 判失败时服务器**同时**撤销这条连接的身份（走 dropIdentity，与 AUTH_LOGOUT 同一个收口）。
+   *   原来只回一句错误：客户端退回游客显示，服务器的 socket.role 仍是 member/admin，
+   *   于是"我退出了却还能录像"——两边各说各话（坑 47：一个概念一个来源，含撤销这条路）。 */
+  /* ★ 2026-10-09 AUTH_LOGOUT：把"绑定身份"这条只进不出的路补上出口。
+   *   C→S { token } → 应答 { ok }。做三件事：① 作废这张票（**只作废本连接自己那张**——
+   *   传别人的 token 进来不能把它删掉，那是"踢人 DoS"）；② 把 socket 上的
+   *   username/displayName/avatar/role 清回游客；③ 广播 room-state（昵称回退"成员 xxxx"）。
+   *   ▸ 人**留在房里**：退出登录不该把人踢出会议（游客本来就可以在场，这是产品的既有语义）。 */
+  AUTH_LOGOUT: 'auth-logout',
 
   /* ── 房间（与 Mesh 版一致，沿用语义） ─────────────────────── */
-  CREATE_ROOM: 'create-room',           // C→S 可带 { password }；应答 { roomNumber }
+  CREATE_ROOM: 'create-room',           // C→S 可带 { password, roomNumber? }；应答 { roomNumber }。★ 2026-10-04h roomNumber=原号续开（6 位且未被占用才生效；号在用明确拒绝）——配合字幕账本时间线回溯（meetingStartFromLedger）：重启后原号重建，AI 从账本恢复记忆/看板
   JOIN_ROOM: 'join-room',               // C→S { roomNumber, password }；应答 { roomNumber }
   ROOM_CREATED: 'room-created',         // S→C { roomNumber }（服务器先广播，再应答）
   ROOM_NOT_FOUND: 'room-not-found',     // S→C { roomNumber }
@@ -187,7 +197,13 @@ module.exports = {
   //                    media:[{producerId,kind,source,owner,byteCount,score,layers}],
   //                    counts:{members,producers,consumers}, control:{hostId,controllerId} }] }
   // GET /dashboard  → 面板页（sfu/public/dashboard.html）
-  // GET /config.json → { iceServers }（★ 可达性：config.json 里的 STUN/TURN 下发给浏览器）
+  // GET /config.json → { iceServers, lanUrl, tsUrl?, asrEngine, aiEnabled, authTtlMs,
+  //                       assetVersions, netCheck }（★ 可达性 + 界面说实话：
+  //   ▸ 这里每一个字段都是"服务器此刻的事实"，不是配置文件的复读——
+  //     `lanUrl` 按 announcedIp + HTTPS 是否真的开着拼（关着时不许硬写 https://），
+  //     `tsUrl` 只在真探测到组网地址时出现（面板上那颗按钮跟着它双向显隐），
+  //     `netCheck` = sfu/nets.js 的 diagnose() 结果（含「媒体端口」「通告地址」两项），
+  //     `assetVersions` 给页面比对"我加载到的是不是这一版"（坑 40 的收官）。）
 
   /* ── ★ 09-17e 值守归档（C3-N1 过夜值守 ≥7h，前端第 30 步）──
    * ▎字幕账本的"服务器权威副本"：浏览器内存只留最近 500 条（环形），溢出旧段攒批走这里落盘。
@@ -195,6 +211,40 @@ module.exports = {
    *     → append 到 sfu/captions/cap-<房间号>-<UTC日期>.jsonl（每行一条 JSON；房间号 6 位白名单）
    *   GET  /api/captions?room=130525&format=txt|json → 全档回读（跨文件按 ts 排序）
    *     （txt 给前端「⬇ 记录」合并导出；json 给将来 G2 的 LLM 纪要吃） */
+
+  /* ── ★ 2026-10-09 真人语音金标准的 HTTP（`/golden` 录制页 ↔ `bench:asr-golden`）──
+   * ▎这是**开发者的量具**，不是会议功能：它把"我念的一句话 + 那句话的标准答案"存成
+   *   16k/单声道/16bit WAV + jsonl 账本，让准确率第一次有可比输入（此前只有合成语音，
+   *   而合成语音与真人数据在本项目已经两次给出相反答案）。
+   * ▎门禁 = requireAdmin（甲类·工具）。它与房间无关（没有 6 位房号可交给
+   *   requireRoomAccess），而且"往服务器写录音"本就该比"读一份纪要"更严。
+   * ▎落盘：`sfu/voice-golden/manifest.jsonl`（append-only，读侧按 id 取最后一次）+
+   *   `sfu/voice-golden/wav/<id>.wav`；整目录已进 .gitignore（那是本人语音与句子原文）。
+   *   GET  /api/golden → { sentences[], distances[], items[], ffmpeg, gateDb, limits }
+   *     （句子清单**只有 sfu/golden.js 一份**：前端抄一份、跑表抄一份就会不可比）
+   *   POST /api/golden  body=裸音频字节（webm/opus 或 wav 都吃，ffmpeg 判容器）
+   *     头：X-Golden-Id（^[a-z0-9][a-z0-9_-]{0,31}$，白名单形状防穿越）
+   *         X-Golden-Dist（near|far）、X-Golden-Text（encodeURIComponent 后的期望文本）
+   *     → { ok, id, wav, peakDb, secs, ms, warn }；peakDb 出自 Asr.measureWavLevel——
+   *       与生产能量闸同一个函数，所以"这句在会议里会不会被当静音删"录当场就知道。
+   *   静态短地址：GET /golden → golden.html（页面本身不设门禁，与 /dashboard 同理；
+   *       它调的两个接口才要 token）。 */
+
+  /* ── ★ 2026-10-08 第 51 步：共享文件的 HTTP（字节不进信令）──
+   * ▎为什么用 HTTP 不用 socket.io：上传要走**进度条**（fetch 给不了 upload 进度，
+   *   前端因此用 XMLHttpRequest），而下载要给 `<iframe>`/`<img>` 直接用、还要能流式与大文件。
+   *   信令只留"清单变了 / 谁在看哪一页"这类小消息——**大块字节走它自己的路**（同 D+2 录制）。
+   * ▎落盘布局：`sfu/files/<房间号>/index.json`（台账：名字/大小/时间/上传者）+
+   *   `blob/<唯一文件名>`。台账与磁盘**对账**：读台账时磁盘上不存在的条目不列出来
+   *   （"清单里有一份但点开 404"是最难查的那种坏）。房间销毁 → 整目录删除；
+   *   进程重启先 `sweepStaleParts()` 清掉上次崩溃留下的 `.part`。
+   *   POST /api/files?room=<6位>        body=裸字节；头 X-File-Name(百分号编码)/X-Uploader-Name
+   *     → { file:{name,size,ts,by,byName} }；四道闸：房间令牌 → 房间还在(409) → 限流 30 次/分
+   *       → 单文件/每房间/数量三档配额（**超了当场 abort 请求，不收下来再拒**）
+   *   GET  /api/files?room=<6位> → { files, view, roomExists, limits }（view=现在谁在带大家看哪一页）
+   *   GET  /files/<房间号>/<文件名>[?roomToken=] → 下载/内联预览
+   *     ▸ 门禁在**格式校验之前**（没权限的人拿不到"房间号格式不对"这种探测反馈）；
+   *       文件名两次钳路径（不许 ../ ），不认识的扩展名一律 attachment + nosniff。 */
 
   /* ── ★ 09-13 数据通道上的消息分家（应用层，非信令）──
    *   { type:'chat', msgId, text } 聊天（第 11 步）
@@ -247,7 +297,20 @@ module.exports = {
    *   sfu/config.json（可选）统一管：port/maxMembers/listenIp/announcedIp/rtcMin~MaxPort/
    *   iceServers（STUN/TURN，经 /config.json 下发到两条 Transport 的底层 PC）/
    *   https:{enabled,port,cert,key,autoSelfSigned}（自动起 HTTPS+wss，证书缺失时
-   *   用 openssl 现场自签）。部署步骤见 README「跨网络部署」。 */
+   *   用 openssl 现场自签）。部署步骤见 README「跨网络部署」。
+   * ★ 2026-10-06~09 这一组里加了三个"配一次就长期对"的键：
+   *   ▸ `announcedIp:"auto"` —— 每次开机自己挑网卡地址（挑法在 sfu/nets.js，避开
+   *     VirtualBox/WSL 那种"本机通、别人路由不到"的假局域网口）；换 WiFi 不必再跑 start:lan。
+   *   ▸ `rtcServerPort`（env `MEDIASOUP_RTC_SERVER_PORT`）—— ★ 跨网的关键一刀：
+   *     mediasoup 的 **WebRtcServer** 把**所有** Transport 的 RTP 汇到这一个端口，
+   *     并在**同一端口再开一份 TCP** ⇒ 防火墙/路由器只需转发**一条** UDP+TCP；
+   *     封 UDP 的网络（公司 VPN/酒店）由 TCP 候选兜住。没配时退回 rtcMin~MaxPort 的随机段（旧行为）。
+   *     ▸ 配了它又是多网卡通告时，服务器**按每张网卡 IP 各绑一个**（wildcard 与具体 IP
+   *       在同一端口上会冲突，EADDRINUSE 会静默退化成"只有 UDP"——见坑 133）。
+   *   ▸ `announceExtra`（env `MEDIASOUP_ANNOUNCE_EXTRA`，另有明示注入 `ANNOUNCE_EXTRA_IPS`）——
+   *     一条 Transport **同时**通告局域网地址与组网地址（默认 "tailscale"），
+   *     于是"让外面进来"和"同 WiFi 的同事连不上"不再是同一个旋钮的两端。
+   *     ▸ 观测：`/metrics` 的 `sfu_rtc_server_port` / `sfu_rtc_server_instances`。 */
 
   /* ══ ★ 09-24 AI 会议助理（第四类：AI 信令 + 统一 Provider 契约）══
    * ▎AI_JOIN / AI_LEAVE：任何成员都能邀请/送走 AI 助理（教学版权限从宽，G6 分级可收紧）；
@@ -272,19 +335,28 @@ module.exports = {
   AI_STREAM: 'ai-stream', // S→C { id, delta, done, mock? }（流式增量；done=true 为收尾帧）
   AI_MINUTES: 'ai-minutes', // C→S { type:'segment'|'final', since? } 应答 { file, path, mock }
   AI_OP: 'ai-op',         // C→S { goal } 应答 { started, goal }（后续走既有远程协助五信令）
+  //   ▸ ★ 2026-10-08：谁该发这条，判据从"句首动词"换成了"提到哪台机器 × 要做什么动作"。
+  //     旧判据 `/^(操作|打开|点击|帮我操作|远程)/` 会把「@ai 打开白板」「@ai 打开共享文件面板」
+  //     这类**房间级指令**在客户端就改道到这里，于是服务器的 ROOM_ACTION_RULES 根本没机会跑
+  //     ——界面没动、AI 却回一句听起来很合理的话（用户那句"操控实体不行"的成因之一，见 AGENTS 坑 127）。
+  //     房间级开关一律走 room-control（tools-first，排在 LLM 之前），这条只留给操作**另一台电脑**。
 
   /* ══ ★ 2026-10-03 补齐：语音链路**下行**广播（原来总表只写了 C→S 请求，把"服务器主动推"漏了）══
    * ▎为什么值得单独列：这几条是整条语音闭环的出口，而它们**没有 ack、没有兜底重发**——
    *   漏写一条，后来人只会照着请求侧改，客户端监听挂错/挂漏都不会报错（静默失效）。
    * ▎共同口径：**广播 = 尽力而为**（丢了不补，因为下一条很快就来）；
    *   需要"绝不能丢"的状态（授权、房间快照）才走 room-state / 带 ack 的请求-应答。 */
-  ASR_CAPTION: 'asr-caption', // S→C 广播 { name, text, interim?, latMs?, stage? }
+  ASR_CAPTION: 'asr-caption', // S→C 广播 { name, text, interim?, latMs?, stage?, fin?, wake? }
   //   interim=true  → 一句话**累积中的半句**：只刷字幕条，不进历史、不触发唤醒；
   //   无 interim    → 定稿：进字幕账本 + 参与 AI 唤醒/追问判定。
   //   ★ latMs（2026-10-03 新增）= 服务器实测「这个人说完 → 这句定稿广播出去」的毫秒数。
   //     起点是最后一个判定为有声的 RMS 窗（窗长 0.5s，所以这个数是**下限**，不虚报更快）；
   //     0 / 缺失 = 服务器认为这一句的起点不可靠（例如陈旧时间戳），前端**保持上一次读数**，
   //     绝不自己编一个 —— 会瞎填的读数比没有读数更糟。
+  //   ★ fin（2026-10-05 新增）= 这一句**为什么**定稿：silence / max-open / max-age / gap / flush。
+  //     只有 silence 是"RMS 证明人已经停了"，其余四种都发生在人还在说的时候——
+  //     所以 latMs=0 配 fin=max-age 是**可解释的 0**（引擎太慢被时长闸切断），
+  //     而 latMs=0 且没有 fin 才是无头故障。自测与日报据此把"降级"与"丢失"分开。
   //   ★ stage = { wait, trans }（末段口径的拆分）：
   //     wait = 说完 → 这次转写**开始**（静音判定 + 调度），trans = 模型耗时。
   //     ▸ 为什么要拆：只有一个总数时"4s"可能是模型慢、也可能是我们在等，
@@ -298,6 +370,7 @@ module.exports = {
   AI_TTS_STATE: 'ai-tts-state', // S→C 广播 { enabled, engine }（能力开关会漂：端点可达性随网络出口变化，翻转必须重新下发）
   BOARD_STATE: 'board-state', // S→单个成员 { strokes:[...] }（晚到的人/刷新后补画白板账本；实时仍走 SCTP 'board' 频道）
   BOARD_RECORD: 'board-record', // C→S { op:'end'|'undo'|'clear', stroke? }（只上报"整笔"，实时通道不留给持久化——见 client 注释）
+  BOARD_SIGNAL: 'board-signal', // ★ 2026-10-04f C→S→C 白板笔迹的**信令兜底** { payload:{type:'board',msgId,op,...} }：SCTP 对晚到者/消费竞态时灵时不灵（真浏览器 e2e 实测），与聊天 D+1 同款"双发 + msgId 去重"；服务器只中继不落账（账本仍归 BOARD_RECORD）
   REMOTE_QUALITY: 'remote-quality', // 控制端→S→被控端 { fps }：闭环自适应的建议值（被控端只调本地限流间隔，下一帧生效，不重启抓屏）
 
   /* ★ 2026-10-03 第 38 步：客户端自报的**播报延迟**（唯一一条"客户端 → 服务器"的观测上报）。
@@ -354,6 +427,41 @@ module.exports = {
   //     { kind:'window', state }  最大化 / 还原 / 最小化 / 全屏（Browser.setWindowBounds）
   //     { kind:'quality', preset } ★ 09-30 画质档：'smooth'|'standard'|'hd' → agent 运行时换
   //       screencast 的 quality/fps/尺寸（老通道新语义，服务器仍不解析、原样透传 + 门禁）
+
+  /* ══ ★ 2026-10-08 第 51 步：共享文件浏览（全房间同时看同一份文档）══
+   * ▎用户要的是"房间里所有人**同时看到**共享文件并操作"，支持 PDF/Word/.md/PPT/Excel/图片。
+   *   零依赖那条红线在这里最难：Word/Excel/PPT 是 **OOXML = 一个 ZIP 包里的几份 XML**，
+   *   而浏览器自带 `DecompressionStream('deflate-raw')` —— 于是"不装任何库读 Office"成立
+   *   （实现：sfu/public/fileview.js，纯函数、Node 里能单测；旧版 .doc/.xls/.ppt 没有可解析的
+   *   公开结构，**如实报"请下载后查看"，不吹**）。
+   * ▎同步模型（这一段是这一步的设计核心）：
+   *   · **服务器持有一份权威状态** `room.fileView`——不是"谁发我转给谁"，而是"房间现在在看什么"；
+   *   · **只在变化时广播**，且滚动这种**连续量节流**（FILE_VIEW_MIN_MS），
+   *     换文件/翻页这类**离散事件绕过节流**（否则最该立刻同步的动作被限流吃掉）；
+   *   · 位置传**比例 0~1** 而不是像素：每人窗口高度不同，像素版本一到别人屏幕上就错位；
+   *   · 新人进房靠 `files-state` **单播补发**清单 + 当前视角（不补发 = 晚来的人永远看不见，
+   *     这正是白板当年踩过的那一脚）；
+   *   · 客户端有 `applyingRemote` **断环闸**：照别人状态做的那一小段时间不再往外广播，
+   *     否则两个跟随者会互相拽着滚（回声 = 无限循环）。
+   * ▎安全（上传的是**别人给的字节**，两道缺一不可）：
+   *   ① 渲染层：先转义再拼接、链接协议白名单（javascript:/data: 降级成文字）、
+   *      属性上下文补转引号；② 服务器：非白名单类型一律 `Content-Disposition: attachment`
+   *      + `application/octet-stream` + `nosniff`（**SVG/HTML 有意不在放行表里**）。
+   *      只有前端转义，遇到"在新标签里直接打开下载链接"就漏了。
+   *   取字节与列清单都要**房间令牌**（同字幕归档那套 requireRoomAccess）。 */
+  FILES_LIST: 'files-list',       // C→S 请求应答 {} → { files:[{name,size,ts,by,byName}], limits, view }（进面板时拉一次 + 手动刷新）
+  FILES_STATE: 'files-state',     // S→C **单播给进房的人** { files, view, limits }（空房也发：把"没有文件"当成一个事实，而不是让前端去猜沉默）
+  FILES_UPDATED: 'files-updated', // S→C 广播 { files, view, limits }（上传/删除之后清单变了才发）
+  FILES_DELETE: 'files-delete',   // C→S { name } → { ok, error }；权限=房主/admin/**上传者本人**；删的正是当前在看的那份时顺带清 fileView
+  FILES_VIEW: 'files-view',       // C→S { name|null, page, scroll, zoom }（**无 ack 的观测型上报**：我在看什么）
+  //   ▸ 服务器 sanitize 后写 room.fileView 并按上面那条规则广播 FILES_VIEW_STATE；
+  //     限流 200 次/10s 每人（滚动很密，这条线是防"手滑一直滚"而不是防攻击）。
+  //   ▸ ★ 客户端有一条**发送侧守卫**（client.js 的 emitFileView）：`filesFollow === false` 时不上报。
+  //       解耦必须是双向的——"关掉跟随"如果只挡"别人→我"，那么我自由浏览时的每一次翻页
+  //       都在把全房拽过来（真机实测过，见 check:files 的 S 组）。主讲权只交给
+  //       **此刻在同步环里、并且真的动了手**的那个人。
+  FILES_VIEW_STATE: 'files-view-state', // S→C 广播 { view:{name,page,scroll,zoom,byId,byName,ts}, ts }
+  //   ▸ 带着 byId：客户端据此判"这条是我自己发的"（不回环），也据此在界面上写明**谁**在带大家看。
 
   /* ══ ★ 09-30 借鉴 billd-desk：远程控制「设备码」配对（脱离"必须先开会建房"）══
    * ▎痛点：原来想远程控自己电脑，得先在浏览器 create-room、把房号抄给 agent、再进房点控制。

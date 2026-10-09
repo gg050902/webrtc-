@@ -292,23 +292,29 @@ const VIDEO_STATS = `JSON.stringify((() => {
     if (!fn) return JSON.stringify({ fnMissing: true, before });
     fn(2400, { wait: 1200, trans: 1200 });
     const cs = getComputedStyle(el);
-    const after = { text: el.textContent, cls: el.className, display: cs.display,
-      color: cs.color, title: String(el.title || '').replace(/\\n/g, ' · ').slice(0, 150) };
+    /* ★ 2026-10-03 形状变了：图标留在 index.html，JS 只往子节点 #capLatNum 写数字。
+       所以这里断言的是"数字落在子节点里 + 图标一个都没被抹掉"——
+       旧写法（整写 textContent）在真浏览器里会把图标一起清掉，正是这次要修的毛病。 */
+    const num = document.getElementById('capLatNum');
+    const after = { text: num ? num.textContent : el.textContent, cls: el.className, display: cs.display,
+      color: cs.color, svg: el.querySelectorAll('svg.i').length,
+      title: String(el.title || '').replace(/\\n/g, ' · ').slice(0, 150) };
     fn(0);                       // 脏值：应保持上一次的读数
-    return JSON.stringify({ before, after, kept: el.textContent });
+    return JSON.stringify({ before, after, kept: num ? num.textContent : el.textContent });
   })()`));
   chk(!capLatUi.noEl, `页面里存在 #capLat 元素（index.html 新增那一行真的被托管出来了）`);
   chk(!capLatUi.fnMissing, `client.js 的 renderCapLatency 在全局可见（经典脚本；不存在=接线断了）`);
   chk(capLatUi.before && capLatUi.before.display === 'none',
     `初始 hidden 真的生效（display=${capLatUi.before && capLatUi.before.display}；坑 24"关不掉"的哨兵）`);
   chk(capLatUi.after && capLatUi.after.display !== 'none'
-    && capLatUi.after.text === '⏱ 2.4s' && /cap-lat ok/.test(capLatUi.after.cls),
-    `调用后读数现身：「${capLatUi.after && capLatUi.after.text}」 class=「${capLatUi.after && capLatUi.after.cls}」 display=${capLatUi.after && capLatUi.after.display}`);
+    && capLatUi.after.text === '2.4s' && /cap-lat ok/.test(capLatUi.after.cls)
+    && capLatUi.after.svg === 1,
+    `调用后读数现身：「${capLatUi.after && capLatUi.after.text}」 class=「${capLatUi.after && capLatUi.after.cls}」 图标=${capLatUi.after && capLatUi.after.svg} 枚 display=${capLatUi.after && capLatUi.after.display}`);
   chk(capLatUi.after && /^rgb\(/.test(capLatUi.after.color || ''),
     `三色样式真的应用上了（color=${capLatUi.after && capLatUi.after.color}；CSS 变量被吞时这里是初值）`);
   chk(capLatUi.after && /等待 1\.2s/.test(capLatUi.after.title) && /转写 1\.2s/.test(capLatUi.after.title),
     `悬浮提示摊开拆分：${capLatUi.after && capLatUi.after.title}`);
-  chk(capLatUi.kept === '⏱ 2.4s', `脏值 latMs=0 不覆盖读数（保持「${capLatUi.kept}」，不编数）`);
+  chk(capLatUi.kept === '2.4s', `脏值 latMs=0 不覆盖读数（保持「${capLatUi.kept}」，不编数）`);
 
   /* ★ 2026-10-03 第 38 步：AI 气泡上的"🔊 X.Xs 后开口"同样要在真浏览器里验一次
    *   （理由与上面那条一样：假 DOM 看不见 CSS）。这里手工登记一个锚点再调
@@ -327,13 +333,15 @@ const VIDEO_STATS = `JSON.stringify((() => {
     const chip = bubble.querySelector('.msg-voice-lat');
     return JSON.stringify({
       text: chip ? chip.textContent : '(无)',
+      svg: chip ? chip.querySelectorAll('svg.i').length : 0,
       color: chip ? getComputedStyle(chip).color : '',
       radius: chip ? getComputedStyle(chip).borderRadius : '',
       stillThere: voiceAnswerAt.has(TS),
       lastChildIsTime: bubble.lastChild === time,
     });
   })()`));
-  chk(/🔊 2\.3s 后开口/.test(vlat.text), `读数贴在气泡上：「${vlat.text}」`);
+  chk(/^2\.3s 后开口$/.test(vlat.text) && vlat.svg === 1,
+    `读数贴在气泡上：图标 +「${vlat.text}」`);
   chk(/^rgb\(/.test(vlat.color) && vlat.radius !== '0px',
     `.msg-voice-lat 的样式真的生效（color=${vlat.color} radius=${vlat.radius}）`);
   chk(vlat.stillThere === false && vlat.lastChildIsTime === true,

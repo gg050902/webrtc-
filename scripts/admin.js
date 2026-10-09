@@ -39,7 +39,21 @@ const store = require('../sfu/store');
  *   早先这里"照抄"了一份 hashPassword，那是最危险的一类重复：两边参数一旦漂移，
  *   CLI 建出来的账号在网页上永远登不上，而报错只说"用户名或密码不对"。
  *   现在结构上就不可能不一致了（见 sfu/password.js 文件头）。 */
-const { newSalt, hashPassword, randomPassword } = require('../sfu/password');
+const { newSalt, hashPassword, randomPassword, strengthError } = require('../sfu/password');
+
+/* ★ 2026-10-09 密码规则只留一份：判据住在 sfu/password.js 的 strengthError()，
+ *   网页注册（sfu/server.js 的 passwordStrengthError）与本 CLI 的 adduser/passwd 都调它。
+ * ▎为什么这是一条真缺陷而不只是整洁问题：原来这两处各写一份——
+ *   网页要求"≥8 位且至少两类字符"，而 CLI 只查"≥6 位"，**并且那句报错写着
+ *   "与网页注册的规则一致"**。于是"用 admin:passwd 重置一次密码"可以把一个
+ *   达标的口令换成网页根本注册不出来的弱口令，而终端提示让人以为两边一致。
+ *   同一个概念两处实现一定漂（AGENTS 坑 47），这次漂在安全规则上。
+ * ▎下限读同一个 env，测试/部署改一处两边同时生效；随机生成的 16 位口令天然满足，
+ *   所以"忘了密码、懒得想"这条主路径不受影响。 */
+function checkPw(pw) {
+  const err = strengthError(pw, { minLen: Math.max(6, Number(process.env.AUTH_PASSWORD_MINLEN) || 8) });
+  return err ? `❌ ${err}（与网页注册同一份判据：sfu/password.js）` : null;
+}
 
 const [, , cmd, ...rest] = process.argv;
 
@@ -118,10 +132,8 @@ function doAddUser() {
   }
   const usedGenerated = !password;
   const pw = password || randomPassword();
-  if (String(pw).length < 6) {
-    console.error('❌ 密码至少 6 位（与网页注册的规则一致）');
-    return 1;
-  }
+  const strengthErr = checkPw(pw);
+  if (strengthErr) { console.error(strengthErr); return 1; }
   const salt = newSalt();
   const created = store.createUser({
     username,
@@ -155,10 +167,8 @@ function doPasswd() {
   }
   const usedGenerated = !password;
   const pw = password || randomPassword();
-  if (String(pw).length < 6) {
-    console.error('❌ 密码至少 6 位（与网页注册的规则一致）');
-    return 1;
-  }
+  const strengthErr = checkPw(pw);
+  if (strengthErr) { console.error(strengthErr); return 1; }
   const salt = newSalt();
   store.setPassword(username, salt, hashPassword(pw, salt));
   store.appendAudit('admin-passwd', 'cli', { target: username });

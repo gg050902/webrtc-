@@ -31,6 +31,12 @@ const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
+/* ★ 2026-10-06 "本机该对外说哪个 IP"与服务器共用同一份实现（sfu/nets.js，零依赖的项目文件，
+ *   不违反本脚本"不 require node_modules"的约定）。
+ *   ▎为什么：这件事原先 doctor 与 server 各写一份遍历+排序。两份判据一旦漂，
+ *     就会出现"doctor 说没问题、服务器实际用了另一个网卡"——而这两个地址都看起来能用，
+ *     排查的人会先怀疑网络。同一个概念两个来源 = 迟早各说各话（坑 47）。 */
+const Nets = require('../sfu/nets.js');
 
 const JSON_MODE = process.argv.includes('--json');
 
@@ -220,11 +226,13 @@ function localIPv4s() {
   return out;
 }
 
-/** 从候选里挑一个"最像局域网地址"的（192.168 / 10. / 172.16-31） */
+/** 从候选里挑一个"最可能真的能跨机"的：判据在 sfu/nets.js（与服务器同一份，坑 47）。
+ *   旧写法只看"是不是 192.168/10/172.16-31"，于是 VirtualBox 的 192.168.56.1 会排在前面
+ *   ——doctor 报"配置正确"，服务器却通告了一个别人根本路由不到的地址。 */
 function pickLanIp(list) {
-  const usable = list.filter((c) => !c.linkLocal);
-  const prefer = usable.filter((c) => /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(c.address));
-  return prefer[0] || usable[0] || null;
+  const p = Nets.pickPrimaryIp(list.filter((c) => !c.linkLocal).map((c) => ({ ip: c.address, name: c.name })));
+  if (!p) return null;
+  return list.find((c) => c.address === p.ip && c.name === p.name) || null;
 }
 
 /** openssl 是否可用：先看 PATH，再看 Git for Windows 自带的目录 */
@@ -310,6 +318,17 @@ function loadConfig() {
   }
 }
 
+/* ★ A7d 的"给别人留多少显存"：这台 8GB 卡上除了 Qwen worker 还住着
+ *   whisper 常驻兜底（small ≈1.2GB，主引擎就绪后会 release，但开机窗口是两个都在的）
+ *   与浏览器视频解码/投屏。取 1500 MiB 是**按这套共存关系算出来的**，不是拍的：
+ *   宁可把预算算保守一点（少开一个 worker 只是少几个人并发），也不能让引擎悄悄掉回 CPU
+ *   ——后者会让整场会议的字幕慢一个量级而零报错（坑 67/76 那一族）。
+ *   不同机器共存关系不同，所以可用 ASR_VRAM_HEADROOM_MIB 覆写（0 是合法值 = "不留余量"，
+ *   所以判"有没有传"而不是判真假——坑 54）。 */
+const HEADROOM_RAW = process.env.ASR_VRAM_HEADROOM_MIB;
+const VRAM_HEADROOM_MIB = (HEADROOM_RAW === undefined || HEADROOM_RAW === ''
+  || !Number.isFinite(Number(HEADROOM_RAW))) ? 1500 : Math.max(0, Number(HEADROOM_RAW));
+
 const FIREWALL_HINT = [
   '以管理员身份执行（或直接跑 npm run start:lan 自动放行）：',
   'netsh advfirewall firewall add rule name="meeting-web-tcp" dir=in action=allow protocol=TCP localport=3001,3443',
@@ -330,6 +349,13 @@ const FIREWALL_HINT = [
   const listenIp = typeof cfg.listenIp === 'string' && cfg.listenIp.trim() ? cfg.listenIp.trim() : '0.0.0.0';
   const nics = localIPv4s();
   const lanIp = pickLanIp(nics);
+  /* ★ 2026-10-09（K3）：入口地址要用**解析后的真地址**说。
+   *   ▎announcedIp 从 10-06 起允许写 "auto"（= 每次开机自己探测，"配一次就长期对"的那个写法），
+   *     而 D3 直接把配置里的字串拼进 URL，于是体检报告打出 `https://auto:3443/` ——
+   *     一个谁也打不开的主机名。用户照它去试，会以为是自己配坏了（坑 82：界面/工具在无声地撒谎）。
+   *   ▸ 判据：auto/空 → 用本次探测到的网卡地址；明示地址 → 原样。 */
+  const wantsAuto = !announcedIp || /^(auto|detect|true|本机|自动)$/i.test(announcedIp);
+  const entryHost = wantsAuto ? (lanIp ? lanIp.address : '') : announcedIp;
 
   /* ════════ A. 环境 ════════ */
 
@@ -473,6 +499,109 @@ const FIREWALL_HINT = [
     add('A', 'A7-asr-worker', 'skip', 'whisper 未安装，跳过常驻 worker 检查', { priority: 5 });
   }
 
+  // A7b 本地 Qwen 引擎的算力档位（★ 2026-10-03d：GPU 加速要用 CUDA 版 torch——
+  //   CPU 版 torch 遇到 NVIDIA 显卡也只会用 CPU，转写 2.2s/段；GPU 上 bf16 实测快一个量级。
+  //   这条检查只读 torch.cuda.is_available()，不装不卸任何东西）
+  {
+    const { execFile } = require('child_process');
+    const torchInfo = await new Promise((resolve) => {
+      execFile('python', ['-c', 'import torch;print(torch.__version__, torch.cuda.is_available())'],
+        { timeout: 30000, windowsHide: true }, (err, out) => {
+          if (err) return resolve(null);
+          const [ver, hasCuda] = String(out).trim().split(/\s+/);
+          resolve({ ver, hasCuda: hasCuda === 'True' });
+        });
+    });
+    if (!torchInfo) {
+      add('A', 'A7b-torch', 'warn', 'python 里没有 torch → 本地 Qwen ASR/TTS 引擎起不来（字幕走 whisper 兜底、音色走 Edge/浏览器）',
+        { advice: 'pip install torch --index-url https://mirrors.aliyun.com/pytorch-wheels/cu130/ （有 NVIDIA 显卡装 cu 版，无卡装 CPU 版）', priority: 22 });
+    } else if (torchInfo.hasCuda) {
+      add('A', 'A7b-torch', 'ok', `torch ${torchInfo.ver} 支持 CUDA → 本地 Qwen 引擎将用 GPU 加速（转写/合成快一个量级）`,
+        { detail: 'worker 启动日志会打 🔥 ...（GPU 加速...）；想强制 CPU 设 QWEN_ASR_DEVICE=cpu / QWEN_TTS_DEVICE=cpu', priority: 55 });
+    } else if (/^\d+\.\d+\.\d+$/.test(torchInfo.ver)) {
+      add('A', 'A7b-torch', 'warn', `torch ${torchInfo.ver} 是 CPU 版 → 本地 Qwen 引擎只能用 CPU（转写约 2.2s/段，TTS 合成 44s/句）`,
+        { detail: '本机若有 NVIDIA 显卡（nvidia-smi 能看到），换 CUDA 版 torch 可快一个量级',
+          advice: 'pip install torch==<版本>+cu130 --index-url https://mirrors.aliyun.com/pytorch-wheels/cu130/ --no-deps --user', priority: 25 });
+    } else {
+      add('A', 'A7b-torch', 'ok', `torch ${torchInfo.ver} 已支持 CUDA`, { priority: 55 });
+    }
+  }
+
+  // A7c AI 听觉/录制管线端口段体检（★ 2026-10-04g 同源：这两段绝不能落在 Windows
+  //   动态端口区 49152-65535 里，否则出站连接随机抢走端口 → ffmpeg bind 失败秒崩
+  //   ×5 → "对话一段时间字幕就断了"。这里逐个探 4 个端口：被占 = warn 并给排查方向）
+  {
+    const base = Number(process.env.ASR_PIPE_PORT_BASE)
+      || Number((loadConfig().cfg || {}).asrPipePortBase) || 26000;
+    const segments = [
+      { name: 'AI 听觉管线', ports: [base, base + 2, base + 4, base + 6] },
+      { name: '录制管线', ports: [27000, 27002, 27004, 27006] },
+    ];
+    for (const seg of segments) {
+      const busy = [];
+      await Promise.all(seg.ports.map((port) => new Promise((resolve) => {
+        const s = require('net').connect({ host: '127.0.0.1', port, timeout: 400 }, () => { s.destroy(); busy.push(port); resolve(); });
+        s.on('error', () => resolve());
+        s.on('timeout', () => { s.destroy(); resolve(); });
+      })));
+      if (!busy.length) {
+        add('A', 'A7c-pipeports', 'ok', `${seg.name}端口段 ${seg.ports[0]} 起空闲（bind 不会被出站连接抢占）`, { priority: 50 });
+      } else {
+        add('A', 'A7c-pipeports', 'warn', `${seg.name}端口段被占：${busy.join('/')} → 相关的 ffmpeg 起不来（AI 耳朵/录制的秒崩大概率是它）`,
+          { detail: '这些端口必须落在系统动态端口区之外；被占的可能：另一个实例在跑 / 其它软件',
+            advice: `关掉占用者，或换端口段：环境变量 ASR_PIPE_PORT_BASE=${base + 1000}（录制段同理）`, priority: 30 });
+      }
+    }
+  }
+
+  // A7d 本地 Qwen worker 池的**显存预算**（★ 2026-10-07 H1：多开 worker 是多人会议的容量刀，
+  //   但一个常驻 ≈1.9GB——这台 8GB 卡上还跑着浏览器解码与 whisper 兜底。
+  //   显存吃紧的下场不是报错，是**引擎静默回落 CPU**（10-04e 被这一条坑过一整轮假红），
+  //   所以"配了几个"必须在开机前就有人核对一遍，而不是等字幕变慢再猜。）
+  {
+    const Q = require(path.join(SFU_DIR, 'ai', 'asr_qwen_local.js'));
+    // 取值判据走 worker 池那**同一个函数**（服务器也是它）——两处各写一份优先级，
+    // 就会报出"体检说配了 2 个、服务器实际起了 1 个"这种没人会怀疑的矛盾（坑 47）。
+    const workers = Q.resolveWorkers(process.env.ASR_QWEN_WORKERS, loadConfig().cfg.asrQwenWorkers);
+    const need = workers * Q.VRAM_PER_WORKER_MIB;
+    let gpu = null;
+    try {
+      const out = execFileSync('nvidia-smi',
+        ['--query-gpu=memory.total,memory.used', '--format=csv,noheader,nounits'],
+        { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] });
+      const [total, used] = String(out).split('\n')[0].split(',').map((s) => Number(s.trim()));
+      if (Number.isFinite(total)) gpu = { total, used: Number.isFinite(used) ? used : 0 };
+    } catch (e) { /* 没有 NVIDIA 卡 / nvidia-smi 不在 PATH */ }
+
+    if (!gpu) {
+      if (workers > 1) {
+        add('A', 'A7d-vram', 'warn', `配了 ${workers} 个 Qwen worker，但本机读不到 nvidia-smi（无 NVIDIA 卡？）`,
+          { detail: 'CPU 上多开 worker 抢的是核数而不是显存，转写本身约 2.2s/段，扩容收益有限',
+            advice: '无卡机器建议保持 ASR_QWEN_WORKERS=1，多人会议用云端引擎（config.asrEngine="qwen" + DASHSCOPE_API_KEY）',
+            priority: 24 });
+      } else {
+        add('A', 'A7d-vram', 'skip', '本机读不到 nvidia-smi，跳过 worker 显存预算体检（CPU 引擎不受这条约束）',
+          { priority: 4 });
+      }
+    } else if (need > gpu.total - VRAM_HEADROOM_MIB) {
+      add('A', 'A7d-vram', 'warn',
+        `${workers} 个 Qwen worker 要 ${need} MiB，而显卡只有 ${gpu.total} MiB（当前已用 ${gpu.used}）——超预算`,
+        { detail: `判据：一个 worker 常驻 ≈${Q.VRAM_PER_WORKER_MIB} MiB，还要给浏览器解码与 whisper 兜底留出 `
+            + `${VRAM_HEADROOM_MIB} MiB。显存不够时 torch 不会报错，只会**悄悄把推理退回 CPU**——`
+            + '于是"扩容"换来的是更慢，而且没有任何一行日志说明原因（10-04e 实测）。',
+          advice: `改小档：npm run start:sfu 之前设 ASR_QWEN_WORKERS=${Math.max(1, Math.floor((gpu.total - VRAM_HEADROOM_MIB) / Q.VRAM_PER_WORKER_MIB))}`
+            + `（或写进 sfu/config.json 的 asrQwenWorkers）；确实要更多人同时开麦，换云端引擎或更大显存的机器`,
+        priority: 26 });
+    } else {
+      add('A', 'A7d-vram', 'ok',
+        `Qwen worker ${workers} 个 ≈ ${need} MiB，显卡 ${gpu.total} MiB（当前已用 ${gpu.used}），余量充足`,
+        { detail: workers === 1
+          ? '单 worker 的容量线：bench:asr-multi 实测 8 路并发时连基线都 p95≈2.8s；多人会议可设 ASR_QWEN_WORKERS=2 近似翻倍'
+          : '按成员稳定分片：同一个人的段回同一个槽（顺序不会乱），别人占别的槽',
+          priority: 52 });
+    }
+  }
+
   // A8 服务端神经语音（★ 09-30c：AI 语音去"AI 味"——Edge TTS 端点可达性随网络出口而定）
   {
     const Tts = require('../sfu/ai/tts.js');
@@ -535,33 +664,67 @@ const FIREWALL_HINT = [
       { detail: `字段：${Object.keys(cfg).join(', ')}`, priority: 88 });
   }
 
+  /* ════════ B1b 媒体端口形态（K1 跨网）════════
+   * ▎为什么要体检这一项：跨网要转发的东西**取决于端口形态**——
+   *   随机端口段要转一整段（家用路由器多半做不到），固定端口只需一条 UDP+TCP。
+   *   而这件事原先只有读代码的人知道，交付前自查清单上它是空白的。 */
+  {
+    const rtcPort = Number(cfg.rtcServerPort) || 0;
+    if (rtcPort > 0) {
+      add('B', 'B1b-media-port', 'ok',
+        `媒体走固定端口 UDP+TCP ${rtcPort}（WebRtcServer）—— 端口映射/安全组只需这一条`,
+        {
+          detail: '禁 UDP 的网络（部分公司/校园网）会自动退到 TCP 候选；两条都在同一个号上，防火墙也只需一条规则对',
+          advice: `路由器上映射 ${rtcPort}/udp 与 ${rtcPort}/tcp → 本机；防火墙已由 allow-firewall.bat 放行 4443-4446`,
+          priority: 34,
+        });
+    } else {
+      add('B', 'B1b-media-port', 'warn',
+        '媒体走随机端口段（40000-49999，且只有 UDP）—— 跨网要转发一整段，禁 UDP 的网络没有退路',
+        {
+          detail: `配了 rtcMinPort/rtcMaxPort 但没配 rtcServerPort`,
+          advice: 'sfu/config.json 加 "rtcServerPort": 4443（或跑一次 npm run start:lan 自动写）；随后 npm run test:crossnet 验一次',
+          priority: 34,
+        });
+    }
+  }
+
   // B2 announcedIp vs 本机实际 IPv4（"别的电脑看不到画面"的头号原因）
   const nicList = nics.map((c) => `${c.address}(${c.name}${c.linkLocal ? '·自动私有' : ''})`).join('  ') || '（没有非回环网卡）';
-  if (!announcedIp) {
-    add('B', 'B2-announcedIp', 'fail', 'announcedIp 没配 —— 别的电脑 100% 看不到你的画面',
-      {
-        detail: `本机网卡：${nicList}`,
-        advice: lanIp
-          ? `在 sfu/config.json 加一行 "announcedIp": "${lanIp.address}"（或直接跑 npm run start:lan 自动写）`
-          : '本机没探测到可用局域网 IPv4（没连网？），连上网络后再配',
-        priority: 1,
-      });
+  /* ★ 2026-10-06 判据更新：服务器现在**没配也会自己挑网卡 IP**（sfu/nets.js + 启动自检），
+   *   所以"没配 = 100% 看不到画面"这句话已经不成立了——留着它会把人支去配一个
+   *   反而更容易过期的写死地址（坑 71 的文档版：一次能力升级会让另一处的结论悄悄失效）。 */
+  /* wantsAuto 已在函数开头算过一次（入口地址那一条要用），这里直接复用 —— 同一判据不写两份（坑 47） */
+  if (wantsAuto) {
+    if (!lanIp) {
+      add('B', 'B2-announcedIp', 'fail', '本机没有可用的非回环 IPv4（没连网？）—— 别的电脑连不到',
+        { detail: `本机网卡：${nicList}`, advice: '先连上 WiFi/有线，再跑 npm run doctor 复测', priority: 1 });
+    } else {
+      add('B', 'B2-announcedIp', 'ok',
+        `announcedIp ${announcedIp ? '写成 "auto"' : '未配置'} → 每次开机自动选用 ${lanIp.address}（网卡 ${lanIp.name}）`,
+        {
+          detail: `本机所有网卡：${nicList}。自动选择按"名字像真的对外网口 + 私网段"排序（判据在 sfu/nets.js），`
+            + '不会挑到 VirtualBox/WSL 那种"本机通、别人路由不到"的地址',
+          advice: '跨机前记得放行防火墙：npm run start:lan（它会一并生成 HTTPS 与邀请链接地址）',
+          priority: 90,
+        });
+    }
   } else if (/^127\./.test(announcedIp)) {
     add('B', 'B2-announcedIp', 'fail', `announcedIp=${announcedIp} 是回环地址，别的电脑连不到`,
       {
         detail: `本机网卡：${nicList}`,
-        advice: `改成局域网 IP，例如 "announcedIp": "${lanIp ? lanIp.address : '192.168.x.x'}"`,
+        advice: `改成局域网 IP，例如 "announcedIp": "${lanIp ? lanIp.address : '192.168.x.x'}"；`
+          + '或写 "auto" 让服务器每次开机自己挑（推荐——写死的地址会随 DHCP 漂移）',
         priority: 1,
       });
   } else if (!nics.some((c) => c.address === announcedIp)) {
     add('B', 'B2-announcedIp', 'warn',
       `announcedIp=${announcedIp} 与本机实际 IPv4（${lanIp ? lanIp.address : '无'}）不一致 —— 这是"别的电脑看不到画面"的头号原因`,
       {
-        detail: `本机所有网卡：${nicList}。媒体面会把 announcedIp 告诉对方，对方按这个地址回连；写错了就是"能进房、黑屏/转圈"`,
-        advice: (lanIp
-          ? `改 sfu/config.json： "announcedIp": "${lanIp.address}" （换 WiFi/重启路由器后 IP 会变，每次重跑 npm run start:lan 最省事）`
-          : '先把机器连上局域网，再填它的 IPv4')
-          + '。同一个问题服务器启动时也会自检一次（日志里打 "❌ announcedIp=... 与本机网卡不匹配"），两处告警指的是同一件事',
+        detail: `本机所有网卡：${nicList}。媒体面会把 announcedIp 告诉对方，对方按这个地址回连；写错了就是"能进房、黑屏/转圈"`
+          + '（服务器启动时也会自动纠偏成本次的真实网卡，所以这一行现在描述的是"配置会过期"这件事本身）',
+        advice: `最省事：把它改成 "auto"（每次开机自己探测，永不过期）。`
+          + (lanIp ? ` 或改成本次的 ${lanIp.address}（跑 npm run start:lan 自动写）` : ''),
         priority: 1,
       });
   } else {
@@ -910,14 +1073,16 @@ const FIREWALL_HINT = [
   if (!httpsEnabled) {
     add('D', 'D3-https-entry', 'skip', 'HTTPS 未启用，跳过入口可达性测试',
       { detail: '跨机访问请启用 https（见 B4）：http 页面拿不到摄像头', priority: 46 });
-  } else if (!announcedIp) {
-    add('D', 'D3-https-entry', 'skip', '没有 announcedIp，跳过 HTTPS 入口测试',
-      { detail: `本机可用地址：${lanIp ? lanIp.address : '无'}；配好 announcedIp 后本项会自动测`, priority: 46 });
+  } else if (!entryHost) {
+    add('D', 'D3-https-entry', 'skip', '本机没有可用的非回环 IPv4，跳过 HTTPS 入口测试',
+      { detail: '连上网（或起一条 Tailscale）之后本项会自动测；announcedIp 写 "auto" 就是让服务器自己挑', priority: 46 });
   } else if (!portState[httpsPort]) {
     add('D', 'D3-https-entry', 'skip', `本机 ${httpsPort} 没在监听（服务器未启动），跳过 HTTPS 入口测试`,
-      { detail: `启动服务器后（npm run start:sfu）再跑一次，就能验证 https://${announcedIp}:${httpsPort}/ 是否可访问`, priority: 46 });
+      { detail: `启动服务器后（npm run start:sfu）再跑一次，就能验证 https://${entryHost}:${httpsPort}/ 是否可访问`, priority: 46 });
   } else {
-    const url = `https://${announcedIp}:${httpsPort}/`;
+    /* 主机名一律用解析后的地址：配置写的是 "auto" 时，把它原样拼进 URL 会得到
+     * `https://auto:3443/` 这种谁也打不开的链接（本轮体检报告里真实出现过）。 */
+    const url = `https://${entryHost}:${httpsPort}/`;
     const r = await httpGetText(url, 5000);
     if (r.ok && r.status === 200) {
       add('D', 'D3-https-entry', 'ok', `HTTPS 入口可达：${url} → HTTP ${r.status}`,

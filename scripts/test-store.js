@@ -23,7 +23,11 @@ const crypto = require('crypto');
 const ROOT = path.join(__dirname, '..');
 
 let pass = 0, fail = 0;
+// 坑 110 的常驻守卫：本文件约定 ok(名字, 条件)
+const { guard: guardOk } = require('./assert-order-guard.js');
 const ok = (name, cond, extra = '') => {
+  const bad = guardOk('name-first', name, cond);
+  if (bad) { fail++; console.log(`  FAIL  ${String(name).slice(0, 60)}  · 参数顺序守卫：${bad}`); return; }
   if (cond) { pass++; console.log(`  PASS  ${name}`); }
   else { fail++; console.log(`  FAIL  ${name}${extra ? ' — ' + extra : ''}`); }
 };

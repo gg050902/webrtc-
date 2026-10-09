@@ -304,8 +304,18 @@ async function waitJs(cdp, expr, timeout = 20000, label = '') {
     await sleep(70);
   }
   await cdp._send(cdp.pageWs, 'Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-  await sleep(1000);
-  const afterY = await agent.cdp.evaluate('window.scrollY');
+  /* ★ 2026-10-04：改成"等到它发生为止"（上限 4s），不再是固定 sleep(1000) 读一次。
+   * ▎为什么：滚动发生在**另一台浏览器**里，这一条断言走的是完整一趟往返
+   *   （pointer → 前端 → 信令 → agent → CDP），负载高时 1s 不够——本机实测：
+   *   与别的检查并跑时这条红、单独复跑就绿（**会移动的失败是负载不是代码**）。
+   * ▎但"容忍负载"不等于"放弃判据"：仍然要求真的滚了 ≥50px，只是给它到点为止的时间；
+   *   到点还没滚才红——那种红才是可以拿去查代码的红。 */
+  let afterY = beforeY;
+  for (let deadline = Date.now() + 4000; Date.now() < deadline; ) {
+    afterY = await agent.cdp.evaluate('window.scrollY');
+    if (afterY > beforeY + 50) break;
+    await sleep(200);
+  }
   const diag = await cdp.evaluate('JSON.stringify({ ts: window.__ts, tm: window.__tm, twoFinger: window.__tm2, mids: window.__mids })');
   console.log(`   [DIAG] canvas = ${diag}`);
   console.log(`   [DIAG] pointer 事件序列 = ${await cdp.evaluate('JSON.stringify(window.__ptrs)')}`);
@@ -328,8 +338,13 @@ async function waitJs(cdp, expr, timeout = 20000, label = '') {
   await cdp._send(cdp.pageWs, 'Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: tx, y: ty, id: 1 }] });
   await sleep(70);
   await cdp._send(cdp.pageWs, 'Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-  await sleep(800);
-  const clicked = await agent.cdp.evaluate('window.__clicked || 0');
+  /* 同上一条：点击也要"等到真的被触发"（同一趟跨进程往返，判据不降）。 */
+  let clicked = 0;
+  for (let deadline = Date.now() + 4000; Date.now() < deadline; ) {
+    clicked = await agent.cdp.evaluate('window.__clicked || 0');
+    if (clicked > 0) break;
+    await sleep(200);
+  }
   chk(clicked > 0, `手机单指点击 → 被控端真实按钮被触发（clicked=${clicked}）`);
 
   /* ⑧ 手机形态：既要能"参会"（布局不炸、抽屉能开），又要能"控电脑"（控制台装得下）

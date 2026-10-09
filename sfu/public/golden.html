@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>真人语音金标准 · 云会议</title>
+<!--
+  ★ 2026-10-09 sfu/public/golden.html —— 录一份"我自己念的、带标准答案的"语音
+
+  ▎这页为什么存在（它服务的是一个此前无法回答的问题）
+    语音这条线的自动化证据全部来自合成语音（System.Speech 音色 + Chromium 假麦克风）。
+    合成语音有两处结构失真：它每句都写着「小明」，所以**测不出误唤醒**；它的电平节奏也不是
+    真人节奏。10-03 那次"自测 1.4s vs 真会中位 3.9s"、10-05 那次"回归全绿而真麦克风 -56dB
+    被闸当静音删"，都是合成数据与真人数据给出**相反答案**的事故。
+    所以要判断"这套语音真人开会能不能用"，必须先有一份真人念的、带标准答案的音频。
+    这页就是那份数据的采集入口；跑表的是 `npm run bench:asr-golden`。
+
+  ▎为什么句子不在这里写死
+    句子清单的唯一来源是 sfu/golden.js 的 SENTENCES（录制页与 bench 两个读者共用一份）。
+    前端抄一份、脚本抄一份，就会出现"录的句子和跑的句子不是同一批"——那两张 CER 表不可比。
+
+  ▎为什么当场把峰值念出来
+    服务器回的是 `Asr.measureWavLevel()` 的读数——那**正是生产能量闸用的同一个函数**。
+    于是"这句在会议里会不会被当静音删掉"在录的时候就看得见，而不是录完 20 句才发现整批是废的。
+    同一个概念只允许有一个来源（AGENTS 坑 47）。
+
+  ▎零依赖：浏览器原生 MediaRecorder + fetch；样式内联；不引任何前端库。
+-->
+<script>
+  /* 首帧之前把主题落上去，否则会先闪一下深色再翻浅色（与 index/dashboard 同写法）。
+     键名必须与会议页那份一致（'sfu-theme'），不一致就等于"这个开关只管首页"。 */
+  try {
+    var t = localStorage.getItem('sfu-theme');
+    if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
+  } catch (e) { /* 隐私模式读不到：按默认（水墨深色）走 */ }
+</script>
+<style>
+  /* 配色沿用面板页那一套语义 token（浅色档另定一档）——不在这里发明第三套颜色。
+     实测教训（10-07 H4）：dashboard 曾经自带一套只按深色定的内联样式，
+     用户选了宣纸、点进 /dashboard 又是一整页黑，界面在无声地说"那个开关只管首页"。 */
+  :root {
+    --bg0: #14100a; --bg1: #1c1710; --bg2: #241d13;
+    --line: #3a2f1e; --line-soft: #2c2417;
+    --fg: #ece5d8; --fg-muted: #b3a88f; --fg-faint: #8a8070;
+    --accent: #d8b36a; --accent-strong: #e6c37c; --accent-soft: #6a5327;
+    --ok: #8fbf7f; --warn: #e0a96a; --danger: #e07a7a;
+    --accent-on: #14100a;
+  }
+  html[data-theme="light"] {
+    --bg0: #f4efe3; --bg1: #fdfdf7; --bg2: #f1ead9;
+    --line: #ded3bc; --line-soft: #e7dfcc;
+    --fg: #241d12; --fg-muted: #4a4232; --fg-faint: #6b6250;
+    --accent: #7a5d10; --accent-strong: #654d0c; --accent-soft: #d8c9a6;
+    --ok: #2f6b2a; --warn: #8a5a10; --danger: #8f3a3a;
+    --accent-on: #fdfdf7;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg0); color: var(--fg); min-height: 100vh;
+    font: 14px/1.7 ui-sans-serif, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+    padding: 26px 20px 60px;
+  }
+  .wrap { max-width: 940px; margin: 0 auto; }
+  h1 { font-size: 20px; letter-spacing: .04em; margin-bottom: 6px; }
+  h1 .seal { display: inline-block; width: 22px; height: 22px; line-height: 22px; text-align: center;
+    background: var(--danger); color: #fff; border-radius: 4px; font-size: 13px; margin-right: 8px; vertical-align: -2px; }
+  .sub { color: var(--fg-faint); font-size: 12.5px; margin-bottom: 18px; }
+  .sub a { color: var(--accent); text-decoration: none; }
+  .card { background: var(--bg1); border: 1px solid var(--line-soft); border-radius: 10px; padding: 16px 18px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; margin-bottom: 8px; color: var(--accent); font-weight: 600; }
+  .card p { color: var(--fg-muted); font-size: 12.5px; }
+  .rowbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { background: transparent; color: var(--fg-muted); border: 0; padding: 7px 14px; font-size: 13px; cursor: pointer; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-on); }
+  .hint { color: var(--fg-faint); font-size: 12px; }
+  ul.list { list-style: none; }
+  li.item { display: flex; gap: 12px; align-items: flex-start; padding: 11px 4px; border-top: 1px solid var(--line-soft); }
+  li.item:first-child { border-top: 0; }
+  .idx { color: var(--fg-faint); font-size: 12px; width: 22px; flex: none; padding-top: 3px; }
+  .txt { flex: 1 1 auto; }
+  .why { color: var(--fg-faint); font-size: 11.5px; margin-top: 2px; }
+  .st { font-size: 12px; margin-top: 4px; }
+  .st.ok { color: var(--ok); } .st.warn { color: var(--warn); } .st.bad { color: var(--danger); }
+  .acts { display: flex; gap: 8px; flex: none; }
+  button.rec { background: var(--bg2); color: var(--fg); border: 1px solid var(--line); border-radius: 7px;
+    padding: 6px 12px; font-size: 12.5px; cursor: pointer; }
+  button.rec:hover:not(:disabled) { border-color: var(--accent); }
+  button.rec[data-on="1"] { background: var(--danger); color: #fff; border-color: var(--danger); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .foot { color: var(--fg-faint); font-size: 12px; margin-top: 16px; }
+  code { background: var(--bg2); padding: 1px 6px; border-radius: 4px; font-size: 12px; color: var(--accent); }
+  @media (max-width: 620px) {
+    li.item { flex-wrap: wrap; } .acts { width: 100%; justify-content: flex-end; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span class="seal">會</span>真人语音金标准</h1>
+  <div class="sub">
+    录一份"我自己念的、带标准答案"的语音，让 <code>npm run bench:asr-golden</code> 量得出**准确率**（此前只有延迟有尺）。
+    · <a href="/">回会议页</a> · <a href="/dashboard">观测面板</a>
+  </div>
+
+  <div class="card" id="why">
+    <h2>为什么要录这个</h2>
+    <p>
+      所有自动化测试喂的都是合成语音，而它每句都写着「小明」——**结构上测不出误唤醒**；它的电平节奏也不是真人的。
+      这个项目已经被合成数据与真人数据给过的**相反答案**烫过两次（自测 1.4s / 真会中位 3.9s；回归全绿 / 真麦克风 -56dB 被当静音删）。
+      所以"这套语音真人开会到底能不能用"这个问题，只有你念一遍才答得了。
+    </p>
+    <p style="margin-top:8px">
+      录完在终端跑 <code>npm run bench:asr-golden</code>：它会把这批真人录音分别喂给本机 Qwen3-ASR 与 whisper，
+      出字级错误率（CER）对照表。产物只落在 <code>sfu/voice-golden/</code>（已进 .gitignore，不会提交）。
+    </p>
+  </div>
+
+  <div class="card">
+    <div class="rowbar">
+      <span class="hint">距离档（建议两档各录一遍）：</span>
+      <span class="seg" id="seg"></span>
+      <span class="hint" id="distHint"></span>
+    </div>
+    <div class="rowbar">
+      <button class="rec" id="allBtn" disabled>逐句录（点下面每句的「录」）</button>
+      <span class="hint" id="progress" aria-live="polite">加载中…</span>
+    </div>
+    <ul class="list" id="list"></ul>
+    <div class="foot" id="foot"></div>
+  </div>
+</div>
+
+<script>
+  /* 与会议页同一份登录态：键名 wb_auth（recordings/dashboard 也是读它）。
+     没登录 / 不是管理员 → 明确说"需要管理员"，不许让页面停在"加载中"装成还在跑（坑 82）。 */
+  const token = (() => {
+    try { return (JSON.parse(localStorage.getItem('wb_auth') || '{}') || {}).token || ''; }
+    catch (e) { return ''; }
+  })();
+
+  const $ = (id) => document.getElementById(id);
+  let meta = null;          // /api/golden 回来的 { sentences, distances, items, gateDb }
+  let dist = 'near';
+  let rec = null;           // 当前 MediaRecorder
+  let recBtn = null;        // 当前那颗按钮（停止时要复位）
+
+  const mimePick = () => {
+    /* Edge/Chrome 支持 webm/opus； Safari 只给 mp4。服务器那侧交给 ffmpeg 判格式，
+       所以这里"能录什么就报什么"，但必须把类型带上——裸 blob 会让 ffmpeg 猜错容器。 */
+    const c = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
+    return c.find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
+  };
+
+  function renderSeg() {
+    const box = $('seg'); box.textContent = '';
+    (meta ? meta.distances : []).forEach((d) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.textContent = d.label;
+      b.setAttribute('aria-pressed', String(d.key === dist));
+      b.onclick = () => { dist = d.key; renderAll(); };
+      box.appendChild(b);
+    });
+    const hit = (meta && meta.distances || []).find((d) => d.key === dist);
+    $('distHint').textContent = hit ? hit.hint : '';
+  }
+
+  function statusOf(id) {
+    return (meta && meta.items || []).find((r) => r.id === id) || null;
+  }
+
+  function renderList() {
+    const ul = $('list'); ul.textContent = '';
+    if (!meta) return;
+    let done = 0;
+    meta.sentences.forEach((s, i) => {
+      const id = dist + '-' + (i + 1);
+      const rec0 = statusOf(id);
+      if (rec0) done++;
+      const li = document.createElement('li'); li.className = 'item';
+      const idx = document.createElement('span'); idx.className = 'idx'; idx.textContent = String(i + 1);
+      const box = document.createElement('div'); box.className = 'txt';
+      const t = document.createElement('div'); t.textContent = s.text;
+      box.appendChild(t);
+      const w = document.createElement('div'); w.className = 'why'; w.textContent = '为什么是这句：' + (s.why || '');
+      box.appendChild(w);
+      const st = document.createElement('div'); st.className = 'st';
+      if (rec0) {
+        const quiet = rec0.peakDb !== null && rec0.peakDb < meta.gateDb;
+        st.className = 'st ' + (quiet ? 'warn' : 'ok');
+        st.textContent = `已录 · 峰值 ${Number(rec0.peakDb).toFixed(1)} dBFS · ${rec0.secs || '?'}s`
+          + (quiet ? ` —— 低于闸门 ${meta.gateDb}dB：这句在会议里会被当静音删，建议靠近麦克风重录` : '');
+      } else { st.className = 'st'; st.textContent = '未录'; }
+      box.appendChild(st);
+      const acts = document.createElement('div'); acts.className = 'acts';
+      const btn = document.createElement('button'); btn.className = 'rec'; btn.type = 'button';
+      btn.textContent = rec0 ? '重录' : '录';
+      btn.onclick = () => toggle(btn, id, s.text);
+      acts.appendChild(btn);
+      li.append(idx, box, acts);
+      ul.appendChild(li);
+    });
+    const total = meta.sentences.length;
+    $('progress').textContent = `本档已录 ${done}/${total} · 两档合计目标 ${total * 2} 句`;
+    $('foot').textContent = done >= total
+      ? '这一档齐了。换另一档再录一遍，然后回终端跑 npm run bench:asr-golden。'
+      : '缺的句子不会让跑表报错——它会自动回落到合成语音并把「合成场」写在表头（跳过必须说话，不许当成通过）。';
+  }
+  function renderAll() { renderSeg(); renderList(); }
+
+  async function toggle(btn, id, text) {
+    if (rec && recBtn === btn) { try { rec.stop(); } catch (e) { /* 已经停了 */ } return; }
+    if (rec) { try { rec.stop(); } catch (e) { /* 同上 */ } }   // 一次只允许一路录音
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+      /* 三件套全部关掉是**有意的**：这页要量的是"你的麦克风 + 这个房间"的原始电平与噪声，
+         浏览器自带的降噪/自动增益会把它们抹平，于是 CER 表量的不再是你的真实条件。
+         （会议里正相反——那边要开 AEC 防啸叫。同一个设备、两种目的，参数就不该共用。） */
+    } catch (e) {
+      $('progress').textContent = '拿不到麦克风：' + (e && e.name || e) + '（权限/被别的程序占用？）';
+      return;
+    }
+    if (!window.MediaRecorder) { $('progress').textContent = '这个浏览器没有 MediaRecorder，换 Edge/Chrome 再来'; stream.getTracks().forEach((t) => t.stop()); return; }
+    const chunks = [];
+    const mr = new MediaRecorder(stream, mimePick() ? { mimeType: mimePick() } : undefined);
+    mr.ondataavailable = (ev) => { if (ev.data && ev.data.size) chunks.push(ev.data); };
+    mr.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop());          // 录完立刻放设备，别一直占着那盏灯
+      if (recBtn) { recBtn.textContent = recBtn.dataset.prev || '录'; recBtn.removeAttribute('data-on'); }
+      rec = null;
+      const blob = new Blob(chunks, { type: mr.mimeType || 'audio/webm' });
+      if (!blob.size) { $('progress').textContent = '录到 0 字节：可能是麦克风权限被拒'; return; }
+      recBtn = null;
+      $('progress').textContent = '上传与转码中…';
+      try {
+        const res = await fetch('/api/golden', {
+          method: 'POST',
+          headers: {
+            Authorization: 'Bearer ' + token,
+            'Content-Type': blob.type,
+            'x-golden-id': id,
+            'x-golden-dist': dist,
+            'x-golden-text': encodeURIComponent(text),
+          },
+          body: blob,
+        });
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok) { $('progress').textContent = '❌ ' + (j.error || ('HTTP ' + res.status)); return; }
+        await load();
+        $('progress').textContent = j.warn ? ('已存，但：' + j.warn) : ('已存：' + id + '（峰值 ' + Number(j.peakDb).toFixed(1) + ' dBFS）');
+      } catch (e) {
+        $('progress').textContent = '❌ 上传失败：' + (e && e.message || e);
+      }
+    };
+    rec = mr; recBtn = btn;
+    btn.dataset.prev = btn.textContent; btn.textContent = '停止'; btn.setAttribute('data-on', '1');
+    mr.start();
+  }
+
+  async function load() {
+    if (!token) {
+      $('progress').textContent = '未登录：先用管理员账号在会议页登录（这页是采集工具，只对管理员开放）';
+      $('allBtn').disabled = true;
+      return;
+    }
+    let res;
+    try { res = await fetch('/api/golden', { headers: { Authorization: 'Bearer ' + token } }); }
+    catch (e) { $('progress').textContent = '❌ 读不到 /api/golden：' + (e && e.message || e); return; }
+    if (res.status === 401) { $('progress').textContent = '需要管理员身份：这个页面会往服务器写录音，所以比读纪要更严'; $('allBtn').disabled = true; return; }
+    meta = await res.json().catch(() => null);
+    if (!meta || !Array.isArray(meta.sentences)) { $('progress').textContent = '❌ 返回格式不对'; return; }
+    if (!meta.ffmpeg) {
+      $('foot').textContent = '⚠️ 服务器没探测到 ffmpeg：现在能录但转不成 WAV，跑表也就没有真人场输入。装好 ffmpeg 后重启服务器（npm run doctor 看 A 组）。';
+    }
+    $('allBtn').disabled = false;
+    if (!dist && meta.distances && meta.distances[0]) dist = meta.distances[0].key;
+    renderAll();
+  }
+
+  $('allBtn').onclick = () => {
+    /* "逐句录"不做成一键连录：每句都要人对着麦克风念，自动跳下一句只会让人跟着赶，
+       赶出来的语速与停顿不是开会时的节奏——那这批金标准就白录了。 */
+    const first = [...document.querySelectorAll('#list button.rec')].find((b) => b.textContent === '录');
+    if (first) first.click(); else $('progress').textContent = '这一档已录齐，换另一档';
+  };
+
+  load();
+</script>
+</body>
+</html>

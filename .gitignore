@@ -18,6 +18,10 @@ sfu/config.json.bak-*
 reasonix.toml
 sfu/captions/
 sfu/minutes/
+# ★ 2026-10-09 真人语音金标准：录音文件 + 句子原文（`bench:asr-golden` 读它出准确率表）。
+#   和字幕账本同一条理由——那是本人说过的话，不该进仓库；`sfu/logs/golden-*.json`
+#   里的明细同样带原文，已被上面的 sfu/logs/ 挡住。
+sfu/voice-golden/
 sfu/logs/
 sfu/boards/
 sfu/users.json
@@ -60,3 +64,10 @@ models/
 # Python 字节码缓存（worker 脚本跑一次就会生成，本机产物）
 __pycache__/
 *.pyc
+
+# 真浏览器检查/端到端留下的截图（工具产物，不入库；2026-10-06）
+wb-rd-shots/
+sfu/files/
+
+# ★ 2026-10-09 补：共享文件的产物目录。AGENTS 的文件地图一直写着它被忽略，而 .gitignore 里其实
+#   没有这一行——下次有人 git add -A 就会把别人上传的会议文档原样推上公网。

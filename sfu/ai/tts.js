@@ -10,11 +10,17 @@
  *
  * ▎协议要点（逆向自公开的 edge-tts 行为，无任何官方 SDK）：
  *   1) 连 wss://speech.platform.bing.com/...?TrustedClientToken=<固定值>
- *      &Sec-MS-GEC=<防滥用令牌>&Sec-MS-GEC-Version=...
+ *      &ConnectionId=<随机 hex>&Sec-MS-GEC=<防滥用令牌>&Sec-MS-GEC-Version=1-<Chromium完整版本>
  *      Sec-MS-GEC = SHA256( 按 300s 取整的 Windows 纪元 tick 数 + 固定 token ) 大写 hex；
+ *      ★ 10-05 修复：微软 2025 起要求 **ConnectionId 参数 + Cookie:muid=<32位大写hex>**，
+ *        且 Sec-MS-GEC-Version/UA 必须用"较新的 Chromium 版本"——旧实现（130 版、无 muid）
+ *        被服务端 403 拒绝；同时 Node 内置 WebSocket **不支持自定义 headers**（muid 发不出去），
+ *        故改为 **手写 WebSocket 升级**（https.request + Upgrade:websocket，零依赖红线内）。
  *   2) 先发一条 speech.config 文本帧，再发 ssml 文本帧（SSML 里带音色/语速/文本）；
  *   3) 服务端回二进制帧：前 2 字节大端 = 头部长度，其后是头 + MP3 音频分片；
  *      收到文本帧 Path:turn.end 即合成完成。
+ *   ★ 时间戳格式：X-Timestamp 用 "Www Mmm dd yyyy hh:mm:ss GMT+0000 (Coordinated Universal Time)"
+ *     风格（edge-tts 对照实现；ssml 帧尾部多一个 "Z"，上游注释确认是服务端如此要求）。
  *
  * ▎可靠性设计：
  *   · 合成失败/超时/断网 → resolve(null)，调用方回落浏览器 TTS，功能不降级；
@@ -27,14 +33,16 @@
 'use strict';
 
 const crypto = require('crypto');
+const https = require('https');
 
-/* ── 协议常量（公开的固定值） ─────────────────────────────── */
+/* ── 协议常量（公开的固定值；版本对齐 edge-tts 7.2.7 的"当前可用"组合） ── */
 const TRUSTED_CLIENT_TOKEN = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
 const WSS_URL = 'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1'
   + `?TrustedClientToken=${TRUSTED_CLIENT_TOKEN}`;
+const CHROMIUM_VERSION = '143.0.3650.75';       // 旧值 130 会被服务端 403（10-05 实测）
+const CHROMIUM_MAJOR = CHROMIUM_VERSION.split('.')[0];
 const EDGE_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
-  + 'Chrome/130.0.0.0 Safari/537.36 Edg/130.0.2849.68';
-const CHROMIUM_VERSION = '130.0.2849.68';
+  + `Chrome/${CHROMIUM_MAJOR}.0.0.0 Safari/537.36 Edg/${CHROMIUM_MAJOR}.0.0.0`;
 const AUDIO_FORMAT = 'audio-24khz-48kbitrate-mono-mp3';
 const WIN_EPOCH = 11644473600;          // 1601→1970 的秒差（Windows FILETIME 纪元）
 const WINDOWS_TICKS_PER_SEC = 10000000; // FILETIME 以 100ns 为单位
@@ -61,9 +69,107 @@ function xmlEscape(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
-function nowStamp() {
-  return new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+/* X-Timestamp 需 edge-tts 同款格式："Www Mmm dd yyyy hh:mm:ss GMT+0000 (Coordinated Universal Time)"。
+ * ssml 帧尾部还要再加一个 "Z"（上游对照实现注释确认"服务端就是如此要求，不是笔误"），
+ * 由 synthesizeOnce 里按帧类型区分——这里只产基础格式。 */
+function edgeTimestamp(d = new Date()) {
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const mons = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const p = (n) => String(n).padStart(2, '0');
+  return `${days[d.getUTCDay()]} ${mons[d.getUTCMonth()]} ${p(d.getUTCDate())} ${d.getUTCFullYear()} `
+    + `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} GMT+0000 (Coordinated Universal Time)`;
 }
+
+/* ── 手写 WebSocket 客户端（★ 10-05） ──────────────────────
+ * 为什么不直接用 Node 内置 WebSocket：**它不支持自定义 headers**，而新端点必须发
+ * Cookie:muid=... ——内置构造器的第二参是 protocols 不是 options，headers 根本发不出去。
+ * Node 的 https 模块原生支持 WebSocket 升级（Upgrade 头 → 'upgrade' 事件，返回裸 socket），
+ * 帧编解码（客户端必须 mask）几十行即可——零依赖红线内，且比任何第三方实现都透明。
+ * 只实现本协议用到的：文本帧发送；文本/二进制/ping/close 帧接收。 */
+function wsConnect(urlStr, headers, { timeoutMs = 12000 } = {}) {
+  return new Promise((resolve) => {
+    const u = new URL(urlStr);
+    u.protocol = 'https:';   // https.request 不认 wss: 协议头，升级靠 Upgrade 头走
+    const req = https.request(u, { headers: {
+      Connection: 'Upgrade',
+      Upgrade: 'websocket',
+      'Sec-WebSocket-Version': '13',
+      'Sec-WebSocket-Key': crypto.randomBytes(16).toString('base64'),
+      ...headers,
+    } });
+    let settled = false;
+    const fail = (why) => { if (settled) return; settled = true; resolve({ ws: null, why }); };
+
+    req.setTimeout(timeoutMs, () => { fail('timeout'); try { req.destroy(); } catch (e) { /* 已关 */ } });
+    req.on('response', (res) => { res.resume(); fail(`http-${res.statusCode}`); }); // 未升级 = 服务器直接回了 HTTP
+    req.on('error', (e) => fail(e.message));
+    req.on('upgrade', (res, socket, head) => {
+      if (settled) { try { socket.destroy(); } catch (e) { /* 已关 */ } return; }
+      settled = true;
+      const ws = {
+        readyState: 1,
+        close() {
+          if (ws.readyState > 1) return;
+          ws.readyState = 3;
+          try { socket.write(encodeWsFrame(Buffer.alloc(0), 0x8)); } catch (e) { /* 已关 */ }
+          try { socket.end(); } catch (e) { /* 已关 */ }
+        },
+        send(text) {
+          if (ws.readyState !== 1) return;
+          try { socket.write(encodeWsFrame(Buffer.from(text, 'utf8'), 0x1)); } catch (e) { /* 已关 */ }
+        },
+      };
+      ws.onmessage = ws.onclose = ws.onerror = null;
+      let buf = head && head.length ? Buffer.from(head) : Buffer.alloc(0);
+      socket.on('data', (d) => {
+        buf = Buffer.concat([buf, d]);
+        while (true) {
+          if (buf.length < 2) break;
+          const opcode = buf[0] & 0x0f;
+          const masked = (buf[1] & 0x80) !== 0;
+          let len = buf[1] & 0x7f, off = 2;
+          if (len === 126) { if (buf.length < 4) break; len = buf.readUInt16BE(2); off = 4; }
+          else if (len === 127) { if (buf.length < 10) break; len = Number(buf.readBigUInt64BE(2)); off = 10; }
+          if (masked) off += 4; // 服务器→客户端按规范不 mask；防御式跳过
+          if (buf.length < off + len) break;
+          const payload = buf.subarray(off, off + len);
+          buf = buf.subarray(off + len);
+          if (opcode === 0x9) { try { socket.write(encodeWsFrame(payload, 0xA)); } catch (e) { /* 已关 */ } } // ping→pong
+          else if (opcode === 0x8) { ws.readyState = 3; try { socket.end(); } catch (e) { /* 已关 */ } }
+          else if ((opcode === 0x1 || opcode === 0x2) && ws.onmessage) {
+            ws.onmessage({ data: opcode === 0x1 ? payload.toString('utf8') : payload });
+          }
+        }
+      });
+      socket.on('error', () => { ws.readyState = 3; if (ws.onerror) ws.onerror(new Error('socket error')); });
+      socket.on('close', () => { ws.readyState = 3; if (ws.onclose) ws.onclose(); });
+      resolve({ ws, why: null }); // 之后由调用方挂 onmessage 并发送 config/ssml（升级完成即可发）
+    });
+    req.end();
+  });
+}
+
+/* 帧编码：客户端 → 服务器必须 mask（RFC 6455）；头部长度分 7/16/64 位三档 */
+function encodeWsFrame(payload, opcode) {
+  const mask = crypto.randomBytes(4);
+  const len = payload.length;
+  let header;
+  if (len < 126) header = Buffer.from([0x80 | opcode, 0x80 | len]);
+  else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode; header[1] = 0x80 | 126; header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | opcode; header[1] = 0x80 | 127; header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  const masked = Buffer.alloc(len);
+  for (let i = 0; i < len; i++) masked[i] = payload[i] ^ mask[i & 3];
+  return Buffer.concat([header, mask, masked]);
+}
+
+/* 最近一次合成失败原因（探测端读它写日志；成功时清空）——"机制要有证据"（坑 76） */
+let lastSynthError = null;
+function getLastSynthError() { return lastSynthError; }
 
 /* ── 并发闸（同 ASR_CONCURRENCY 的思路：2 个在途，多的排队） ── */
 const TTS_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.TTS_CONCURRENCY) || 2));
@@ -98,42 +204,46 @@ function cachePut(key, buf) {
 }
 
 /* ── 单次合成：建立 WS → config → ssml → 收音频 → turn.end ── */
-function synthesizeOnce(text, { voice, rate, timeoutMs }) {
-  return new Promise((resolve) => {
-    const url = `${WSS_URL}&Sec-MS-GEC=${secMsGec()}&Sec-MS-GEC-Version=1-${CHROMIUM_VERSION}`;
-    let ws;
-    try {
-      ws = new WebSocket(url, { headers: {
-        'User-Agent': EDGE_USER_AGENT,
-        'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
-      } });
-    } catch (e) { resolve(null); return; }
+async function synthesizeOnce(text, { voice, rate, timeoutMs }) {
+  const url = `${WSS_URL}&ConnectionId=${crypto.randomUUID().replace(/-/g, '')}`
+    + `&Sec-MS-GEC=${secMsGec()}&Sec-MS-GEC-Version=1-${CHROMIUM_VERSION}`;
+  const { ws, why } = await wsConnect(url, {
+    'User-Agent': EDGE_USER_AGENT,
+    'Accept-Encoding': 'gzip, deflate, br, zstd',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Pragma': 'no-cache',
+    'Cache-Control': 'no-cache',
+    'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold', // 端点认这个来源（公开逆向结论）
+    'Cookie': `muid=${crypto.randomBytes(16).toString('hex').toUpperCase()};`, // ★ 10-05 起必须（旧实现 403 根因之一）
+  }, { timeoutMs: timeoutMs || 12000 });
+  if (!ws) { lastSynthError = why; return null; }
 
+  return await new Promise((resolve) => {
     const chunks = [];
     let done = false;
     const finish = (result) => {
       if (done) return;
       done = true;
-      try { if (ws && ws.readyState <= 1) ws.close(); } catch (e) { /* 已关 */ }
+      try { ws.close(); } catch (e) { /* 已关 */ }
       clearTimeout(timer);
+      if (result && result.length) lastSynthError = null; else lastSynthError = lastSynthError || 'no-audio';
       resolve(result);
     };
     const timer = setTimeout(() => finish(null), timeoutMs || 12000);
 
-    ws.onopen = () => {
-      // ① speech.config：声明输出格式（24k 48kbps mono MP3）
-      ws.send(`X-Timestamp:${nowStamp()}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n`
-        + JSON.stringify({ context: { synthesis: { audio: {
-          metadataoptions: { sentenceBoundaryEnabled: 'false', wordBoundaryEnabled: 'false' },
-          outputFormat: AUDIO_FORMAT,
-        } } } }));
-      // ② ssml：真正的合成请求（文本经 XML 转义，绝无注入面）
-      const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='zh-CN'>`
-        + `<voice name='${xmlEscape(voice)}'><prosody rate='${xmlEscape(rate)}' pitch='+0Hz'>`
-        + `${xmlEscape(text)}</prosody></voice></speak>`;
-      ws.send(`X-RequestId:${crypto.randomUUID().replace(/-/g, '')}\r\nContent-Type:application/ssml+xml\r\n`
-        + `X-Timestamp:${nowStamp()}\r\nPath:ssml\r\n\r\n${ssml}`);
-    };
+    // ① speech.config：声明输出格式（24k 48kbps mono MP3）
+    ws.send(`X-Timestamp:${edgeTimestamp()}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n`
+      + JSON.stringify({ context: { synthesis: { audio: {
+        metadataoptions: { sentenceBoundaryEnabled: 'false', wordBoundaryEnabled: 'false' },
+        outputFormat: AUDIO_FORMAT,
+      } } } }));
+    // ② ssml：真正的合成请求（文本经 XML 转义，绝无注入面）
+    const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='zh-CN'>`
+      + `<voice name='${xmlEscape(voice)}'><prosody rate='${xmlEscape(rate)}' pitch='+0Hz'>`
+      + `${xmlEscape(text)}</prosody></voice></speak>`;
+    ws.send(`X-RequestId:${crypto.randomUUID().replace(/-/g, '')}\r\nContent-Type:application/ssml+xml\r\n`
+      + `X-Timestamp:${edgeTimestamp()}Z\r\nPath:ssml\r\n\r\n${ssml}`);
+
     ws.onmessage = (ev) => {
       const data = ev.data;
       if (typeof data === 'string') {
@@ -141,7 +251,7 @@ function synthesizeOnce(text, { voice, rate, timeoutMs }) {
         return;
       }
       // 二进制帧：[2 字节头长（大端）][头][音频分片]
-      const buf = Buffer.from(data instanceof ArrayBuffer ? new Uint8Array(data) : data);
+      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
       if (buf.length < 2) return;
       const headerLen = buf.readUInt16BE(0);
       if (buf.length > headerLen + 2) chunks.push(buf.subarray(headerLen + 2));
@@ -176,6 +286,12 @@ function sweepAudio(maxAgeMs = 30 * 60000) {
 async function synthesize(text, opts = {}) {
   const say = String(text || '').trim();
   if (!say) return null;
+  /* ★ 2026-10-06 测试接缝：TTS_FAKE_FAIL=1 = "启动探测通过、真合成失败"。
+   * ▎为什么要这条缝：Edge 端点可达性随网络出口漂（403 时本机什么都改不了），
+   *   而"AI 答应了却不说话"恰恰只在这条路径上发生——没有接缝就只能等网络自己坏一次，
+   *   于是这条最要命的分支从来没有被确定性测过（与 window.__SFU_ASR__、TEST_RECORD 同一条思路）。
+   * ▎放在缓存查询之前：否则同一句话命中缓存会绕过失败，测试测的是缓存不是链路（坑 72）。 */
+  if (process.env.TTS_FAKE_FAIL === '1') return null;
   const voice = opts.voice || DEFAULT_VOICE;
   const rate = opts.rate || DEFAULT_RATE;
   const key = cacheKey(say.slice(0, 500), voice, rate);
@@ -211,12 +327,40 @@ async function synthesize(text, opts = {}) {
   }
 }
 
+/* ══ 念出来之前的文本清洗（2026-10-05 用户点名："纪要那个长名字就不说了，费时间"）══
+ * ▎为什么不念路径：「/minutes/283648/20261005-221203-segment.md」念出来是
+ *   "斜杠 minutes 斜杠 二八三四八 横杠 二零二六…"——几十秒的废话，而气泡里
+ *   本来就有可以点的链接。**嘴上只说人听得懂的话，文件名交给人眼看。**
+ * ▎同一套规则浏览器那一轨也要用（client.js 的 speakableText）：两处是不同运行时，
+ *   做不到一份代码，所以这里导出给服务器用，并由 `test:asr` 拿同一条样例
+ *   断言"两边都不会把路径念出来"（改了忘同步会当场红，而不是留下一条更难查的抱怨）。
+ * ▎纯函数、零依赖，直接能被单测。 */
+function speakable(text) {
+  return String(text || '')
+    .replace(/```[\s\S]*?```/g, '（代码块）')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')          // markdown 链接：留名字，去地址
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/\*\*([^*]*)\*\*/g, '$1')
+    .replace(/^[#>\-\s|]+/gm, '')
+    .replace(/\|/g, '，')
+    .replace(/https?:\/\/\S+/g, '（链接）')
+    /* 路径类：以 / 开头的多段路径，或任何 .md/.webm/.mkv/.mp3/.wav 文件名 */
+    .replace(/(?:[.\/\\][\w.\-\/\\]{6,})/g, '（文件）')
+    .replace(/@ai/gi, 'A I')
+    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '')
+    .replace(/（文件）[，,、]?\s*(（文件）)+/g, '（文件）')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 module.exports = {
+  speakable,
   synthesize,
   putAudio,
   getAudio,
   sweepAudio,
   secMsGec,
+  getLastSynthError,
   DEFAULT_VOICE,
   DEFAULT_RATE,
 };

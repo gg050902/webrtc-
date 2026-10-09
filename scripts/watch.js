@@ -23,6 +23,8 @@ const BASE = argOf('--url', 'http://localhost:3001');
 const INTERVAL = Math.max(5, parseInt(argOf('--interval', '10'), 10)) * 1000;
 const MAX_RSS = parseInt(argOf('--max-rss', '512'), 10) * 1048576;
 const voiceState = { asrMiss: 0, tts: null, counters: {}, fallbackRounds: 0, gapRounds: 0, capSlowRounds: 0, speakSlowRounds: 0, bootWaitRounds: 0 }; // ★ 09-30f：语音链路翻转诊断的上一轮状态；counters = 计数基准；*Rounds = 各条"连续两轮才算"的退化判据
+/* ★ 2026-10-07 H6：跨网形态的上一轮观测（level 只在这里记账——判据是"变没变"，不是"是什么"）。 */
+const netState = { level: null };
 const WEBHOOK = process.env.WATCH_WEBHOOK_URL || null;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;   // ★ 09-24 G8：接口门禁后必须带 token
 const AUTH_HEADERS = ADMIN_TOKEN ? { Authorization: `Bearer ${ADMIN_TOKEN}` } : {};
@@ -49,6 +51,61 @@ function alert(key, text) {
   lastAlert.set(key, now);
   console.log(`[${ts()}] 🚨 告警[${key}] ${text}`);
   pushWebhook(text);
+}
+
+/* ★ 2026-10-07 H6：把"这台服务器还能不能被外面连上"变成**常驻告警**。
+ * ▎为什么要这一步：`nets.diagnose()` 的结论以前只在两个地方出现过——启动日志（滚过去就没了）
+ *   和邀请面板（得有人正好点开）。而跨网这件事的失效方式恰好是**沉默**的：
+ *   DHCP 漂了 IP、路由器换了信道、Tailscale 掉线、HTTPS 被谁关掉——
+ *   服务器自己一切正常，网页也打得开，只有"外面的人"进不来，而他是唯一会来报告的人（坑 36 的形态）。
+ * ▎判据的三条纪律：
+ *   ① **只在"变差"时报**，不在"一直是这样"时报。家里/办公室内网部署本来就该是 lan-only，
+ *     一条天天误报的告警等于没有告警（坑 67/82 同一条）；
+ *   ② **第一观测不下结论**——watch 每次启动都从零开始，若"没有上一轮"就报警，
+ *     那么每次值班启动都会叫一次，那和 ① 是同一种噪音；
+ *   ③ 恢复要说出来（只报坏不报好，人会开始怀疑"是不是没修好"，而实际上修好了）。
+ * @param netCheck 服务器 `/config.json` 下发的 netCheck（nets.diagnose() 的返回值）；null=老服务器/读失败
+ * @param prev     跨轮状态（{ level }），就地改写
+ * @param now      当前时刻（可注入，方便断言）
+ * @returns 告警数组 [{key, text}]
+ */
+const NET_RANK = { 'localhost-only': 0, 'lan-only': 1, 'tailscale': 2, 'public': 3 };
+function diagnoseNetAccess(netCheck, prev, now) {
+  const out = [];
+  if (!netCheck || typeof netCheck.level !== 'string' || !(netCheck.level in NET_RANK)) {
+    return out;                       // 读不到 = 不下结论（"读不到"≠"读到 0"，坑 71 同一条）
+  }
+  const level = netCheck.level;
+  /* 配置漂移**先判、且不受"有没有上一轮"影响**：它是一个此刻成立的事实
+     （自愈把 level 保住了，用户的配置文件仍然是错的），不需要基线就能报。
+     ▸ 这一条的位置不是随便挑的：原先写在下面 `level === before` 的提前返回之后，
+       于是"配置过期但 level 没变"这个**最常见**的形态一条都不会报——
+       断言（test:watch H6 组最后一条）当场把它抓了出来。 */
+  const drift = (netCheck.items || []).find((i) => i && i.label === '配置核对' && i.state === 'bad');
+  if (drift) {
+    out.push({
+      key: 'net-config-drift',
+      text: `config.json 里的 announcedIp 已过期，本次靠**运行时自愈**顶着：${drift.detail}`
+        + (drift.fix ? `｜请把它固化下来：${drift.fix}` : '')
+        + '｜自愈只保这一次运行；不写回配置是刻意的（那是用户的配置文件，工具不该改）。',
+    });
+  }
+  const before = prev.level;
+  prev.level = level;                 // ★ 先记账再判断：任何一条分支都不许漏掉这次更新
+  if (!before || level === before) return out;   // 纪律 ② 与"没变不重复报"
+  if (NET_RANK[level] < NET_RANK[before]) {
+    const bad = (netCheck.items || []).filter((i) => i && i.state === 'bad');
+    out.push({
+      key: 'net-downgrade',
+      text: `跨网能力**下降**：${before} → ${level}。` + (netCheck.headline || '')
+        + (bad.length ? `｜现在不合格的检查：${bad.map((b) => b.label).join('、')}` : '')
+        + (bad[0] && bad[0].fix ? `｜建议先试：${bad[0].fix}` : '')
+        + '｜判据：sfu/nets.js 的 diagnose()，界面版在邀请面板里（点房间号徽标）。',
+    });
+  } else {
+    console.log(`[${ts()}] ✅ 跨网能力恢复：${before} → ${level}`);
+  }
+  return out;
 }
 
 /* ★ 2026-10-03 语音/协作的**退化诊断**抽成纯函数。
@@ -133,6 +190,20 @@ function diagnoseVoiceAndCollab(metricsText, collab, prev, state) {
   const rejected = delta('sfu_board_records_total{op="rejected"}');
   if (rejected > 0) out.push({ key: 'board-rejected', text: `白板归档有 ${rejected} 笔被服务器拒绝（颜色/坐标不合法）——客户端可能在送脏数据` });
 
+  /* ②b 本地 Qwen ASR worker 因"单次推理超时"被换过进程（坑 89 的自愈路径）。
+   *   ▎为什么值得报警但又不是故障：这条**本来就是为偶发失控准备的**，触发说明模型
+   *     确实会偶尔停不下来（实测单次 93.5s / p50 0.5s），而系统靠换进程 + whisper 兜底
+   *     接住了、字幕没丢。所以措辞是"知道一下"而不是"坏了"。
+   *   ▎更重要的另一面：在加这条之前，这个重启路径**从来没有被真实触发过**，
+   *     按坑 76 的纪律就不能声称"已验证"。有了这条告警，"到底卡死过没有"变成查得到的事实。
+   *   ▸ 老服务器没有这一行时 delta 返回 0（不是 NaN）→ 静默跳过，不会误报。 */
+  const restarted = delta('sfu_ai_asr_worker_restarts_total');
+  if (restarted > 0) {
+    out.push({ key: 'asr-worker-restart', text: `本地 Qwen ASR worker 因单次推理超预算被重启 ${restarted} 次`
+      + `（预算 ${Math.round((Number(process.env.ASR_TIMEOUT_MS) || 12000) / 1000)}s）——这些段已回落 whisper 兜底、字幕没丢，`
+      + `但说明模型存在偶发失控，值得看一眼显存/CPU 是否有别的东西在抢` });
+  }
+
   /* ③ 房间动作"说了没做"：服务器发出了指令，客户端却一次都没回执。
    *    同样要连续 2 轮：回执是异步的，单轮里可能只是还没到。 */
   let issued = 0; let applied = 0;
@@ -173,6 +244,49 @@ function diagnoseVoiceAndCollab(metricsText, collab, prev, state) {
   latRule('speakSlowRounds', 'speak-ok', 'sfu_ai_speech_latency_ms', 'speech-slow', '播报延迟（看到答案→听见开口）',
     SPK_WARN_MS, '①Edge 神经语音端点是否不可达（sfu_ai_tts_enabled）②本地 Qwen3-TTS 是否在 CPU 上合成（RTF>1，一句 ~12s）'
     + '③是否 aiTtsLocalWait=1 让慢引擎抢了实时播报 ④客户端是否根本没在播（自动播放策略拦截）');
+  /* ⑤ ★ 2026-10-06 夜二「没人叫它，它却开口了」——这条产品规矩的生产端哨兵。
+   * ▎为什么必须常驻而不是靠一次人工验证：用户拍板的规矩是"只有叫到小明，小明才说话"，
+   *   而违反它的形态**极其安静**——AI 答得条理分明，只是没人叫它。日志不会红、
+   *   界面不会报错，只有用户一次次说"它又在插话"（这次就是攒到 18/21 才发现）。
+   *   任何一次改动把免唤醒窗口或宽表带回来，这一条要在下一轮值守里喊出来。
+   * ▎判据（不是"有 follow-up 就报"，那样会把合法形态报成故障）：
+   *   纯唤醒模式（`aiChatWindowMs === 0`）下，唯一合法的"没被叫到也答"是
+   *   **被 2s 分段切断的半句**，而它每次前面必有一次 `name-only`（只叫名字的唤醒）。
+   *   所以违规量 = `follow-up 增量 − name-only 增量`，累计 ≥2 才报（单轮 1 次的
+   *   同音误听不值得打断人，误报的代价是以后没人看告警）。
+   * ▎对话模式（用户自己把 aiChatWindowSec 设成正数）下这条**整体沉默**——
+   *   那是他选的形态，不是故障；判据要用服务器交出来的事实，不是猜。 */
+  const labeledCounter = (base, labelVal) => {
+    /* 必须锚行首：Prometheus 的 `# HELP` 行里也含同名与标签文本，
+       不加锚会把帮助文档读成一个样本值（这个坑本项目踩过一次，坑 74）。 */
+    const re = new RegExp('^' + base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      + '\\{' + labelVal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\} (\\d+)', 'm');
+    const m = re.exec(metricsText);
+    return m ? Number(m[1]) : null;      // null = 这行不存在（老服务器），与"读到 0"是两种语义
+  };
+  const labeledDelta = (key, base, labelVal) => {
+    const v = labeledCounter(base, labelVal);
+    if (v === null) return null;
+    const d = v - (prev[key] || 0); prev[key] = v;
+    return d;
+  };
+  const winMs = collab && typeof collab.aiChatWindowMs === 'number' ? collab.aiChatWindowMs : null;
+  const dTail = labeledDelta('via|follow-up', 'sfu_ai_answer_via_total', 'via="follow-up"');
+  const dName = labeledDelta('via|wake', 'sfu_ai_answer_via_total', 'via="wake"');
+  const dNo = labeledDelta('throttled|name-only', 'sfu_ai_answer_throttled_total', 'reason="name-only"');
+  if (winMs === 0 && dTail !== null && dName !== null && dNo !== null) {
+    const excess = dTail - Math.max(0, dNo);
+    state.unprompted = Math.max(0, (state.unprompted || 0) + excess);
+    const MIN = Math.max(1, Number(process.env.WATCH_UNPROMPTED_MIN) || 2);
+    if (state.unprompted >= MIN) {
+      out.push({ key: 'ai-unprompted', text: `AI 在**没人叫它**的时候答了话：本轮免唤醒续答 ${dTail} 次`
+        + `、只叫名字的唤醒 ${dNo} 次（累计超出 ${state.unprompted} 次），而服务器处于纯唤醒模式`
+        + ' —— 查：①追问窗口是否被 config.aiChatWindowSec 打开成 0 以外'
+        + ' ②唤醒表是否被放宽（歧义写法/称呼语境那条分层判据）③是否有客户端绕过服务器直接 ai-ask' });
+    }
+  } else if (winMs !== 0) {
+    state.unprompted = 0;   // 对话模式 / 老服务器没有这几行：不下结论，也不留着旧账
+  }
   return out;
 }
 
@@ -227,6 +341,20 @@ async function tick() {
     }
   } catch (e) { /* metrics 拉不到单独不算告警（api 已覆盖） */ }
 
+  /* ⑤ ★ 2026-10-07 H6：跨网能力退化。判据在服务器算（sfu/nets.js 的 diagnose()），
+   *   这里只读结论——值守工具不该自己再写一份"能不能跨网"（坑 47：一个概念一个来源；
+   *   两份判据迟早会给出两个答案，而半夜看到两个答案的人会两个都不信）。
+   *   /config.json 是公开接口（不带 token 也要能读到，否则值守看不到这份判定）。 */
+  try {
+    const res = await fetch(`${BASE}/config.json`, { cache: 'no-store' });
+    if (res.ok) {
+      const cfg = await res.json();
+      for (const a of diagnoseNetAccess(cfg && cfg.netCheck, netState, Date.now())) {
+        alert(a.key, a.text);
+      }
+    }
+  } catch (e) { /* 读不到 config.json 不报警：老服务器本来就没有这一项（"读不到"≠"坏了"） */ }
+
   /* ★ 09-30f 语音链路告警（P4）：AI 的"耳朵/嘴巴"悄悄坏掉是长跑值守最阴的故障——
    *   转写照常出文件但 worker 死了会退 CLI（字幕变慢 N 倍），没人会主动发现。
    *   这里用 /metrics 的两个 gauge 做状态翻转检测：
@@ -269,7 +397,7 @@ async function tick() {
    ▎为什么非要能 require：这段逻辑跑在**长跑值守**里，判断错了的代价是要么天天误报、
    要么永远不报，两种都会让人放弃看告警；而没有别的办法验证「判断错了」这件事本身。 */
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { diagnoseVoiceAndCollab };
+  module.exports = { diagnoseVoiceAndCollab, diagnoseNetAccess, NET_RANK };
 }
 if (require.main === module) {
   console.log(`👀 watch 启动：每 ${INTERVAL / 1000}s 轮询 ${BASE}` +

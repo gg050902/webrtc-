@@ -116,8 +116,31 @@ function randomPassword(len = 16) {
   return out;
 }
 
+/* ★ 2026-10-09 密码强度判据抽到这里（唯一实现）。
+ * ▎为什么：这条规则原来只住在 sfu/server.js 的注册路径里，而 `scripts/admin.js passwd`
+ *   自己写了一句"密码至少 6 位（与网页注册的规则一致）"——**它并不一致**：
+ *   网页要 ≥8 且至少两类字符，CLI 只查 ≥6 位。于是"用命令行重置一次密码，
+ *   反而把一个达标的口令换成了网页根本注册不出来的弱口令"，而且没人觉得哪里不对。
+ *   同一个概念（这个系统认为什么算可用密码）被两处分别写一遍，就一定会漂——
+ *   这次漂在安全规则上，比漂在样式上贵。
+ * @param {string} pw
+ * @param {{minLen?:number}} [opts]  下限由调用方给（server 读 config/env，CLI 读同一个 env）
+ * @returns {string|null}  null = 合格；否则是能直接给用户看的一句话
+ */
+function strengthError(pw, opts = {}) {
+  const minLen = Number.isFinite(opts.minLen) && opts.minLen > 0 ? opts.minLen : 8;
+  if (typeof pw !== 'string' || !pw) return '密码不能为空';
+  if (pw.length < minLen) return `密码至少 ${minLen} 位`;
+  let classes = 0;
+  if (/[a-zA-Z]/.test(pw)) classes += 1;
+  if (/[0-9]/.test(pw)) classes += 1;
+  if (/[^a-zA-Z0-9]/.test(pw)) classes += 1;
+  if (classes < 2) return '密码需包含至少两类字符（字母/数字/符号）';
+  return null;
+}
+
 module.exports = {
   SALT_BYTES, KEY_LEN, KEY_LEN_V2,
   newSalt, hashPassword, hashPasswordLegacy, verifyPassword,
-  hashAlgoOf, needsUpgrade, randomPassword,
+  hashAlgoOf, needsUpgrade, randomPassword, strengthError,
 };

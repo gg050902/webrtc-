@@ -3,184 +3,156 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI 头像替换预览</title>
+  <title>AI 小明 · 矢量表情演示</title>
+  <!-- ★ 演示页不自绘头像：样式直接链接生产 style.css，SVG 运行时从 client.js 的
+       aiAvatarSvg() 抽取——与会议页永远同一份（坑 47：一个概念只有一个来源）。 -->
+  <link rel="stylesheet" href="../../style.css?v=20261007">
   <style>
-    :root {
-      --bg0: #0e0c0a;
-      --bg1: #171209;
-      --bg2: #1f1a13;
-      --fg: #f0ebe3;
-      --accent: #d8b36a;
-      --accent-border: rgba(216, 179, 106, .45);
-      --ease: cubic-bezier(.22, .61, .36, 1);
-      --shadow-1: 0 8px 24px rgba(0, 0, 0, .35);
-    }
+    :root { color-scheme: dark; }
     * { box-sizing: border-box; }
     body {
-      margin: 0; padding: 40px 24px;
-      background: var(--bg0); color: var(--fg);
+      margin: 0; padding: 56px 24px 80px;
+      background: #0e0c0a; color: #f0ebe3;
       font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      display: flex; flex-direction: column; align-items: center;
     }
-    h1 { font-size: 20px; margin: 0 0 8px; font-weight: 600; }
-    p { color: rgba(240, 235, 227, .65); margin: 0 0 28px; font-size: 14px; }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-      gap: 24px;
+    h1 {
+      margin: 0 0 8px; font-size: 24px; font-weight: 600; letter-spacing: .04em;
     }
-    .card {
-      background: var(--bg2);
-      border: 1px solid rgba(216, 179, 106, .12);
-      border-radius: 16px;
-      padding: 20px;
+    h1 .en {
+      display: block; margin-top: 6px;
+      font-size: 11px; font-weight: 500; letter-spacing: .28em;
+      color: rgba(216, 179, 106, .8); text-transform: uppercase;
     }
-    .card h2 { font-size: 15px; margin: 0 0 16px; color: var(--accent); font-weight: 600; }
-    .demo { display: flex; align-items: center; gap: 16px; }
+    .pv-sub {
+      margin: 0 0 40px; max-width: 560px; text-align: center;
+      color: rgba(240, 235, 227, .62); font-size: 13.5px; line-height: 1.8;
+    }
+    .pv-sub code { color: #d8b36a; font-size: 12.5px; }
 
-    /* 成员行小头像 */
-    .member-row {
+    .pv-stage { display: flex; gap: 48px; align-items: flex-start; flex-wrap: wrap; justify-content: center; }
+
+    /* 演示格：用生产类名（ai-tile / ai-face-wrap），生产 CSS 原样生效 */
+    .pv-tile {
+      position: relative; width: 320px; height: 320px;
+      background: #171209;
+      border: 1px solid rgba(216, 179, 106, .14);
+      border-radius: 20px; overflow: hidden;
+    }
+    .pv-tile .video-label {
+      position: absolute; left: 0; right: 0; bottom: 0;
+      padding: 10px 14px; font-size: 13px; color: rgba(240, 235, 227, .85);
+      background: linear-gradient(transparent, rgba(0, 0, 0, .55));
+      display: flex; align-items: center; gap: 8px;
+    }
+    .pv-tile .ai-status {
+      margin-left: 2px; padding: 1px 8px; font-size: 10px; color: #d8b36a;
+      background: rgba(216, 179, 106, .14); border-radius: 999px;
+    }
+
+    .pv-panel { display: flex; flex-direction: column; gap: 20px; }
+    .pv-panel h2 {
+      margin: 0 0 10px; font-size: 12px; font-weight: 600;
+      letter-spacing: .18em; color: rgba(240, 235, 227, .45); text-transform: uppercase;
+    }
+    .pv-btns { display: flex; flex-direction: column; gap: 8px; width: 220px; }
+    .pv-btn {
+      appearance: none; border: 1px solid rgba(216, 179, 106, .25);
+      background: #1f1a13; color: #f0ebe3;
+      padding: 10px 16px; border-radius: 12px;
+      font-size: 13.5px; text-align: left; cursor: pointer;
+      transition: background .2s, border-color .2s, transform .1s;
+      display: flex; justify-content: space-between; align-items: center; gap: 8px;
+    }
+    .pv-btn:hover { background: #29221a; }
+    .pv-btn:active { transform: scale(.985); }
+    .pv-btn .k { font-size: 11px; color: rgba(240, 235, 227, .4); font-family: ui-monospace, Consolas, monospace; }
+    .pv-btn.on { border-color: rgba(216, 179, 106, .65); background: rgba(216, 179, 106, .12); }
+    .pv-btn.on .k { color: #d8b36a; }
+
+    /* 成员行小头像（生产 .member-row / .ai-av 同款结构） */
+    .pv-row {
       display: flex; align-items: center; gap: 10px;
-      background: rgba(255,255,255,.03);
-      border-radius: 10px; padding: 8px 12px;
+      padding: 10px 14px; width: 220px;
+      background: #1f1a13; border: 1px solid rgba(216, 179, 106, .14);
+      border-radius: 12px; font-size: 13px;
     }
-    .ai-av {
-      width: 24px; height: 24px;
-      border-radius: 50%; overflow: hidden;
-      border: 1px solid var(--accent-border);
-      background: #f2ede1;
-    }
-    .ai-av img { width: 100%; height: 100%; object-fit: cover; object-position: center; display: block; }
-    .ai-av.speaking { animation: aiRingPulse 1.2s ease-in-out infinite; }
-    @keyframes aiRingPulse {
-      0%, 100% { box-shadow: 0 0 0 2px var(--accent-border); }
-      50% { box-shadow: 0 0 0 4px rgba(216, 179, 106, .5); }
-    }
+    .pv-row .m-bot-note { margin-left: auto; font-size: 11px; color: rgba(240, 235, 227, .45); }
 
-    /* AI 视频格子 */
-    .ai-tile {
-      position: relative;
-      width: 220px; height: 220px;
-      background: #14100a;
-      border-radius: 16px;
-      display: grid; place-items: center;
-      overflow: hidden;
+    .pv-foot {
+      margin-top: 48px; max-width: 560px; text-align: center;
+      color: rgba(240, 235, 227, .38); font-size: 12px; line-height: 1.9;
     }
-    .ai-face-wrap {
-      position: absolute;
-      left: 50%; top: 50%;
-      transform: translate(-50%, -50%);
-      width: min(76%, 220px);
-      aspect-ratio: 1;
-      background:
-        radial-gradient(circle at 50% 40%, #f7f3ea 0%, #efe9dc 58%, #e2d9c6 100%);
-      border-radius: 50%;
-      overflow: hidden;
-      box-shadow:
-        0 0 0 1px rgba(216, 179, 106, .35),
-        0 0 0 8px rgba(216, 179, 106, .06),
-        0 14px 34px rgba(6, 4, 2, .5);
-    }
-    .ai-tile .ai-face {
-      display: block;
-      width: 100%; height: 100%;
-      border-radius: 50%;
-      object-fit: cover; object-position: center;
-    }
-    .ai-tile.speaking .ai-face-wrap {
-      box-shadow:
-        0 0 0 1px rgba(216, 179, 106, .5),
-        0 0 0 10px rgba(216, 179, 106, .1),
-        0 0 34px rgba(216, 179, 106, .3);
-    }
-    .ai-tile.thinking .ai-face-wrap { filter: brightness(.94); }
-    .ai-tile.happy .ai-face { filter: saturate(1.06) brightness(1.03); }
-
-    .state-btns { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; }
-    .state-btns button {
-      background: rgba(216,179,106,.12); border: 1px solid rgba(216,179,106,.25);
-      color: var(--fg); border-radius: 8px; padding: 6px 12px;
-      cursor: pointer; font-size: 13px;
-    }
-    .state-btns button.active { background: rgba(216,179,106,.35); }
-    .old-new { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
-    .old-new > div { text-align: center; }
-    .old-new img { width: 120px; height: 120px; border-radius: 50%; object-fit: cover; }
-    .label { font-size: 12px; color: rgba(240,235,227,.55); margin-top: 8px; }
+    .pv-foot code { color: rgba(216, 179, 106, .75); font-size: 11.5px; }
   </style>
 </head>
 <body>
-  <h1>AI 助理头像替换预览</h1>
-  <p>左侧是成员列表里的小头像，右侧是会议网格里的大格子。点击按钮可切换 speaking / thinking / happy 状态。</p>
+  <h1>AI 小明<span class="en">Vector Avatar · Live States</span></h1>
+  <p class="pv-sub">
+    内联 SVG 矢量脸：眼 / 眉 / 嘴 / 腮红是独立元素，状态由格子类驱动变形——
+    <code>.speaking</code> 张嘴、<code>.thinking</code> 凝神、<code>.happy</code> 笑。
+    眨眼与呼吸常驻，无需切换任何素材。
+  </p>
 
-  <div class="grid">
-    <div class="card">
-      <h2>旧版 vs 新版</h2>
-      <div class="old-new">
-        <div>
-          <img src="xiaoming-anim-old.webp" alt="旧版">
-          <div class="label">旧版国风头像</div>
-        </div>
-        <div>
-          <img src="xiaoming-anim.webp" alt="新版">
-          <div class="label">新版 Q 版 3D</div>
-        </div>
-      </div>
+  <div class="pv-stage">
+    <div class="pv-tile ai-tile" id="tile" style="width:320px;height:320px;aspect-ratio:auto">
+      <div class="ai-face-wrap" role="img" aria-label="AI 小明"></div>
+      <div class="video-label">AI 小明<span class="ai-status" id="statusChip">聆听中…</span></div>
     </div>
 
-    <div class="card">
-      <h2>成员列表效果</h2>
-      <div class="demo">
-        <div class="member-row">
-          <span class="ai-av" id="rowAv"><img src="xiaoming-anim-sm.webp" alt=""></span>
+    <div class="pv-panel">
+      <section>
+        <h2>状态</h2>
+        <div class="pv-btns" id="btns">
+          <button class="pv-btn on" data-st="">聆听 / 静置 <span class="k">calm</span></button>
+          <button class="pv-btn" data-st="thinking">思考 <span class="k">.thinking</span></button>
+          <button class="pv-btn" data-st="speaking">说话 <span class="k">.speaking</span></button>
+          <button class="pv-btn" data-st="happy">开心 <span class="k">.happy</span></button>
+        </div>
+      </section>
+      <section>
+        <h2>成员行小头像</h2>
+        <div class="pv-row member-row">
+          <span class="ai-av" id="rowAv"></span>
           <span>AI 小明</span>
+          <span class="m-bot-note">24px 徽章</span>
         </div>
-      </div>
-      <div class="state-btns">
-        <button onclick="setRow('idle')" class="active" id="b-row-idle">idle</button>
-        <button onclick="setRow('speaking')" id="b-row-speaking">speaking</button>
-      </div>
-      <p style="margin-top:12px;font-size:12px">speaking = 嘴部开合说话动画，idle = 呼吸眨眼</p>
-    </div>
-
-    <div class="card">
-      <h2>会议网格效果</h2>
-      <div class="demo">
-        <div class="ai-tile" id="tile">
-          <div class="ai-face-wrap">
-            <img class="ai-face" id="tileFace" src="xiaoming-anim.webp" alt="AI 小明">
-          </div>
-        </div>
-      </div>
-      <div class="state-btns">
-        <button onclick="setTile('idle')" class="active" id="b-tile-idle">idle</button>
-        <button onclick="setTile('speaking')" id="b-tile-speaking">speaking</button>
-        <button onclick="setTile('thinking')" id="b-tile-thinking">thinking</button>
-        <button onclick="setTile('happy')" id="b-tile-happy">happy</button>
-      </div>
+      </section>
     </div>
   </div>
 
+  <p class="pv-foot">
+    本页不持有头像代码：SVG 运行时抽取自 <code>client.js · aiAvatarSvg()</code>，
+    样式来自 <code>style.css</code> 第 27 节——这里看到的与会议里跑的是同一份。
+  </p>
+
   <script>
-    const rowAv = document.getElementById('rowAv');
-    const rowIm = rowAv.querySelector('img');
-    const tile = document.getElementById('tile');
-    const tileFace = document.getElementById('tileFace');
-    const IDLE = 'xiaoming-anim.webp', IDLE_SM = 'xiaoming-anim-sm.webp';
-    const TALK = 'xiaoming-talk.webp', TALK_SM = 'xiaoming-talk-sm.webp';
-    [new Image(), new Image()].forEach((im, i) => { im.src = i ? TALK_SM : TALK; }); // 预加载
-    function setRow(st) {
-      rowAv.classList.toggle('speaking', st === 'speaking');
-      rowIm.src = st === 'speaking' ? TALK_SM : IDLE_SM;
-      document.querySelectorAll('.card:nth-child(2) .state-btns button').forEach(b => b.classList.remove('active'));
-      document.getElementById('b-row-' + st).classList.add('active');
-    }
-    function setTile(st) {
-      tile.classList.remove('speaking', 'thinking', 'happy');
-      if (st !== 'idle') tile.classList.add(st);
-      tileFace.src = st === 'speaking' ? TALK : IDLE;
-      document.querySelectorAll('.card:nth-child(3) .state-btns button').forEach(b => b.classList.remove('active'));
-      document.getElementById('b-tile-' + st).classList.add('active');
-    }
+    (async () => {
+      const src = await (await fetch('../../client.js', { cache: 'no-store' })).text();
+      const m = src.match(/function aiAvatarSvg\(\) \{[\s\S]*?\n\}/);
+      if (!m) { document.body.innerHTML = '<p style="color:#e0636f">抽取 aiAvatarSvg() 失败：client.js 结构变了？</p>'; return; }
+      const aiAvatarSvg = new Function(m[0] + '; return aiAvatarSvg;')();
+
+      const tile = document.getElementById('tile');
+      const rowAv = document.getElementById('rowAv');
+      const chip = document.getElementById('statusChip');
+      const LABEL = { '': '聆听中…', thinking: '思考中…', speaking: '正在发言…', happy: '完成！' };
+
+      tile.querySelector('.ai-face-wrap').innerHTML = aiAvatarSvg();
+      rowAv.innerHTML = aiAvatarSvg();
+
+      document.getElementById('btns').addEventListener('click', (e) => {
+        const b = e.target.closest('.pv-btn');
+        if (!b) return;
+        const st = b.dataset.st;
+        for (const x of b.parentElement.children) x.classList.toggle('on', x === b);
+        tile.classList.toggle('thinking', st === 'thinking');
+        tile.classList.toggle('speaking', st === 'speaking');
+        tile.classList.toggle('happy', st === 'happy');
+        rowAv.classList.toggle('speaking', st === 'speaking');
+        chip.textContent = LABEL[st] || LABEL[''];
+      });
+    })();
   </script>
 </body>
 </html>

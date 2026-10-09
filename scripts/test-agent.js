@@ -63,7 +63,13 @@ function cleanupTestDb() {
 process.on('exit', cleanupTestDb);
 
 let pass = 0, fail = 0, skip = 0;
-const ok = (n, c) => { if (c) { pass++; console.log('  PASS  ' + n); } else { fail++; console.log('  FAIL  ' + n); } };
+// 坑 110 的常驻守卫：本文件约定 ok(名字, 条件)。顺序写反 ⇒ 条件位是一句中文（truthy）⇒ 永远绿。
+const { guard: guardOk } = require('./assert-order-guard.js');
+const ok = (n, c, d) => {
+  const bad = guardOk('name-first', n, c);
+  if (bad) { fail++; console.log('  FAIL  ' + String(n).slice(0, 60) + '  · 参数顺序守卫：' + bad); return; }
+  if (c) { pass++; console.log('  PASS  ' + n); } else { fail++; console.log(`  FAIL  ${n}${d ? '  · ' + d : ''}`); }
+};
 const skipped = (n, why) => { skip++; console.log('  SKIP  ' + n + '（' + why + '）'); };
 
 let serverProc = null;

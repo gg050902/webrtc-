@@ -34,7 +34,13 @@ const PORT = resolvePort();
 const URL = `http://localhost:${PORT}`;
 
 let pass = 0, fail = 0;
-const ok = (n, c) => { if (c) { pass++; console.log('  PASS  ' + n); } else { fail++; console.log('  FAIL  ' + n); } };
+// 坑 110 的常驻守卫：本文件约定 ok(名字, 条件)
+const { guard: guardOk } = require('./assert-order-guard.js');
+const ok = (n, c, d) => {
+  const bad = guardOk('name-first', n, c);
+  if (bad) { fail++; console.log('  FAIL  ' + String(n).slice(0, 60) + '  · 参数顺序守卫：' + bad); return; }
+  if (c) { pass++; console.log('  PASS  ' + n); } else { fail++; console.log(`  FAIL  ${n}${d ? '  · ' + d : ''}`); }
+};
 
 /* 自管服务器：返回 proc，null 表示复用了别人已经起好的服务。
  * ▎为什么不无脑起一个？用户可能正开着 `npm start` 在用——

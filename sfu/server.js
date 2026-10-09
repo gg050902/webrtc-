@@ -64,9 +64,38 @@ const Asr = require('./ai/asr');
  *   自动回落 whisper（功能永不降级）；=whisper 强制本地；=qwen 强制云端（失败按"这段没有"）。
  * ▎备份：改造前的 whisper 实现在 backup/asr-whisper-20261001/（git 历史为权威备份）。 */
 const QwenAsr = require('./ai/asr_qwen');
+/* 环境变量取数值的唯一写法：**显式判"有没有传"**，不用 `Number(env) || 默认值`。
+ * ▎坑 54 的复发防守：`Number('0')` 是 0（falsy），`|| 默认` 会把"用户明明白白传了 0"
+ *   读成"没传"——调参的时候量出来的全是错的，而且一行报错都没有（当年 AI 阈值就这样）。
+ * ▎非数值（拼错、空格、'abc'）也回默认：宁可按默认跑，也不要 NaN 渗进比较式
+ *   （`x > NaN` 恒 false = "永远没人说话"那种查不出来的病）。 */
+function numEnvOr(raw, dflt) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return dflt;
+  const n = Number(String(raw).trim());
+  return Number.isFinite(n) ? n : dflt;
+}
 function asrEngineMode() {
   return String(CONFIG.asrEngine || process.env.ASR_ENGINE || 'auto').toLowerCase();
 }
+/* ★ 2026-10-03f 「qwen-local 这一路此刻真的可用吗」——**单一判据**。
+ * ▎为什么必须收口成一处：原先 asrEngineMode()/serverAsrEngineLabel() 只看 config 与
+ *   模型目录，而 getQwenLocalAsr() 还看 `ASR_QWEN_LOCAL=0` —— 三个读者、两套口径（坑 47）。
+ * ▎实测后果有两条，都很坏：
+ *   ① 按文档推荐的并行测试配法（AGENTS 坑 76：显存吃紧时 `ASR_QWEN_LOCAL=0`）启动，
+ *      服务器把 getQwenLocalAsr() 的返回值直接 .warm() → 对 null 调方法 → uncaughtException → **启动即自杀**；
+ *   ② 与此同时 /config.json 还对外宣称引擎是 qwen-local —— 界面说假话（坑 67 的 UI 版），
+ *      用户会去找一个"已经关掉的东西"重装。
+ * ▎dead 也在这里判：worker 连崩之后它就该被算作"不可用"，让标签落回 whisper，
+ *   而不是继续挂着 qwen-local 的名字却一段都转不动。 */
+/* ▸ 决策与解释**同一个来源**：qwenLocalUsable() 决定走不走，qwenLocalState().why 负责说人话。
+ *   分成两处写的必然漂移——判据改了、日志还在念旧原因（坑 47）。 */
+function qwenLocalState() {
+  if (process.env.ASR_QWEN_LOCAL === '0') return { ok: false, why: 'ASR_QWEN_LOCAL=0 显式关掉' };
+  if (!QwenLocalAsr.resolveModelDir()) return { ok: false, why: '没找到 models/qwen3-asr-0.6b' };
+  if (QwenLocalAsr && QwenLocalAsr.dead) return { ok: false, why: 'worker 此前已连崩判死' };
+  return { ok: true, why: '' };
+}
+function qwenLocalUsable() { return qwenLocalState().ok; }
 /* ★ 2026-10-02 「服务端到底能不能转写」——/config.json、/metrics、启动日志**共用这一处判断**。
  * ▎原来 /config.json 写的是 `asrEnabled: !!WHISPER`。引擎换成 Qwen 之后这个判据就不成立了，
  *   而且它失效的方向很坏：asrEnabled=false 会让前端**退回浏览器 Web Speech**
@@ -75,7 +104,7 @@ function asrEngineMode() {
 function serverAsrEngineLabel() {
   const m = asrEngineMode();
   if (m === 'qwen') return QwenAsr.readKey() ? 'qwen' : (WHISPER ? 'whisper' : 'none');
-  if (m === 'qwen-local') return process.env.QWEN_ASR_MODEL ? 'qwen-local' : (WHISPER ? 'whisper' : 'none');
+  if (m === 'qwen-local') return qwenLocalUsable() ? 'qwen-local' : (WHISPER ? 'whisper' : 'none');
   return WHISPER ? 'whisper' : 'none';
 }
 function serverAsrAvailable() { return serverAsrEngineLabel() !== 'none'; }
@@ -98,12 +127,17 @@ function asrPrimaryReady() {
  *   → 浏览器 TTS；ASR 链 = 按 asrEngine 配置（auto 时 whisper worker 优先，qwen-local
  *   用 config.asrEngine='qwen-local' 显式启用——本地 0.6B 延迟未经基准前不抢默认）。 */
 const QwenLocalAsr = require('./ai/asr_qwen_local');
+const Golden = require('./golden');   // ★ 2026-10-09 真人语音金标准（录制页的采集与账本）
 const QwenTts = require('./ai/tts_qwen');
 let qwenAsrLocal = null;
 function getQwenLocalAsr() {
-  if (process.env.ASR_QWEN_LOCAL === '0') return null;
+  /* ★ 2026-10-03f 这里原先自己又测了一遍环境变量 —— 于是"这条路走不走"有两处判据
+   *   （这里 + serverAsrEngineLabel），而 label 那处漏看了 dead。
+   *   现在统一挂到 qwenLocalUsable()：一个概念只有一个来源（坑 47），
+   *   dead 也一起管进来了——worker 判死之后 label 会立刻落回 whisper，不再挂着假名字。 */
+  if (!qwenLocalUsable()) return null;
   if (!qwenAsrLocal) qwenAsrLocal = QwenLocalAsr;
-  return qwenAsrLocal.dead ? null : qwenAsrLocal;
+  return qwenAsrLocal;
 }
 /* ★ 09-29 常驻 ASR worker（单例）：
  * ▎CLI 转写每段都要重启 Python + 重载模型（固定 2~4s+），分段持续转写场景下
@@ -147,9 +181,12 @@ function releaseFallbackAsr() {
 
 async function prewarmAsrWorker() {
   try {
-    // ★ 先等 whisper 探测收敛（启动回调时探测还是异步进行中——早检查会静默空跑，已实测踩中）
-    for (let i = 0; !WHISPER && i < 100; i++) await new Promise((r) => setTimeout(r, 100));
-    if (!WHISPER || process.env.ASR_WORKER === '0') return;
+    /* ★ 2026-10-04h 结构性提速：**不再等 whisper 探测、worker 自己就是探测器**。
+     *   慢机器上冷启动税是层层串行的：--help 探测（45s/候选）→ worker 预热 → 主引擎，
+     *   合计 3-5 分钟 = "开会前几分钟字幕不能用"的体感。现在探测与预热**并行**：
+     *   worker 的 transcribe 内部 await boot（boot 成功=探测通过），spawn 立即发生，
+     *   python 冷 import 与探测同时进行。探测此后只服务 CLI 兜底与文案标签。 */
+    if (process.env.ASR_WORKER === '0') return;
     if (fallbackAsrReleased) return; // 主引擎已经就位，这趟预热不必再跑（省一次模型加载）
     const w = getResidentAsr(CONFIG.asrModel || Asr.DEFAULT_MODEL);
     if (!w) return;
@@ -190,7 +227,8 @@ async function probeAiTts({ force = false } = {}) {
   aiTtsState.probing = true;
   try {
     const buf = await Tts.synthesize('你好', { timeoutMs: 6000 });
-    setAiTtsEnabled(!!buf, buf ? null : 'endpoint-unreachable');
+    setAiTtsEnabled(!!buf, buf ? null
+      : `endpoint-unreachable${Tts.getLastSynthError ? ' (' + Tts.getLastSynthError() + ')' : ''}`);
   } catch (e) { setAiTtsEnabled(false, String(e && e.message).slice(0, 80)); }
   aiTtsState.probedAt = Date.now();
   aiTtsState.probing = false;
@@ -248,6 +286,11 @@ function serverVoiceReady() {
  *   浏览器朗读会把"已经播出去的前几段"和"整段文字"叠成两个声音；
  *   宁可"念了一半"，也比"两个声音抢着念"可信（文字气泡始终完整）。 */
 const TTS_MAX_PARTS = Math.max(1, Number(process.env.TTS_MAX_PARTS) || 3);
+/* ★ 2026-10-06 「要不要让浏览器自己念」这件事必须有截止时刻（单位 ms，默认 8s）。
+ * ▎实测锚点：健康的 Edge 合成一句 1.4s（2026-10-05 夜跑），而单段内部超时是 6s、
+ *   TTS_CONCURRENCY=2 时长答案的第二波还要排队——不给截止时刻，
+ *   "它答应了却不说话"的等待时间由**最慢那一路的失败**决定，而不是由用户的耐心决定。 */
+const TTS_DECIDE_MS = Math.max(1500, Number(process.env.TTS_DECIDE_MS) || 8000);
 function splitForTts(text) {
   const segs = String(text).split(/(?<=[。！？!?；;\n])/).map((s) => s.trim()).filter(Boolean);
   const out = [];
@@ -264,11 +307,21 @@ function splitForTts(text) {
  * ▎引擎顺序的理由见 localTtsWaitEnabled 上方的实测说明：Edge 毫秒级、本地 Qwen 在 CPU 上
  *   比播放还慢（RTF>1），所以"可达的快引擎"永远排在"好看的慢引擎"前面。 */
 async function synthAndEmit(roomNumber, text, ts, seq, total) {
-  const clean = String(text || '').replace(/\*\*/g, '').trim().slice(0, 500);
+  /* ★ 2026-10-05 夜：念之前先洗文本（长路径/URL/markdown 记号/emoji 全去掉）。
+     原来这里只剥 `**`，于是"纪要已生成：/minutes/283648/20261005-221203-segment.md"
+     被逐字念成几十秒的"斜杠 minutes 斜杠 数字"——用户点名"那个长名字就不说了，费时间"。 */
+  const clean = Tts.speakable(text).slice(0, 500);
   if (!clean) return false;
   if (aiTtsState.enabled) {
     try {
-      const buf = await Tts.synthesize(clean, { voice: CONFIG.aiTtsVoice || undefined });
+      /* ★ 2026-10-06 显式给一个**比默认更短**的合成预算（默认 12s）。
+       * ▎理由：这条链的下游本来就配了"发不出来就通知前端自己念"的回落，
+       *   所以这里等满 12 秒买不到任何东西，只买到 12 秒静音。
+       *   实测健康值 1.4s/句（2026-10-05 夜跑），6s 是四倍余量。 */
+      const buf = await Tts.synthesize(clean, {
+        voice: CONFIG.aiTtsVoice || undefined,
+        timeoutMs: Number(process.env.TTS_EDGE_TIMEOUT_MS) || 6000,
+      });
       if (buf) {
         const id = Tts.putAudio(buf, 'mp3');
         io.to(roomNumber).emit('ai-audio', { url: `/ai-tts/${id}.mp3`, ts, seq, total });
@@ -293,6 +346,55 @@ async function synthAndEmit(roomNumber, text, ts, seq, total) {
     }
   }
   return false;
+}
+
+/* ★ 2026-10-04 「一条答案该怎么披露」只有这一个来源。
+ * ▎为什么要抽出来：@ai 打字问答与语音问答（唤醒词）是两条独立的答案通路，
+ *   而它们各自内联了一份"证据链文案 + ai 元信息"。两份迟早会漂——
+ *   本轮就是被用户的截图抓出来：语音那条**既没把 streamId 带回去**（于是流式气泡与
+ *   终态气泡各留一条，同一句话在聊天里出现两遍、名字还一个叫「AI 助理」一个叫「AI 小明」），
+ *   也没带 trace（于是只有打字问答能看到"检索了几条"，语音问答像二等答案）。
+ *   症状是"界面上两个地方说法不同"——本项目为这一类坑栽过很多次（坑 47/51/52/56）。 */
+function aiTraceParts(r) {
+  const parts = [];
+  if (r.totalDocs) {
+    /* ★ 09-25：把检索范围写清楚——"本场会议 N 条"与"全档 M 条"（M>N 说明存档里还有
+     *   房间号复用前 / 更早的会议记录）是两种不同强度的证据，用户有权知道。 */
+    parts.push(r.scoped && r.allDocs > r.totalDocs
+      ? `📚 本场检索 ${r.totalDocs} 条字幕取 ${(r.hits || []).length} 条（全档 ${r.allDocs} 条）`
+      : `📚 检索 ${r.totalDocs} 条字幕取 ${(r.hits || []).length} 条`);
+  }
+  if (r.turns > 1) parts.push(`💬 第 ${r.turns} 轮`);
+  /* ★ 09-25：把"多查询改写"写进证据链。它是**答案可信度的一部分**——
+   *   "我第一遍没找到，是靠把问题改写成别的说法才找到的"与"我直接就找到了"，
+   *   是两种不同的确定程度；静默处理等于偷偷降低了透明度。 */
+  if (r.rewrites) {
+    parts.push(`🔄 原问法召回不足（覆盖率 ${r.rewrites.topCoverBefore}），`
+      + `已用 ${r.rewrites.used} 条改写查询融合检索`);
+  }
+  if (r.intent && r.intent !== 'question') {
+    /* ★ 2026-10-03f 加 chat 标签：对话轨**没有检索证据**（hits 恒为空），
+     *   所以这一行就是气泡上唯一的说明——不写的话用户会以为它又"翻了会议记录"。
+     *   证据链不披露一个不存在的来源，和不去撒谎是同一件事（坑 47）。 */
+    parts.push(`🎯 ${({ minutes: '生成纪要', recap: '回顾', operator: '远程操作', chat: '直接回答（没查会议记录）' })[r.intent] || r.intent}`);
+  }
+  return parts;
+}
+
+/** 答案的机器可读元信息（token 用量 / 意图 / 第几轮 / 证据原话）。两条通路共用。 */
+function aiAnswerMeta(r) {
+  return {
+    mock: !!r.mock, tokens: (r.usage && r.usage.totalTokens) || 0,
+    file: r.file || null, path: r.path || null,
+    intent: r.intent || null, turns: r.turns || 0,
+    hits: (r.hits || []).length, usedHits: r.usedHits || 0, totalDocs: r.totalDocs || 0,
+    scoped: !!r.scoped, allDocs: r.allDocs || 0,
+    /* ★ 09-25：把**答案真正的依据**原话一起发给前端（此前只发条数，且固定取检索命中）。
+     *   `r.evidence` 已经是"哪个来源驱动了答案就展示哪个"——注入了看板证据就是那些条目，
+     *   否则才是检索命中的字幕。用户能真正核对"AI 是照着我说的/看板上的哪句话回答的"：
+     *   **可验证从口号变成事实**（光有数字仍然只能选择相信）。 */
+    hitList: r.evidence || [],
+  };
 }
 
 async function speakAnswerForRoom(roomNumber, text, ts) {
@@ -328,6 +430,14 @@ function makeSpeakPipeline(roomNumber, ts) {
    *   两个引擎共用一条流水线，但**约束按引擎的能力来定**。 */
   const slowEngineOnly = !aiTtsState.enabled && QwenTts.alive && localTtsWaitEnabled();
   const budget = slowEngineOnly ? ttsCharBudget() : 500;
+  /* ★ 2026-10-06 「让浏览器自己念」这个决定的截止时刻同样**按引擎能力定**（与上面的预算同一条理由）：
+   *   · 快引擎（Edge）：6s 内还没出音频就是坏了，等下去只买到静音 → 截止 8s。
+   *   · 慢引擎（本地 Qwen，用户显式开 aiTtsLocalWait 才走）：一句实测要 5~20s，
+   *     8s 截止会**每次都抢在神经音色之前**把它判死——那等于把用户专门打开的那个开关变成空转。
+   *     开这个开关的人买的就是"好听但慢"，所以这里等满它自己的合成上限（60s）。
+   *   ▎不做这一层区分的后果就是"配置写着 true、效果永远是浏览器朗读"，
+   *     而界面上没有任何地方会说这件事——正是坑 67 那一类"写了但从来没生效"。 */
+  const decideMs = slowEngineOnly ? Math.max(TTS_DECIDE_MS, 60000) : TTS_DECIDE_MS;
   let consumed = 0;   // 已经交给 TTS 的字符数（含标点）
   let seq = 0;
   let spokenChars = 0;
@@ -359,10 +469,27 @@ function makeSpeakPipeline(roomNumber, ts) {
         sentence = rest.slice(0, 10 + c.index + 1);
       } else return;
       sentence = sentence.trim();
+      /* ★ 2026-10-09 播报不许切出半句话（用户点名"念到一半就没声了"）。
+       *   旧写法是 `sentence.slice(0, room)` —— 预算只剩 11 字而这一句 30 字时，
+       *   它就把这一句**拦腰截断**念出去，听起来正是"话说一半"。
+       *   ▸ 新规则：① **第一句永远整句念**（哪怕超预算）——先让人听到一句完整的话，
+       *      这比"字数达标"重要；② 之后的句子放不下就**整句不念**（文字气泡里全都有），
+       *      并记一次 ai-tts-budget。约束按引擎能力定的那层判断没变，改的只是"怎么切"。
+       *   ▸ 与生成侧那条"第一句写给耳朵听"的约束配合：模型本来就该把结论压进短句，
+       *      这里是**保险丝**而不是主要手段（光靠 prompt 不保险，光靠截断会切半句）。 */
+      const room = budget - spokenChars;
+      if (sentence.length > room) {
+        if (spokenChars > 0) {
+          if (!saidTruncated) {
+            saidTruncated = true;
+            logEvent('info', 'ai-tts-budget', { roomNumber, budget, note: '预算已满，剩下的句子只以文字显示（不切半句）' });
+          }
+          return;
+        }
+        logEvent('info', 'ai-tts-budget', { roomNumber, budget, note: `首句 ${sentence.length} 字超预算，仍整句念出（不切半句）` });
+      }
       consumed += sentence.length;
       rest = rest.slice(sentence.length);
-      const room = budget - spokenChars;
-      if (sentence.length > room) sentence = sentence.slice(0, room);
       spokenChars += sentence.length;
       const mySeq = seq++;
       jobs.push(synthAndEmit(roomNumber, sentence, ts, mySeq, 0).then((ok) => {
@@ -375,9 +502,18 @@ function makeSpeakPipeline(roomNumber, ts) {
     feed(buf) { cutReady(buf, false); },
     async finish(buf) {
       cutReady(buf || '', true);
-      await Promise.all(jobs);
+      /* ★ 2026-10-06 「通知前端自己念」是一次**决定**，不是一句"我保证之后再也不会发音频了"。
+       * ▎原来这里 `await Promise.all(jobs)`：TTS_CONCURRENCY=2 而长答案能切出 3 段时，
+       *   第二波要等第一波让位；Edge 真挂住时单段内部超时 12s → 这条决定最坏要 20s+ 才说出口。
+       *   实测口径（2026-10-05 夜跑）：健康的 Edge 合成一句 1.4s，答案上屏→听到首段 2.5s。
+       *   等一个死掉的端点等到 20s，用户听到的就是"它答应了却不说话"（坑 66 的第三种形态：
+       *   不是没发信号，是**信号来得太晚**）。
+       * ▸ 截止时刻 decideMs 按引擎定（快引擎 8s、显式开启的本地神经音色等满 60s），
+       *   真晚到的那一段音频由前端按 ts 丢掉（ai-tts-fail 现在会把 ts 记进 serverTtsDropped
+       *   ——配套改动，缺一半就会两个声音抢着念同一句话）。 */
+      await Promise.race([Promise.all(jobs), new Promise((r) => setTimeout(r, decideMs))]);
       if (!deliveredAny) io.to(roomNumber).emit('ai-tts-fail', { ts });
-      return { delivered: deliveredAny, sentences: seq, truncated: saidTruncated };
+      return { delivered: deliveredAny, sentences: seq, truncated: saidTruncated, decidedByTimeout: !deliveredAny };
     },
   };
 }
@@ -408,6 +544,11 @@ try {
   CONFIG = require('./jsonc').parseJsonc(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'));
   console.log('📄 已加载 sfu/config.json');
 } catch (e) { /* 没有配置文件 = 全用默认值（本机演示模式） */ }
+/* ★ 2026-10-09 把配置里的增益档位交给 asr 模块（那个模块看不见 CONFIG）。
+ * ▎为什么这一步必须存在：config.example.json 里写了 asrGainTargetDb/asrGainCapDb，
+ *   而读取方只认 env —— 那用户照模板配完就是一条**静默失效的配置**，
+ *   正是坑 60（"复制 example 改名却没生效"）与坑 67（写了但从来没生效）的合体形状。 */
+try { Asr.configureGain({ targetDb: CONFIG.asrGainTargetDb, capDb: CONFIG.asrGainCapDb }); } catch (e) { /* 用默认档 */ }
 
 /* ★ 09-30：给"自动化测试/基准脚本"一个**显式的 HTTPS 关闭开关**。
  * ▎为什么需要它（这是测试基建的一个真实脆弱点）：
@@ -458,6 +599,79 @@ const MIME = {
   '.svg':  'image/svg+xml',
   '.json': 'application/json; charset=utf-8',
 };
+
+/* ★ 2026-10-07 第 51 步：会议共享文件的存储层（判据全在 sfu/files.js，这里只做 HTTP/信令的接线）。
+ * ▎为什么单独一个模块而不是写在这八千行里：这一层的判据是**安全性的**
+ *   （路径穿越 / 名字撞车 / 把用户上传的 .html 当网页发出去 = 存储型 XSS），
+ *   必须能被穷举断言；而穷举断言要求"纯函数 + 可指到临时目录"。
+ *   同一条纪律的先行者：password.js（口令方案）、nets.js（该对外说哪个 IP）、jsonc.js（配置解析）。
+ * ▎配额可用 config.json（fileMaxMb / fileRoomMb / fileMaxCount）或环境变量
+ *   （FILE_MAX_MB / FILE_ROOM_MAX_MB / FILE_MAX_COUNT）覆盖；显式配 0 = 关掉上传功能。 */
+const Files = require('./files');
+const FILE_LIMITS = Files.resolveLimits(CONFIG);
+/* 启动清扫：收走"上一辈子"留下的上传半成品（进程被杀/断电/磁盘满都会留下 .part）。
+ * ▎为什么放在启动而不是定时：这些文件只可能来自**已经死掉的**那次上传，
+ *   开机扫一遍就够；定时扫要额外判"是不是正在传"，反而多一处会误删的地方。
+ * ▎删不掉不阻塞启动（磁盘问题不该让服务器起不来）。 */
+try {
+  const swept = Files.sweepStaleParts(60 * 60 * 1000);
+  if (swept > 0) console.log(`🧹 清掉了 ${swept} 个上次遗留的上传半成品（.part）`);
+} catch (e) { /* ignore */ }
+/* ★ 2026-10-09 金标准录制页同理：录制中途关页面/进程被杀会留下 .src.part 原始件，
+ *   它们不会被任何列表读到（列表只认 manifest + .wav），但会一直占磁盘。 */
+try { Golden.sweepStaleParts(60 * 60 * 1000); } catch (e) { /* 目录还没建：本来就没有垃圾 */ }
+/* ★ 2026-10-09 金标准录制页的 .part 同样要扫（转码被进程被杀打断时会留半截源文件）。 */
+try {
+  const gswept = Golden.sweepStaleParts(60 * 60 * 1000);
+  if (gswept > 0) console.log(`🧹 清掉了 ${gswept} 个金标准录制的半成品`);
+} catch (e) { /* ignore */ }
+console.log(`📁 共享文件目录：${Files.FILES_DIR}（单文件 ${Files.fmtMb(FILE_LIMITS.maxFileBytes)} / 每房间 ${Files.fmtMb(FILE_LIMITS.maxRoomBytes)} / ${FILE_LIMITS.maxCount} 个）`);
+
+/* ★ 2026-10-06 静态资源的**内容版本号**（把"记得 bump ?v=" 这条人纪律换成机器纪律）。
+ * ▎为什么这是一条真缺陷而不只是整洁问题：本项目最贵的一次事故是坑 40——
+ *   改了 client.js，页面还跑旧版，而服务器发的 `Cache-Control: no-store` 完全没错，
+ *   是 Service Worker 整层绕过了 HTTP 缓存头。修完之后，防线变成"改代码的人记得 bump 版本参数"——
+ *   这种东西一定会被忘掉（AGENTS 里已经有过好几次"依赖人记得"的失败）。
+ * ▸ 现在的机制：HTML 里的 `client.js?v=…` / `style.css?v=…` / `countup.js?v=…` 由服务器
+ *   按文件内容哈希改写；文件一改，URL 自己就变，浏览器与 SW 的缓存键跟着变。
+ *   同时 /config.json 下发同样的版本，页面可以**对比自己实际加载到的版本**发现"我跑的是旧的"。
+ * ▸ 哈希按 mtime+size 缓存：每次请求都读文件算 sha1 是浪费，而这类文件一分钟也变不了几次。 */
+const ASSET_VER_CACHE = new Map();     // 文件名 -> { key, ver }
+function assetVersion(name) {
+  const file = path.join(__dirname, 'public', name);
+  let st;
+  try { st = fs.statSync(file); } catch (e) { return 'missing'; }
+  const key = `${st.mtimeMs}:${st.size}`;
+  const hit = ASSET_VER_CACHE.get(name);
+  if (hit && hit.key === key) return hit.ver;
+  let ver;
+  try {
+    ver = crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex').slice(0, 10);
+  } catch (e) { ver = 'unknown'; }
+  ASSET_VER_CACHE.set(name, { key, ver });
+  return ver;
+}
+const VERSIONED_ASSETS = ['client.js', 'style.css', 'countup.js', 'fileview.js'];
+/* ★ 2026-10-07 正则从 VERSIONED_ASSETS **生成**，不再手写第二份文件名清单。
+ *   原先数组里一份、正则里一份：加 fileview.js 时只改数组的后果是
+ *   "/config.json 下发了它的版本指纹，但 HTML 里的 ?v= 没被改写" ——
+ *   页面自检读到 loaded=undefined 于是一声不吭，或者反过来天天误报"你跑的是旧的"。
+ *   一个概念一个来源（坑 47），这类"两处清单"迟早漂。 */
+const ASSET_TAG_RE = new RegExp(
+  `((?:src|href)=")(\\.\/)?(${VERSIONED_ASSETS.map((f) => f.replace(/\./g, '\\.')).join('|')})(\\?v=[^"]*)?(")`,
+  'g'
+);
+/** 把 HTML 里对这些资源的引用改写成当前版本（已经带 ?v= 的替换，没带的补上）。 */
+function injectAssetVersions(html) {
+  return html.replace(ASSET_TAG_RE,
+    (m, pre, rel, file, _old, tail) => `${pre}${rel || ''}${file}?v=${assetVersion(file)}${tail}`);
+}
+/** /config.json 用的版本表——页面拿它对照自己 script/link 标签上真正加载到的版本。 */
+function assetVersions() {
+  const out = {};
+  for (const f of VERSIONED_ASSETS) out[f.replace(/\W/g, '')] = assetVersion(f);
+  return out;
+}
 
 /* ★ 09-24 G8-①：HTTP 层管理员门禁
  * ▎要解决什么：/api/rooms、/metrics 这些接口此前**完全裸奔**——
@@ -753,6 +967,166 @@ async function requestHandler(req, res) {
     return;
   }
 
+  /* ★ 2026-10-07 第 51 步：会议共享文件（存储层与安全判据全在 sfu/files.js）
+   *     POST /api/files?room=<6位>   上传：body = 文件原始字节，文件名在 X-File-Name 头里
+   *     GET  /api/files?room=<6位>   列表：本场会能看到的文件 + 当前"谁在看哪一份"
+   *     GET  /files/<房>/<名>        取字节：前端 fetch 后自己渲染（docx/xlsx/pptx/md/csv），
+   *                                  或让浏览器直接下载 / 用内置阅读器打开（pdf、图片）
+   *
+   * ▎为什么上传走 HTTP 而不是复用 A4 那套 socket.io 分块：
+   *   A4 是"**发给某一个人**"的临时传输（点对点、不落盘、收完就散）。
+   *   共享文件要的是"**落盘 + 全房可见 + 晚进房的人也拿得到**"——那是 HTTP 的活：
+   *   有 Content-Length 可以提前判配额、有背压（写盘慢就暂停收流）、有断线语义，
+   *   不必再自己发明一套配额与进度协议（A4 那套 64KB 分块 + 台账就是自己发明的代价）。
+   * ▎门禁与字幕/纪要同一档：requireRoomAccess（房间令牌或管理员）。
+   *   理由也相同——本产品**允许游客进会**，游客没有登录 token，只靠进房时发的房间令牌；
+   *   若这里加 admin 门禁，游客就传不了文件，而且是"静默传不上去"（坑：功能坏了不报错）。
+   * ▎"这场会能看到哪些"的下界是 room.createdAt（房间号会回收复用，见 Files.listFiles 的注释）。 */
+  if (pathname === '/api/files') {
+    if (req.method === 'POST') { handleFileUpload(req, res); return; }
+    const q = new URL(req.url, 'http://localhost').searchParams;
+    const room = String(q.get('room') || '');
+    if (!requireRoomAccess(req, res, room).ok) return;
+    if (!Files.validRoom(room)) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: '房间号必须是 6 位数字' }));
+      return;
+    }
+    const room0 = rooms.get(room);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify({
+      files: Files.listFiles(room, { since: room0 ? room0.createdAt : 0 }),
+      view: room0 ? room0.fileView || null : null,
+      roomExists: !!room0,
+      limits: {
+        maxFileBytes: FILE_LIMITS.maxFileBytes,
+        maxRoomBytes: FILE_LIMITS.maxRoomBytes,
+        maxCount: FILE_LIMITS.maxCount,
+      },
+    }));
+    return;
+  }
+  /* ★ 2026-10-09 真人语音金标准（采集端）。
+   * ▎它是**开发者的量具**，不是会议功能：句子清单 + 已录条目给录制页读，
+   *   POST 收一条录音（webm/opus）→ ffmpeg 转 16k/mono/s16le WAV → 落 sfu/voice-golden/。
+   *   ▸ 门禁走 requireAdmin（甲类·工具)：它不属于任何房间、没有 6 位房号可传给
+   *     requireRoomAccess，而且"往服务器写文件"这件事本来就该比读纪要更严。
+   *   ▸ 为什么当场把峰值量出来回给页面：`Asr.measureWavLevel` 就是生产能量闸用的那一个函数
+   *     ——录制时看到的电平与会议里被闸拦不拦**是同一把尺**（坑 47）。用户录完立刻知道
+   *     "这句太安静了，会被当成静音删掉"，而不是录完 30 句才发现整批是废的。 */
+  if (pathname === '/api/golden' && req.method === 'GET') {    if (!requireAdmin(req, res).ok) return;
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify({
+      sentences: Golden.SENTENCES,
+      distances: Golden.DISTANCES,
+      items: Golden.list(),
+      ffmpeg: !!FFMPEG_OK,
+      ffmpegBin: FFMPEG_BIN,
+      limits: { maxClipBytes: Golden.MAX_CLIP_BYTES, maxClips: Golden.MAX_CLIPS },
+      gateDb: asrMinPeakDb(),   // 录制页拿它做"这句会不会被当静音删掉"的当场提示（同一个来源）
+    }));
+    return;
+  }
+  if (pathname === '/api/golden' && req.method === 'POST') {
+    if (!requireAdmin(req, res).ok) { req.destroy(); return; }   // 拒了必须把请求体丢掉（"先付费再拒绝"= 白收）
+    const head = (k) => {
+      const raw = String(req.headers[k] || '');
+      try { return decodeURIComponent(raw); } catch (e) { return raw; }   // 中文头必须 encodeURIComponent
+    };
+    const text = head('x-golden-text').trim().slice(0, 200);
+    const dist = ['near', 'far'].includes(head('x-golden-dist')) ? head('x-golden-dist') : 'near';
+    const id = Golden.safeId(head('x-golden-id'));
+    const json = (code, obj) => {
+      res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(obj));
+    };
+    if (!text || !id) return json(400, { error: '缺少 x-golden-text 或 x-golden-id' });
+    if (Golden.list().length >= Golden.MAX_CLIPS && !Golden.list().some((r) => r.id === id)) {
+      return json(409, { error: `金标准已到 ${Golden.MAX_CLIPS} 条上限；先删 sfu/voice-golden/ 里的旧条目再录` });
+    }
+    try {
+      const made = await Golden.transcodeClip({ req, ffmpegBin: FFMPEG_OK ? FFMPEG_BIN : '', id });
+      const abs = path.join(Golden.GOLDEN_DIR, made.wav);
+      const lvl = Asr.measureWavLevel(abs);                    // 与生产能量闸同一个函数
+      const gateDb = asrMinPeakDb();
+      /* ★ 只剔账、不删字节：新录的那份已经覆盖了同名 wav，若在这里按旧记录 unlink
+         就会把刚转好的文件删掉（同名！），账本于是指向一条不存在的 wav，
+         列表再把这条过滤掉——用户看到"重录成功却查无此条"。回归当场把这条抓红了。 */
+      Golden.dropFromLedger(id);
+      Golden.appendRecord({
+        id, text, wav: made.wav, dist, source: 'human',
+        peakDb: lvl ? Math.round(lvl.peakDb * 10) / 10 : null,
+        secs: lvl ? +(lvl.samples / 16000).toFixed(2) : null,
+        bytes: made.bytes, ts: Date.now(),
+      });
+      logEvent('info', 'golden-recorded', { id, dist, peakDb: lvl ? Math.round(lvl.peakDb) : null, bytes: made.bytes });
+      return json(200, {
+        ok: true, id, wav: made.wav, ms: made.ms,
+        peakDb: lvl ? lvl.peakDb : null,
+        // 过不了生产能量闸的句子，转写引擎根本不会看它一眼——当场说，别等跑表才发现
+        warn: lvl && lvl.peakDb < gateDb
+          ? `峰值 ${lvl.peakDb.toFixed(1)} dBFS 低于当前闸门 ${gateDb}dB：这句在会议里会被当静音删掉，请靠近麦克风或调大系统输入增益`
+          : '',
+      });
+    } catch (e) {
+      return json(Number(e.status) || 500, { error: String(e.message || e).slice(0, 200) });
+    }
+  }
+  if (pathname.startsWith('/files/')) {
+    const parts = pathname.split('/').filter(Boolean);      // ['files', room, name…]
+    let room = ''; let name = '';
+    try {
+      room = decodeURIComponent(parts[1] || '');
+      /* 名字可能本身含斜杠的转义（%2F）——pathname 是**未解码**的，
+       * 所以先按 '/' 切、再把剩余各段拼回来解码，才不会把一个名字切成两段。 */
+      name = decodeURIComponent(parts.slice(2).join('/'));
+    } catch (e) { name = ''; }
+    if (!requireRoomAccess(req, res, room).ok) return;
+    if (!Files.validPathParts(room, name)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('403 Forbidden');
+      return;
+    }
+    // 第二道路径钳制（validPathParts 已经挡了 / 与 \，这里再确认一次真实路径没跑出目录）
+    const fp = Files.blobPath(room, name);
+    if (!fp.startsWith(Files.blobDir(room) + path.sep)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('403 Forbidden');
+      return;
+    }
+    /* ★ 只有"这场会的列表里能看到它"才给下载——列表与下载**同一个判据**，
+     *   否则知道文件名就能绕过 since 过滤读到上一场会的材料（一个概念一个来源，坑 47）。 */
+    const room0 = rooms.get(room);
+    const visible = Files.listFiles(room, { since: room0 ? room0.createdAt : 0 }).some((f) => f.name === name);
+    if (!visible) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('文件不存在（或不属于本场会议）');
+      return;
+    }
+    let st;
+    try { st = fs.statSync(fp); } catch (e) { st = null; }
+    if (!st || !st.isFile()) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('文件不存在');
+      return;
+    }
+    const pol = Files.servePolicy(name);
+    res.writeHead(200, {
+      'Content-Type': pol.mime,
+      'Content-Length': st.size,
+      'Content-Disposition': pol.disposition,
+      /* nosniff：绝不许浏览器"猜"类型。用户上传的 .png 里塞 HTML 时，
+       * 猜类型就是把它当网页渲染（这是内容嗅探型 XSS 的经典入口）。 */
+      'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'no-store',
+    });
+    // 流式发（最大 40MB 的文件整读进内存会让长跑的堆一直抖）
+    const rs = fs.createReadStream(fp);
+    rs.on('error', () => { try { res.destroy(); } catch (e) { /* 已经断了 */ } });
+    rs.pipe(res);
+    return;
+  }
+
   // ★ 09-13 可达性：把 ICE 服务器配置下发给浏览器（客户端 fetch 后建 Transport 用）
   if (pathname === '/config.json') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -760,14 +1134,65 @@ async function requestHandler(req, res) {
       iceServers: Array.isArray(CONFIG.iceServers) ? CONFIG.iceServers : [],
       videoSvc: !!CONFIG.videoSvc, // ★ D+3：VP9 SVC 开关（true = 摄像头改用单路 SVC 上传）
       authTtlMs: AUTH_TTL_MS, // ★ G6：token TTL（回归用它开短 TTL 实测过期路径）
+      /* ★ 2026-10-09 把密码规则下发给登录卡：原来卡片上不写要求，用户填完昵称密码点「注册」
+       *   才被拒一句"密码至少 8 位"——规则该在打字之前看见，而不是在失败之后才知道。 */
+      passwordMinLen: passwordMinLen(),
       asrEnabled: serverAsrEngineLabel() !== 'none', // ★ 09-27d/09-28 → 2026-10-02 换引擎后不能只盯 whisper（见 serverAsrEngineLabel）
       asrEngine: serverAsrEngineLabel(), // ★ 2026-10-02 让页面/排障能看见"现在究竟是哪套引擎在听话"
+      /* ★ 2026-10-06 前端资源版本表（配合上面的 assetVersion / 下面的"页面自检"）：
+       *   页面拿自己 script/link 标签上**实际加载到**的 ?v= 与这里比，一比就发现
+       *   "我跑的还是旧版"——那正是"AI 明明修好了，用户那边还是不行"最难自查的形状。 */
+      assetVersions: assetVersions(),
       // ★ 09-16 局域网交付：announcedIp 存在时，告诉前端"发给别的电脑的邀请链接长什么样"——
-      //   服务器机自己访问的是 localhost，直接复制 location.href 别的电脑打不开
-      lanUrl: ANNOUNCED_IP ? `https://${ANNOUNCED_IP}:${(tlsCfg.port || 3443)}` : null,
+      //   服务器机自己访问的是 localhost，直接复制 location.href 别的电脑打不开。
+      // ★ 2026-10-06 协议名跟着 HTTPS 走（原来无论开没开都硬写 https://）：
+      //   HTTPS 关着的部署（本机开发/自测）照这条规则复制出来的链接是"打不开的 https"，
+      //   而这正是"邀请链接发出去别人点不开"里最难查的一种——链接看起来完全正常。
+      lanUrl: ANNOUNCED_IP ? `${tlsCfg.enabled ? 'https' : 'http'}://${ANNOUNCED_IP}:${tlsCfg.enabled ? (tlsCfg.port || 3443) : PORT}` : null,
+      /* ★ 2026-10-06 跨网稳定入口（这台机器装了 Tailscale 才有）：
+       *   与 lanUrl 的分工就一句话——lanUrl 给"坐在同一个局域网里的同事"，
+       *   tsUrl 给"不在同一个网络里的人"（100.x 不随你换 WiFi/热点而变，也不用配端口映射）。
+       *   没装就是 null，前端不显示这一项；绝不编一个"看起来能用"的地址。
+       *   ▸ TS_IP 是**操作者明示**的覆盖（与 announcedIp 的环境变量同一层语义）：
+       *     Tailscale 装在非标准网卡、或这台机器通过别的组网工具拿到 100.x 时用得上，
+       *     也让"这条链接真的会出现在顶栏"这件事可以被自测跑通（不靠本机恰好装了谁）。 */
+      tsUrl: (() => {
+        const forced = String(process.env.TS_IP || '').trim();
+        const t = forced ? { ip: forced, name: 'TS_IP' } : Nets.pickTailscaleIp();
+        if (!t) return null;
+        return `${tlsCfg.enabled ? 'https' : 'http'}://${t.ip}:${tlsCfg.enabled ? (tlsCfg.port || 3443) : PORT}`;
+      })(),
       // ★ 09-24 AI 模式：**只下发布尔值**——前端据此显示「LLM / Mock」状态灯。
       //   密钥本身绝不下发（连末四位都不给）：浏览器是公开可下载的资源，任何回显都是泄露。
       aiEnabled: AI.aiEnabled(),
+      /* ★ 2026-10-07 跨网可达性判定（判据的唯一实现是 sfu/nets.js 的 diagnose）。
+       *   ▎为什么放在 /config.json 而不是新开一个 /api/netcheck：这个接口已经是
+       *     "这台服务器对外的自我描述"（lanUrl / tsUrl / iceServers 都在里面），
+       *     再加一个端点只是多一处要过门禁、多一条会漏写的路。
+       *   ▸ 只回**判定结论与本机那一个地址**，不回整张网卡表——
+       *     把内网拓扑端给任意一个访问页面的人是没必要的暴露。 */
+      netCheck: Nets.diagnose({
+        ip: ANNOUNCED_IP,
+        nic: ANNOUNCED_DECISION.nic,
+        source: ANNOUNCED_DECISION.source,
+        stale: ANNOUNCED_DECISION.stale,
+        listenIp: LISTEN_IP,
+        httpsEnabled: !!tlsCfg.enabled,   // SFU_NO_HTTPS=1 已在启动时把它改成 false，这里读到的就是本次的真值
+        httpsPort: tlsCfg.port || 3443,
+        port: PORT,
+        /* ★ K1（2026-10-09）：媒体端口形态进判定。0 = 随机端口段且只有 UDP；
+         *   >0 = 全 Worker 共用这一个 UDP+TCP 号（跨网只需一条映射，禁 UDP 还能走 TCP）。
+         *   注意读的是**本次真的挂上了几个**，不是"配置里写了多少"——
+         *   端口被占时 attachRtcServer 会退回随机段，那时报 4443 就是界面在撒谎（坑 67/82）。 */
+        rtcServerPort: rtcServers.size ? RTC_SERVER_PORT : 0,
+        rtcMinPort,
+        rtcMaxPort,
+        mediaIps: MEDIA_IPS,
+        announceExtra: ANNOUNCE_EXTRA,
+        iceServers: Array.isArray(CONFIG.iceServers) ? CONFIG.iceServers : [],
+        tailscaleIp: (String(process.env.TS_IP || '').trim())
+          || (Nets.pickTailscaleIp() || {}).ip || '',
+      }),
       // ★ 09-24 真远程桌面：告诉前端"本服务器支持桌面代理（agent/index.js）"。
       //   前端据此决定要不要显示「🖥️ 控制电脑」按钮和 agent 相关指引。
       remoteDesktop: true,
@@ -840,6 +1265,7 @@ async function requestHandler(req, res) {
 
   const urlPath = pathname === '/' ? '/index.html'
     : pathname === '/dashboard' ? '/dashboard.html' // 观测面板的短地址
+    : pathname === '/golden' ? '/golden.html'       // ★ 10-09 真人语音金标准录制页的短地址
     : pathname;
   const filePath = path.normalize(path.join(__dirname, 'public', urlPath));
   // ★ 安全钳制：解析后的真实路径必须还在 public 目录里，
@@ -857,13 +1283,21 @@ async function requestHandler(req, res) {
       return;
     }
     const ext = path.extname(filePath);
+    /* ★ 2026-10-06 托管 HTML 时把资源引用的 `?v=` 改写成**当前文件的真实版本**（内容哈希）。
+     *   ▎为什么值得动这一处：这个项目最贵的坑是"改了代码，页面还跑旧的"（坑 40），
+     *     而它的防守一直靠"记得 bump 版本参数"——**靠人记得的防线一定会被忘掉**。
+     *     现在把版本交给服务器：谁改了 client.js / style.css，URL 自己就变了，
+     *     浏览器与 SW 的缓存键跟着变，前端一行纪律都不用记。
+     *   ▸ 只改 HTML 里的这三类引用，不碰其它字节（HTML 很小，正则一次扫完）。 */
+    let body = data;
+    if (ext === '.html') body = injectAssetVersions(data.toString('utf8'));
     // ★ 静态资源禁缓存（排版实修）：页面样式迭代频繁，启发式缓存会让浏览器吃旧 CSS——
     //   "改了样式不生效"比慢加载可怕得多（演示项目无带宽压力，no-store 一劳永逸）
     res.writeHead(200, {
       'Content-Type': MIME[ext] || 'application/octet-stream',
       'Cache-Control': 'no-store',
     });
-    res.end(data);
+    res.end(body);
   });
 }
 
@@ -939,9 +1373,13 @@ async function snapshotRooms() {
       });
     }
     const ctl = remoteCtl.get(roomNumber);
+    // ★ 2026-10-07 第 51 步：这场会能看到的共享文件（下界 = 本场会开始时刻，与列表/下载同一条判据）
+    let roomFiles = [];
+    try { roomFiles = Files.listFiles(roomNumber, { since: room.createdAt }); } catch (e) { roomFiles = []; }
     list.push({
       roomNumber,
       createdAt: room.createdAt,
+      resumed: !!room.resumed,   // ★ 2026-10-04h 续会标记（面板/测试可辨识）
       durationSec: Math.round((Date.now() - room.createdAt) / 1000),
       // ★ D+4：空房宽限期状态（面板显示"空房宽限中 · 剩 xx s"）
       emptySince: room.emptySince || null,
@@ -956,6 +1394,12 @@ async function snapshotRooms() {
         consumers: members.reduce((a, m) => a + m.consumers, 0),
       },
       control: { hostId: (ctl && ctl.hostId) || null, controllerId: (ctl && ctl.controllerId) || null },
+      /* ★ 2026-10-07 第 51 步：共享文件在面板上的三格——几个文件、占多少、谁在看哪一份。
+       * ▎没有文件的房间走的是 listFiles 的快路径（目录不存在 → 立刻空数组），
+       *   所以面板 2s 一轮的轮询不会因此多出可观的 IO。 */
+      filesCount: roomFiles.length,
+      filesBytes: roomFiles.reduce((a, f) => a + (Number(f.size) || 0), 0),
+      filesView: room.fileView ? { name: room.fileView.name, page: room.fileView.page, byName: room.fileView.byName } : null,
     });
   }
   return {
@@ -969,12 +1413,42 @@ async function snapshotRooms() {
       asrReady: asrPrimaryReady(),   // ★ 2026-10-03 主引擎此刻是否接得住活（预热期=false，别把正确行为当故障）
       asr: COLLAB.asr,
       answers: COLLAB.answers,
+      answerVia: COLLAB.answerVia,   // ★ 2026-10-06 被叫才答 / 免唤醒续答 各多少次（watch 的判据）
+      /* 免唤醒窗口的当前宽度（毫秒）。watch 需要它才能判断"没被叫到却答话"是不是违规：
+         aiChatWindowSec>0 是**用户自己开的对话模式**，那时 follow-up 多于 name-only 是正常形态；
+         =0 才是回归。把配置事实交出去，而不是让告警工具去猜服务器的设置。 */
+      aiChatWindowMs: AI_CHAT_WINDOW_MS,
       throttled: COLLAB.throttled,
       roomControl: COLLAB.roomControl,
       roomApplied: COLLAB.roomApplied,
       board: COLLAB.board,
+      files: COLLAB.files,   // ★ 2026-10-07 第 51 步：共享文件的上传/删除/同步/被拒计数
+      /* ★ 2026-10-06 输入侧健康（口径见 COLLAB.input 上方注释）。快照里补一个"多久没听到声音"，
+       *   因为读的人要的是"现在"，而 lastVoiceTs 是时刻——换算只写这一处（坑 47）。 */
+      input: Object.assign({}, COLLAB.input, {
+        voiceAgeMs: COLLAB.input.lastVoiceTs ? Date.now() - COLLAB.input.lastVoiceTs : null,
+      }),
+      gainApplied: COLLAB.gainApplied,   // ★ 2026-10-09 安静麦克风的增益触发证据（与 /metrics 同一个数）
       capLat: COLLAB.capLat,   // ★ 2026-10-03 字幕延迟：{n, sum, max, last}（面板与 /metrics 同源，不另算一份）
       speakLat: COLLAB.speakLat, // ★ 2026-10-03 播报延迟：同上，客户端实测上报
+      /* ★ 2026-10-04 转写并发的触发证据（与 /metrics 同一个对象，不另算一份——坑 47）。
+         面板上"转写引擎"那一格讲的是"谁在转写"，这一格讲的是"转写得并行吗"。 */
+      seg: COLLAB.seg,
+      refine: COLLAB.refine,   // ★ 2026-10-07 整句重转 {n, fixed, ms, skipped}——"改没改这句话"数得出来
+      /* ★ H5b：让路判据用的那条线本身也要能被外部读到（面板/复盘/watch 都靠它判断
+         "多人房里重转到底还有多少在做"，而不是猜）。放在 collab 里而不是单独一路，
+         是因为它与 refine 四格是同一件事的四个面（坑 47：一个概念一个来源）。 */
+      asrBusy: asrEngineBusy,
+      /* ★ 2026-10-07 H1：本地 worker 池的**事实**（不是配置值）。
+         三个数分开：配了几个 / 几个真活着 / 各自的重启计数。
+         为什么"配了"不够：槽会被连崩判死或正在冷却，那时它名义上在、实际不干活，
+         而用户的感受是"我明明配了 2 个为什么还这么慢"（坑 82 的仪表版）。 */
+      asrWorkers: (() => {
+        const q = getQwenLocalAsr();
+        if (!q) return null;
+        return { configured: q.workerCount, alive: q.aliveCount, restarts: q.restarts,
+                 slots: q.slotStats.map((x) => ({ i: x.idx, alive: x.alive, dead: x.dead, restarts: x.restarts })) };
+      })(),
     },
     rooms: list,
   };
@@ -994,29 +1468,94 @@ async function snapshotRooms() {
 const COLLAB = {
   asr: {},            // via -> { n, sec }（转写段数与累计耗时）
   answers: 0,         // AI 真答出去的次数
-  throttled: {},      // reason -> n（被哪道闸拦下：dup / echo / inflight / interval）
+  /* ★ 2026-10-06 夜二 **按"为什么答"分类计数**（用户拍板的规矩：只有被叫到名字才开口）。
+   *   ▎为什么要有这一格而不是只看 answers：`answers` 涨说明它在说话，但说不出它是
+   *     "被叫了才答"还是"又把会议闲聊当成对自己说的"。而后者正是这条产品规矩的违反形态，
+   *     且**不会有任何报错**——纯靠人工去翻日志是查不住的（坑 76：机制要有触发证据）。
+   *   ▸ 不变式：`follow-up` 只应来自"被分段切断的半句"（每次前面必有一次 name-only），
+   *     所以 watch 的规则是 `follow-up > name-only 次数 + 余量` 就告警。 */
+  answerVia: { wake: 0, 'follow-up': 0 },
+  /* ★ 2026-10-07 整句重转的账（"它到底改没改这句话"必须数得出来，坑 76）。
+   *   n = 发起过重转的句子数；fixed = 重转结果被采用的句子数（= 屏幕上那句被整句版替换过）；
+   *   ms = 累计耗时；skipped = **因为 worker 正在忙别人的段而让路**的次数（★ H5b）。
+   *   三格合起来回答用户的"识别太笨"有没有被真的治：
+   *   若 fixed/n 常年很低，说明整句那次要么失败要么被判"丢字"——那就不该宣称在修。
+   *   ▸ `skipped` 为什么必须单独一本账：让路策略最容易坏在"其实一直在让路、于是从来没重转过"，
+   *     而那看起来与"重转在做但都没被采用"一模一样。只有前两本数分不开这两种病（坑 76）。 */
+  refine: { n: 0, fixed: 0, ms: 0, skipped: 0 },
+  /* ★ 2026-10-09 模型输入峰值增益的触发计数。
+   *   ▎为什么单列一本：10-05 那把"按实测峰值提增益"的刀上线时，**没有任何一处能证明它跑过**，
+   *     于是"安静麦克风被救回来"这件事只能靠人对着字幕感觉。而 COLLAB.input.voiced
+   *     已经数了"过了能量闸的段数"——两本一除就是"过闸的段里有多少被提过音量"。
+   *     分子长期为 0 而分母不为 0 = 增益那条路根本没生效（坑 76 的标准形状）。 */
+  gainApplied: 0,
+  throttled: {},      // reason -> n（被哪道闸拦下：dup / echo / inflight / interval / name-only）
   roomControl: {},    // action -> n（服务器发出的房间动作）
   roomApplied: {},    // action -> n（客户端回执"我真的执行了"）—— 与上面的差 = 说了没做
   board: { stroke: 0, undo: 0, clear: 0, rejected: 0 },
+  /* ★ 2026-10-07 第 51 步：共享文件的账。
+   *   upload/delete = 成功次数；rejected = 被配额或名字判据挡下的次数（**这本最重要**：
+   *   上传失败在前端只是一个 toast，而"为什么传不上去"只有这个计数能回答）；
+   *   view = 有人切换/翻页/滚动导致的同步次数（"跟随主讲"这条链路到底有没有在动）。 */
+  files: { upload: 0, delete: 0, view: 0, rejected: 0 },
+  /* ★ 2026-10-06 听觉的**输入侧**健康：量的不是"转写得快不快"，而是"到底有没有声音进来"。
+   *   ▎为什么这条值得单独有读数：2026-10-06 用 test:voice-longrun 查"识别一段时间就停"时，
+   *     服务器日志里 60 段全是 `peak=-90 dBFS`（**纯数字零**）——不是模型停了、不是闸错杀、
+   *     不是端口撞了，是**根本没有音频送达**（那次是假麦克风的夹具断供）。
+   *     而当时的所有计数器只会说"零转写"，把一条输入侧的事实说成了识别侧的故障，
+   *     差点让人去优化一个不存在的问题（坑 58：先量对指标；坑 65：断言 0 之前先证明输入进去了）。
+   *   ▸ 有了这三格，"识别失败"第一次能一眼分成两种病：
+   *       lastPeakDb≈-90 且 zeroStreak 一直涨 → 对方没送声音（设备/权限/浏览器/夹具）
+   *       lastPeakDb 正常但零转写            → 管线或模型的问题（这才该去查 sfu/ai）
+   *   ▸ 这也是一个**产品级**诊断：值班的人问"他为什么没字幕"，答案可能只是"他麦克风没开"。 */
+  input: { lastPeakDb: -99, lastVoiceTs: 0, zeroStreak: 0, quietSkipped: 0, voiced: 0,
+    voiceThr: -50, floorDb: null },   // ★ 2026-10-06 自适应"有声"判据当前用的哪条线、噪声底多少
   /* ★ 2026-10-03 字幕端到端延迟（"说完"→"定稿字幕广播出去"）。
    *   ▎为什么要量这一条而不是只量转写耗时：用户抱怨的"字幕很慢"其实包含三段
    *     ——静音判定的等待、模型转写、以及分段窗口本身的长度；而 `sfu_ai_asr_seconds_total`
    *     只覆盖中间那一段。只看转写会得出"2s 不算慢啊"的错误结论，
    *     因为真正决定体感的是**从人停止发声到字幕出现**的总长（同坑 58：先量对指标）。
    *   ▎口径：lastVoiceTs 是"最后一个判定为有声的 RMS 窗到达时刻"，
-   *     窗口本身 0.5s（astats reset=8000 @16kHz），所以这个起点天然偏晚 ≤0.5s，
+   *     窗口本身 0.5s（astats 每帧 1024 采样 @16kHz，reset 8 帧），所以这个起点天然偏晚 ≤0.5s，
    *     量出来的延迟是**下限**——宁可保守，也不要在界面上虚报"比实际更快"。 */
   capLat: { n: 0, sum: 0, max: 0, last: 0 },
   /* ★ 2026-10-03 播报延迟（客户端实测："答案上屏 → 真的听见第一句"）。
    *   与 capLat 同一条方法论：这条链路的故障全是"它答应了却没声音"，
    *   没有读数时连"到底有没有出声"都要靠人猜（历史上查过三次才查明白）。 */
   speakLat: { n: 0, sum: 0, max: 0, last: 0 },
+  /* ★ 2026-10-04 转写并发的**触发证据**（坑 76 的纪律：机制"在"不等于机制"生效"）。
+   *   ▎为什么必须量这个：并发化改完之后，从来没有人证明过它真的并行过——
+   *     而 GPU 时代单段转写只要 0.3~0.6s、分段窗口却有 2s，
+   *     完全可能**一段早早就转完了、下一段还没到**，于是 segInFlight 永远 ≤1，
+   *     并发能力付了钱却没在用。这跟当年"抢跑快照从上线起一次都没触发过"是同一种病。
+   *   ▸ launched：启动过多少段；
+   *   ▸ peak    ：同时在途的历史最大值（=1 就说明这条管线实际上仍是串行）；
+   *   ▸ blocked ：轮询时在途已满、只能跳过这一轮的次数（>0 才是"并发真的成了约束"的证据）。
+   *     口径是"轮数"不是"段数"——要数到段得每轮先探测目录，为一个观测指标花真开销不值。 */
+  seg: { launched: 0, peak: 0, blocked: 0 },
 };
 function bump(obj, key) { obj[key] = (obj[key] || 0) + 1; }
 function bumpAsr(via, ms) {
   const s = COLLAB.asr[via] || (COLLAB.asr[via] = { n: 0, sec: 0 });
   s.n += 1; s.sec += (ms || 0) / 1000;
 }
+/* ★ 2026-10-07 H5b：**全服务器**此刻有几个转写任务在途（跨房间、跨成员）。
+ * ▎为什么需要这个数：`bench:asr-multi` 量到"开整句重转"之后
+ *   4 路并发分段 p95 1.40s→2.21s、8 路 3.04s→4.38s、吞吐只剩基线的 ~72%——
+ *   重转是真话的**竞争对手**，它们排的是同一个单进程 worker（`ASR_CONCURRENCY` 那个信号量
+ *   只包 whisper CLI，qwen-local 的排队发生在 Python 侧，别把两件事搞混）。
+ * ▸ 于是定稿前的整句重转要**让路**：worker 还在处理别人的段时，这一句就用拼接结果定稿
+ *   （字幕照出不延迟，只是这一句不做第二次推理）。单人房里 finalize 那一刻在途恒为 0，
+ *   重转一次也不会少做；满房时才让路——**这正好把代价花在真正人多的一线**。
+ * ▸ 计在 `runEngines` 的入口/出口（分段与整句**共用**这一个函数 = 同一个来源，坑 47），
+ *   所以它天然包含重转自己：让路判定必须在**发起之前**读，不能在 await 之后读。 */
+let asrEngineBusy = 0;
+function bumpAsrBusy(delta) { asrEngineBusy = Math.max(0, asrEngineBusy + delta); return asrEngineBusy; }
+/* 让路线：默认 0 = "只要有别家在途就让路"；`ASR_REFINE_YIELD=-1` 彻底不让路（回到 H5 之前的行为，
+   排障与 A/B 用）。取负数而不是关掉 ASR_REFINE，是为了保留重转、只关掉"让路"这一个变量。 */
+const REFINE_YIELD_ABOVE = process.env.ASR_REFINE_YIELD !== undefined && process.env.ASR_REFINE_YIELD !== ''
+  ? Number(process.env.ASR_REFINE_YIELD)
+  : (CONFIG.asrRefineYield === undefined || CONFIG.asrRefineYield === null ? 0 : Number(CONFIG.asrRefineYield));
 /* 两条延迟共用一个累加器（同一形状、同一口径：n/sum/max/last），
  * 免得两处各写一份"均值怎么算、最大值怎么更新"而慢慢漂移。 */
 function bumpLat(c, ms) {
@@ -1065,6 +1604,20 @@ function buildMetrics(snap) {
    *   语音体验出问题时先看这两个：是"耳朵没就位"还是"嘴没就位"，一眼分清。 */
   help('sfu_ai_asr_worker_enabled', 'gauge', '1 when the resident whisper worker is alive (0 = CLI fallback)');
   L.push(`sfu_ai_asr_worker_enabled ${getResidentAsr(CONFIG.asrModel || Asr.DEFAULT_MODEL) ? 1 : 0}`);
+  /* ★ 2026-10-07 H1：本地 Qwen worker 池的三条读数。
+   *   ▎为什么"配了 2 个"与"活着 2 个"必须分开报：分片是按成员哈希的，某个槽连崩判死后
+   *     那个人会被退到别的槽（慢一点），而只看配置数会以为一切正常。
+   *   ▎`workers` 是**配置值**、`workers_alive` 是**事实**——这正是坑 82 那条"过期声明比缺失更糟"
+   *     的反向应用：报配置不报事实的仪表会让人去做无用排查。 */
+  const qPool = getQwenLocalAsr();
+  if (qPool) {
+    help('sfu_ai_asr_qwen_workers', 'gauge', 'Configured number of local Qwen ASR worker processes (H1 capacity knob)');
+    L.push(`sfu_ai_asr_qwen_workers ${qPool.workerCount || 1}`);
+    help('sfu_ai_asr_qwen_workers_alive', 'gauge', 'How many of those workers are actually ready right now');
+    L.push(`sfu_ai_asr_qwen_workers_alive ${qPool.aliveCount || 0}`);
+    help('sfu_ai_asr_qwen_in_flight', 'gauge', 'Transcription requests currently queued across all local Qwen workers');
+    L.push(`sfu_ai_asr_qwen_in_flight ${qPool.inFlight || 0}`);
+  }
   help('sfu_ai_tts_enabled', 'gauge', '1 when Edge neural TTS endpoint is reachable (0 = browser speechSynthesis fallback)');
   L.push(`sfu_ai_tts_enabled ${aiTtsState.enabled ? 1 : 0}`);
   help('sfu_ai_asr_engine_qwen', 'gauge', '1 when the Qwen3-ASR (DashScope) engine is active for new transcriptions');
@@ -1073,6 +1626,36 @@ function buildMetrics(snap) {
    *   少了这一行，watch 只能在开机预热期误报（误报的代价是以后没人看告警）。 */
   help('sfu_ai_asr_primary_ready', 'gauge', '1 when the configured primary ASR engine can take work now (local worker loaded / cloud key present)');
   L.push(`sfu_ai_asr_primary_ready ${asrPrimaryReady() ? 1 : 0}`);
+  /* ★ 2026-10-06 输入侧三格（口径见 COLLAB.input）："这个人为什么没字幕"第一次可以不靠猜。
+   *   zeroStreak 一直涨 + last_peak_db≈-90 = 根本没声音进来（设备/权限/浏览器/夹具），
+   *   而不是模型或管线坏了——这两种病的处方完全相反，混起来就会去优化一个不存在的问题。 */
+  help('sfu_ai_asr_input_last_peak_db', 'gauge', 'Peak level (dBFS) of the last audio segment the server measured; -99 = never measured anything');
+  L.push(`sfu_ai_asr_input_last_peak_db ${COLLAB.input.lastPeakDb}`);
+  help('sfu_ai_asr_input_voice_age_ms', 'gauge', 'Milliseconds since the last segment passed the energy gate (no sample = -1)');
+  L.push(`sfu_ai_asr_input_voice_age_ms ${COLLAB.input.lastVoiceTs ? Date.now() - COLLAB.input.lastVoiceTs : -1}`);
+  help('sfu_ai_asr_input_zero_streak', 'gauge', 'Consecutive measured segments that were pure digital silence (input dropout detector)');
+  L.push(`sfu_ai_asr_input_zero_streak ${COLLAB.input.zeroStreak}`);
+  /* ★ 2026-10-09 "安静麦克风被提音量"这条机制的触发证据。
+   *   ▎分母用 input_voiced_total（过了能量闸的段数）：gain_applied / voiced 就是
+   *     "有声音进来的段里，有多少真被提到过目标峰值"。分子恒为 0 而分母在涨
+   *     = 那条 10-05 的救赎整条没跑（而它坏了不会有任何报错，只会让字幕继续糊）。 */
+  help('sfu_ai_asr_gain_applied_total', 'counter', 'Segments whose model-input peak gain was raised (0 while voiced>0 = the quiet-mic gain path never ran)');
+  L.push(`sfu_ai_asr_gain_applied_total ${COLLAB.gainApplied}`);
+  /* ★ 2026-10-06 自适应"有声"判据的两个数：阈值与噪声底。
+   *   ▎为什么必须暴露：判据从"绝对 -50"改成"跟着这台机器的噪声底走"之后，
+   *     如果不出数，"这个人被切句/被憋住"就又要靠读代码猜（坑 76：机制生效与否要看得见）。 */
+  help('sfu_ai_asr_input_voice_threshold_db', 'gauge', 'The level (dBFS) above which a 0.5s RMS window counts as "someone is speaking" (adaptive, capped by ASR_FLUSH_DB)');
+  L.push(`sfu_ai_asr_input_voice_threshold_db ${COLLAB.input.voiceThr}`);
+  help('sfu_ai_asr_input_noise_floor_db', 'gauge', 'Estimated noise floor (dBFS, 20th percentile of recent non-silent RMS windows); NaN until enough samples');
+  L.push(`sfu_ai_asr_input_noise_floor_db ${COLLAB.input.floorDb == null ? NaN : COLLAB.input.floorDb}`);
+  /* ★ 2026-10-05 本地 Qwen worker 因"单次推理超时"被重启的次数（累计）。
+   *   ▎为什么要单独一条：坑 89 的修法（12s 预算 + 超时换进程）在测试里**从未被真实触发过**，
+   *     而"没触发过"和"触发了但没人看见"在观测上是一样的。有了这条数，
+   *     用户真实会议里到底有没有卡死过、自愈有没有接住，是**查得到**的（坑 76）。
+   *   ▸ watch.js 在它 >0 时报一条 warn：不是故障，但值得知道——那说明模型确实会偶发失控。 */
+  const qwenRestarts = (QwenLocalAsr && typeof QwenLocalAsr.restarts === 'number') ? QwenLocalAsr.restarts : 0;
+  help('sfu_ai_asr_worker_restarts_total', 'counter', 'times the local Qwen ASR worker was replaced after a per-inference timeout (0 = the stall-recovery path has not been needed)');
+  L.push(`sfu_ai_asr_worker_restarts_total ${qwenRestarts}`);
   /* ★ 2026-10-03 语音链路与协作动作的累计计数（口径见上面 COLLAB 的注释） */
   help('sfu_ai_asr_segments_total', 'counter', 'Transcribed audio segments, by engine that actually did it');
   for (const [via, s] of Object.entries(COLLAB.asr)) {
@@ -1082,6 +1665,37 @@ function buildMetrics(snap) {
   for (const [via, s] of Object.entries(COLLAB.asr)) {
     L.push(`sfu_ai_asr_seconds_total{engine="${via}"} ${s.sec.toFixed(1)}`);
   }
+  /* ★ 2026-10-04 转写并发的触发证据（坑 76）。
+   *   ▎为什么单独三条：并发化早就写了，但**从来没有人证明它并行过**。
+   *     GPU 上单段 0.3~0.6s、分段窗口 2s，完全可能一段早转完、下一段还没到，
+   *     于是 in-flight 恒为 1 —— 代码在、能力没被用上，而且零报错。
+   *     peak=1 且 blocked=0 就是这个诊断结论；不看这三个数，我们只能继续猜。 */
+  help('sfu_ai_asr_segments_launched_total', 'counter', 'Transcription segments started by the audio pipe');
+  L.push(`sfu_ai_asr_segments_launched_total ${COLLAB.seg.launched}`);
+  help('sfu_ai_asr_segments_inflight_peak', 'gauge', 'Highest number of segments transcribing at the same time (1 = the pipe is still effectively serial)');
+  L.push(`sfu_ai_asr_segments_inflight_peak ${COLLAB.seg.peak}`);
+  help('sfu_ai_asr_segments_blocked_ticks_total', 'counter', 'Poll ticks skipped because the in-flight cap was reached');
+  L.push(`sfu_ai_asr_segments_blocked_ticks_total ${COLLAB.seg.blocked}`);
+  /* ★ 2026-10-07 整句重转的触发证据（坑 76：机制"在"不等于机制"生效"）。
+   *   ▎fixed/n 这个比值就是"这套到底改了多少句话"。若 n 一直为 0，说明整句重转
+   *     从来没被触发（单段成句占多数，或被开关关了）；n 有而 fixed 为 0，
+   *     则是整句那次总是失败或被判"丢字"——两种都指向完全不同的排查方向。 */
+  help('sfu_ai_asr_refine_total', 'counter', 'Utterances re-transcribed as one whole-audio pass (0 = the whole-sentence path never ran)');
+  L.push(`sfu_ai_asr_refine_total ${COLLAB.refine.n}`);
+  help('sfu_ai_asr_refine_adopted_total', 'counter', 'Whole-audio transcripts that replaced the stitched segment text (the on-screen sentence was rewritten)');
+  L.push(`sfu_ai_asr_refine_adopted_total ${COLLAB.refine.fixed}`);
+  help('sfu_ai_asr_refine_seconds_total', 'counter', 'Cumulative wall-clock spent on whole-utterance re-transcription');
+  L.push(`sfu_ai_asr_refine_seconds_total ${(COLLAB.refine.ms / 1000).toFixed(1)}`);
+  /* ★ H5b「让路」那一本账 + 此刻在途数：只有"发起/采用"两本数分不开
+     "重转在做但都没被采用" 与 "重转一直在让路、于是根本没做"（坑 76）。
+     在途数是一条 gauge——它回答"这台 worker 现在到底有多忙"，
+     而 H5 的处方是否生效，看的就是这条线在多人会议里有没有长期 >0。 */
+  L.push('# HELP sfu_ai_asr_refine_skipped_busy_total Times whole-utterance re-transcription yielded to in-flight segment work (H5b).');
+  L.push('# TYPE sfu_ai_asr_refine_skipped_busy_total counter');
+  L.push(`sfu_ai_asr_refine_skipped_busy_total ${COLLAB.refine.skipped}`);
+  L.push('# HELP sfu_ai_asr_engine_busy In-flight ASR engine jobs right now (segment + refine share this counter).');
+  L.push('# TYPE sfu_ai_asr_engine_busy gauge');
+  L.push(`sfu_ai_asr_engine_busy ${asrEngineBusy}`);
   /* ★ 2026-10-03 两组端到端延迟读数（字幕 / 播报），三行一组：
    *   avg 看整体体感、max 看最坏一次（"是不是偶尔卡很久"）、last 让 watch.js
    *   能在**不重启**的前提下发现"延迟刚刚变差了"。
@@ -1101,7 +1715,13 @@ function buildMetrics(snap) {
   latBlock('sfu_ai_speech_latency_ms', COLLAB.speakLat, 'answer shown to first audio actually playing (client reported)');
   help('sfu_ai_answers_total', 'counter', 'How many times the AI assistant actually replied');
   L.push(`sfu_ai_answers_total ${COLLAB.answers}`);
-  help('sfu_ai_answer_throttled_total', 'counter', 'Replies suppressed by a gate (dup/echo/inflight/interval)');
+  /* ★ 2026-10-06 夜二 "为什么答"的两本账。用户规矩是**只有被叫到名字才开口**，
+   *   而违反它的形态是静默的（它答得很自然，只是没人叫它），所以必须有一对可告警的计数：
+   *   via="wake" 是合规的，via="follow-up" 只应等于"被分段切断的半句"（每次前面都有一次 name-only）。 */
+  help('sfu_ai_answer_via_total', 'counter', 'Voice-triggered replies by cause: via="wake" (name called) / via="follow-up" (unprompted continuation: split-sentence tail or chat window). Equals sfu_ai_answers_total; typed @ai questions are counted in neither.');
+  L.push(`sfu_ai_answer_via_total{via="wake"} ${COLLAB.answerVia.wake}`);
+  L.push(`sfu_ai_answer_via_total{via="follow-up"} ${COLLAB.answerVia['follow-up']}`);
+  help('sfu_ai_answer_throttled_total', 'counter', 'Replies suppressed by a gate (dup/echo/inflight/interval/name-only)');
   for (const [r, n] of Object.entries(COLLAB.throttled)) {
     L.push(`sfu_ai_answer_throttled_total{reason="${r}"} ${n}`);
   }
@@ -1117,6 +1737,23 @@ function buildMetrics(snap) {
   for (const k of ['stroke', 'undo', 'clear', 'rejected']) {
     L.push(`sfu_board_records_total{op="${k}"} ${COLLAB.board[k]}`);
   }
+  /* ★ 2026-10-07 第 51 步：共享文件的可观测面。
+   * ▎为什么 `rejected` 值得单独一条 counter：上传失败在前端只是一个一闪而过的 toast，
+   *   而"传不上去"的原因（超单文件 / 房间满了 / 名字不合法 / 房间已销毁）只有服务器知道。
+   *   没有这本账，用户报"我传不上去"时就只能靠猜（同坑 76：机制要有触发证据）。
+   * ▎存量（文件数与字节数）是 gauge、按房间打标签：面板与巡检脚本都能一眼看出
+   *   "哪场会的共享空间快满了"。 */
+  help('sfu_files_events_total', 'counter', 'Shared-file events by kind (upload/delete/view/rejected)');
+  for (const k of ['upload', 'delete', 'view', 'rejected']) {
+    L.push(`sfu_files_events_total{kind="${k}"} ${COLLAB.files[k] || 0}`);
+  }
+  help('sfu_files_count', 'gauge', 'Shared files currently stored, per room');
+  help('sfu_files_bytes', 'gauge', 'Shared file bytes currently stored, per room');
+  for (const r of rooms) {
+    if (!r.filesCount) continue;      // 没有共享文件的房间不产行（Prometheus 里 0 行与"值为 0"是两件事）
+    L.push(`sfu_files_count{room="${r.roomNumber}"} ${r.filesCount}`);
+    L.push(`sfu_files_bytes{room="${r.roomNumber}"} ${r.filesBytes}`);
+  }
   help('sfu_room_members', 'gauge', 'Members per room');
   for (const r of rooms) L.push(`sfu_room_members{room="${r.roomNumber}"} ${r.counts.members}`);
   help('sfu_producer_bytes_total', 'counter', 'Cumulative bytes forwarded per producer');
@@ -1127,6 +1764,13 @@ function buildMetrics(snap) {
   }
   help('sfu_workers', 'gauge', 'mediasoup Worker processes in the pool');
   L.push(`sfu_workers ${workers.length}`);
+  /* ★ K1（2026-10-09）跨网：媒体端口形态是一条运维事实，得能从 /metrics 读到
+   *   （watch/告警不必去猜配置——0 = 随机端口段且只有 UDP，>0 = 全服务器共用这个 UDP+TCP 号）。
+   *   取的是 rtcServers.size 而不是配置值：端口被占退回随机段时，这里必须显示 0。 */
+  help('sfu_rtc_server_port', 'gauge', 'Fixed UDP+TCP media port (WebRtcServer); 0 = random port range, UDP only');
+  L.push(`sfu_rtc_server_port ${rtcServers.size ? RTC_SERVER_PORT : 0}`);
+  help('sfu_rtc_server_instances', 'gauge', 'How many workers have the fixed media port attached');
+  L.push(`sfu_rtc_server_instances ${rtcServers.size}`);
   help('sfu_recordings_active', 'gauge', 'Server-side recordings currently running');
   L.push(`sfu_recordings_active ${snap.recordingCount || 0}`);
   help('sfu_process_uptime_seconds', 'gauge', 'SFU server process uptime in seconds');
@@ -1293,6 +1937,138 @@ function handleCaptionRead(res, room, format) {
   res.end(text);
 }
 
+/* ★ 2026-10-07 第 51 步：共享文件的上传处理与全房广播
+ *
+ * ▎上传的三段判据（顺序是刻意的）：
+ *   ① **门禁在最前**：没权限的人不该通过"文件名合不合法 / 房间在不在"得到任何信息；
+ *      而且拒了之后要 `req.destroy()`——否则浏览器还在往一个没人读的 socket 里灌 40MB
+ *      （先付费再拒绝 = 白付，见 Files.saveUpload 里同一条注释）。
+ *   ② **房间必须此刻真的存在**：房间令牌 TTL 是 24h，而房间 TTL 只有 60s——
+ *      令牌还在、房间早没了是完全可能的（用户挂机一夜回来点上传）。
+ *      这时给一句"会议已经结束了"，比"上传失败"有用得多。
+ *   ③ 名字与配额判据全在 Files 里（一个概念一个来源），这里只负责翻译成人话的 HTTP 状态码。
+ *
+ * ▎上传成功后必须**广播**，不能只回 ack：房间里另外三个人不会自己去轮询列表。
+ *   同一件事还有第二个入口——晚进房的人在 joinRoom 里收到 files-state（见那里）。
+ *   两条路共用同一个 broadcastFiles 取的列表，所以不会出现"我看到 3 个、他看到 2 个"。 */
+async function handleFileUpload(req, res) {
+  const q = new URL(req.url, 'http://localhost').searchParams;
+  const room = String(q.get('room') || '');
+  const gate = requireRoomAccess(req, res, room);
+  if (!gate.ok) { try { req.destroy(); } catch (e) { /* 已经断了 */ } return; }
+  if (!Files.validRoom(room)) {
+    res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ error: '房间号必须是 6 位数字' }));
+    try { req.destroy(); } catch (e) { /* ignore */ }
+    return;
+  }
+  if (!rooms.has(room)) {
+    res.writeHead(409, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ error: '这场会议已经结束了（房间令牌还有效，但房间已经不在）——重新创建/加入房间后再传' }));
+    try { req.destroy(); } catch (e) { /* ignore */ }
+    return;
+  }
+  if (!rateLimit(`files-up:${room}`, 30, 60000)) {
+    res.writeHead(429, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ error: '上传太频繁了（每分钟 30 次上限），歇一分钟再试' }));
+    bump(COLLAB.files, 'rejected');
+    try { req.destroy(); } catch (e) { /* ignore */ }
+    return;
+  }
+  /* 文件名走请求头（body 是文件的每一个字节，没有地方放元数据）。
+   * ▎为什么要 encodeURIComponent 再传：HTTP 头只能安全携带 ASCII，
+   *   而会议里传的文件十有八九叫「Q3 评审会材料.docx」。直接塞中文进头，
+   *   Node 会按 latin1 编解码，收到的是乱码（不报错，只是名字变成"æµè¯"）。 */
+  const rawHead = String(req.headers['x-file-name'] || q.get('name') || '');
+  let rawName = rawHead;
+  try { rawName = decodeURIComponent(rawHead); } catch (e) { /* 没编码过就按原样用 */ }
+  /* 上传者昵称同样要解码：昵称十有八九是中文，而 HTTP 头只能安全携带 ASCII。 */
+  const rawWho = String(req.headers['x-uploader-name'] || '');
+  let byName = rawWho;
+  try { byName = decodeURIComponent(rawWho); } catch (e) { byName = rawWho; }
+  byName = byName.slice(0, 64) || null;
+  const byId = String(req.headers['x-uploader-id'] || '').slice(0, 64) || null;
+
+  try {
+    const entry = await Files.saveUpload(room, rawName, req, FILE_LIMITS, { id: byId, name: byName });
+    bump(COLLAB.files, 'upload');
+    logEvent('info', 'file-uploaded', { roomNumber: room, name: entry.name, size: entry.size, by: byName });
+    console.log(`📁 [${room}] ${byName || '某位成员'} 上传了「${entry.name}」（${Files.fmtMb(entry.size)}）`);
+    broadcastFiles(room, 'add', byName, entry.name);
+    if (!res.headersSent) {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ ok: true, file: entry, url: Files.fileUrl(room, entry.name) }));
+    }
+  } catch (err) {
+    bump(COLLAB.files, 'rejected');
+    const status = Number(err && err.status) || 500;
+    if (status >= 400 && status < 500) logEvent('warn', 'file-upload-rejected', { roomNumber: room, name: rawName.slice(0, 80), reason: String(err && err.message).slice(0, 160), status });
+    else logEvent('error', 'file-upload-failed', { roomNumber: room, name: rawName.slice(0, 80), reason: String(err && err.message).slice(0, 200) });
+    if (!res.headersSent) {
+      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: (err && err.message) || '上传失败' }));
+    } else {
+      try { res.end(); } catch (e) { /* ignore */ }
+    }
+  }
+}
+
+/** 全房广播"文件清单变了"（上传/删除/同步都走这里，列表只有这一个来源）。 */
+function broadcastFiles(roomNumber, change, byName, name) {
+  const room = rooms.get(roomNumber);
+  const files = Files.listFiles(roomNumber, { since: room ? room.createdAt : 0 });
+  io.to(roomNumber).emit('files-updated', {
+    files,
+    change: change || 'sync',
+    name: name || null,
+    byName: byName || null,
+    count: files.length,
+    ts: Date.now(),
+  });
+  return files;
+}
+
+const NAME_MAX_FILE = 160;   // 同步状态里的文件名长度上限（防畸形载荷）
+/* 滚动同步的广播节流（毫秒）。
+ * ▎为什么"换文件/翻页"要**绕开**这个节流：那是离散事件，晚 120ms 到就等于"我点了没反应"；
+ *   而滚动是连续的，丢掉中间几帧完全无感（最新值胜出）。同一条通道上两种语义要用两种处置
+ *   ——一刀切的节流会把翻页也变粘（坑 62 的近亲：策略要分层，别用一个参数管两件事）。
+ * ▎诚实边界：节流窗口末尾那一次滚动可能被丢掉，所以**客户端在滚动停下后还会补发一次**
+ *   （debounce 200ms）——靠两端配合保证"最终位置一定同步"，服务器不需要再养一个定时器。 */
+const FILE_VIEW_MIN_MS = 120;
+/** 「谁在看哪一份、看到哪儿了」——全房同步的那一份状态（跟随主讲用）。
+ *  ▎为什么服务器要存一份而不是纯广播：晚进房/刚刷新的人需要**当前值**，
+ *    而广播只有"变化那一刻"。存一份 + 新人补发，和 room-state / board-state 是同一条做法。
+ *  ▎有变化才广播（JSON 比对）+ 滚动按 FILE_VIEW_MIN_MS 节流：滚动同步很密，
+ *    逐条转发会把信令面变成噪音——与 net-levels / talk-stats 同一条纪律。 */
+function setRoomFileView(roomNumber, socket, view) {
+  const room = rooms.get(roomNumber);
+  if (!room) return null;
+  const name = view && view.name ? String(view.name).slice(0, NAME_MAX_FILE) : null;
+  const next = name ? {
+    name,
+    page: Math.max(1, Math.min(9999, parseInt(view && view.page, 10) || 1)),
+    // 滚动位置用**比例**（0~1）而不是像素：每个人的窗口高度不一样，
+    // 传像素的话"跟随"到大屏上就滚过头了（同一个概念要挑一个与设备无关的量）。
+    scroll: Math.max(0, Math.min(1, Number(view && view.scroll) || 0)),
+    zoom: Math.max(0.2, Math.min(5, Number(view && view.zoom) || 1)),
+    byId: socket.id,
+    byName: (socket.displayName || '某位成员').slice(0, 64),
+    ts: Date.now(),
+  } : null;
+  const prev = room.fileView;
+  const sig = (v) => JSON.stringify(v && { name: v.name, page: v.page, scroll: v.scroll, zoom: v.zoom });
+  room.fileView = next;                    // 状态永远存最新（新人补发读的就是它）
+  if (sig(prev) === sig(next)) return next;   // 没变就不发
+  const discrete = !prev || prev.name !== (next && next.name) || prev.page !== (next && next.page);
+  const now = Date.now();
+  if (!discrete && now - (room.fileViewSentAt || 0) < FILE_VIEW_MIN_MS) return next;   // 滚动节流
+  room.fileViewSentAt = now;
+  io.to(roomNumber).emit('files-view-state', { view: next, ts: now });
+  bump(COLLAB.files, 'view');
+  return next;
+}
+
 
 /* ★ 09-13 可达性：可选的 HTTPS 服务器（config.json 的 https.enabled = true 时启动）
  * ▎为什么有它？跨机访问时页面必须是安全上下文（https），getUserMedia 才能开摄像头。
@@ -1341,7 +2117,7 @@ if (tlsCfg.enabled) {
     /* ★ 09-24 追加：**SAN 没覆盖当前局域网 IP 也要重签**（DHCP 漂移自愈）。
      *   只判"有没有 SAN"是不够的：换过网络的开发机，证书里留着上一次的旧 IP，
      *   手机上照样是证书不匹配。这里拿当前探测到的所有 IP 去比对，缺哪个就重签。 */
-    const lanIps = (detectLocalIps() || []);
+    const lanIps = Nets.listLocalIps().map((e) => e.ip);
     const driftedIps = missing || !sanInfo.hasSan ? [] : lanIps.filter((ip) => !sanInfo.ips.includes(ip));
     const staleIpDrift = driftedIps.length > 0;
     if (missing || staleNoSan || staleIpDrift) {
@@ -1366,7 +2142,7 @@ if (tlsCfg.enabled) {
         catch (e) { /* 试下一个 */ }
       }
       if (!opensslBin) throw new Error('找不到 openssl（PATH 与 Git 目录都没有）');
-      // 局域网 IP 复用文件里已有的探测逻辑（detectLocalIps 是函数声明，会提升，此处可调用）
+      // 局域网 IP 来自 sfu/nets.js（与 announcedIp、doctor 同一份探测，坑 47）
       /* ★ 09-24：**把所有局域网 IP 都写进 SAN**，不只取第一个——
        *   一台机器常见"WLAN 一个网段 + 有线一个网段"（本机就有 WLAN 192.168.74.x），
        *   只写第一个的话，换另一张网卡访问就又不匹配了。多写几个的成本是 0。 */
@@ -1495,28 +2271,29 @@ const LISTEN_IP = process.env.MEDIASOUP_LISTEN_IP || CONFIG.listenIp || '127.0.0
  *     ② config.json 的 announcedIp **且与本机某个网卡一致**（有效才用）
  *     ③ 都不成立 → 自动挑一个本机对外 IPv4（私网优先），并打印醒目提示
  *   这样"IP 换了"从致命故障降级为一行提示——延迟满足 ⟨可靠性⟩ 而非 ⟨可配置性⟩。 */
-function detectLocalIps() {
-  const os = require('os');
-  const ips = [];
-  for (const list of Object.values(os.networkInterfaces())) {
-    for (const ni of list || []) {
-      if (ni.family === 'IPv4' && !ni.internal) ips.push(ni.address);
-    }
-  }
-  // 私网优先（192.168/10/172.16-31 才是典型的局域网可达地址）
-  const priv = (ip) => /^192\.168\./.test(ip) || /^10\./.test(ip) || /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
-  return ips.sort((a, b) => (priv(b) ? 1 : 0) - (priv(a) ? 1 : 0));
-}
+/* ★ 2026-10-06 网卡 IP 的"该说哪一个"搬进 sfu/nets.js 作唯一实现（server 与 doctor 共用）。
+ *   ▎为什么这比"取第一个非回环 IPv4"重要：开发机上 VirtualBox/WSL/Docker 都会挂一个
+ *     192.168.x 的地址，看起来和 WLAN 一模一样，挑错了就是"本机全好、别人黑屏、零报错"
+ *     （坑 36 那类沉默故障）。排序判据写在 nets.js 里并且有断言钉着。
+ * ▎新增一个合法配置值：`"announcedIp": "auto"`（或留空）= **明确选择"每次开机自己探测"**，
+ *   比写死一个会漂移的 IP 更不容易坏——这就是"配一次就长期对"的那一次配置。 */
+const Nets = require('./nets');
 const ANNOUNCED_DECISION = (() => {
-  const ips = detectLocalIps();
-  const env = process.env.MEDIASOUP_ANNOUNCED_IP;
-  if (env) return { ip: env, source: 'env', ips };
-  const cfg = CONFIG.announcedIp;
-  if (cfg && ips.includes(cfg)) return { ip: cfg, source: 'config', ips };
-  if (cfg) return { ip: ips[0] || undefined, source: 'fallback', stale: cfg, ips };
-  return { ip: ips[0] || undefined, source: 'auto', ips };
+  const r = Nets.resolveAnnouncedIp(CONFIG.announcedIp);
+  if (process.env.MEDIASOUP_ANNOUNCED_IP) {
+    return { ip: process.env.MEDIASOUP_ANNOUNCED_IP, source: 'env', ips: r.ips, nic: null };
+  }
+  return r;
 })();
 const ANNOUNCED_IP = ANNOUNCED_DECISION.ip;
+
+/* ---- K1：固定端口媒体入口（见 startOneWorker 里那段"为什么"） ----
+   ▸ 常量声明必须排在用它的那个函数之前：顶层那串语句是有顺序的，
+     把 const 写在后面虽然本例跑得起来（函数在文件更后面才被调用），但一旦有人在模块加载期
+     调用它，TDZ 抛错会静默砍掉后面所有初始化（坑 69 的原样复发）。 */
+const RTC_SERVER_PORT = Math.max(0, Number(process.env.MEDIASOUP_RTC_SERVER_PORT) || Number(CONFIG.rtcServerPort) || 0);
+/** workerPid → WebRtcServer（Transport 创建时按房间的 Worker 取；取不到就退回随机端口那条路） */
+const rtcServers = new Map();
 
 async function startOneWorker() {
   const w = await mediasoup.createWorker({
@@ -1526,10 +2303,23 @@ async function startOneWorker() {
   });
   workers.push(w);
   if (!worker) worker = w; // 兼容旧引用（workers[0]）
+  /* ★ K1（2026-10-09，跨网主线）：给这个 Worker 挂一条**固定端口**的媒体入口（WebRtcServer）。
+   *   ▎为什么要它：默认形态是"每条 Transport 在 40000-49999 里随机要一对 UDP 端口"，
+   *     于是"把会议开到别的网络"需要**转发一整段端口**（家用路由器多半做不到），
+   *     而 Windows 防火墙也只被 start:lan 放了 UDP 那一段。
+   *   ▸ WebRtcServer 让**这个 Worker 上所有 Transport 共用一个端口号**，
+   *     并且同一个号码同时开 **UDP + TCP**：
+   *       · 端口映射只需要一条（UDP 4443 + TCP 4443 → 这台机器）；
+   *       · TCP 那一路让"公司/校园网把 UDP 全封了"的浏览器也能连上（ICE 会退到 tcp 候选）；
+   *       · 同口号还便于 HTTPS 场景把 443 直接映射过来。
+   *   ▸ 没配 rtcServerPort（默认 0）时**完全不启用**，行为与旧版逐字一致（随机端口段）。
+   *   ▸ 多个 Worker 不能抢同一个号，所以第 i 个 Worker 用 base+i（写进启动日志）。 */
+  if (RTC_SERVER_PORT) await attachRtcServer(w, workers.length - 1);
   // Worker 是常驻 C++ 进程；万一崩了：摘出池子 → 记日志 → 5 秒补一个新槽位
   w.on('died', () => {
     const i = workers.indexOf(w);
     if (i >= 0) workers.splice(i, 1);
+    rtcServers.delete(w.pid);
     /* ★ 09-24：优雅退出时**不报错也不补位**。
      *   否则 Ctrl+C 关服务会打出一行 "❌ Worker 挂了" —— 一个正常的退出被渲染成故障，
      *   演示时看到会以为程序崩了（这正是本次实跑时观察到的现象）。 */
@@ -1544,8 +2334,90 @@ async function createWorker() {
   const count = Math.max(1, Number(CONFIG.workerCount) || Number(process.env.MEDIASOUP_WORKERS) || 1);
   for (let i = 0; i < count; i++) await startOneWorker();
   console.log(`⚙️  mediasoup Workers×${workers.length} 已启动（端口 ${rtcMinPort}-${rtcMaxPort}）`);
+  console.log(`📡 媒体通告地址：${MEDIA_IPS.map((e) => `${e.ip}(${e.kind})`).join('  ') || '（无：只有回环，别的设备连不上）'}`);
+  if (RTC_SERVER_PORT) {
+    const ports = workers.map((w, i) => RTC_SERVER_PORT + i).join('/');
+    console.log(`🔌 媒体走**固定端口** UDP+TCP ${ports}（WebRtcServer 已挂 ${rtcServers.size} 个）——跨网/端口映射只需转发这一条`);
+  } else {
+    console.log('🔌 媒体走随机端口段（要固定端口+TCP 兜底：config.json 里设 "rtcServerPort": 4443）');
+  }
   return workers[0];
 }
+
+async function attachRtcServer(w, index) {
+  const port = RTC_SERVER_PORT + (index || 0);
+  try {
+    /* 固定端口 + 多地址通告一起用时：每个地址各绑自己的网卡、共用同一个口号
+     * （口号只这一个，端口映射/防火墙才真的只需一条）。 */
+    const srv = await w.createWebRtcServer({ listenInfos: mediaListenInfos(port) });
+    rtcServers.set(w.pid, srv);
+    srv.on('close', () => rtcServers.delete(w.pid));
+    logEvent('info', 'rtc-server-up', { pid: w.pid, port, listenIp: LISTEN_IP, announcedIp: ANNOUNCED_IP || '' });
+    return srv;
+  } catch (e) {
+    /* 端口被占/权限不足时**不假装成功**：整个服务继续用随机端口段跑，
+     * 并把这件事打进日志——固定端口是"更好"，不是"必须"，一条都不能因此起不来。 */
+    console.warn(`⚠️ 固定端口媒体入口起不来（端口 ${port}）：${e.message} —— 自动改用随机端口段 ${rtcMinPort}-${rtcMaxPort}`);
+    logEvent('warn', 'rtc-server-failed', { pid: w.pid, port, error: e.message });
+    return null;
+  }
+}
+
+/** ★ K2（2026-10-09）：这条服务器对外通告**几个地址**（判据在 nets.announceIps，只有一处）。
+ *   ▸ 默认 'tailscale'：装了组网工具就自动多给一条候选，同网的人与组网的人各走各的；
+ *     没装就只有主地址，行为与 K2 之前逐字一致。
+ *   ▸ ANNOUNCE_EXTRA_IPS=127.0.0.2 这类"明示注入"是给自测与特殊环境留的口子：
+ *     它允许一个不属于本机网卡表的地址进来，好让"多地址真的变成多条 ICE 候选"
+ *     这件事可以被断言（不要求测试机必须有第二张网卡，也不要求谁去装 Tailscale）。 */
+const ANNOUNCE_EXTRA = (() => {
+  const raw = process.env.MEDIASOUP_ANNOUNCE_EXTRA !== undefined
+    ? process.env.MEDIASOUP_ANNOUNCE_EXTRA : CONFIG.announceExtra;
+  if (raw === undefined || raw === '' || raw === null) return 'tailscale';
+  if (typeof raw === 'boolean') return raw ? 'all' : 'none';
+  if (Array.isArray(raw)) return raw;
+  return String(raw);
+})();
+const ANNOUNCE_EXPLICIT = String(process.env.ANNOUNCE_EXTRA_IPS || '')
+  .split(',').map((x) => x.trim()).filter(Boolean);
+const MEDIA_IPS = Nets.announceIps({
+  primary: ANNOUNCED_IP,
+  primaryNic: ANNOUNCED_DECISION.nic,
+  extra: ANNOUNCE_EXTRA,
+  explicit: ANNOUNCE_EXPLICIT,
+}).filter((e) => e.kind === 'explicit' || Nets.isAdvertisableIp(e.ip));
+
+/** 拼 listenInfos（多地址通告用）。给了 port 就是固定端口入口，不给就在端口段里随机。 */
+function mediaListenInfos(port) {
+  const list = [];
+  // 一个地址时保持老写法（绑 0.0.0.0）；多个地址时每条绑**自己那块网卡**——
+  // 否则 0.0.0.0:P 与 <网卡IP>:P 会抢同一个号（EADDRINUSE），固定端口就永远起不来。
+  // ▸ 代价要写明白：多地址 + 固定端口时服务器**不再监听 0.0.0.0:P**，
+  //   所以自测探"这个号通不通"要按通告出去的那些地址探，别探 127.0.0.1（那是通配的假设）。
+  const multi = MEDIA_IPS.length > 1;
+  for (const e of (multi ? MEDIA_IPS : [{ ip: ANNOUNCED_IP || '', nic: ANNOUNCED_DECISION.nic }])) {
+    const bindIp = multi ? e.ip : LISTEN_IP;
+    for (const protocol of ['udp', 'tcp']) {
+      const li = { protocol, ip: bindIp };
+      if (e.ip) li.announcedIp = e.ip;
+      if (port) li.port = port;
+      list.push(li);
+    }
+  }
+  return list;
+}
+
+/** 这个房间的 Transport 该用哪种 listen 配置（固定入口有就用，没有就按老路走）。 */
+function transportListenOptions(room) {
+  const srv = room && room.workerPid ? rtcServers.get(room.workerPid) : null;
+  if (srv) return { webRtcServer: srv };
+  if (MEDIA_IPS.length > 1) return { listenInfos: mediaListenInfos(0) };
+  return {
+    listenIps: ANNOUNCED_IP
+      ? [{ ip: LISTEN_IP, announcedIp: ANNOUNCED_IP }]
+      : [{ ip: LISTEN_IP }],
+  };
+}
+
 // 轮询挑一个 Worker 挂新 Router（无状态策略；扩展点：按 Router 数最少需要记账）
 function pickWorker() {
   if (!workers.length) throw new Error('没有可用的 mediasoup Worker');
@@ -1620,16 +2492,19 @@ const authTokens = new Map(); // token -> { username, role, expiresAt }
  * ▎规则：≥ passwordMinLen（默认 8，可配置）且至少两类字符（字母/数字/符号）。
  *   纯数字 8 位这类一眼就能被撞库字典吃掉的口令，在"能跑一晚上、能传文件、能控制电脑"
  *   的系统里属于必须拦下的软肋。 */
+/* ★ 2026-10-09 判据本体搬到 sfu/password.js 的 strengthError()——因为 scripts/admin.js 的
+ *   `passwd` 也需要它（原来那里只查"≥6 位"，与这里的"≥8 且两类字符"并不一致，
+ *   却写着"与网页注册的规则一致"）。规则只能有一份：否则一次 CLI 重置就能把达标的口令
+ *   换成网页根本注册不出来的弱口令，而那句提示还让人以为两边一致。
+ *   这里只负责**解析下限**（env > config > 8），判据交给那一份。 */
 function passwordStrengthError(pw) {
-  if (typeof pw !== 'string' || !pw) return '密码不能为空';
-  const minLen = Math.max(6, Number(process.env.AUTH_PASSWORD_MINLEN) || Number(CONFIG.passwordMinLen) || 8);
-  if (pw.length < minLen) return `密码至少 ${minLen} 位`;
-  let classes = 0;
-  if (/[a-zA-Z]/.test(pw)) classes += 1;
-  if (/[0-9]/.test(pw)) classes += 1;
-  if (/[^a-zA-Z0-9]/.test(pw)) classes += 1;
-  if (classes < 2) return '密码需包含至少两类字符（字母/数字/符号）';
-  return null;
+  return Password.strengthError(pw, { minLen: passwordMinLen() });
+}
+/* 下限的唯一解析处（env > config > 8）：注册校验、/config.json 下发、CLI 都读它。
+ * ▎为什么要下发：登录卡上原先不写"至少几位、要几类字符"，用户只能注册失败之后才看到
+ *   一句拒绝——而拒绝发生在填完所有字段之后，是最劝退的一种失败。规则要在打字之前就说得清。 */
+function passwordMinLen() {
+  return Math.max(6, Number(process.env.AUTH_PASSWORD_MINLEN) || Number(CONFIG.passwordMinLen) || 8);
 }
 
 /* ★ 09-29 登录失败锁定：同一账号连续错 5 次 → 锁定 AUTH_LOCK_MS（默认 15 分钟）。
@@ -1807,7 +2682,8 @@ const clientIp = (socket) => (socket.handshake && socket.handshake.address) || '
  *   原因见那个文件头：两处各存一份实现时，任何一边改了参数，CLI 建的账号就登不上，
  *   而且报错只会说"用户名或密码不对"，排查方向全被带偏。
  *   这里解构出来，下面原有调用点（hashPassword(pw, salt)）一个字都不用改。 */
-const { hashPassword, newSalt, randomPassword, needsUpgrade, verifyPassword } = require('./password');
+const Password = require('./password');
+const { hashPassword, newSalt, randomPassword, needsUpgrade, verifyPassword } = Password;
 function validUsername(u) {
   return typeof u === 'string' && /^[a-zA-Z0-9_一-龥]{2,16}$/.test(u);
 }
@@ -1920,7 +2796,7 @@ function resolveFfmpegDeep() {
  *     被修正过（漂移时自动回退本机 IP），这里只负责把"用了什么、为什么"讲清楚。
  */
 function checkAnnouncedIp() {
-  const { ip, source, stale, ips } = ANNOUNCED_DECISION;
+  const { ip, source, stale, ips, nic } = ANNOUNCED_DECISION;
   if (!ip) {
     console.log(`⚠️ 没探到对外 IPv4：当前只通告 ${CONFIG.listenIp || '127.0.0.1'}，`
       + `\n   本机可用 IP：${ips.join('、') || '(无)'} —— 别的电脑将看不到画面（跑 npm run start:lan 可自动写好）`);
@@ -1929,15 +2805,29 @@ function checkAnnouncedIp() {
   if (source === 'fallback') {
     console.log(`🩹 announcedIp 已自动纠偏：config.json 里的 ${stale} 不是本机网卡`
       + `（当前实际 ${ips.join('、')}）→ 本次运行改用 ${ip}`);
-    console.log(`   ▸ 已经能正常跨机；想永久生效：把 config.json 的 announcedIp 改成 ${ip}（或跑 npm run start:lan 自动重写）`);
+    console.log(`   ▸ 已经能正常跨机；想永久生效：把 announcedIp 改成 "auto"（每次开机自己探，永不过期）`
+      + `，或跑 npm run start:lan 重写成本次的 ${ip}`);
   } else if (source === 'auto') {
-    console.log(`✅ 自动选用本机 IP ${ip} 作为 announcedIp（config.json 未设置）`);
+    console.log(`✅ 自动选用本机 IP ${ip}${nic ? `（网卡 ${nic}）` : ''} 作为 announcedIp`
+      + '（config.json 未设置或写了 "auto"）');
   } else {
-    console.log(`✅ announcedIp=${ip}（来源：${source === 'env' ? '环境变量' : 'config.json'}，与本机网卡一致）`);
+    console.log(`✅ announcedIp=${ip}${nic ? `（网卡 ${nic}）` : ''}`
+      + `（来源：${source === 'env' ? '环境变量' : 'config.json'}，与本机网卡一致）`);
+  }
+  /* ★ 2026-10-06 跨网稳定入口：**报出来但不抢主位**。
+   *   ▎Tailscale 的 100.x 地址跨网络不变（家里/公司/4G 都能到），正是"配一次就长期对"的那个地址；
+   *     可它只对同一张 tailnet 里的设备可达——拿它当 announcedIp 会把"坐在旁边同事"挡在外面。
+   *     所以主地址仍是局域网 IP，这里单独给一条：装了 Tailscale 的人照着这一行发跨网链接即可。 */
+  const ts = Nets.pickTailscaleIp();
+  if (ts) {
+    const tlsOn = CONFIG.https && CONFIG.https.enabled;
+    console.log(`🌐 检测到 Tailscale 地址 ${ts.ip} —— 别的网络用 `
+      + `${tlsOn ? `https://${ts.ip}:${(CONFIG.https && CONFIG.https.port) || 3443}` : `http://${ts.ip}:${PORT}`} `
+      + '也能进这个会（同一张 tailnet 内免配置、IP 不随网络变）');
   }
 }
 const recordSessions = new Map(); // recordId -> 会话（跨连接状态放全局：坑 18）
-const RECORD_BASE_PORT = 50000;   // ffmpeg 收 RTP 的端口对从这里起（每路占 2 个，避开 RTC 段 40000~49999）
+const RECORD_BASE_PORT = 27000;   // ffmpeg 收 RTP 的端口对从这里起（每路占 2 个）——★ 2026-10-04g 从 50000 挪来：50000-65535 是 Windows 动态端口区，出站连接会随机占走导致 bind 失败；27000 在两个平台的动态区之外、也不撞 AI 听觉管线的 26000-26998 与 mediasoup 的 40000-49999
 
 /* ★ D+2 核心：真正开一场录制（信令 record-start 与 TEST_RECORD 端到端自测共用这一份代码）
  * ▎tracks = [{ producer, kind }]：要录的媒体路数（成员的 camera+mic，或单指定一路）
@@ -2081,6 +2971,56 @@ const aiShortId = (id) => String(id).slice(-4); // AI 块内的短 id（server �
 const aiHearing = new Map();          // roomNumber -> Map(memberId -> {rms, ts})（bot 的听觉账本）
 const aiAudioPipes = new Map();       // roomNumber -> Set<管线对象>
 
+/* ★ 2026-10-04h 续会识别 + 记忆重建（数据源 = 磁盘上的字幕账本，"内存=热窗口、文件=权威副本"
+ *   总纲的第三块拼图：前两块是"字幕热窗口溢出归档"与"AI 应答入账"，这里是"重启后把它们接回来"）。
+ *
+ * ▎meetingStartFromLedger(roomNumber)：从账本时间线的**末尾**往回走，把"相邻间隔 ≤10 分钟"
+ *   的连续段算作同一场会；若这段连续线的最后一记距今 ≤30 分钟，返回它的起点（= 续会开始时刻），
+ *   否则返回 0（不是续会）。既有防线不破坏：真正的新一场会距上一场的字幕早已超窗，回溯跨不过去。 */
+const RESUME_GAP_MS = 10 * 60000;      // 时间线上间隔超过这个 = 两场会
+const RESUME_FRESH_MS = 30 * 60000;    // 最近一记距今超过这个 = 不是续会
+function meetingStartFromLedger(roomNumber) {
+  try {
+    const caps = loadCaptions(roomNumber);
+    if (!caps.length) return 0;
+    const last = caps[caps.length - 1];
+    if (Date.now() - (last.ts || 0) > RESUME_FRESH_MS) return 0;
+    let start = last.ts || 0;
+    for (let i = caps.length - 2; i >= 0; i--) {
+      const t = caps[i].ts || 0;
+      if (start - t > RESUME_GAP_MS) break;   // 前一记与当前位置的间隔超过阈值 = 上一场
+      start = t;
+    }
+    return start || 0;
+  } catch (e) { return 0; }
+}
+
+/* rebuildBrainFromLedger：把账本里最近一段对话回放进 ConversationMemory——
+ *   重启后 AI 的"会话记忆"（指代消解用：用户说"那他什么时候交"要能接上重启前的话头）。
+ *   配对是**近似**的：按时间顺序把最近一条用户发言当作待答问题、遇到 AI 发言就凑成一轮。
+ *   记忆本来就只服务上下文拼接，不需要逐字逐轮的精确（诚实边界写在注释里）。 */
+function rebuildBrainFromLedger(roomNumber, brain) {
+  try {
+    const room = rooms.get(roomNumber);
+    const caps = loadCaptions(roomNumber)
+      .filter((e) => !room || !room.createdAt || (e.ts || 0) >= room.createdAt)
+      .slice(-60);
+    let pendingQ = '';
+    for (const e of caps) {
+      const isAi = e.from === 'ai-bot' || /AI 小明|ai-bot/i.test(String(e.name || ''));
+      if (isAi) {
+        if (pendingQ) { brain.memory.push(pendingQ, e.text || ''); pendingQ = ''; }
+      } else if (String(e.text || '').length >= 4) {
+        pendingQ = String(e.text);
+      }
+    }
+    if (brain.memory.length) {
+      console.log(`♻️ AI 助理的记忆已从字幕账本回放（${brain.memory.length} 轮）——重启不失忆`);
+      logEvent('info', 'ai-memory-rebuilt', { roomNumber, turns: brain.memory.length });
+    }
+  } catch (e) { /* 重建失败只影响上下文连续性，不挡新会话 */ }
+}
+
 /* ★ 09-24e 每房间一个"智能体"（检索索引 + 会话记忆）的生命周期管理
  * ▎为什么放在房间级而不是全局：会话记忆必须**按房间隔离**——两个人同时在两个房间
  *   问不同的问题，记忆串了就是灾难（AI 会把 A 房间的事答进 B 房间）。
@@ -2102,6 +3042,9 @@ function getRoomBrain(roomNumber) {
      *   那用"房间创建时刻"就能根治。完整推演见 brain.js 的 scopeEntries 注释。 */
     b = new Brain.RoomBrain(turns, { since: (room && room.createdAt) || 0 });
     roomBrains.set(roomNumber, b);
+    // ★ 2026-10-04h 重启续会：把账本里最近的对话回放进会话记忆（检索索引本就从磁盘
+    //   loadCaptions 实时建，天然不受重启影响——丢的只有这段"最近聊到哪了"）
+    rebuildBrainFromLedger(roomNumber, b);
     if (process.env.AI_DEBUG_SCOPE) {
       console.log(`[scope-debug] 新建 brain since=${b.since} (${b.since ? new Date(b.since).toISOString() : '不限'})`);
     }
@@ -2139,6 +3082,15 @@ function getRoomBoard(roomNumber) {
   if (!b) {
     b = new Digest.Digest({ maxPerKind: Number(CONFIG.aiBoardMaxPerKind) || 20 });
     roomBoards.set(roomNumber, b);
+    /* ★ 2026-10-04h 重启续会：看板是内存态，服务器重启即空——把账本里本场会的
+     *   历史字幕一次性回放进去（决定/风险/行动项全部回来），AI 入会时看板已攒好，
+     *   "重启不失忆"在看板这一侧也成立。只在创建时回放一次（本函数每次字幕都会进）。 */
+    try {
+      const room = rooms.get(roomNumber);
+      const caps = loadCaptions(roomNumber)
+        .filter((e) => !room || !room.createdAt || (e.ts || 0) >= room.createdAt);
+      if (caps.length) b.ingest(caps);
+    } catch (e) { /* 回放失败 = 空白看板重新攒，不挡新字幕 */ }
   }
   return b;
 }
@@ -2146,18 +3098,24 @@ function disposeRoomBoard(roomNumber) {
   roomBoards.delete(roomNumber);
 }
 
-/* AI 主动发言：**只在"有人需要知道"时才开口**，且严格节流。
+/* AI 主动发言：**默认整条关闭**（★ 2026-10-06 夜二，用户点名"不叫它就不该说话"）。
  *
- * ▎产品判断（这一段是设计意图，不是技术细节）：一个会不停插话的 AI 比不说话更糟。
- *   所以开口的门槛设得很高——只报两类「不提醒就会有损失」的事：
+ * ▎为什么关掉：这段逻辑的产物是**没有任何人叫它、它自己插一句话**
+ *   （日志 `ai-proactive-say kind=unowned-todo`）。在"和 AI 讨论纪要"的演示里那是加分项，
+ *   在**正常开会**里它就是"乱说话"：行动项抽取是规则+LLM 推断，误报时没人知道它为什么开口，
+ *   而用户只看到"我没叫它，它抢着说话"。既然"叫名字才答话"是这条产品线的总开关，
+ *   主动播报就只能显式开启：`config.aiProactiveSay: true` 或 `AI_PROACTIVE_SAY=1`。
+ * ▎看板照旧记账（ai-board 广播、纪要、日报都不受影响）——**记**与**说**是两件事，
+ *   这次关掉的只是"说"。
+ *
+ * ▎原设计（保留在下面，开启后生效）：只报两类「不提醒就会有损失」的事——
  *     ① 出现**没人认领的行动项**（会上承诺了，但没人接 → 会后必然烂尾）
  *     ② 出现**新的风险点**（来不及/阻塞 → 越早知道越好）
- *   决定与议题**只进看板不发言**：它们是存档性质的，不需要打断会议。
- *
- * ▎为什么要节流：规则抽取难免偶有误报，若不限速，三五条误报连成一串就成了刷屏机器人。
- *   45s 冷却 + 每次只说**一条**（挑最新最要紧的那条），把噪声压到可接受。
+ *   决定与议题**只进看板不发言**。节流：45s 冷却 + 每次只说**一条**（挑最新最要紧的那条）。
  */
+const AI_PROACTIVE_SAY = CONFIG.aiProactiveSay === true || Number(process.env.AI_PROACTIVE_SAY) === 1;
 function maybeAiSpeakUp(roomNumber, added) {
+  if (!AI_PROACTIVE_SAY) return;                          // 没被叫到就不开口（默认路径）
   const room = rooms.get(roomNumber);
   if (!room || !room.aiBot) return;                     // 助理不在场就不说话（它得有"嘴"）
   const now = Date.now();
@@ -2186,8 +3144,19 @@ function maybeAiSpeakUp(roomNumber, added) {
 function feedBoard(roomNumber, entries) {
   const room = rooms.get(roomNumber);
   if (!room) return null;                 // 房间已销毁/号码回收：不消化（否则会凭空造一个孤儿看板）
+  /* ★ 2026-10-05 夜二（用户第二张截图实锤）：**AI 自己的话不能进会议看板**。
+   *   现场链条：AI 回答「你好，我在呢，能听见你说话。有什么需要我帮忙的？比如帮你记会议纪要、
+   *   开白板或者调一下布局都行。」→ 这条被当字幕入账本（09-30e 为了"追问你刚才说了什么"）
+   *   → 看板的行动项抽取把它认成了"一条没有负责人的待办"
+   *   → `maybeAiSpeakUp` 主动播报「我记到一条行动项还没有负责人：<AI 自己的原话>——谁来认领?」
+   *   即 **AI 复述自己的话并叫人来认领**，用户看到的正是"它乱说话"。
+   * ▸ 修在喂看板这一层（不是入账本那一层）：账本仍是全量的（RAG 要能检索到 AI 说过什么），
+   *   而看板记的是**人**定下的决定/风险/待办——一个概念一个来源（坑 47），
+   *   判据只写在这一处。 */
+  const human = (Array.isArray(entries) ? entries : []).filter((e) => e && !e.bot);
+  if (!human.length) return null;
   const board = roomBoards.get(roomNumber) || getRoomBoard(roomNumber);
-  const r = board.ingest(entries);
+  const r = board.ingest(human);
   if (!r.addedCount) return r;            // 没抽出新东西 → 不广播（"有变化才发"）
   io.to(roomNumber).emit('ai-board', {
     ...board.snapshot(),
@@ -2211,15 +3180,83 @@ function memberDisplayName(roomNumber, memberId) {
   return `成员 ${aiShortId(memberId)}`;
 }
 
+/* ★ 2026-10-04g AI 听觉管线端口段从 51000 挪到 26000：**51000-51998 落在 Windows
+ *   动态端口区（默认 49152-65535）里**——任何出站连接（AI 对话时的 DeepSeek/TTS
+ *   请求、字幕归档 fetch…）都可能被系统临时占走这个端口作为源端口 → ffmpeg 静音
+ *   退场后重生时 bind 失败 → 秒崩 ×5 → "停止自愈，本路转写中断"= 用户报的
+ *   "跟 AI 助理对话一段时间字幕就断了"（今日四场真实会议的 app-*.jsonl 全部有
+ *   asr-recorder-gave-up，退出码 0xBEBBB1B7 = AVERROR_INVALIDDATA）。
+ *   ▸ 26000 在 Windows 动态区之外、Linux 动态区（32768+）之外，也不撞 mediasoup
+ *     的 40000-49999；可用 ASR_PIPE_PORT_BASE / config.asrPipePortBase 覆盖。
+ *   ▸ 端口改为**进程级同步预留**（原来只在"管线注册后"可见——bot 入会补挂循环
+ *     并发起多根管线时会撞号，两张 SDP 同写 51000 的现场已在 e2e 抓到）。 */
+const ASR_PIPE_PORT_BASE = Number(process.env.ASR_PIPE_PORT_BASE)
+  || Number(CONFIG.asrPipePortBase) || 26000;
+const asrPipePorts = new Set();   // 进程级预留（含"已分配未注册"的窗口）
+function allocAsrPipePort() {
+  for (let p = ASR_PIPE_PORT_BASE; p <= ASR_PIPE_PORT_BASE + 998; p += 2) {
+    if (!asrPipePorts.has(p)) { asrPipePorts.add(p); return p; }
+  }
+  return 0; // 段用尽（教学规模到不了）
+}
+function releaseAsrPipePort(port) { if (port) asrPipePorts.delete(port); }
+
 // 单路音频管线：PlainTransport 把这路音频 RTP 推给本机 ffmpeg，astats 每 ~2s 吐一次 RMS
+/* ★ 2026-10-09 能量闸阈值（"这段有没有声音"）的唯一判据。
+ *   原来这个数是 `handleSegment` 里的一个函数内 const，而今天录制页需要**同一个数**
+ *   来当场告诉用户"这句太安静，会议里会被当静音删掉"——如果在页面侧再写一个 -62，
+ *   就会出现"录制时说不安静、进了会议却没字幕"这种自相矛盾的读数（坑 47/82）。
+ *   env ASR_MIN_PEAK_DB > config.asrMinPeakDb > -62（-62 是 10-05d 从真人麦克风定的）。
+ * ▸ 为什么是**函数**而不是模块级 const：CONFIG 是启动时才读的，取值时刻必须是"现在"，
+ *   否则 /config.json 与录制页会读到还没装好配置的默认值（坑 67：把"我没读到"当成"读到 0"）。 */
+function asrMinPeakDb() {
+  const fromEnv = Number(process.env.ASR_MIN_PEAK_DB);
+  if (String(process.env.ASR_MIN_PEAK_DB || '') !== '' && Number.isFinite(fromEnv)) return fromEnv;
+  return Number.isFinite(CONFIG.asrMinPeakDb) ? Number(CONFIG.asrMinPeakDb) : -62;
+}
+
+/* ★ 2026-10-03b 「任意转写能力」判据（与下方 if 分支共用同一个谓词——坑 47：一个概念只留一个来源）。
+ *   whisper CLI 探测收敛 = 有兜底转写器；本地 Qwen worker 活着 = 有主引擎；
+ *   配了 qwen-local 模型目录 = worker 正在/将会加载。三者任一即具备"能把 wav 变文字"的能力。 */
+function aiAsrCapableNow() {
+  if (WHISPER) return true;
+  const rw = getResidentAsr(CONFIG.asrModel || Asr.DEFAULT_MODEL);
+  if (rw && rw.alive) return true;   // ★ 2026-10-04h 兜底 worker 活着就算能力在岗（不等 --help 探测）
+  const q = getQwenLocalAsr();
+  if (q && q.alive) return true;
+  /* ★ 2026-10-09 这里改读判据而不是读 env：env 是"启动绑定跑过了"的痕迹，
+     而我们要的答案是"这台引擎的模型在不在盘上"。绑定那一步哪天挪走或跳过，
+     旧写法会 quietly 变成 false（坑 67 家族：把"我没设置"读成"它不可用"）。 */
+  return asrEngineMode() === 'qwen-local' && !!QwenLocalAsr.resolveModelDir();
+}
+/* ★ 2026-10-05 分段秒数**唯一来源**（坑 47）：曾经这里有两处——管线用 env>config>2，
+ *   而启动日志用模块默认值拼"每 Ns 一段"，实测配置 2s 时日志却打"每 4s"，
+ *   用户照着日志排查必然得出错误结论（坑 67 家族：日志要说实话）。 */
+function resolveAsrSegmentSec() {
+  return Math.max(2, Math.min(15, Number(process.env.ASR_SEGMENT_SEC)
+    || Number(CONFIG.asrSegmentSec) || 2));
+}
 async function startAiAudioPipe(roomNumber, producer, memberId) {
   const room = rooms.get(roomNumber);
   if (!room || !room.router) return;
+  /* ★ 2026-10-03b 等转写能力就绪再定管线形态（真浏览器 e2e 抓到的竞态，用户侧症状
+   *   就是"语音识别时灵时不灵"）：原实现看 attach **那一刻** WHISPER 探测完没有——
+   *   服务器刚启动就进会/开字幕的人（探测要几秒）会把耳朵打成"只量响度"形态，
+   *   **引擎 3 秒后就绪也不再升级，这一路永远哑**（实测：90s 零转写，零报错）。
+   *   修法：先等能力就绪（whisper 探测通常 1~3s 收敛；whisper 没装时等本地 Qwen
+   *   worker 加载完），上限 120s；超时按老行为降级为只量响度，绝不无限挂起。
+   *   ▸ 等待期间房间销毁/人走就撤——管线本来也不该起来。 */
+  const waitStart = Date.now();
+  while (!aiAsrCapableNow() && rooms.get(roomNumber) && Date.now() - waitStart < 120000) {
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  if (!rooms.get(roomNumber)) return;
+  let allocatedPort = 0;   // ★ 2026-10-04g 启动失败时归还预留端口（成功路径各自在关闭时释放）
   try {
-    const used = new Set([...(aiAudioPipes.get(roomNumber) || [])].map((x) => x.port));
-    let port = 51000;
-    while (used.has(port)) port += 2;
-    if (port > 51998) return; // 端口段用尽（教学规模到不了）
+    // ★ 2026-10-04g 端口改为进程级同步预留（alloc 即占位，防并发撞号；释放点见各关闭路径）
+    const port = allocAsrPipePort();
+    allocatedPort = port;
+    if (!port) return; // 端口段用尽（教学规模到不了）
     const t = await room.router.createPlainTransport({ listenIp: { ip: '127.0.0.1' }, rtcpMux: true, comedia: false });
     await t.connect({ ip: '127.0.0.1', port });
     const c = await t.consume({ producerId: producer.id, rtpCapabilities: room.router.rtpCapabilities });
@@ -2229,8 +3266,8 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
       sdpMediaSection(c, 'audio', port)].join('\r\n');
     const sdpFile = path.join(LOGS_DIR, `ai-${roomNumber}-${producer.id}.sdp`);
     fs.writeFileSync(sdpFile, sdp);
-    /* ★ 09-28：whisper 可用 → 分段录音 + 逐段转写（"AI 的耳朵"正式上线）
-     *   不可用 → 原 astats 模式（只记响度）。两条路径都吃同一路 RTP。
+    /* ★ 09-28：有转写能力 → 分段录音 + 逐段转写（"AI 的耳朵"正式上线）
+     *   没有且等满超时 → 原 astats 模式（只记响度）。两条路径都吃同一路 RTP。
      * ▎本轮修掉的三个真缺陷（都是多人会议才会暴露的）：
      *   ① **目录冲突**：原来所有成员共用 asr-<房间号>/seg-%04d.wav——A 的 seg-0003.wav
      *      会被 B 的同名文件覆盖，两人同时说话时转写直接错乱/丢失。现在按 memberId 分目录；
@@ -2238,30 +3275,48 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
      *      每句话的尾巴丢在未落盘的部分。现在**跳过最新那段** + 两次采样大小一致双保险；
      *   ③ **静音段白转**：短段直接删掉不进 whisper（省 CPU，也少些幻觉文本）。
      * ▎收尾：producerclose 后把最后一段补转，别丢会议最后一句话。 */
-    if (WHISPER) {
+    if (aiAsrCapableNow()) {
       const safeMember = String(memberId).replace(/[^\w-]/g, '').slice(-12) || 'm';
       let segDir = path.join(LOGS_DIR, 'asr', roomNumber, safeMember);
       fs.mkdirSync(segDir, { recursive: true });
       const speakerName = memberDisplayName(roomNumber, memberId);
       // 分段秒数：config.json > 环境变量 > 默认（5s）。越小越灵敏、越大上下文越完整。
-      const segSec = Math.max(3, Math.min(15, Number(CONFIG.asrSegmentSec) || Asr.DEFAULT_SEGMENT_SEC));
+      // ★ 2026-10-03e 实测改默认账：真浏览器 e2e 证明 ffmpeg 的分段文件**写满才落盘**
+      //   （in-flight 段 statSync 恒 0 字节 → 抢跑快照机制从未真正生效），字幕延迟的真实
+      //   下限 = 说完 → 下一个窗口边界。GPU 上转写一段只要 ~0.6s，窗口 2s 让最坏等待
+      //   从 4s 砍到 2s、说话中的半句字幕刷新也更勤；代价是碎片更多（已有句内去重兜住）。
+      //   CPU 部署建议保持 4s（转写 2.2s/段，窗口太碎只会更忙）。
+      const segSec = resolveAsrSegmentSec();
       const asrModel = CONFIG.asrModel || Asr.DEFAULT_MODEL;
-      // ★ 2026-10-02 能量闸阈值（dBFS 峰值）：-45 ≈ "整段最响的一下都比正常语音轻 20dB"，
-      //   实测纯静音 -99、安静房间噪声 -60~-70、正常说话峰值 -20~-10 —— 阈值落在中间很安全。
-      const ASR_MIN_PEAK_DB = Number(process.env.ASR_MIN_PEAK_DB) || -45;
+      // ★ 2026-10-02 能量闸阈值（dBFS 峰值）／04i 默认 -45→-55／**05 夜 -55→-62**
+      //   这条阈值已经被真机数据改过两次，每次都是"假设的麦克风"和"实际的麦克风"对不上：
+      //   ① -45 是拿 TTS 全幅音色校准的（假设真说话 -20~-10），房间 134156 实测真笔记本麦
+      //      峰值只有 -46~-50 → 一半语音被删；
+      //   ② 降到 -55 之后，房间 283648（2026-10-05 18:43）实测**同一个人**的峰值在
+      //      **-56 ~ -65**：那 66 秒里 8 段被拦、只有 4 段进转写，用户看到的就是
+      //      "说了半天没字幕 / 字幕全是碎片"。安静房间噪声底实测在 -70 以下、纯静音 -99。
+      //   -62 = 让开"离麦远/音量小"这一整档真实用户，仍拦得住噪声底与静音。
+      //   ▸ 判据用 `Number.isFinite` 而不是 `||`：`||` 会让"显式设成 0"静默变回默认值（坑 54）。
+      const ASR_MIN_PEAK_DB = asrMinPeakDb();   // ★ 10-09 收成一处：录制页的当场提示用它，别再各写一个 -62
       let alive = true;
       let curRec = null;
       const doneSet = new Set();
       console.log(`🤖 AI 小明开始聆听：${speakerName}（${segSec}s 一段，模型 ${asrModel}，${getResidentAsr(asrModel) ? '常驻转写 worker' : 'CLI 逐段转写'}，说完约 ${segSec}~${segSec * 2}s 出字幕）`);
 
+      /* ★ 2026-10-05 停机收口一处（坑 47）：producerclose / stopAiAudioPipeline / 关机路径
+       *   都走这个闭包。为什么必须是闭包而不是往管线对象里塞 proc 快照：录音进程是**自愈重生**
+       *   的（curRec 会被换掉），快照必然过期；且必须同时置 alive=false——只杀进程不置标志，
+       *   exit 回调会把它当"异常退出"按自愈逻辑再拉起来（症状 = 撤权/离房后 ffmpeg 又活了）。 */
+      const stopAsrPipe = () => {
+        alive = false;
+        releaseAsrPipePort(port);   // ★ 2026-10-04g 管线随 producer 关闭释放端口
+        try { if (curRec) curRec.kill(); } catch (e) { /* 已退 */ }
+      };
       /* ★ 09-27c 实修（用户反馈"AI 听不见"的根因）：原代码在这里写了 `pipe.alive = ...`，
        *   而 const pipe 声明在本函数**后面**（astats 公共尾部）——TDZ 必然抛错 →
        *   每次 ASR 管线启动即崩 → AI 永远听不见。修法：whisper 分支自带
        *   producerclose 监听（置 alive=false 并杀当前录音进程），不再触碰外部 pipe。 */
-      c.on('producerclose', () => {
-        alive = false;
-        try { if (curRec) curRec.kill(); } catch (e) { /* 已退 */ }
-      });
+      c.on('producerclose', stopAsrPipe);
       // 单个 ffmpeg 持续录音并分段（无空窗——旧串行模式在转写期间丢语音，是"不灵敏"的根因）
       // ★ 09-30f 静音驱动早转写参数：说完静音 1.2s 就快照转写"正在写的段"（不等窗口封口）
       /* ★ 2026-10-03 别再往下调这个 1200：实测过，**调到 900 反而慢一倍**
@@ -2272,9 +3327,83 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
        *   ▸ 这正是要"先量再改"的原因：按直觉 900 应该更快 300ms。
        *   ▸ 想再降延迟，动 `asrSegmentSec` 或换更快的引擎，别动这道闸。 */
       const FLUSH_MS = Math.max(600, Number(process.env.ASR_FLUSH_SILENCE_MS) || 1200);
-      const FLUSH_DB = Number(process.env.ASR_FLUSH_DB) || -38;
+      /* ★ 2026-10-07 RMS 冷启动宽限（见下面 rmsAlive 那条判据的注释）。
+       *   ▸ 为什么是 8 秒而不是 4 秒（实测，不是拍的）：`ametadata=print:file=-:direct=1`
+       *     打到**管道**上时，ffmpeg 仍按 ~4KB 块交付——一条 RMS 行约 50 字节，
+       *     于是"第一行 RMS"要等约 5 秒的音频攒够一个块才到 Node。
+       *     真跑日志：开机第一句已经转写出「小明」了，`成句闸` 那行仍是 `rms=0行/0有声`，
+       *     4.4s 时宽限到期 → 退回 gap 代理判据 → 把这句话切在「小明」上，
+       *     而"只含名字的碎片"会 arm 分段续接窗 → 紧跟的下一句被当成后半句接了话。
+       *   ▸ 宽限盖过"第一个块"即可，再长就会把真没有 RMS 的环境拖到只靠保险丝收口。
+       *     （RMS 成块到达本身是下一刀的靶子：它让 lastVoiceTs 最坏滞后 5 秒，
+       *      见 后续升级方向.md 里记的那条。） */
+      const RMS_GRACE_MS = Math.max(1000, Number(process.env.ASR_RMS_GRACE_MS) || 8000);
+      /* ★ 2026-10-05 夜 -38 → -50（同一把尺子的第三次校准，前两次是能量闸：-45→-55→-62）
+       * ▎这个阈值回答的是"这 0.5 秒的窗里有没有人在说话"（RMS_level，不是峰值）。
+       *   -38 同样是拿响麦克风校准的：房间 283648 实测**同一个人**的语音峰值只有 -56~-65，
+       *   RMS 更低 → 阈值永远不越线 → `lastVoiceTs` 整场不刷新，连带三件事一起坏掉：
+       *   ① "说完→静音确认→立刻定稿"那条快路径**整场没生效过**（只能退回 1.5s 代理判据）；
+       *   ② 延迟读数的起点没有锚，`stage.wait` 恒 0、⏱ 显示 0.0s（界面在撒谎，见 finalizeUtterance）；
+       *   ③ 抢跑快照的触发判据也读它，等于那套机制对安静麦克风形同虚设（坑 76 的形状）。
+       *   ▸ -50 落在"安静真语音（RMS 约 -45~-55）"与"房间噪声底（-60~-70）"之间；
+       *     响麦克风不受影响（语音远高于 -50，静音仍会掉下去）。可用 ASR_FLUSH_DB 覆盖。 */
+      const FLUSH_DB = Number(process.env.ASR_FLUSH_DB) || -50;
+      /* ★★ 2026-10-06 绝对阈值 → **相对本机噪声底**（安静麦克风的最后一块拼图）。
+       *   ▎上面那次校准（-38→-50）方向对、做法错：它仍然是一条绝对 dBFS 线，
+       *     于是"比 -50 更轻的真语音"照样被判成没人在说话。本机 ffmpeg 同链路实测：
+       *       语音峰值 -56 dBFS → RMS -59 → 阈值 -50 判"无声" ❌（10-05d 那位用户就在这个档位）
+       *     而这类人的后果是**反向**的：lastVoiceTs 永不刷新 ⇒ silenceConfirmed 每一段都成立
+       *     ⇒ 每个 2s 段各自成句、各自定稿、各自唤醒 ⇒ "语音识别好乱 / 它答好几遍"。
+       *   ▸ ★ 2026-10-07 夜：判据从 `min(FLUSH_DB, 噪声底+6)` 换成**双边钳位**
+       *     `clamp(噪声底+6, -74, -42)`（两条线都能用 env 覆盖，见下）。
+       *     原来那行"吵房间（底 -45）⇒ 阈值仍被 -50 钳住 ⇒ 与今天一字不差"把**冻结旧行为**
+       *     当成了安全性质，而旧行为正是这个 bug 的成因：底噪 -43 本身就高于阈值 -50 ⇒
+       *     每一帧都判"有人在说" ⇒ silenceConfirmed 永不成立 ⇒ **三句话粘成一条 blob**。
+       *     这不是推演——`TEST_ASR_DEBUG=1 npm run test:asr-live` 复跑当场摊出
+       *     `voiceThr=-50.0 floor=-42.9`、495/1444 帧判有声、定稿只剩一条（见 asr.js 函数头全文）。
+       *   ▸ 两条硬线的分工：`-74` = 再安静也不往下追（别把线噪声当语音）；
+       *     `-42` = **绝不比这更迟钝**，房间再吵，-42 以下的真语音仍算有人在说——
+       *     这条线是为了不把 10-05d 那批安静麦克风用户整个弄聋（坑 91 的另一半）。
+       *   ▸ 估计数是纯函数 Asr.createVoiceTracker（test:asr ③.11 逐条断言：吵/中/安静三档
+       *     **只有该变的那一档变**，中档与安静档与 10-06 一字不差）。
+       *   ▸ ASR_VOICE_ADAPT=0 可退回旧的绝对阈值（排障时的对照开关，不改任何其它行为）。 */
+      const voiceTrack = process.env.ASR_VOICE_ADAPT === '0'
+        ? { feed: (db) => ({ voiced: Number.isFinite(db) && db > FLUSH_DB, floorDb: null, thresholdDb: FLUSH_DB }), get thresholdDb() { return FLUSH_DB; }, get floorDb() { return null; } }
+        : Asr.createVoiceTracker({
+            absDb: FLUSH_DB,
+            /* 注意用 `||` 之前的显式判空：-74/-42 是负数，`Number(env) || 默认` 在传 0 时会失效，
+               而这里"传 0"本身不是合法线位，所以直接沿用项目惯用的显式兜底写法（坑 54）。 */
+            sensitiveFloor: numEnvOr(process.env.ASR_VOICE_SENSITIVE_FLOOR, -74),
+            deafCeil: numEnvOr(process.env.ASR_VOICE_DEAF_CEIL, -42),
+          });
       let lastVoiceTs = 0;
-      let flushedBase = null;
+      /* ★ 2026-10-06 每代录音进程各自的 RMS 到达统计（lines=收到多少行 RMS、
+       *   voice=其中多少行过阈值）。进程静音退场会重生，所以这两个数也随重生归零。 */
+      const rmsSeen = { lines: 0, voice: 0, minDb: 0, maxDb: -999 };
+      let flushDbgTs = 0;   // ★ 诊断日志节流（ASR_DEBUG 用）
+      let gateDbgTs = 0;    // ★ 2026-10-05 成句闸状态行的节流（同上）
+      /* ★ 2026-10-05 「delta 尾段快照」状态（旧"copy 全段"抢跑的重写，见下方 flush 块）。
+       * ▎为什么推翻重写：旧实现 copy 整段给转写器**并把它标记为已处理**，封口后的完整版
+       *   反而被跳过——尾巴只能等下一个分段边界，既丢句尾又更晚（实测调 900ms 反慢一倍的机制）。
+       * ▎新机制（PCM 渐进段 + 只扑新增 delta）：每秒轮询"正在写的那个 .pcm 长到哪了"，
+       *   只把 **上次已扑位置之后的新增字节** 包成 tail-*.wav 送转写；原段不标 doneSet，
+       *   封口后照常全量转写——两份文本由句内归并（mergeTranscript）合成一句，宁重不漏。
+       * ▎记账三件：flushedBytes=扑之前先记水位（即使转写失败也要记！否则下一轮把同一段
+       *   反复重扑=风暴）；flushedOkTs=转写**成功**才记时间戳（失败允许下一轮继续扑，
+       *   且只扑失败之后新增的部分）；tailSeq=尾巴文件序号（防同名覆盖）。
+       * ▎tailInFlight 串行化：同时只允许一个尾巴快照在转写，否则 tail2 可能先于 tail1
+       *   返回 → 句内文本倒序（「打开白板」变「白板打开」）。 */
+      const flushedBytes = new Map();   // baseName → 已扑走的字节水位
+      const flushedOkTs = new Map();    // baseName → 最近一次尾巴转写成功的时间
+      let tailSeq = 0;
+      let tailInFlight = 0;
+      const tailPending = () => tailInFlight > 0;
+      /* RMS 行滞后余量：lastVoiceTs 是"响 RMS 行到达"的墙钟，而该行覆盖的是**上一窗**
+       * 的音频（astats 的 0.5s 窗 + 管道/解析延迟），所以真语音可能延伸到最后
+       * 一次 lastVoiceTs 之后 ~1s。判"这段值得扑"时把这个余量算进去——
+       * 原则：宁可在静音段上白扑一次（能量闸毫秒级打发，几乎零成本），
+       *      也不要在真尾巴上不扑（那正是 chop 复发）。 */
+      const RMS_LAG_MS = 1000;
       /* ★ 2026-10-02 录音进程**自愈**（用户报"AI 听不到声音"的真根因之一）：
        *   实测 ffmpeg 拿 SDP 当输入时，**长时间收不到 RTP 会自己退出**
        *   （静默约半分钟后 stderr 报 `Error during demuxing: -138`，进程结束，无任何上层报错）。
@@ -2299,7 +3428,7 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
         let mx = -1;
         try {
           for (const f of fs.readdirSync(segDir)) {
-            const m = f.match(/^seg-(\d+)\.wav$/);
+            const m = f.match(/^seg-(\d+)\.pcm$/);   // ★ 2026-10-05 段格式 wav→pcm（见 spawnRecorder 注释）
             if (m) mx = Math.max(mx, Number(m[1]));
           }
         } catch (e) { /* 目录还没建起来 */ }
@@ -2308,43 +3437,117 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
       const spawnRecorder = () => {
         const startIdx = nextSegIndex();
         recBornAt = Date.now();
+        /* ★ 2026-10-05 实修（latMs 恒 0 / 语句被半途定稿的根因）：ametadata 的 print 打到
+         *   `file=-`（stdout 管道）时**默认带 32KB 块缓冲**——实测同一条 6s 音频：
+         *   不带 direct 时 259 行 RMS 全在进程退出那一刻（5.61s）才到齐；带 `direct=1`
+         *   首行 0.11s 就位。后果不是"数字难看"而是**信号彻底失真**：lastVoiceTs 只在
+         *   录音进程静音退场（~21s 一次）时才被整批刷新 → 说话期间它一直是过期值 →
+         *   ① 定稿的 latMs/stage.wait 恒为 0（起点压根没设过）；② `silenceConfirmed`
+         *   在**真说话时**为真 → 每个 2s 段一成型就被迫切句（重复句闸兜住了大部分碎片，
+         *   但"同一句拆两半、AI 答两遍"的窗口一直开着）。
+         *   ▸ direct=1 = "reduce buffering when printing to user-set file or pipe"
+         *     （ffmpeg -h filter=ametadata 可查），是这条管线的**生命线**，别删。 */
+        /* ★ 2026-10-05 ★ 本轮核心修复（"语音识别一段时间就停/碎句/丢尾"的最后一块拼图）：
+         *   分段输出从 **wav 改成 raw s16le（.pcm）** + `-segment_format_options flush_packets=1`。
+         * ▎为什么必须这么改（全部来自本机真跑的探针 seg-probe/2/3，不是猜测）：
+         *   ① ffmpeg 的默认写缓冲让**任何**输出文件在进程存活期间都是整段滞留的——
+         *      wav 段 in-flight 时 statSync 恒 0 字节（"静音抢跑快照"从上线起就从未生效过）；
+         *   ② 顶层 `-flush_packets 1` 只作用于最外层 muxer，**传不进 segment 的子上下文**
+         *      （wav/s16le 两种格式实测都无变化）；
+         *   ③ `-segment_format_options flush_packets=1` 是给子 muxer 的字典——实测
+         *      in-flight 段文件每 0.5s 涨 ~16KB 渐进落盘，轮转/编号正常（探针逐秒采样）。
+         *       注意 s16le 必须显式 `-c:a pcm_s16le`（否则默认编码器选 adpcm_ima_alp，
+         *       被 s16le muxer 秒拒"Could not write header"——探针第一次就踩了）。
+         * ▎渐进落盘带来的三个能力：抢跑快照终于有数据可扑（尾段延迟再砍一刀）、
+         *   ffmpeg 进程被杀时已落盘部分不丢（原来整段滞留 = 全丢）、rN 自愈代际连续读。
+         * ▎代价：段文件不再是 WAV，handleSegment 转写前要包 44 字节头（Asr.wrapPcmToWav）。
+         *   ★ 这条参数与段名 `seg-%04d.pcm` 是**一份约定的三个落点**（args/包装/文件名），
+         *   改任何一处都要三处同改。 */
+        /* ★★ 2026-10-06 决定性修复：`reset` 的单位是**帧**，不是采样点。
+         *   ▎原来把 reset 写成 8000，注释里当作"8000 采样 = 0.5s 一窗"。ffmpeg 自己的文档写着：
+         *     `reset <int> Set the number of FRAMES over which cumulative stats are calculated
+         *     before being reset`——音频帧是 1024 采样，16kHz 下一帧 64ms，
+         *     所以 8000 帧 ≈ **512 秒**，等于整场会议从不重置。
+         *   ▎后果是一条完整因果链（也是用户三次抱怨的那件事）：
+         *     累计 RMS 永远停留在"这场会平均有多响"的水平（实测 [-25.8,-10.6] dBFS，
+         *     纯数字静音期间也不掉），于是 `db > FLUSH_DB` 几乎每行都成立 ⇒
+         *     `lastVoiceTs` 恒等于"现在" ⇒ `silenceConfirmed`（静音满 1.2s）**永不成立** ⇒
+         *     每一句都被 10s 的 `UTTERANCE_MAX_OPEN_MS` 保险丝切断 ⇒
+         *     ① 字幕定稿延迟 3~10s（"延迟还很大"）；② 非 silence 定稿按坑 90 归零 ⇒
+         *     ⏱ 读数几乎永远不出现（"不知道慢在哪"）；③ 抢跑快照的 birth 判据也失真。
+         *   ▎改法：`reset=8`（8 帧 ≈ 0.5s）。对照实验（本机 ffmpeg 9.0.1 真跑）：
+         *     同样的"响 2s + 纯零 2s"素材，reset 给 8000 时静音段读 -12.7 dBFS，
+         *     reset=8 时静音段读 **-inf**、有声段读 -11.7 ⇒ 这才叫"此刻有没有人说话"。
+         *   ▸ 键也从 `Overall.RMS_level` 换成 `1.RMS_level`（声道窗内值）：
+         *     Overall 这一组本来就是累计语义，换键不换 reset 也一样不灵。
+         *   ▸ 断言补在 scripts/test-asr.js 的 ③.10：直接驱动 ffmpeg 跑这条滤镜链，
+         *     钉"静音段必须给 -inf / 有声段必须给正常电平"——语义写错不会让任何功能变红，
+         *     只会让所有人的字幕慢 8 秒（坑 57：外部依赖的语义必须能被证伪）。 */
         curRec = require('child_process').spawn(FFMPEG_BIN, [
           '-loglevel', 'error', '-protocol_whitelist', 'file,udp,rtp',
           '-fflags', '+genpts', '-i', sdpFile,
           '-ar', '16000', '-ac', '1',
-          '-af', 'astats=metadata=1:reset=8000,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-',
-          '-f', 'segment', '-segment_time', String(segSec), '-segment_format', 'wav',
+          '-af', 'astats=metadata=1:reset=8,ametadata=print:key=lavfi.astats.1.RMS_level:file=-:direct=1',
+          '-c:a', 'pcm_s16le',
+          '-f', 'segment', '-segment_time', String(segSec), '-segment_format', 's16le',
+          '-segment_format_options', 'flush_packets=1',
           '-reset_timestamps', '1', '-segment_start_number', String(startIdx),
-          path.join(segDir, 'seg-%04d.wav'),
+          path.join(segDir, 'seg-%04d.pcm'),
         ], { stdio: ['ignore', 'pipe', 'pipe'] });
-        // RMS 行解析：`lavfi.astats.Overall.RMS_level=-38.2`（每 0.5s 一行；-inf=纯静音）
+        // RMS 行解析：`lavfi.astats.1.RMS_level=-38.2`（每帧 64ms 一行，值覆盖最近 8 帧≈0.5s；-inf=纯静音）
+        let stderrTail = '';   // ★ 2026-10-04g 崩溃现场留档：秒崩时 stderr 常来不及打印，exit 时带上尾巴
         curRec.stderr.on('data', (d) => {
+          stderrTail = (stderrTail + String(d)).slice(-600);
           if (process.env.ASR_DEBUG_FFMPEG) console.log(`[asr-ffmpeg] ${String(d).slice(0, 200)}`);
         });
         curRec.stdout.on('data', (d) => {
           const matches = String(d).match(/RMS_level=(-?[\d.]+|-inf)/g);
           if (!matches || !matches.length) return;
           recCrashes = 0; // 又在收音频了 = 这条命是好的，崩溃预算重置
+          /* ★ 2026-10-06 RMS 到达计数（查"真实会议延迟 3.9s vs 受控自测 1.4s"这条差）：
+           *   成句闸与 ⏱ 读数都挂在 lastVoiceTs 上，而它**只在 db > FLUSH_DB 的那一行**才刷新。
+           *   于是"这一路 RMS 到底来了多少行、其中多少被判成有声"直接决定
+           *   silenceConfirmed 多久才成立一次——之前这两个数没人记，只能靠猜（坑 76）。
+           *   ▸ 只数不判：不改任何行为，纯粹让"信号稀不稀"变成一个可打印的事实。 */
+          rmsSeen.lines += matches.length;
           const last = matches[matches.length - 1].split('=')[1];
           const db = last.startsWith('-inf') ? -99 : parseFloat(last);
-          if (Number.isFinite(db) && db > FLUSH_DB) lastVoiceTs = Date.now();
+          if (Number.isFinite(db)) {
+            if (db < rmsSeen.minDb) rmsSeen.minDb = db;
+            if (db > rmsSeen.maxDb) rmsSeen.maxDb = db;
+          }
+          /* ★ 2026-10-06 判据换成自适应（理由见 voiceTrack 上方那段）：
+           *   安静麦克风（语音 RMS -59）在旧的 `db > FLUSH_DB(-50)` 下**永远判无声**，
+           *   于是每一段都被当成"人说完了" ⇒ 碎句 + 重复唤醒 + AI 多答。 */
+          const vd = voiceTrack.feed(db);
+          /* 观测口径进全局（谁最后说话就是谁的值——这是"每路一个"的量，取最新一次即可回答
+           *   "刚才那个人被判有声/无声用的是哪条线"）。 */
+          COLLAB.input.voiceThr = Math.round(vd.thresholdDb * 10) / 10;
+          COLLAB.input.floorDb = vd.floorDb == null ? null : Math.round(vd.floorDb * 10) / 10;
+          if (vd.voiced) { lastVoiceTs = Date.now(); rmsSeen.voice += 1; }
         });
         curRec.on('exit', (code) => {
-          if (!alive || !rooms.get(roomNumber)) return; // 正常收尾（producer 关/房间销毁）
+          if (!alive || !rooms.get(roomNumber)) { releaseAsrPipePort(port); return; } // 正常收尾（producer 关/房间销毁）
           const livedMs = Date.now() - recBornAt;
           const idleDeath = code === 0 && livedMs > 15000;   // 静音太久的正常退场
           if (!idleDeath) recCrashes += 1;
+          const errTail = stderrTail.replace(/\s+/g, ' ').trim().slice(-300);
           if (recCrashes > 5) {
-            console.log(`⚠️ AI 听觉管线的录音进程反复**异常**退出（${recCrashes} 次，最后一次只活了 ${Math.round(livedMs / 1000)}s）——停止自愈，本路转写中断；开 ASR_DEBUG_FFMPEG 看 stderr`);
-            logEvent('warn', 'asr-recorder-gave-up', { roomNumber, member: memberId, crashes: recCrashes, livedMs });
+            console.log(`⚠️ AI 听觉管线的录音进程反复**异常**退出（${recCrashes} 次，最后一次只活了 ${Math.round(livedMs / 1000)}s）——停止自愈，本路转写中断；stderr 尾巴：${errTail || '(无输出)'}`);
+            logEvent('warn', 'asr-recorder-gave-up', { roomNumber, member: memberId, crashes: recCrashes, livedMs, stderr: errTail });
             return;
           }
-          console.log(`🩹 AI 听觉管线：录音进程退出（code=${code}，活了 ${Math.round(livedMs / 1000)}s · ${idleDeath ? '静音退场' : '异常'}），1s 后自愈重启`);
-          logEvent('info', 'asr-recorder-respawn', { roomNumber, member: memberId, code, livedMs, idle: idleDeath, crashes: recCrashes });
+          /* ★ 2026-10-04g 秒崩用指数退避（1s→2s→4s→…上限 30s）：端口被系统临时
+           *   占走之类的瞬时冲突会持续几秒——固定 1s 重试会在 6 秒内把预算烧光
+           *   （今日真实会议的 gave-up 全是这个形状）；退避给了冲突方退场的时间。 */
+          const backoff = (!idleDeath && livedMs < 1000)
+            ? Math.min(30000, 1000 * Math.pow(2, recCrashes)) : 1000;
+          console.log(`🩹 AI 听觉管线：录音进程退出（code=${code}，活了 ${Math.round(livedMs / 1000)}s · ${idleDeath ? '静音退场' : '异常'}），${backoff}ms 后自愈重启${errTail ? ` · stderr：${errTail}` : ''}`);
+          logEvent('info', 'asr-recorder-respawn', { roomNumber, member: memberId, code, livedMs, idle: idleDeath, crashes: recCrashes, backoff, stderr: errTail || undefined });
           setTimeout(() => {
-            if (!alive || !rooms.get(roomNumber)) return;
+            if (!alive || !rooms.get(roomNumber)) { releaseAsrPipePort(port); return; }
             spawnRecorder();
-          }, 1000);
+          }, backoff);
         });
       };
       spawnRecorder();
@@ -2358,15 +3561,149 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
        *   超 UTTERANCE_GAP_MS 无新片段）才"成句"——成句时一次性：入账本 + 上字幕 + 唤醒判定。
        *   字幕条中途显示**累积中的半句**（interim，不进历史），成句后的全句才进历史。 */
       const UTTERANCE_GAP_MS = Math.max(800, Number(process.env.ASR_UTTERANCE_GAP_MS) || 1500);
-      const utterances = new Map(); // memberId → { text, lastAt }
+      /* ★ 2026-10-05 保险丝（见 recordLoop 成句闸）：lastAt 超 10s 无任何追加才强制成句。
+       *   只兜"噪声把 RMS 卡在阈值上方、silenceConfirmed 永不为真"这类病态场景；
+       *   正常路由 silenceConfirmed 成句，从不依赖它。 */
+      const UTTERANCE_MAX_OPEN_MS = Math.max(3000, Number(process.env.ASR_UTTERANCE_MAX_MS) || 10000);
+      /* ★ 2026-10-05 夜二 第二把保险丝：**这句开了多久**（从第一个片段算起），默认 6s。
+       * ▎为什么 10s 那把不够：它量的是"多久没进展"（idleTextMs），而**连续音频**
+       *   （用户 20:47 那场：房间里有视频/电视在放，每 2s 都有新片段进来）
+       *   永远在"进展"，于是这句可以无限长下去——实测账本里
+       *   「你好 有没有 你好小明」从 20:47:17 的片段拖到 20:47:27 才定稿，
+       *   **用户体感的"延迟大"就是这 10 秒**（而 ⏱ 因为不是静音定稿，按诚实性规则不显示）。
+       * ▸ 两个时钟量两件不同的事，必须都在：`idleTextMs`（多久没变长）兜"没人说了"，
+       *   `ageMs`（这句开了多久）兜"一直在说但一直不切"。
+       * ▸ 6s 是"字幕可读性"与"句子完整性"的折中：再长就成段落了，观众读不完。
+       *   这一路定稿 reason='max-age' → 不产延迟读数（人还在说，量出来的数不是延迟）。 */
+      const UTTERANCE_MAX_AGE_MS = Math.max(4000, Number(process.env.ASR_UTTERANCE_AGE_MS) || 6000);
+      /* ══ ★ 2026-10-07 「整句重转」（用户那句"识别的太笨了 + 字幕长度太短，要整句话能显示出来"）══
+       * ▎病灶（一次性对照实验量出来的，同一批生产函数、同一段音频，脚本量完即删）：
+       *   管线原先把语音切成 **2 秒一段分别转写**，再用 mergeTranscript 把碎片拼成一句。
+       *   拼出来的东西长这样（真跑打印，不是编的）：
+       *     「小明，今天的服务。」+「起负载看起来怎么样？」   ← 「服务器」被切在段边界上
+       *     「小明，帮我记一下。」+「明天下午三点的评审。」+「怎会？」← 「会」凭空变成一句幻觉
+       *     「小明把纪要升。」+「乘一下。」                  ← 「生成」被切成「升 / 乘」
+       *   对照：把**整句音频一次**喂给同一个模型，六句里逐字全对的从 **1 句变成 3 句**，
+       *   多余字数 6→4，而模型总耗时 **4.34s → 3.22s（还省了 26%）**——
+       *   因为一次调用的固定开销 + 不再重复吐同一个词，比三次短调用更便宜。
+       *   ▸ 所以模型侧不是"拿延迟换准确率"（总推理量反而降了 26%）；但**端到端确实更慢一点**：
+       *     test:asr-live 的"说完→上字幕"从 1.7~1.8s 变成 2.7~3.1s，换来的是
+       *     逐字全对、带句末标点的一整句（旧的是「…的评审。」——「会」字凭空不见）。
+       *     ⏱ 读数是诚实上移的，不是被藏起来的。
+       *   ▸ ★ 试过的一刀已**干净实测否决**（别再重复，两次都是真跑）：想省掉"等尾巴段封口
+       *     被挑走"那 ~0.5 秒（改成抢跑时从后往前挑"最新一段还没听过的"段，并让尾巴闸认已
+       *     吃掉的字节）。第一次跑出来 3.7~5.4s、reason 退化 split——但那次的真凶是
+       *     **我自己为跑界面检查另起的 3021 服务器**（它的 whisper 常驻 worker 占着 GPU，
+       *     整句推理从 0.6s 被顶到 4.3s），坑 81/87 第五次应验：**量之前先问这台机器上还有谁在干活**。
+       *     清干净重测：延迟确实降到 ~2.2s，可账本里只有一句正常字幕，AI 却先回
+       *     「嗯，我在听。」（只含名字的碎片句被单独定稿了），随后把没叫它的闲聊
+       *     「今天天气真不错，拍卖呀！」当成那声「嗯」后面的**半句续接**接了话——
+       *     省 0.5 秒买回的是用户明令禁止的插话（详见 pendingTailSegment 里那段）。
+       *     与 10-03b 那条「FLUSH 降到 900ms 反而 9.6s」同族：动这条时序闸门只能拿端到端实测判。
+       *   ▸ 留开关：`ASR_REFINE=0` / `config.asrRefine:false` 可整条关掉回到旧行为。
+       *   ▸ 上限：只攒 REFINE_MAX_SEC 秒（默认 12s ≈ 384KB/人）——内存有界是长跑的硬要求。 */
+      const ASR_REFINE_ON = process.env.ASR_REFINE !== '0' && CONFIG.asrRefine !== false;
+      const REFINE_MAX_SEC = Math.max(3, Math.min(20,
+        Number(process.env.ASR_REFINE_MAX_SEC) || Number(CONFIG.asrRefineMaxSec) || 12));
+      /* 16kHz × 单声道 × 16bit = 32000 字节/秒；关掉重转时置 0（留声那段直接跳过，不占内存） */
+      const REFINE_MAX_BYTES = ASR_REFINE_ON ? Math.round(REFINE_MAX_SEC * 32000) : 0;
+      /* 一段成句 = 分段路径本来就只调用了一次模型，那已经是"整句一次转写"，不必重复 */
+      const REFINE_MIN_CHUNKS = 2;
+      const utterances = new Map(); // memberId → { text, lastAt, textAt, bornAt }
+      /* ★ 2026-10-07 「整句重转」的音频账本：一路句话的**已封口段** PCM 依次留在内存里，
+       *   定稿时把整段音频一次喂给模型，拿它自己标好标点的那句话当作最终文本。
+       *   ▎为什么单独一个 Map 而不是挂在 utterances 的 u 上：u 是"文字的句子"，
+       *   而音频段在**任何文字产出之前**就到了（能量闸过了就该留声）——
+       *   两个生命周期不同步，硬塞进同一个对象就会在"转写失败但音频是真的"那条路上丢声。
+       *   ▸ 上限：只留 ASR_REFINE_MAX_SEC 秒（默认 12s ≈ 384KB/人），超出就不再追加，
+       *     定稿时改用"已经攒到的这一段"——**内存有界**是过夜长跑的硬要求（第 30 步的总纲）。 */
+      const uttAudio = new Map(); // memberId → { chunks: [Buffer], bytes: 0 }
       const dbg = (...a) => { if (process.env.ASR_DEBUG) console.log('[asr-dbg]', ...a); };
+      /* ★ 2026-10-07 转写引擎链抽成**唯一一处**（原先内联在 handleSegment 里，
+       *   而"整句重转"要同一条链再走一遍——两条链各写一份就是坑 47 等着漂移）。
+       *   返回值把"哪个引擎转的、总共多久、模型纯推理多久"一起交出来，
+       *   调用方决定怎么记账、怎么打日志（分段路径与整句路径的口径不同，见各自注释）。 */
+      /* ★ H5b 的"在途"口径放在**外壳**里，而不是塞进引擎链的每一层：
+         分段与整句共用 `runEngines` 这一个入口，所以一个计数器就够覆盖两条路；
+         而 `finally` 保证抛错、判空、房间没了这些出口都减得回去（漏一条 = 计数只增不减
+         = 重转永久让路，症状与"让路策略生效"完全一样，坑 68 那一族）。 */
+      const runEngines = async (wavPath, key) => {
+        bumpAsrBusy(1);
+        try { return await runEnginesInner(wavPath, key); }
+        finally { bumpAsrBusy(-1); }
+      };
+      /* `key` = 这一路音频属于哪个成员。**必须一路带到 transcribe({key})**：
+         worker 池按它做稳定分片（同一个人的段回同一个槽），漏传就等于所有请求都落到 0 号槽，
+         多开的 worker 白开——而且不会有任何报错（坑 76：机制在 ≠ 生效）。 */
+      const runEnginesInner = async (wavPath, key) => {
+        const engine = asrEngineMode();
+        const t0 = Date.now();
+        let text = '';
+        let via = '';
+        if ((engine === 'qwen' || engine === 'auto') && QwenAsr.readKey()) {
+          text = await QwenAsr.transcribeFile(wavPath);
+          if (text) via = 'qwen';
+        }
+        if (!text && (engine === 'qwen-local' || (!text && engine === 'auto' && process.env.ASR_QWEN_LOCAL === '1'))) {
+          const local = getQwenLocalAsr();
+          if (local && local.alive) {          // ★ 只用"已就绪"的 worker——未就绪期间 whisper 兜底，不卡字幕
+            text = await local.transcribe(wavPath, { key });
+            if (text) via = 'qwen-local';
+          }
+        }
+        if (!text && engine !== 'qwen') {
+          // 本地 Qwen 失败也回落 whisper（显式 qwen-local 模式同样兜底——"不要有 bug"优先于引擎洁癖）
+          const worker = getResidentAsr(asrModel);
+          text = worker
+            ? await worker.transcribe(wavPath)
+            : await Asr.transcribeFile(WHISPER, wavPath, { outDir: segDir, model: asrModel });
+          via = worker ? '常驻' : 'CLI';
+        }
+        /* ★ 2026-10-02 第二道防线：模型偶尔在**有声音**的段里也夹带提示词回显或经典幻句
+         *   （「字幕by XXX」「谢谢大家」——whisper 路径已在 asr.js 里洗过，这里覆盖
+         *   Qwen 云/本地两条引擎，让"洗文本"这件事在所有引擎上口径一致）。
+         *   ▸ ★ 2026-10-07 洗完什么都不剩时的处置**交给调用方**：分段路径据此跳过这一段，
+         *   而整句路径必须据此**保留分段拼出来的句子**（宁漏修不丢字，判据见 Asr.preferRefined）。 */
+        const qEng = via === 'qwen-local' ? getQwenLocalAsr() : null;
+        /* startedAt 也带出来：分段路径要用它算"说完→这次转写开始"的等待（stage.wait），
+         *   漏带就等于把 t0 留在函数里——本轮先踩了这一脚：调用方引用 t0 → ReferenceError →
+         *   整条成句路径静默停摆（日志里那行 asr-seg-err 把它救了回来，见坑 90 同族）。 */
+        return { raw: String(text || ''), text: Asr.cleanTranscript(String(text || '')), via, ms: Date.now() - t0, startedAt: t0, modelMs: qEng ? qEng.lastModelMs : 0 };
+      };
+
       const handleSegment = async (full, baseName) => {
         if (doneSet.has(baseName)) return false;
         doneSet.add(baseName);
         let size = 0;
         try { size = fs.statSync(full).size; } catch (e) { dbg(baseName, 'stat 失败'); return false; }
         dbg(baseName, `size=${size}`);
-        if (size < 40000) { try { fs.unlinkSync(full); } catch (e) { /* 已删 */ } return false; } // 静音/太短
+        /* ★ 2026-10-05 size 闸 40000→3200（≈1.25s→0.1s PCM）：旧阈值对 PCM 段是"静默删除器"——
+         *   实测「把白板打开」的尾巴段（9086B，含"开"字）被它无日志吃掉，"打开"变"打"，
+         *   房间动作命中失手很难查。真正的过滤器是下面的能量闸（量 dBFS 而不是字节数）；
+         *   size 闸只兜"0/几字节"的碎屑，且**任何丢弃都要留痕**（静默是上一轮的教训）。
+         *   阈值可用 ASR_SEG_MIN_BYTES 覆盖（更小段也过闸，交给能量闸判）。 */
+        const SEG_MIN_BYTES = Number(process.env.ASR_SEG_MIN_BYTES) || 3200;
+        if (size < SEG_MIN_BYTES) {
+          if (process.env.ASR_DEBUG) console.log(`[asr-gate] ${speakerName} ${baseName} size=${size}B < ${SEG_MIN_BYTES}B → 丢弃`);
+          try { fs.unlinkSync(full); } catch (e) { /* 已删 */ }
+          return false;
+        }
+        /* ★ 2026-10-05 PCM→WAV 包装：转写引擎与能量闸都只吃 WAV。
+         *   .pcm 段（ffmpeg 的渐进输出，见 spawnRecorder）包成 tmp-*.wav 供本函数使用；
+         *   收尾/抢跑传进来的 tail-*.wav 已是 WAV（不包）。tmp 在每条出口手动收走
+         *   （显式而非 finally：Windows 上文件被模型读着时删不掉，失败留给清理循环兜底）。 */
+        let wavPath = full;
+        let tmpWav = null;
+        let ampWav = null;   // ★ 2026-10-04i 增益版（模型输入）；原始 tmp-*.wav 保留给能量闸口径
+        const dropTmp = () => {
+          if (tmpWav) { try { fs.unlinkSync(tmpWav); } catch (e) { /* 占用/已删 */ } }
+          if (ampWav) { try { fs.unlinkSync(ampWav); } catch (e) { /* 占用/已删 */ } }
+        };
+        if (full.endsWith('.pcm')) {
+          tmpWav = path.join(path.dirname(full), 'tmp-' + baseName.replace(/\.pcm$/, '.wav'));
+          try { Asr.wrapPcmToWav(full, tmpWav); wavPath = tmpWav; }
+          catch (e) { dbg(baseName, 'PCM 包装失败', e && e.message); return false; }
+        }
         /* ★ 2026-10-02 **能量闸**（本轮"AI 一直收到重复的一句话"的源头治理）：
          *   上面那道 size 门槛量的是**时长**不是**能量**——一段 4s 的纯静音有 128KB，
          *   照样大摇大摆进了转写；而 whisper 遇到没人说话的音频，会顺着 --initial_prompt
@@ -2378,56 +3715,140 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
          *   ▸ measureWavLevel 读不到文件、或 wav 不是我们预期的 PCM16 单声道时返回 null
          *     = "判断不了" → 照常转写。**fail-open 是硬要求**：宁可漏过一次静音过滤，
          *     也绝不能把谁说的一句真话当成静音删掉。 */
-        const lvl = Asr.measureWavLevel(full);
+        const lvl = Asr.measureWavLevel(wavPath);
         dbg(baseName, `peak=${lvl ? lvl.peakDb.toFixed(1) : 'null'}`);
         if (lvl && lvl.peakDb < ASR_MIN_PEAK_DB) {
+          /* 输入侧记账（口径见 COLLAB.input）：-88 以下当作"一个采样都没动"（数字零），
+           * 之上算"有声音但没过闸"——两者是完全不同的病，混在一起就分不出"没送"与"送太小"。 */
+          if (lvl.peakDb <= -88) COLLAB.input.zeroStreak += 1;
+          else { COLLAB.input.quietSkipped += 1; COLLAB.input.zeroStreak = 0; }
+          COLLAB.input.lastPeakDb = Math.round(lvl.peakDb * 10) / 10;
           try { fs.unlinkSync(full); } catch (e) { /* 已删 */ }
+          dropTmp();
           if (process.env.ASR_DEBUG) console.log(`[asr-gate] ${speakerName} ${baseName} 峰值 ${lvl.peakDb.toFixed(1)} dBFS → 判静音，不转写`);
           logEvent('debug', 'asr-silence-skipped', { roomNumber, member: memberId, peakDb: Math.round(lvl.peakDb) });
           return false;
         }
-        // ★ 转写引擎选择（2026-10-01）：qwen（DashScope 云）→ qwen-local（本地 0.6B）→ 常驻 whisper → CLI
-        const engine = asrEngineMode();
-        const t0 = Date.now();
-        let text = '';
-        let via = '';
-        if ((engine === 'qwen' || engine === 'auto') && QwenAsr.readKey()) {
-          text = await QwenAsr.transcribeFile(full);
-          if (text) via = 'qwen';
+        /* 过了闸 = 这一刻**确实有声音进来**：断供计数器归零，并留下"最后一次有声"的时刻。
+         *   有这两格，"零字幕"才第一次能被分成"没人送声音"与"送了但没转出来"两种病。 */
+        if (lvl) {
+          COLLAB.input.zeroStreak = 0;
+          COLLAB.input.voiced += 1;
+          COLLAB.input.lastPeakDb = Math.round(lvl.peakDb * 10) / 10;
+          COLLAB.input.lastVoiceTs = Date.now();
         }
-        if (!text && (engine === 'qwen-local' || (!text && engine === 'auto' && process.env.ASR_QWEN_LOCAL === '1'))) {
-          const local = getQwenLocalAsr();
-          if (local && local.alive) {          // ★ 只用"已就绪"的 worker——未就绪期间 whisper 兜底，不卡字幕
-            text = await local.transcribe(full);
-            if (text) via = 'qwen-local';
+        /* ★ 2026-10-04i 按实测峰值**比例增益**（安静真麦克风的救赎）：
+         *   目标峰值 -8 dBFS；增益 = 目标 - 实测。**钳位 05 夜从 +20 抬到 +40**：
+         *   上一版只给 +20，于是 -56 dBFS 的真人语音被提到 -36 就送进模型——那仍是耳语电平，
+         *   出来的就是「下面」「小米」这种糊结果（房间 283648 实测）。抬到 +40 之后
+         *   -56→-16、-62→-22，落回模型的好工作区；响麦（-12）依旧 0 增益，不会削顶。
+         *   ▸ 线性缩放在 wrapPcmToWav 内完成（零重编码）；增益只作用于**模型输入**（amp-*.wav），
+         *     能量闸/RMS/账本全部看原始电平——一个概念一个来源（坑 47）。 */
+        if (lvl && wavPath === tmpWav) {
+          const gainDb = Asr.modelGainDb(lvl.peakDb);   // ★ 10-09 算式收成 asr.js 一处（原先两处内联）
+          if (gainDb > 0) {
+            ampWav = path.join(path.dirname(tmpWav), 'amp-' + path.basename(tmpWav));
+            try {
+              Asr.wrapPcmToWav(full, ampWav, { gainLin: Math.pow(10, gainDb / 20) });
+              wavPath = ampWav;
+              COLLAB.gainApplied += 1;   // ★ 10-09 触发计数：安静麦克风到底被提过几次音量（坑 76）
+              dbg(baseName, `增益 +${gainDb.toFixed(1)}dB（峰值 ${lvl.peakDb.toFixed(1)} → ${Asr.gainTargetDb()} dBFS）`);
+            } catch (e) { dbg(baseName, '增益包装失败，用原始电平转写'); }
           }
         }
-        if (!text && engine !== 'qwen') {
-          // 本地 Qwen 失败也回落 whisper（显式 qwen-local 模式同样兜底——"不要有 bug"优先于引擎洁癖）
-          const worker = getResidentAsr(asrModel);
-          text = worker
-            ? await worker.transcribe(full)
-            : await Asr.transcribeFile(WHISPER, full, { outDir: segDir, model: asrModel });
-          via = worker ? '常驻' : 'CLI';
+        /* ★ 2026-10-07 留声（"整句重转"的输入）：过了能量闸 = 这段里确实有人出声，
+         *   于是把**已封口的整段 PCM** 原样留一份，定稿时整句重转一次。
+         *   ▸ 只留 .pcm 封口段：抢跑的 tail-*.wav 是同一段的一个**前缀切片**，
+         *     留着就会重复计入（拼出来的整句音频里同一段出现两遍）。
+         *   ▸ 放在转写之前而不是之后：模型超时/判空/清洗丢弃的那些段，声音仍然是真的。 */
+        if (ASR_REFINE_ON && full.endsWith('.pcm') && REFINE_MAX_BYTES > 0) {
+          try {
+            const ua = uttAudio.get(memberId) || { chunks: [], bytes: 0 };
+            const buf = fs.readFileSync(full);
+            if (ua.bytes + buf.length <= REFINE_MAX_BYTES) { ua.chunks.push(buf); ua.bytes += buf.length; }
+            else dbg(baseName, `整句音频到上限（${ua.bytes}B），本段不再留`);
+            uttAudio.set(memberId, ua);
+          } catch (e) { /* 读不到就不重转，分段路径照常出字（fail-open） */ }
         }
-        /* ★ 2026-10-02 第二道防线：模型偶尔在**有声音**的段里也夹带提示词回显或经典幻句
-         *   （「字幕by XXX」「谢谢大家」——whisper 路径已在 asr.js 里洗过，这里覆盖
-         *   Qwen 云/本地两条引擎，让"洗文本"这件事在所有引擎上口径一致）。
-         *   洗完什么都不剩 → 这段等于没人说话，直接跳过（不上字幕、不进账本、不唤醒）。 */
-        text = Asr.cleanTranscript(text);
-        dbg(baseName, `engine=${engine} via=${via || 'none'} text=${JSON.stringify(String(text).slice(0, 24))}`);
+        // ★ 转写引擎选择：见 runEngines（2026-10-07 抽成唯一一处，分段与整句两条路共用）
+        const eng = await runEngines(wavPath, memberId);
+        const { via, text: cleanedText, ms: transMs } = eng;
+        const text = cleanedText;
+        /* ★ 2026-10-03d 归因拆分：Node 侧的"转写 X.Xs"含排队；worker 自报的"模型 Y.Ys"
+         *   是纯推理。两者差一大截 = 排队（并发段在同一个 worker 上串行），不是模型慢。 */
+        const modelMs = eng.modelMs;
+        const queueTag = modelMs && transMs > modelMs + 400
+          ? `，排队 ${((transMs - modelMs) / 1000).toFixed(1)}s` : '';
+        const modelTag = via === 'qwen-local' && modelMs ? `，模型 ${(modelMs / 1000).toFixed(2)}s` : '';
+        console.log(`🤖 [ASR/${via}] ${speakerName}（转写 ${(transMs / 1000).toFixed(1)}s${queueTag}${modelTag}）：${text.slice(0, 50)}`);
+        dbg(baseName, `engine=${asrEngineMode()} via=${via || 'none'} text=${JSON.stringify(String(text).slice(0, 24))}`);
         try { fs.unlinkSync(full); } catch (e) { /* 已删 */ }
-        if (!text || !rooms.get(roomNumber)) return false;
+        if (!text || !rooms.get(roomNumber)) { dropTmp(); return false; }
         /* ★ 2026-10-03 记账：**只有真出了字幕才算一次转写**。
          *   被能量闸/清洗挡掉的段不计——否则"退化到 CLI"会被一堆被丢弃的静音段
          *   在指标里伪装成"引擎很忙"，那正是我们要能一眼看出的事。 */
-        bumpAsr(via, Date.now() - t0);
-        const transMs = Date.now() - t0;
-        console.log(`🤖 [ASR/${via}] ${speakerName}（转写 ${(transMs / 1000).toFixed(1)}s）：${text.slice(0, 50)}`);
+        bumpAsr(via, transMs);
         // 累积进当前语句 + 字幕条显示"累积中的句子"（interim：不进历史、不触发唤醒）
-        const u = utterances.get(memberId) || { text: '', lastAt: 0 };
-        u.text = `${u.text} ${text}`.trim().slice(0, 800);
-        u.lastAt = Date.now();
+        /* ★ 2026-10-03b 句内也要去重（真浏览器 e2e 实测抓到）：跨段重复/碎片的文本
+         *   原来被**无条件追加**进同一句——抢跑快照听过一遍的半截、封口段对同几个字的
+         *   复听、截断音频上的幻觉尾巴，全都拼进账本，成句变成
+         *   「小明帮我记一下…评审。 小鸣 帮我记一下…3点的评审会。」这种拼接垃圾
+         *   （asr-live 与 e2e 两次实测的账本文本都是证据）。
+         *   ▸ 2026-10-05 起组装交给 Asr.mergeTranscript：它同时处理"重复/碎片/更全的
+         *     替换/重叠拼尾"四种情形（见下方注释与 asr.js），不再用跨句去重闸兼任。 */
+        /* ▸ ★ 2026-10-05 夜二 自我修正：这里原先写 `bornAt: nowU`，而 `nowU` 在 21 行之后
+         *   才声明（TDZ）→ 第一次建句子表就抛 ReferenceError → 被上层 catch 吞掉 →
+         *   **utterances 永远是空的**：转写照常打印、却永不成句、永不唤醒、永无上屏。
+         *   症状与"耳朵坏了"一模一样而日志没有任何异常——这正是坑 69 教过三次的形状，
+         *   这次是我自己写出来的。判据：**同一块里后声明的 const，不要在它之前引用**；
+         *   要"此刻"就直接 Date.now()，不要借用别人的记账时刻。 */
+        const u = utterances.get(memberId) || { text: '', lastAt: 0, textAt: 0, bornAt: Date.now() };
+        /* ★ 2026-10-05 句内组装改用 Asr.mergeTranscript（纯函数，test:asr 逐条断言）——
+         *   旧三分支用 isDupOrFragment 判"重复就只续窗"，而它第③条
+         *   `b⊆a 且只多 ≤6 字` 恰好把**封口后更全的版本**判成碎片吞掉：
+         *   快照半句「把白板打」+ 封口全量「把白板打开」→ 分支1 命中 → 「开」丢失
+         *   （chop 从去重闸复发的现场，soak 日志实测）。新判据按"哪份更全 + 怎么拼"
+         *   归并：重复只续窗 / 新段更全就替换 / 重叠拼尾巴（细节在 asr.js）。 */
+        const nowU = Date.now();
+        /* ★ 2026-10-06 夜二 「上一句已经说完，这一句是新的」→ 就地定稿 + 另起一句。
+         * ▎现场证据（房间 286716 的真实账本）：静音检测被房间噪声顶住时只能靠 10s
+         *   保险丝收口，于是几句不相干的话粘成一条字幕——
+         *     「哦 不能往上怎么接那个 大木车是不是 你好小明」
+         *     「哎，是吧？ 打开白板。 小明打开打开白板。 不知道，我也没印象。」
+         *   这同时是"识别不准"和"AI 乱接话"的同一个源头：blob 里埋着一次名字，
+         *   **整段**都成了给 AI 的提问（它当然答得莫名其妙）。
+         * ▸ 判据交回给模型自己标出的句末标点（Asr.startsNewSentence，纯函数有单测）：
+         *   累积句以 。！？ 收尾 + 新段与它没有任何归并关系 = 换句。
+         * ▸ 定稿原因记 'split'：它不是"说完→静音"的延迟锚（人正在说下一句），
+         *   所以 latMs 按坑 90 的规矩诚实归零，而不是量出一个撒谎的几十毫秒。 */
+        if (u.text && Asr.startsNewSentence(u.text, text)) {
+          dbg(baseName, `换句定稿：${u.text.slice(0, 24)}`);
+          logEvent('debug', 'asr-sentence-split', { roomNumber, member: memberId });
+          finalizeUtterance(memberId, 'split').catch((e) => {
+            if (process.env.ASR_DEBUG) console.log('[asr-split-err]', e && e.message);
+          });
+          u.text = '';
+          u.bornAt = nowU;
+        }
+        const merged = Asr.mergeTranscript(u.text, text);
+        /* ★ 2026-10-05 **两个时钟必须分开**（e2e 实测把"AI 永不接话"钉死在这两行上）：
+         *   ▸ u.lastAt  = "还有语音进来了"（含纯重复的段）
+         *   ▸ u.textAt  = "这句话真的变长了"
+         *   旧代码只有 lastAt，而且它在**纯重复**（mergeTranscript 判"只续窗不追加"）时
+         *   也照样刷新 —— 于是"有人在不停说同样的话"= 句子永远显得不空闲 =
+         *   成句闸的 10s 保险丝**永远跳不到**。实测证据：`sinceAppend` 最高冲到 **9807ms**，
+         *   离 10000ms 只差 193ms，就被一次"没加进任何新字"的重复段清零。
+         *   后果是一条完整的静默链：不成句 → 不定稿 → 不唤醒 → AI 永不接话 → 喇叭不出声，
+         *   而日志里除了"没有 `成句：` 行"以外**没有任何异常**（坑 76：没触发证据的机制=查不到）。
+         *   ▸ 真实场景不是只有测试里才有：一个人反复强调同一句、两个人先后说同样的话、
+         *     或会议里循环播放的语音提示 —— 都会让 AI 从此装哑。所以这是产品缺陷，不是夹具毛病。
+         *   ▸ 保险丝改看 textAt 之后仍然安全：真在说新内容时 textAt 会跟着走，不会提前断句；
+         *     而"10 秒没有一个新字"时定稿是**无损**的（重复段本来也没往里加东西）。 */
+        const grew = merged !== u.text;
+        if (grew) u.text = merged.slice(0, 800);
+        else dbg(baseName, '句内碎片/重复：只续窗不追加');
+        u.textAt = grew ? nowU : (u.textAt || u.lastAt || nowU);
+        u.lastAt = nowU;
         /* ★ 2026-10-03 把延迟**拆开**记账：光有一个总秒数没法指导优化——
          *   "4s 才出字幕"到底是模型慢，还是我们的静音判定/分段窗口在等？
          *   两者的处方完全相反（前者换引擎/降模型，后者调 asrSegmentSec 与 FLUSH_MS）。
@@ -2437,12 +3858,13 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
          *     用末段的拆分去解释总延迟才成立（用首段会把等待算成不存在的量）。
          *   ▸ 后到的段覆盖前一段的记录，所以 u.stage 始终是"最后一段"的账。 */
         u.stage = {
-          wait: lastVoiceTs && t0 >= lastVoiceTs ? t0 - lastVoiceTs : 0,
+          wait: lastVoiceTs && eng.startedAt >= lastVoiceTs ? eng.startedAt - lastVoiceTs : 0,
           trans: transMs,
         };
         utterances.set(memberId, u);
         io.to(roomNumber).emit('asr-caption', { name: speakerName, text: u.text.slice(0, 200), interim: true });
         logEvent('info', 'asr-segment', { roomNumber, member: memberId, chars: text.length });
+        dropTmp();
         return true;
       };
 
@@ -2458,13 +3880,125 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
        *     污染要堵在进账本之前，不然"对话混乱"会变成"纪要也混乱"。
        *   ▸ 阈值：ASR_DUP_MS（默认 15s）/ AI 回声窗口 45s（比一句回答的朗读时间宽）。 */
       const ASR_DUP_MS = Number(process.env.ASR_DUP_MS) || 15000;
-      const finalizeUtterance = async (memberId) => {
+      /* ★ 2026-10-07 整句重转：把这一句攒下的 PCM 拼成一整段音频，走同一条引擎链再转一次。
+       *   ▸ 增益口径与分段路径**完全一致**（目标 -8 dBFS、钳 +40dB，见 handleSegment 上方那段），
+       *     所以安静麦克风的人不会因为"换了个入口"而掉回耳语电平——一个概念一个来源（坑 47）。
+       *   ▸ 能量闸也照走：整段都没出声就不该叫模型（省一次推理，也省并发名额）。
+       *   ▸ 任何一路不顺（读盘/包装/模型空/异常）都返回 null 让调用方保留拼接结果——
+       *     这条是**加分项**不是必经路径，坏了最多回到今天的行为，不能把人说的话弄丢。 */
+      const refineUtterance = async (chunks) => {
+        const pcm = Buffer.concat(chunks);
+        if (pcm.length < 3200) return null;                 // 与 SEG_MIN_BYTES 同口径：太短不值得重转
+        const tag = `utt-${memberId}-${Date.now()}`;
+        const pcmPath = path.join(segDir, `${tag}.pcm`);
+        const wavPath = path.join(segDir, `${tag}.wav`);
+        const ampPath = path.join(segDir, `${tag}-amp.wav`);
+        const t0 = Date.now();
+        try {
+          fs.writeFileSync(pcmPath, pcm);
+          Asr.wrapPcmToWav(pcmPath, wavPath);
+          const lvl = Asr.measureWavLevel(wavPath);
+          if (!lvl || lvl.peakDb < ASR_MIN_PEAK_DB) return null;
+          let feed = wavPath;
+          const gainDb = Asr.modelGainDb(lvl.peakDb);   // ★ 10-09 与分段那一处共用同一个算式（坑 47）
+          if (gainDb > 0) {
+            Asr.wrapPcmToWav(pcmPath, ampPath, { gainLin: Math.pow(10, gainDb / 20) });
+            feed = ampPath;
+            COLLAB.gainApplied += 1;   // ★ 10-09 触发计数：机制"在"不等于"生效"（坑 76）
+          }
+          const eng = await runEngines(feed, memberId);
+          if (!eng.text) return null;
+          return { text: eng.text, via: eng.via, ms: Date.now() - t0, peakDb: lvl.peakDb, secs: +(pcm.length / 32000).toFixed(1) };
+        } catch (e) {
+          dbg('整句重转异常：' + (e && e.message));
+          return null;
+        } finally {
+          /* Windows 上文件被模型读着时删不掉：失败留给 segDir 的清理循环兜底，
+             但**每次重转都收自己的三个临时文件**，否则一夜下来目录会被 utt-* 堆满。 */
+          for (const p of [pcmPath, wavPath, ampPath]) { try { fs.unlinkSync(p); } catch (err) { /* 占用/已删 */ } }
+        }
+      };
+      /* ★ 2026-10-07 "这句话的尾巴还在不在盘子里"（成句闸的新增条件）
+       * ▎真跑 test:asr-live 才暴露出来的结构缺陷（基线的账本里就有铁证）：
+       *   说「小明，帮我记一下明天下午三点的评审会。」，定稿出来的却是
+       *     「小明，帮我记一下。 明天下午三点的评审。」——**「会」这个字凭空不见了**。
+       *   ▸ 为什么：分段录音是 2 秒一刀，而"挑已封口的段"那条规则**永远跳过最新那段**
+       *     （它可能还在写）。说话在 5.1s 结束， containing 「会」 的那一段（4~6s）在 6.0s
+       *     才轮转封口，而成句闸在 6.3s 就判"静音满 1.2s，可以定稿"——
+       *     那一刻那段音频**还既没被挑走、也没被转写**。于是它落进**下一句**的音频账本里，
+       *     下一句的整句重转就转出了「会。今天天气真不错…」这种开头带上一句尾巴的东西。
+       *   ▸ 这不是延迟问题，是**正确性**问题：丢的字永远不会回来，还会污染下一句。
+       *   ▸ 判据：只要还存在"出生早于（最后一次有声 + RMS 滞后）且还没被消费"的段，
+       *     就等于说话结束的时刻还没被音频覆盖，此时不许定稿。
+       *     兜底不用新加超时：`UTTERANCE_MAX_AGE_MS`(6s) 与 `MAX_OPEN`(10s) 两把保险丝
+       *     本来就在，段不再产出时它们照样会强制收口——**有界等待，不会饿死**（坑 90/108 同族：
+       *     任何"等某个条件"的闸门都必须自己回答"等不到怎么办"）。 */
+      const pendingTailSegment = () => {
+        if (!lastVoiceTs) return false;                    // 没有 RMS 信源时不猜（走 gap 那条兜底路）
+        try {
+          for (const f of fs.readdirSync(segDir)) {
+            if (!f.startsWith('seg-') || !f.endsWith('.pcm') || doneSet.has(f)) continue;
+            const st = fs.statSync(path.join(segDir, f));
+            /* 出生早于"最后有声 + RMS 行滞后"= 这一段的时间区间与刚才那句话重叠；
+             * 太小（不足 0.1s）的碎屑不算尾巴，否则静音期的空段会把闸门永久按住。 */
+            /* ★ 这里**故意不看** flushedBytes（抢跑已经吃掉的字节）。试过：让"抢跑已经听过"
+             *   的段不再拦定稿，可以省回约 0.5 秒——真跑干净机器实测的结果是**回归**：
+             *     账本里只有一句「小明，帮我记一下明天下午三点的评审会。」，可 AI 却
+             *     先回了一句「嗯，我在听。」（那是"光叫名字"的短应答），随后又把
+             *     没叫它的那句闲聊「今天天气真不错，拍卖呀！」当成就跟在那声「嗯」后面的
+             *     **半句续接**接了话（trig 与闲聊句的定稿时刻对得上，是因果不是巧合）。
+             *   ▸ 机制：提前定稿 → 出现只含名字的碎片句 → armed 了 6s 的 `aiAskTailUntil`
+             *     → 下一句（这里是闲聊）被当成续接。省下的 0.5 秒买回的是用户明令禁止的插话。
+             *   ▸ 判据留在这里当路标：**动这条闸门必须同时看"会不会切出只含名字的碎片句"**，
+             *     而不是只看延迟数字（坑 109 同一条：为可读性/延迟动切句判据，必须先给
+             *     完整性与礼仪留下限）。 */
+            if (st.birthtimeMs > 0 && st.birthtimeMs <= lastVoiceTs + RMS_LAG_MS && st.size >= 3200) return true;
+          }
+        } catch (e) { /* 目录读不到 = 不阻塞定稿（fail-open） */ }
+        return false;
+      };
+      const finalizeUtterance = async (memberId, reason) => {
         const u = utterances.get(memberId);
         if (!u || !u.text) return;
         utterances.delete(memberId);
         const room = rooms.get(roomNumber);
-        if (!room) return;
-        const text = u.text.slice(0, 500);
+        if (!room) { uttAudio.delete(memberId); return; }
+        /* ★ 2026-10-07 整句重转（"识别太笨/字幕太短"的正面回答，实测数字见 ASR_REFINE_ON 上方那段）：
+         *   同步换走这一句的音频账本（下一句从零开始攒），然后**在 await 之前**不碰任何共享状态。
+         *   重转成功且 Asr.preferRefined 点头，才用它替换拼接结果。 */
+        const ua = uttAudio.get(memberId);
+        uttAudio.delete(memberId);
+        const stitched = u.text.slice(0, 500);
+        let text = stitched;
+        let refined = null;
+        const canRefine = ASR_REFINE_ON && ua && ua.chunks.length >= REFINE_MIN_CHUNKS;
+        /* ★ 2026-10-07 H5b：worker 正在忙别家的段时**让路**（判据在发起之前读，await 之后读到的是自己）。
+         *   ▸ `bench:asr-multi` 实测：4 路并发下开重转把分段 p95 从 1.40s 顶到 2.21s、
+         *     8 路顶到 4.38s，吞吐只剩基线的 ~72% —— 重转与真话抢的是同一个串行 worker。
+         *   ▸ 让路的代价是"这一句不做第二次推理"（字幕仍出，只是可能带被切掉的词），
+         *     而**抢跑的代价是全场每个人字幕都变慢**——两者不对称，多人时该让。
+         *   ▸ 为什么不做成"只给要送给 AI 的那句重转"：那会把字幕质量在多人房里整体退回去，
+         *     而字幕正是用户抱怨的第一件（见路线图 H5 的处方那一行）。 */
+        const yieldToBusy = canRefine && REFINE_YIELD_ABOVE >= 0 && asrEngineBusy > REFINE_YIELD_ABOVE;
+        if (canRefine && yieldToBusy) {
+          COLLAB.refine.skipped += 1;
+          dbg(`整句重转让路：worker 在途 ${asrEngineBusy} > ${REFINE_YIELD_ABOVE}，这一句用拼接结果定稿`);
+          logEvent('debug', 'asr-refine-yield', { roomNumber, member: memberId, busy: asrEngineBusy });
+        } else if (canRefine) {
+          COLLAB.refine.n += 1;
+          const r = await refineUtterance(ua.chunks);
+          COLLAB.refine.ms += r ? r.ms : 0;
+          if (r && Asr.preferRefined(stitched, r.text)) {
+            refined = r;
+            text = r.text.slice(0, 500);
+            COLLAB.refine.fixed += 1;
+            console.log(`🧠 [整句重转/${r.via}] ${speakerName}（${r.secs}s 音频一次转写，${(r.ms / 1000).toFixed(1)}s）：${text.slice(0, 60)}`);
+            logEvent('info', 'asr-refined', { roomNumber, member: memberId, secs: r.secs, ms: r.ms, chars: text.length });
+          } else {
+            dbg(`整句重转未采用：拼接=${JSON.stringify(stitched.slice(0, 24))} 重转=${JSON.stringify(String(r && r.text || '').slice(0, 24))}`);
+          }
+        }
+        if (!rooms.get(roomNumber)) return;   // 重转期间房间没了：这一句不再入账（磁盘与内存同生命周期）
         const n = normAsrText(text);
         const now = Date.now();
         /* ★ 2026-10-03 锚点改成**每人一条**（存在成员对象上），不再是"全房间最后一句"。
@@ -2500,20 +4034,57 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
          *   而不是只有一个"当时在 /metrics 里看过"的口头保证。
          *   上限 120s：lastVoiceTs 只在 RMS 高于阈值时刷新，若某段音频之后人就再没出声，
          *   陈旧时间戳会把延迟虚报成几分钟——那种值对"要不要再降延迟"毫无参考价值，
-         *   宁可写 0（前端与日报都不显示）。 */
-        const latMs = lastVoiceTs && now > lastVoiceTs && now - lastVoiceTs < 120000
+         *   宁可写 0（前端与日报都不显示）。
+         * ▸ ★ 2026-10-05 夜补上"这一轮是**为什么**定稿的"（坑 90 末段挂的待办）：
+         *   只有 `silence`（RMS 证明人已经停了）才是"说完→定稿"；
+         *   `max-open`（句子开着太久被保险丝强制收口）与 `gap`（没有 RMS 信源时的代理判据）
+         *   都发生在**人还在说**的时刻——拿它们算出来的 15~20ms 当延迟，就是让界面撒谎。
+         *   真机实锤：房间 283648 的字幕条显示「⏱ 0.0s」，而同一句的真实等待是 ~10s。
+         *   ▸ 判据只写在这一处，前端与日报都不用再猜（坑 47）。 */
+        const latMs = reason === 'silence' && lastVoiceTs && now > lastVoiceTs && now - lastVoiceTs < 120000
           ? now - lastVoiceTs : 0;
         bumpCapLat(latMs);
+        /* ★ 2026-10-05 定稿打点：latMs 之外把 stage 与文本头一起记下——"这一句到底在多快、
+         *   慢在哪一段"要能在 ASR_DEBUG 时间线里一读即明（与上面的「成句」行配对）。 */
+        dbg(`定稿：${speakerName} latMs=${latMs} stage=${JSON.stringify(u.stage || null)} text=${JSON.stringify(String(text).slice(0, 24))}`);
         ingestCaptions(roomNumber, [{
           ts: now, from: memberId, name: speakerName, text, asr: true,
+          /* ★ 2026-10-07 `ref:1` = 这一句是**整句音频一次转写**出来的（不是 2s 碎片拼的）。
+           *   进权威副本的理由与 `fin` 一样（坑 56）：事后拿账本一查，
+           *   必须能分清"这场会的字幕是哪条路径产出的"，否则"整句重转到底生没生效"
+           *   就只剩当时在控制台看过的那一眼。 */
+          ref: refined ? 1 : undefined,
           lat: latMs || undefined,   // 缺字段而不是 0：读的人要能分清"没量到"与"量到 0"
+          /* ★ 2026-10-05 夜三 定稿原因也进权威副本：账本里 lat 缺字段时，
+           *   读的人必须能分清"引擎慢、被时长保险丝切断"与"压根没量到"——
+           *   前者是降级路径的正常形态（whisper 兜底一段要 8~10s），后者才是接线断了。 */
+          fin: reason,
+          /* ★ 2026-10-03f 把"慢在哪一段"也存进权威副本。
+           * ▎为什么这条值得单独记：界面悬浮提示与 asr-caption 都带了 stage，
+           *   而**归档里没有**——于是事后拿账本一查，"中位 3.9s"这种数字根本没法归因
+           *   （是等静音判定，还是模型推理？两者的处方完全相反）。
+           *   10-03b 立的纪律是"拆分才是可操作信息"，那时只做到了界面这一层，
+           *   账本这一层漏了 = 现场一过就再也查不到（坑 56"内层算出来了、外层没带出来"第四次）。 */
+          stage: u.stage && (u.stage.wait || u.stage.trans) ? u.stage : undefined,
         }]);
         io.to(roomNumber).emit('asr-caption', {
           name: speakerName, text: text.slice(0, 200), latMs,
+          /* ★ 2026-10-05 夜三 `fin` = 这一句为什么定稿（silence/max-open/max-age/gap/flush）。
+           *   有了它，"latMs=0"才是**可解释的 0**（人被时长闸切断，不是量不到），
+           *   自测与日报也能据此把"降级路径"与"读数丢失"分开——
+           *   否则 test:asr-live 只能看到一串 0，把正确行为报成缺陷（本轮实测就是这条）。 */
+          fin: reason,
           /* 拆分（末段口径）：界面悬浮提示与 /metrics 都靠它回答"慢在哪一段" */
           stage: u.stage || null,
+          /* ★ 2026-10-05 夜 服务器把"这句里有没有叫它"一起下发（名字表只此一处）。
+             浏览器那一轨原先自己 `text.includes('小明')`，而模型常写成小米/晓鸣 →
+             同一次说话两条路一条接一条不接（用户体感"有时理有时不理"）。 */
+          wake: Asr.shouldWake(text),
+          /* ★ 2026-10-07 这一句是不是"整段音频一次转写"的结果。前端不靠它做任何门禁，
+           *   只用来把"字幕条上这句有多可信"说清楚（半句拼接 vs 整句定稿是两件事）。 */
+          refined: !!refined,
         });
-        await asrWakeAndAnswer(roomNumber, memberId, text, speakerName);
+        await asrWakeAndAnswer(roomNumber, memberId, text, speakerName, now);
       };
 
       // 挑一个"已经写完"的段：排除最新（正在写）+ 两次采样大小一致
@@ -2521,7 +4092,7 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
         let names = [];
         const dbgPick = (...a) => { if (process.env.ASR_DEBUG_PICK) console.log('[asr-pick-dbg]', ...a); };
         try {
-          names = fs.readdirSync(segDir).filter((f) => f.startsWith('seg-') && f.endsWith('.wav') && !doneSet.has(f)).sort();
+          names = fs.readdirSync(segDir).filter((f) => f.startsWith('seg-') && f.endsWith('.pcm') && !doneSet.has(f)).sort();
         } catch (e) { return null; }
         dbgPick(`names=${names.length} [${names.slice(-3).join(',')}]`);
         if (names.length < 2) return null;            // 最新那段在写，等它封口
@@ -2547,61 +4118,227 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
        *     所以同一个段不可能被两次并发转写；这点是先读过代码才动手的（坑 43）。
        *   ▸ 上限刻意收在 2：再多就会让同一句话的碎片更乱序，而收益边际递减。 */
       let segInFlight = 0;
+      /* 段处理异常计数（限流日志用；见 launchSegment 的 catch——坑 76：吞异常必须留证据） */
+      let segErrCount = 0;
       const inFlightPaths = new Set();  // ★ 正在被转写读的那个文件，清理时绝不能碰
       const SEG_MAX = Math.max(1, Math.min(2, Number(process.env.ASR_PIPE_CONCURRENCY) || 2));
       const launchSegment = (full, baseName) => {
         segInFlight += 1;
+        COLLAB.seg.launched += 1;
+        if (segInFlight > COLLAB.seg.peak) COLLAB.seg.peak = segInFlight;
         inFlightPaths.add(full);
-        handleSegment(full, baseName)
-          .catch((e) => { if (process.env.ASR_DEBUG) console.log('[asr-seg-err]', e && e.message); })
+        /* ★ 2026-10-05 返回 promise（供 delta 尾段快照拿"真转成功了吗"的结论）：
+         *   成功才记 flushedOkTs（同一段不重复扑）；失败返回 false 允许下一轮补扑。
+         *   handleSegment 的既有出口已经全部分别返回 true/false，这里只兜异常。 */
+        return handleSegment(full, baseName)
+          .catch((e) => {
+            /* ★ 2026-10-05 夜二：这里原先**只在 ASR_DEBUG 下**打印——于是我自己写出的一个
+             *   TDZ ReferenceError（`bornAt: nowU` 引用了 21 行之后才声明的 const）
+             *   把"归并成句"整条路炸掉，而日志里一行异常都没有：
+             *   转写照常打印、字幕一条不出、AI 永不接话、喇叭不出声（= 用户看到的"识别没实现"）。
+             *   ▸ 判据（坑 76 同一条）：**吞掉异常的地方必须留下可查的证据**，
+             *     而且不能只给"愿意开调试开关的人"看——首条与每 20 条打到控制台，
+             *     每次都进结构化日志（可按 asr-segment-error 查）。 */
+            segErrCount += 1;
+            if (segErrCount === 1 || segErrCount % 20 === 0 || process.env.ASR_DEBUG) {
+              const why = String((e && e.message) || e).slice(0, 160);
+              console.log(`⚠️ [asr-seg-err] 第 ${segErrCount} 次段处理异常：${why}`
+                + '（转写有输出却成不了句 = 这一段的代码路径坏了，不是麦克风的问题）');
+              logEvent('warn', 'asr-segment-error', { roomNumber, member: memberId, n: segErrCount, reason: why });
+            }
+            return false;
+          })
           .finally(() => { segInFlight -= 1; inFlightPaths.delete(full); });
       };
 
       const recordLoop = async () => {
         await new Promise((r) => setTimeout(r, 300)); // 等首段产生
         while (alive && rooms.get(roomNumber)) {
+          /* ══ ★ 2026-10-05 delta 尾段快照（"静音抢跑"的最终重写，必须排在成句闸**之前**）══
+           * ▎顺序为什么动不得：静音确认时"扑尾巴"与"成句"会同时满足——
+           *   若先成句，尾段文字就归并不到这句话里，一句被拆成两句、AI 答两次（老病从抢跑入口复发）。
+           *   扑尾巴这一块先跑、且同步把 tailInFlight 置 1，成句闸的 !tailPending() 就挡住它了。
+           * ▎旧实现为什么换掉（坑 76）：ffmpeg 的 wav 段写满才落盘，copyFileSync 拿到的永远是
+           *   0 字节——整套机制从 09-30f 上线起一次都没触发过。段改输出 raw PCM
+           *   （-segment_format_options flush_packets=1，每 0.5s 渐进落盘）之后才真正能"扑到正在写的段"。
+           * ▎delta 水位：只扑"上次扑走之后新落盘的字节"（flushedBytes），不整段重扑——
+           *   同一段可能被扑多次（扑完一句继续说下一句），每层都由 mergeTranscript 句内归并。
+           * ▎扑前即记水位、写盘后即 launchSegment(fire-and-forget)：转写失败也不回退水位——
+           *   原段不标 doneSet，封口后照常全长转写兜底，丢失风险为零，最多损失这次抢跑的延迟优势（宁慢勿丢）。
+           * ▎flushedOkTs 只在**真的转出了字**（handleSegment 返回 true）才记：同一段不重复扑；
+           *   失败/纯静音（能量闸毫秒打发）允许下轮补扑。
+           * ▎birth 判据方向（定案）：`birth <= lastVoiceTs + RMS_LAG_MS`——宁可在静音段白扑一次
+           *   （能量闸毫秒级打发），不可漏扑真尾巴。RMS 行滞后真实语音最多 ~1s（RMS_LAG_MS），
+           *   所以"段出生晚于 lastVoiceTs+1s" = 整段都在说话结束之后 = 纯静音，跳过。
+           *   文件系统拿不到 birthtime（=0）时保守不扑——退回封口路径，只慢不丢。 */
+          if (process.env.ASR_FLUSH !== '0' && alive && lastVoiceTs
+            && Date.now() - lastVoiceTs > FLUSH_MS && segInFlight < SEG_MAX && !tailPending()) {
+            try {
+              const all = fs.readdirSync(segDir).filter((f) => f.startsWith('seg-') && f.endsWith('.pcm')).sort();
+              const newest = all[all.length - 1];
+              if (newest && !doneSet.has(newest)) {
+                const full = path.join(segDir, newest);
+                const st = fs.statSync(full);
+                const flushedTo = flushedBytes.get(newest) || 0;
+                const delta = st.size - flushedTo;
+                const flushMin = Number(process.env.ASR_FLUSH_MIN_BYTES) || 16000; // ≈0.5s PCM(16k s16le)
+                const birthOk = st.birthtimeMs > 0 && st.birthtimeMs <= lastVoiceTs + RMS_LAG_MS;
+                const freshOk = (flushedOkTs.get(newest) || 0) < lastVoiceTs;  // 上次扑成功之后又有新语音
+                if (process.env.ASR_DEBUG && (!flushDbgTs || Date.now() - flushDbgTs > 1000)) {
+                  flushDbgTs = Date.now();
+                  dbg(`flush评估 newest=${newest} size=${st.size} delta=${delta} flushedTo=${flushedTo} birthOk=${birthOk} okTs=${flushedOkTs.get(newest) || 0} sinceVoice=${Date.now() - lastVoiceTs}ms`);
+                }
+                if (birthOk && freshOk && delta >= flushMin) {
+                  const len = delta - (delta % 2);             // PCM16 对齐（截到偶数）
+                  const buf = Buffer.allocUnsafe(len);
+                  const fd = fs.openSync(full, 'r');
+                  try { fs.readSync(fd, buf, 0, len, flushedTo); } finally { fs.closeSync(fd); }
+                  flushedBytes.set(newest, flushedTo + len);   // ★ 扑前即记（见上）
+                  const tailName = `tail-${newest.replace(/\.pcm$/, '')}-${++tailSeq}.wav`;
+                  const tailPath = path.join(segDir, tailName);
+                  fs.writeFileSync(tailPath, Asr.pcmToWavBuffer(buf));
+                  tailInFlight += 1;
+                  const flushTs = Date.now();
+                  dbg(`抢跑触发：${tailName}（delta=${len}B，距 lastVoice ${flushTs - lastVoiceTs}ms）`);
+                  launchSegment(tailPath, tailName)
+                    .then((ok) => { if (ok) flushedOkTs.set(newest, flushTs); })
+                    .finally(() => { tailInFlight -= 1; });
+                }
+              }
+            } catch (e) { /* 抢跑失败不影响常规转写 */ }
+          }
           // ★ 语句组装：静音间隙超过 UTTERANCE_GAP_MS → 成句（入账本+上字幕+唤醒判定）。
           //   ⚠️ 必须在转写之前查——说完话后不再有新段，放 continue 之后成句就永远不会执行
           //   （实测：账本空、AI 永不应答的假失败根因）。
           /* ★ 2026-10-03 加 `segInFlight === 0` 守卫：**有转写在途就不许成句**。
            *   否则会出现"尾巴还在模型里，头半句已经成句并唤醒了"→ 尾巴再成一句、
            *   再唤醒一次 = 上一轮刚修好的"重复接话"从另一个入口漏回来。
-           *   并发度越高这个窗口越常见，所以这条守卫是本次改动的**前置条件**，不是优化。 */
+           *   并发度越高这个窗口越常见，所以这条守卫是本次改动的**前置条件**，不是优化。
+           * ★ 2026-10-05 扩为 `&& !tailPending()`：delta 尾段快照在途时同样不许成句——
+           *   尾段文字还没归并进来就定稿，等于把同一句话拆成两句（抢跑入口的老病）。 */
           try {
             const now = Date.now();
-            if (segInFlight === 0) {
-              for (const [mid, u] of [...utterances]) {
-                if (now - u.lastAt > UTTERANCE_GAP_MS) await finalizeUtterance(mid);
-              }
+            /* ★ 2026-10-07 每轮量一次"还有没有装着这句话尾巴的段没被消费"（判据见
+             *   pendingTailSegment 上方那段）。两处都要用：调试行要说清为什么慢一拍，
+             *   成句闸要据此**先别定稿**。声明放在这里而不是循环体内——
+             *   本轮我自己差点又写出 TDZ（调试行在声明之前引用它）。
+             *   ▸ 只在真有句子开着的时候才扫目录：这是同步系统调用，空转轮次不花这个钱。 */
+            const tailWaitSeg = utterances.size ? pendingTailSegment() : false;
+            /* ★ 2026-10-05 成句闸的"为什么没开"证据（坑 76：机制要有触发证据）。
+             *   ▎为什么现在必须补：e2e 连跑里 `成句：` 一条都没有、转写却一直在跑（41 段），
+             *   于是"没定稿 / AI 不接话 / 喇叭不出声"四条全红，而只看这些红**分不出三种病**：
+             *     ① 守卫没开（segInFlight 或尾巴在途）② 句子表是空的 ③ 判据没过（gap/静音）。
+             *   这一行每秒一条把三个量摊开，下次再遇到直接读日志，不必再靠猜。
+             *   之前它其实是"猜"出来的：我先怀疑计数器泄漏（finally 平衡，排除）、
+             *   再怀疑 continue 顺序（在成句块之后，排除）、再怀疑常量 TDZ（都已定义，排除）。 */
+            if (process.env.ASR_DEBUG && (!gateDbgTs || now - gateDbgTs > 1000)) {
+              gateDbgTs = now;
+              const firstU = utterances.size ? [...utterances.values()][0] : null;
+              dbg(`成句闸 segInFlight=${segInFlight} tail=${tailPending()} 句子数=${utterances.size}`
+                /* ★ 2026-10-07 未消费的尾巴段（true = "这句话的音频还没喂完，先不定稿"）。
+                 *   没有这一格，"定稿为什么慢了一拍"就又是一次猜（坑 76）。 */
+                + ` 尾巴段未消费=${tailWaitSeg}`
+                + ` sinceVoice=${lastVoiceTs ? now - lastVoiceTs : -1}ms`
+                + ` sinceAppend=${firstU ? now - firstU.lastAt : -1}ms`
+                + ` sinceText=${firstU ? now - (firstU.textAt || firstU.lastAt) : -1}ms`
+                + ` rms=${rmsSeen.lines}行/${rmsSeen.voice}有声`
+                /* ★ 2026-10-06 把 RMS 的**实际区间**也打出来：2026-10-06 的浏览器长跑里
+                   5838 行全判有声（silenceConfirmed 永不成立 ⇒ 每条都以 max-age 定稿、
+                   ⏱ 恒为 0），而同一时刻 test:asr-live 走 RTP 那条却能正常 silence 定稿。
+                   没有这两个数，"RMS 是不是被假麦克风的底噪顶住了"只能猜。 */
+                + ` rmsDb=[${rmsSeen.minDb.toFixed(1)},${rmsSeen.maxDb.toFixed(1)}]`
+                /* ★ 自适应判据的当前状态：噪声底与真正生效的阈值——"这个人为什么被切句/被憋住"
+                 *   第一次可以直接读出来，不用猜（判据改了不暴露 = 换了个更难查的黑盒）。 */
+                + ` voiceThr=${voiceTrack.thresholdDb.toFixed(1)}`
+                + ` floor=${voiceTrack.floorDb == null ? '(样本不足)' : voiceTrack.floorDb.toFixed(1)}`);
             }
-          } catch (e) { /* 成句失败不拖垮循环 */ }
-          /* ══ ★ 2026-10-03 静音抢跑**挪到常规转写之前**（实测延迟从 6.97s 里的 wait=4.2s 来）══
-           * ▎原来的顺序是 pick → (没封口段就 continue) → 抢跑。而"刚说完话"这一刻恰恰
-           *   **没有新封口的段**（说话的那 4s 窗还在写），于是 continue 直接跳过抢跑代码——
-           *   抢跑只在"凑巧有封口段"时才执行，等于每隔一个分段边界才有机会一次（4s 一等）。
-           *   改成每轮都先判抢跑，再处理封口段；两者都没活干才睡 300ms。
-           * ▎诚实记录（第一次改完）：只调顺序时总延迟没降（wait 4.0s vs 4.2s），
-           *   因为 wait 被"上一段还在串行转写"占着——那正是下面这段并发要解决的。
-           *   ▸ 语义不变的部分：doneSet 占位防双跑、快照 copy 合法截断、ASR_FLUSH=0 逃生舱。 */
-          if (process.env.ASR_FLUSH !== '0' && alive && lastVoiceTs && Date.now() - lastVoiceTs > FLUSH_MS
-            && segInFlight < SEG_MAX) {
-            try {
-              const all = fs.readdirSync(segDir).filter((f) => f.startsWith('seg-') && f.endsWith('.wav')).sort();
-              const newest = all[all.length - 1];
-              if (newest && newest !== flushedBase && !doneSet.has(newest)) {
-                const full = path.join(segDir, newest);
-                const size = fs.existsSync(full) ? fs.statSync(full).size : 0;
-                if (size >= 48000) { // ≥1.5s 音频才值得抢跑（40000B 门槛之上留余量）
-                  const copy = path.join(segDir, 'f-' + newest);
-                  fs.copyFileSync(full, copy);
-                  flushedBase = newest;
-                  doneSet.add(newest); // 占位：封口后常规轮询与收尾都会跳过
-                  launchSegment(copy, newest);   // ★ 不等它——让下一段并行开始
+            if (segInFlight === 0 && !tailPending()) {
+              for (const [mid, u] of [...utterances]) {
+                /* ★ 2026-10-03b 静音已确认 → 立即成句（不限抢跑路径）。
+                 * ▎原实现成句永远等 UTTERANCE_GAP_MS（1.5s）：但 lastVoiceTs 已经是
+                 *   "RMS 高于阈值"的权威信源——**它距今超过 FLUSH_MS（1.2s）就证明
+                 *   没有人正在说话**，与这段转写是抢跑快照还是封口段无关。再干等
+                 *   1.5s 等于把同一段静音判两次（真浏览器 e2e 实测定稿 7.7s 里有
+                 *   1.4s 是这笔重复等待）。
+                 * ▸ 换气停顿超过 1.2s 会在这里断句——与抢跑闸同一口径（FLUSH_MS），
+                 *   分段窗口本来就是 4s 一刀，断句粒度并没有变得更粗；
+                 *   真在说话时 lastVoiceTs 不断刷新，此判据恒 false，行为不变。 */
+                const silenceConfirmed = lastVoiceTs && now - lastVoiceTs > FLUSH_MS;
+                /* ★ 2026-10-05 实修（test:asr-live 连报不可信 latMs 的根因——**成句闸过早，不是 RMS 慢**）：
+                 *   原判据 `gap OR silenceConfirmed` 里那个 gap 分支，在**转写快的机器**上会落在
+                 *   语音还没说完的时刻：GPU 转写一段只要 ~0.5s，段一追加 u.lastAt 就刷新；
+                 *   而下一段还在写（pickReadySegment 永远跳过最新段）→ segInFlight=0 →
+                 *   循环在"上一次追加"满 1.5s 的那一刻就把**半句话**定稿了。那一刻人还在说，
+                 *   lastVoiceTs 是新鲜的 → latMs 量出来只有几十毫秒（实测 [53]），
+                 *   碎片被切成多句、AI 多次接话的窗口也一直开着。
+                 * ▸ 判据反转：**RMS 信源可用（lastVoiceTs>0）时，唯一权威的成句信号是
+                 *   silenceConfirmed**——lastVoiceTs 是"此刻有没有人在说"的直接测量，
+                 *   gap 只是它不可用时的代理量。gap 退居兜底（lastVoiceTs==0：RMS 解析失败/
+                 *   老 ffmpeg 环境），保住那条路的旧行为。
+                 * ▸ UTTERANCE_MAX_OPEN_MS 保险丝：lastAt 超 10s 无任何追加才强制成句——
+                 *   只兜"噪声把 RMS 卡在阈值上方、沉默永不为真"这类病态场景；
+                 *   顺带解决多人轮替的一处真延迟：A 说完 B 接着说时，A 的句子此前要等
+                 *   **全场**静音才定稿（RMS 是房间级信源）。 */
+                const rmsAlive = lastVoiceTs > 0 || rmsSeen.lines > 0
+                  /* ★ 2026-10-07 冷启动宽限：RMS **一行都还没到过**不等于"这台机器没有
+                   *   RMS 信源"，多半只等于"这条管线刚出生 / 录音进程刚自愈重启"。
+                   *   此时用 1.5s 的 gap 代理判据会把第一句话当场切散——实测被切成
+                   *     「小明」 + 「小明，帮我记一下明天下午三点的评审会。」
+                   *   而只含名字的那半句会 arm 分段续接窗（AI_ASK_TAIL），
+                   *   于是紧跟的那句无关的话被当成"那半句终于说完了"而接了话。
+                   *   ▸ 宽限内不按 gap 切，交给 max-age(6s)/max-open(10s) 两把保险丝收口；
+                   *     宽限过后仍一行 RMS 都没有（老 ffmpeg / 键名不通）才退回 gap 兜底，
+                   *     保住那条路原本的"至少能出字幕"行为。 */
+                  || (Date.now() - recBornAt < RMS_GRACE_MS);
+                /* ★ 2026-10-05 保险丝看的是"这句话多久没变长"（textAt），
+                 *   不再是"多久有人说话"（lastAt）——理由见上面 appendSentence 处的长注释。 */
+                const idleTextMs = now - (u.textAt || u.lastAt);
+                /* ★ 2026-10-05 夜二 第二把保险丝：这句**开了多久**（连续音频下 idleTextMs
+                   永远在刷新，只靠它会把一句拖到十几秒——用户体感的"延迟大"就是这个）。 */
+                const ageMs = now - (u.bornAt || now);
+                const maxAge = ageMs > UTTERANCE_MAX_AGE_MS;
+                /* ★ 2026-10-07 "静音确认"不再单独等于"可以定稿"：还得没有未消费的尾巴段
+                 *   （判据与为什么必须加，见 pendingTailSegment 上方那段——「评审会」丢掉「会」
+                 *   就是这条漏口，而漏掉的尾巴还会跑到下一句的整句音频里）。 */
+                const silenceOk = silenceConfirmed && !tailWaitSeg;
+                const due = maxAge || (rmsAlive
+                  ? (silenceOk || idleTextMs > UTTERANCE_MAX_OPEN_MS)
+                  : (now - u.lastAt > UTTERANCE_GAP_MS));
+                if (due) {
+                  /* 定稿原因只算一次，dbg 与 finalizeUtterance 共用（坑 47：
+                     两处各判一遍，将来改一边就出现"日志说 silence、读数按别的算"） */
+                  const reason = silenceOk ? 'silence' : (maxAge ? 'max-age' : (rmsAlive ? 'max-open' : 'gap'));
+                  dbg(`成句：${mid} reason=${reason} sinceVoice=${lastVoiceTs ? now - lastVoiceTs : -1}ms sinceAppend=${now - u.lastAt}ms age=${ageMs}ms`);
+                  /* ★ 2026-10-03e 不再 await：asrWakeAndAnswer 里含 LLM 调用（2~5s），
+                   *   在单线程的 recordLoop 里同步等它 = **抢跑/轮询全部停摆**——
+                   *   实测慢峰（等待 3.8~4.0s）就是这么来的：A 句的答案在等 LLM，
+                   *   B 句说完时循环刚醒，lastVoiceTs 已过期，抢跑把名额浪费在
+                   *   无人声的空档段上，只能等封口。
+                   *   finalizeUtterance 入口会同步 delete（首个 await 之前执行），
+                   *   不等它的同一轮里不会重入；错误自己 catch。 */
+                  finalizeUtterance(mid, reason).catch((e) => {
+                    if (process.env.ASR_DEBUG) console.log('[asr-finalize-err]', e && e.message);
+                  });
                 }
               }
-            } catch (e) { /* 抢跑失败不影响常规转写 */ }
+            }
+          } catch (e) { /* 成句失败不拖垮循环 */
+            /* ★ 2026-10-05：静默 catch 本身就是这次查不动的原因之一——"成句永不发生"和
+             *   "成句块每轮都抛错"在日志上长得一模一样（都是没有 `成句：` 行）。
+             *   不改变行为（依旧不拖垮循环），但异常要能看见。 */
+            if (process.env.ASR_DEBUG) dbg('成句块异常：' + (e && e.message));
           }
-          if (segInFlight >= SEG_MAX) { await new Promise((r) => setTimeout(r, 200)); continue; }
+          /* ★ 2026-10-05 旧"copy 全段"静音抢跑块在此处删除——已上移到成句闸**之前**、
+           *   重写为 delta 尾段快照（见上方大注释）。两条历史教训留在坑 76：
+           *   ① wav 段写满才落盘 → copyFileSync 拿到 0 字节 → 从 09-30f 上线起整场 0 触发；
+           *   ② 旧块里 `doneSet.add(newest)` 把"正在写的段"自锁成封口后永远跳过的死段。 */
+          if (segInFlight >= SEG_MAX) {
+            /* 口径要说清：这计的是"**轮询时在途已满、只能跳过这一轮**"的轮数，不是段数
+               （一轮可能本来也没段可转）。要精确到"因为并发上限而排队的段数"得先探测再决定，
+               而那会给每轮加一次 readdirSync——为一个观测指标花真开销不值。 */
+            COLLAB.seg.blocked += 1;
+            await new Promise((r) => setTimeout(r, 200)); continue;
+          }
           const pick = await pickReadySegment();
           if (!pick) { await new Promise((r) => setTimeout(r, 300)); continue; }
           launchSegment(pick.full, pick.baseName);
@@ -2614,11 +4351,26 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
            *     "默认它已经做完"的下游动作**——清理、删除、关文件、发通知都算。 */
           try {
             for (const f of fs.readdirSync(segDir)) {
-              if (!doneSet.has(f)) continue;
               const p = path.join(segDir, f);
-              if (inFlightPaths.has(p)) continue;      // 还在转写里的段绝不能删
-              try { fs.unlinkSync(p); } catch (e) { /* 占用中 */ }
+              if (inFlightPaths.has(p)) continue;      // 还在转写里的段（含刚扑出的尾段）绝不能删
+              /* ★ 2026-10-05 清理面扩到三类临时物：tmp-（PCM 包装的临时 WAV）、
+               *   tail-（delta 尾段，正常路径由 handleSegment 转完即删，这里是兜底）、
+               *   f-（旧"copy 全段"抢跑的历史遗留，只清不产）。
+               *   临时物用 mtime 保护：<15s 的跳过——handleSegment 可能正读着它
+               *   （Windows 上被占用的文件删不掉，失败留到下轮）。 */
+              const stale = f.startsWith('tmp-') || f.startsWith('tail-') || f.startsWith('f-') || f.startsWith('amp-');
+              if (!stale && !doneSet.has(f)) continue; // 常规段：处理完（doneSet）才清
+              try {
+                const st = fs.statSync(p);
+                if (stale && Date.now() - st.mtimeMs < 15000) continue;
+                fs.unlinkSync(p);
+                if (process.env.ASR_DEBUG) console.log(`[asr-clean] 清 ${f}`);
+              } catch (e) { /* 占用中/已删：下轮再试 */ }
             }
+            /* ★ 2026-10-05 水位账剪枝：段文件没了（转写完被删）→ 对应条目清掉，
+             *   否则两张 Map 会随会议时长无限长（长跑纪律：内存是热窗口）。 */
+            for (const k of [...flushedBytes.keys()]) if (!fs.existsSync(path.join(segDir, k))) flushedBytes.delete(k);
+            for (const k of [...flushedOkTs.keys()]) if (!fs.existsSync(path.join(segDir, k))) flushedOkTs.delete(k);
           } catch (e) { /* 目录清理竞态 */ }
         }
         // 收尾：把最后一段（ffmpeg 已停、不再增长）也转出来——别丢最后半句话
@@ -2627,62 +4379,107 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
          *   尾巴落进下一条新语句（= 刚修好的"同一句拆两句、AI 答两遍"从退出路径漏回来）。
          *   最多等 20s（一段转写实测 1~7s），超时就带着已有文本收尾——不能无限等，
          *   否则一次卡住的推理会把管线的退出挂死。 */
-        for (let i = 0; segInFlight > 0 && i < 100; i++) await new Promise((r) => setTimeout(r, 200));
+        for (let i = 0; (segInFlight > 0 || tailPending()) && i < 100; i++) await new Promise((r) => setTimeout(r, 200));
         try {
-          const rest = fs.readdirSync(segDir).filter((f) => f.startsWith('seg-') && f.endsWith('.wav') && !doneSet.has(f)).sort();
+          const rest = fs.readdirSync(segDir).filter((f) => f.startsWith('seg-') && f.endsWith('.pcm') && !doneSet.has(f)).sort();
           for (const f of rest) {
             if (!rooms.get(roomNumber)) break;
             try { await handleSegment(path.join(segDir, f), f); } catch (e) { /* 收尾失败可忽略 */ }
           }
         } catch (e) { /* 目录已被清理 */ }
         // ★ 收尾成句：管线退出前把未完结的累积语句走完整流程（入账本+字幕+唤醒）
-        try { for (const [mid] of [...utterances]) await finalizeUtterance(mid); } catch (e) { /* 忽略 */ }
+        //   reason='flush' = 退出时强制收口，**不是**"人说完"，所以这一轮不产延迟读数（见 finalizeUtterance）
+        try { for (const [mid] of [...utterances]) await finalizeUtterance(mid, 'flush'); } catch (e) { /* 忽略 */ }
+        /* ★ 2026-10-05 退场收尾：ASR 支线原来**没有任何地方**关 transport / 删 SDP——
+         *   早退跳过了 astats 支线的 proc.on('exit') 清理（证据：logs/ 里长期躺着 ai-*.sdp）。
+         *   放在 recordLoop 末尾（转写收完再关），close 幂等、重复调用无害。 */
+        try { c.close(); } catch (e) { /* 已关 */ }
+        try { t.close(); } catch (e) { /* 已关 */ }
+        try { fs.unlinkSync(sdpFile); } catch (e) { /* 无所谓 */ }
+        /* ★ 2026-10-05：退场时把管线从账本里摘掉（astats 支线靠 proc exit 摘，ASR 支线的
+         *   录音进程是自愈重生的、没有天然 exit 钩子）——否则 aiHearingStatus().live 会虚高，
+         *   会诊出"假健康"（人走了还说在听），/api/rooms 与入会致辞都会跟着错。 */
+        try { const set = aiAudioPipes.get(roomNumber); if (set) set.delete(asrPipe); } catch (e) { /* 忽略 */ }
       };
+      /* ★ 2026-10-05 实修（用户报"AI 助理的动态效果还是没有变化"的根因，坑 47/76 家族）：
+       *   这里曾经是 `recordLoop(); return;` 直挺挺地早退——把 astats 支线的"共用尾部"
+       *   （注册 aiAudioPipes + 广播 ai-state{listening} + "🎧 已接入"播报）整个跳过。
+       *   ASR 模式（= 现在的主路径）下的三层后果：
+       *   ① 客户端 setAiState 从未被调用 → armAiGestures() 从未调度 → 头像小动作
+       *      （nod/tilt/peek…）永不出现，只剩纯 CSS 呼吸——用户看到的就是"动态效果没有变化"；
+       *   ② "已接入"播报从不发出，入会致辞里的"正在接入"永远停在竞态快照；
+       *   ③ aiAudioPipes 恒空 → aiHearingStatus().live 恒 0 → 致辞永远误报 degraded、
+       *      /api/rooms 观测长期错误、stopAiAudioPipeline/关机清理也摸不到这路管线。
+       *   修法：构造带 stop() 的管线对象（停机走 stopAsrPipe 闭包），先注册再进 recordLoop。 */
+      const asrPipe = {
+        transport: t, consumer: c, memberId, producerId: producer.id, port, sdpFile,
+        stop: stopAsrPipe,
+      };
+      registerAiPipe(roomNumber, asrPipe);
       recordLoop();
       return;
     }
+    /* ★ 2026-10-05 实修（同一天第二处同源缺陷）：这条"只量响度"的降级路径原本让 ametadata
+     *   **打到日志通道**（没写 file=），而整条命令带着 `-loglevel error`——print 是 INFO 级，
+     *   被日志级别整个吞掉。实测：2s 音频跑完，stderr 里 **0 条 RMS**，`aiHearing` 从未被写过，
+     *   AI 的"听觉"指示（第 44 步那排条形）在该模式下是死的，零报错。修法与上面同一招：
+     *   打到 stdout + direct=1（实时），stderr 只负责兜住 ffmpeg 自己的报错不堵管道。 */
     const proc = require('child_process').spawn(FFMPEG_BIN, [
       '-loglevel', 'error', '-protocol_whitelist', 'file,udp,rtp',
       '-fflags', '+genpts', '-i', sdpFile,
-      '-af', 'astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level',
+      '-af', 'astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.1.RMS_level:file=-:direct=1',
       '-f', 'null', '-',
-    ], { stdio: ['pipe', 'ignore', 'pipe'] });
+    ], { stdio: ['pipe', 'pipe', 'pipe'] });
     let buf = '';
-    proc.stderr.on('data', (d) => {
+    proc.stderr.on('data', (d) => { if (process.env.ASR_DEBUG_FFMPEG) console.log(`[asr-ffmpeg-lvl] ${String(d).slice(0, 200)}`); });
+    proc.stdout.on('data', (d) => {
       buf += d.toString();
-      const m = buf.match(/RMS_level=(-?\d+\.?\d*)/g);
+      const m = buf.match(/RMS_level=(-?[\d.]+|-inf)/g);
       if (!m) return;
-      if (buf.length > 8192) buf = buf.slice(-4096); // 防 stderr 积压
-      const rms = parseFloat(m[m.length - 1].split('=')[1]);
+      if (buf.length > 8192) buf = buf.slice(-4096); // 防积压
+      const raw = m[m.length - 1].split('=')[1];
+      const rms = raw.startsWith('-inf') ? -99 : parseFloat(raw);
       if (Number.isNaN(rms)) return;
       if (!aiHearing.has(roomNumber)) aiHearing.set(roomNumber, new Map());
       aiHearing.get(roomNumber).set(memberId, { rms, ts: Date.now() }); // bot 听见：某人当前 -xx dB
     });
     // 被跟的 Producer 关闭（关麦克风/断线）→ 收掉 ffmpeg（exit 回调统一清理管道）
     c.on('producerclose', () => {
-      if (pipe && pipe.alive) pipe.alive(); // ★ 09-27 分段转写循环停机
+      /* ★ 2026-10-05 死代码清理：这里原来是 `if (pipe && pipe.alive) pipe.alive();`——
+       *   pipe 对象从来没有 alive 字段（09-27c 重构后遗留），那行从写下起就没生效过。 */
       try { proc.kill(); } catch (e) { /* 已退 */ }
     });
+    // ★ 2026-10-05：注册 + listening 广播 + 接入播报抽成 registerAiPipe（与 ASR 支线同款——坑 47）
     const pipe = { transport: t, consumer: c, proc, memberId, producerId: producer.id, port, sdpFile };
-    if (!aiAudioPipes.has(roomNumber)) aiAudioPipes.set(roomNumber, new Set());
-    aiAudioPipes.get(roomNumber).add(pipe);
-    // ★ 09-27c：管线建成即追加"接入成功"播报——入会致辞的"正在接入"只是竞态快照
-    io.to(roomNumber).emit('ai-state', { state: 'listening' });
-    io.to(roomNumber).emit('chat-message', {
-      from: 'ai-bot', name: '🤖 AI 小明',
-      text: `🎧 已接入 ${String(memberId).slice(-4)} 的音频，正在聆听（说话带「小明」我就会回答）`,
-      ts: Date.now(),
-    });
+    registerAiPipe(roomNumber, pipe);
     proc.on('exit', () => {
       const set = aiAudioPipes.get(roomNumber);
       if (set) set.delete(pipe);
+      releaseAsrPipePort(port);   // ★ 2026-10-04g astats 分支同样释放端口
       try { c.close(); t.close(); } catch (e) { /* 已关 */ }
       try { fs.unlinkSync(sdpFile); } catch (e) { /* 无所谓 */ }
     });
     console.log(`🤖 AI 管线：${aiShortId(memberId)} 的音频 → astats（端口 ${port}）`);
   } catch (err) {
     console.log(`🤖 AI 管线启动失败（${err.message}）——bot 听觉降级为音量事件（AudioLevelObserver）`);
+    if (allocatedPort) releaseAsrPipePort(allocatedPort); // 启动失败把预留的端口还回去（成功路径各自持有）
   }
+}
+
+/* ★ 2026-10-05 实修：把"注册 + listening 广播 + 接入播报"抽成唯一实现（坑 47）——
+ *   它曾经只存在于 astats 支线的"共用尾部"，而 ASR 支线 `recordLoop(); return;` 早退
+ *   把这段整个跳过（详见调用点注释：头像动态全灭 / 致辞误报 degraded / 停机摸不到管线）。
+ *   两个支线共用它；注册进 aiAudioPipes 的对象可选带 stop()（ASR 支线的停机闭包）。 */
+function registerAiPipe(roomNumber, pipe) {
+  if (!aiAudioPipes.has(roomNumber)) aiAudioPipes.set(roomNumber, new Set());
+  aiAudioPipes.get(roomNumber).add(pipe);
+  // ★ 09-27c：管线建成即追加"接入成功"播报——入会致辞的"正在接入"只是竞态快照
+  io.to(roomNumber).emit('ai-state', { state: 'listening' });
+  io.to(roomNumber).emit('chat-message', {
+    from: 'ai-bot', name: 'AI 小明',
+    text: `🎧 已接入 ${String(pipe.memberId).slice(-4)} 的音频，正在聆听（说话带「小明」我就会回答）`,
+    ts: Date.now(),
+  });
 }
 
 // 停掉某房间全部 AI 管线
@@ -2690,6 +4487,13 @@ function stopAiAudioPipeline(roomNumber) {
   const set = aiAudioPipes.get(roomNumber);
   if (!set) return;
   for (const pipe of set) {
+    /* ★ 2026-10-05：ASR 支线的管线带 stop() 闭包（录音进程自愈重生，快照会过期，
+     *   只有闭包拿得到"此刻那个进程"，且必须同时置 alive=false 防自愈拉回）；
+     *   astats 支线没有 stop，走原 'q\n'+kill 路径。 */
+    if (typeof pipe.stop === 'function') {
+      try { pipe.stop(); } catch (e) { /* 已退 */ }
+      continue;
+    }
     try { pipe.proc.stdin.write('q\n'); } catch (e) { /* 已退 */ }
     try { setTimeout(() => { try { pipe.proc.kill(); } catch (e) { /* 已退 */ } }, 1500); } catch (e) { /* */ }
   }
@@ -2729,7 +4533,7 @@ function aiHearingStatus(roomNumber) {
  * ▎from 用 'ai-bot' 保持一致 → 前端气泡走既有的"机器同事"样式，无需新增分支。 */
 function emitBotSay(roomNumber, text, extra) {
   io.to(roomNumber).emit('chat-message', {
-    from: 'ai-bot', name: '🤖 AI 小明', text, ts: Date.now(),
+    from: 'ai-bot', name: 'AI 小明', text, ts: Date.now(),
     ...(extra || {}),
   });
 }
@@ -2795,7 +4599,7 @@ function setAiBot(roomNumber, on, opts = {}) {
               ? `刚才聊到「${(caps[caps.length - 1].text || '').slice(0, 24)}」，大家继续呀——有结论了吗？`
               : '大家随便聊聊，我一直都在听～（提到「小明」我就会回答）';
           }
-          io.to(roomNumber).emit('chat-message', { from: 'ai-bot', name: '🤖 AI 小明', text: line, ts: Date.now() });
+          io.to(roomNumber).emit('chat-message', { from: 'ai-bot', name: 'AI 小明', text: line, ts: Date.now() });
           io.to(roomNumber).emit('ai-state', { state: 'speaking', text: line });
           setTimeout(() => io.to(roomNumber).emit('ai-state', { state: 'idle' }), Math.min(9000, 2500 + line.length * 80));
           logEvent('info', 'ai-warmup', { roomNumber });
@@ -2810,7 +4614,7 @@ function setAiBot(roomNumber, on, opts = {}) {
           const r = await buildMinutes(roomNumber, { type: 'segment', since: sinceMark.ts });
           sinceMark.ts = Date.now();
           io.to(roomNumber).emit('chat-message', {
-            from: 'ai-bot', name: '🤖 AI 小明',
+            from: 'ai-bot', name: 'AI 小明',
             text: `🌙 值守分段纪要已生成：${r.path}（${r.mock ? '[Mock] ' : ''}本段 ${r.markdown.includes('（本时段没有字幕记录）') ? '无字幕' : '已汇总'}）`,
             ts: Date.now(),
           });
@@ -2835,6 +4639,10 @@ function setAiBot(roomNumber, on, opts = {}) {
       emitBotSay(roomNumber,
         `👋 大家好，我是会议 AI 助理，已作为参会者入会。\n`
         + `${hear}\n`
+        /* ★ 2026-10-06 夜二 把"什么时候开口"的规矩写在入会第一句里（用户的原话是
+         *   "不叫它就不该说话"）：规矩只在代码里，用户就只能靠踩雷来学。
+         *   ▸ 这是**界面上的许可**：说明"我没接话不是坏了，是你没叫我"。 */
+        + `开会时我**不插话**——要我用，喊一声「小明」＋想做的事（例：「小明，把纪要生成一下」）。\n`
         + `我能做：在聊天里说 **@ai 你的问题**（我基于**本场会议**的内容作答，并会标出检索到哪几条）；`
         + `说 **@ai 生成纪要** 我整理成 markdown；字幕开启时我的"听力"最完整。`);
       logEvent('info', 'ai-join-ceremony', {
@@ -2896,45 +4704,22 @@ function setAiBot(roomNumber, on, opts = {}) {
  *   ③ **白名单在服务器、执行在客户端**：服务器只发"做什么"，
  *      客户端那张 socket.on('room-control') 表必须与此处**一一对应**（不一致 = 静默失效）。
  * ══════════════════════════════════════════════════════════════════ */
-const ROOM_ACTIONS = {
-  'board-open':    { cn: '打开实时白板', done: '白板已经打开，所有人都能画了。' },
-  'board-close':   { cn: '关闭白板', done: '白板已收起。' },
-  'captions-on':   { cn: '开启实时字幕', done: '实时字幕已开启，说话就会上字幕。' },
-  'captions-off':  { cn: '关闭实时字幕', done: '字幕已关闭。' },
-  'view-speaker':  { cn: '切到演讲者视图', done: '已切到演讲者视图，大画面跟着说话人走。' },
-  'view-grid':     { cn: '切到宫格视图', done: '已切到宫格视图，所有人一样大。' },
-  /* ★ 2026-10-03 两个白板动作（"把白板清空 / 撤销那一笔"是课堂上最常喊的话）。
-   *   ▸ 仍然只在**房间级共享状态**里活动：白板账本是全房共有的画布，
-   *     不动任何人的摄像头/麦克风/共享/录制 —— 那条边界见下面的结构断言。 */
-  'board-clear':   { cn: '清空白板', done: '白板已经清空了（所有人的画布一起清）。' },
-  'board-undo':    { cn: '撤销白板最近一笔', done: '已撤销白板上最近的一笔。' },
-};
-/* 顺序有讲究：**"关"的模式排在"开"前面**——
- *   否则「把白板关掉」会先被 /白板/ 那类宽松规则命中成"打开白板"。
- * ▎动词表要**覆盖同义说法**（测试第一次就抓到我只写了「打开字幕」，
- *   而用户和 AI 语音转写出来的是「开启实时字幕」——差一个字就整条不命中，
- *   且症状是"AI 回了一句漂亮话、什么都没做"，正是这条路最不该出现的失败）。
- * ▎中文没有词边界（坑 42/49 老账），所以每条都要求"动词 + 它该有的邻居"同时出现，
- *   并给中间修饰语留 0~4 字的窗口（"开启实时字幕"、"把会议室的白板打开"）。 */
-const ROOM_ACTION_RULES = [
-  ['board-close',   /(关闭|关掉|关上|收起|取消|停止)[^。，,]{0,4}白板|白板关掉|把白板关/],
-  ['captions-off',  /(关闭|关掉|关上|收起|取消|不要|停止)[^。，,]{0,4}字幕|字幕关掉|把字幕关/],
-  /* ★ 2026-10-03 clear/undo 排在 board-open **之前**：
-   *   「把白板清空」里同时有"白板"和"清"，若先跑 open 那条宽松动词表
-   *   （含"新建/来一个"）就可能被误判成"打开白板" —— AI 会回一句
-   *   "白板已经打开"而画布根本没动，正是第 36 步最不该出现的失败。 */
-  ['board-clear',   /(清空|清除|擦掉|抹掉|擦干净|全部擦)[^。，,]{0,4}白板|白板清空|白板全部擦|把白板擦/],
-  ['board-undo',    /(撤销|回退|撤回)[^。，,]{0,4}(一笔|一步|那笔|最后|白板)|撤销白板|白板撤销|undo\s*白板/],
-  ['board-open',    /(打开|开启|开一下|开个|启动|启用|调出|新建|来一个|来块)[^。，,]{0,4}白板|白板打开|把白板开/],
-  ['captions-on',   /(打开|开启|开一下|开个|启动|启用|开始|来点)[^。，,]{0,4}字幕|上字幕|把字幕开/],
-  ['view-speaker',  /(演讲者|主讲|聚焦)(视图|模式|界面)|大画面模式/],
-  ['view-grid',     /(宫格|九宫格|平铺|小窗)(视图|模式|界面)|全部一样大/],
-];
-function detectRoomAction(q) {
-  const s = String(q || '');
-  for (const [action, re] of ROOM_ACTION_RULES) { if (re.test(s)) return action; }
-  return null;
-}
+/* ★ 2026-10-05 三张表 + 匹配函数搬到 sfu/ai/roomActions.js（这里只留引用）。
+ *   ▎为什么搬：它们藏在 5000 行文件的一个闭包里，'用户怎么说才算数'这件事
+ *     **没有任何测试跑得动**。一量就是 26% 的自然语句不命中（'白板收起来'、
+ *     '不要字幕了'、'来一张白板'）——正是用户反复反馈的'AI 操控实体还是不行'。
+ *     抽成纯函数才能拿 48 句电池穷举断言（同 rdDecideFps / Asr.mergeTranscript）。
+ *   ▎边界（只碰房间级共享状态）与顺序（'关'排在'开'前判）的纪律都写在那文件头。 */
+const { ROOM_ACTIONS, detectRoomAction, detectRoomActions, detectOutOfScopeCommand, ROOM_ACTION_CAPABILITIES } = require('./ai/roomActions');
+
+/* ★ 2026-10-06 「这条动作在这个房间里等谁的回执」的台账：`房间号|动作` -> 定时器句柄。
+ *   ▎为什么按房间挂而不是比全局计数：COLLAB.roomApplied 是**全服**一个数，
+ *     两个房间同时开白板时，A 房客户端的回执会把 B 房的看门狗一起消掉——
+ *     B 房其实一个人都没执行，却永远不会报。教学版单机只有一间房看不出来，
+ *     多房间（真实落地）就是"告警永远不响"。（同坑 66 那条：清理动作的作用域
+ *     比它看起来更大；判据要认"哪一房的那一条"，别认"有没有发生过同类事"。） */
+const pendingRoomActionAcks = new Map();
+
 /** 执行一条房间级动作：广播给全房，客户端各自落地（见 client.js 第 36 步）。 */
 function applyRoomAction(roomNumber, action, byName) {
   const spec = ROOM_ACTIONS[action];
@@ -2945,6 +4730,36 @@ function applyRoomAction(roomNumber, action, byName) {
   bump(COLLAB.roomControl, action);
   logEvent('info', 'room-control', { roomNumber, action, by: byName || 'ai-bot' });
   console.log(`🎛 [room-control] ${roomNumber} · ${byName || 'AI 小明'} → ${spec.cn}`);
+  /* ★ 2026-10-06 「说了没做」要**当场自己发现并说出来**。
+   *   ▎为什么这条属于"操控实体行不行"：服务器只负责广播，真正改界面的是每个客户端。
+   *     客户端可能根本没收到（旧页面 / SW 缓存了老 client.js）、或收到了但那条动作
+   *     在它这版里没有分支（AI 回了"白板已经打开"，画布一动不动）。
+   *     以前这件事只有 watch.js 事后从 /metrics 的"发出数 vs 执行数"差值里看得见，
+   *     而开会的人当场看到的只是"它没反应"。
+   *   ▸ 做法：给这一房的这一条动作挂一个 4 秒看门狗，回执到了就当场撤销（见
+   *     socket.on('room-control-ack')）；到点还挂着就在**同一个房间**里补一句人话。
+   *     撤销走"认这一条"而不是"比全局计数"——理由见 pendingRoomActionAcks 文件头。
+   *   ▸ 判据是"有没有任何一个客户端回执"，不是"全部客户端"——一个人执行了就算生效，
+   *     这是房间级共享状态（白板开没开是全房同一个事实），不需要人人回执。
+   *   ▸ 同房间同动作连说两次：只保留最后一次的狗（前一句的等待已被后一句覆盖）。 */
+  const ackMs = Number(process.env.ROOM_CONTROL_ACK_MS) || 4000;
+  const ackKey = `${roomNumber}|${action}`;
+  const prevTimer = pendingRoomActionAcks.get(ackKey);
+  if (prevTimer) clearTimeout(prevTimer);
+  const issuedAt = COLLAB.roomControl[action] || 0;
+  pendingRoomActionAcks.set(ackKey, setTimeout(() => {
+    pendingRoomActionAcks.delete(ackKey);
+    if (!rooms.has(roomNumber)) return;                 // 房间已销毁：不往空气里说话
+    const who = byName || 'AI 小明';
+    io.to(roomNumber).emit('chat-message', {
+      from: 'ai-bot', name: who,
+      text: `⚠️ 我发出了「${spec.cn}」，但没有任何客户端执行它——`
+        + '多半是大家的页面还是旧版（硬刷新 Ctrl+F5，或地址后加 ?nosw=1 打开一次）。',
+      ts: Date.now(),
+    });
+    logEvent('warn', 'room-control-noop', { roomNumber, action, issuedAt });
+    bump(COLLAB.throttled, 'room-control-noop');
+  }, ackMs).unref?.());
   return { ok: true, cn: spec.cn, done: spec.done };
 }
 
@@ -2979,7 +4794,32 @@ function appendBoardLine(roomNumber, obj) {
   } catch (e) { /* 归档失败不能影响开会 */ }
 }
 
-async function aiBrain(roomNumber, question, onDelta, onPhase) {
+/* ★ 2026-10-03f Mock 标记只写一处（AI 双轨约定：无 key 的降级答案必须带 [Mock]，
+ *   否则用户分不清这是模板拼的还是模型写的）。
+ * ▎为什么专门抽出来：对话轨（answerChat）与检索轨（answer）是**两条提前 return 的路径**，
+ *   原先这个前缀只写在检索轨那一行 —— 我加对话轨时照抄了"直接返回 r.text"，
+ *   于是无 key 时对话轨的答案丢了标记，被 test:sfu 当场抓到。
+ *   两个出口共用的规则就该是一个函数（坑 47）。 */
+function withMockMark(r) {
+  return (r.mock && AI.aiEnabled() === false ? '[Mock] ' : '') + r.text;
+}
+
+/* ★ 2026-10-09 「这句会不会被念出口」的形状约束（对话轨与检索轨共用同一段文字）。
+ * ▎为什么放在生成侧而不是只靠播报侧截断：慢引擎（本地 Qwen3-TTS，RTF≈4.1）念长答案
+ *   必然越落越远，旧做法是在流水线里按 `aiTtsMaxChars` **拦腰切**——
+ *   预算只剩 11 字而句子 30 字时，用户听到的就是"话说一半然后没声了"。
+ *   截断是处理症状。真正合理的分工是：**结论压进第一句**，
+ *   让"一句完整的话"同时是文字的单位与语音的单位。
+ * ▎流水线那侧的保险丝同步改掉了（首句永远整句念，之后的句子放不下就整句不念），
+ *   两侧一起才成立：只改 prompt 不保险（模型不一定听），只改切法治不了根。 */
+function speakShapeLine(spoken) {
+  if (!spoken) return '';
+  return '\n这句会被**合成成语音念出来**：先把结论放进第一句，那一句不超过 20 字；'
+    + '后面最多再补一两句短句，总共别超过 60 字。'
+    + '不要写文件路径、括号补充、列举腔或 markdown——那些念出来是噪音，看文字就够了。';
+}
+
+async function aiBrain(roomNumber, question, onDelta, onPhase, opts = {}) {
   const room = rooms.get(roomNumber);
   const members = room ? [...room.members] : [];
   const talkRows = room ? [...room.talk.entries()].sort((a, b) => b[1] - a[1]) : [];
@@ -2991,13 +4831,43 @@ async function aiBrain(roomNumber, question, onDelta, onPhase) {
 
   /* ── ⓪ 房间级实体操作（第 36 步）：在**任何模型调用之前**先路由 ──
    * 为什么排第 0 位、且不走 LLM：这类话是短祈使句（"打开白板"），规则识别既准又免费；
-   * 交给模型就可能得到一句"好的，你可以点击白板按钮"——**答应了却没做**（坑 38 同族）。 */
-  const roomAction = detectRoomAction(q);
-  if (roomAction) {
-    const r = applyRoomAction(roomNumber, roomAction);
+   * 交给模型就可能得到一句"好的，你可以点击白板按钮"——**答应了却没做**（坑 38 同族）。
+   * ★ 2026-10-06 改成**一条命令里的多个动作全部执行**：
+   *   「把白板打开，顺便把字幕也开一下」以前只做第一件，AI 回"白板已经打开"，
+   *   字幕一动不动——用户体感就是"操控实体不行"，而这条指令在日志里是"成功"的。
+   *   这类缺口不会报错，只会**少做**，所以判据必须是"说了几件做几件"。 */
+  const roomActions = detectRoomActions(q);
+  if (roomActions.length) {
+    const done = []; const failed = [];
+    for (const a of roomActions) {
+      const r = applyRoomAction(roomNumber, a);
+      if (r.ok) done.push({ said: `${r.cn}了`, hint: r.done });
+      else failed.push(`${r.cn}没成功（${r.why === 'no-room' ? '这个房间已经不存在' : '不支持的动作'}）`);
+    }
+    /* 交代文案：做了几件就说几件，每件都带上它自己的"之后怎么用"。
+     * ▎以前只拼第一条动作的 done 句 —— 「把白板打开，顺便把字幕也开一下」回的是
+     *   "…字幕也开了。白板已经打开，所有人都能画了"，第二件怎么用只字未提；
+     *   说了几件做几件，就得说几件交代几件（同一份信息不要只给一半，坑 56 的形状）。 */
+    const text = done.length
+      ? `${done.map((d) => d.said).join('，')}。${done.map((d) => d.hint).join(' ')}${failed.length ? '；' + failed.join('；') : ''}`
+      : `${failed.join('；')}。`;
     return {
-      text: r.ok ? `${r.cn}了。${r.done}` : `${r.cn}没成功：${r.why === 'no-room' ? '这个房间已经不存在' : '不支持的动作'}`,
-      mock: false, intent: 'room-action', action: roomAction, usage: { totalTokens: 0 },
+      text, mock: false, intent: 'room-action',
+      action: roomActions[0], actions: roomActions, usage: { totalTokens: 0 },
+    };
+  }
+  /* ★ 2026-10-05 越界请求要**明着拒绝**，不许滑进 LLM 变成一句漂亮的答非所问。
+   *   ▎为什么这算"操控实体行不行"的一半：用户说"把摄像头关掉"，以前落到 LLM，
+   *     回一句"作为 AI 助理我暂时无法控制设备…"（或更糟：一段答非所问），
+   *     而用户读到的和"指令没生效"**完全一样**——边界不显眼，功能就看起来是坏的。
+   *     现在一次说清三件事：这条我不做 / 为什么（设备与授权是人的事）/ 我到底能做什么。
+   *   ▸ 判据与 ROOM_ACTIONS 的边界同源（见 sfu/ai/roomActions.js 文件头），
+   *     且必须带祈使标记——"我的摄像头怎么打不开"是求助，不是命令，不能拒。 */
+  const denied = detectOutOfScopeCommand(q);
+  if (denied) {
+    return {
+      text: `「${denied.cn}」这条我不做——${denied.why}。我能替全房做的是：${ROOM_ACTION_CAPABILITIES}。`,
+      mock: false, intent: 'room-action-denied', usage: { totalTokens: 0 },
     };
   }
 
@@ -3015,6 +4885,26 @@ async function aiBrain(roomNumber, question, onDelta, onPhase) {
     return {
       text: `纪要已生成：${r.path}${r.mock ? '（[Mock] 本地模板）' : '（LLM 撰写）'}${picks ? ' —— 要点节选：' + picks : ''}`,
       mock: r.mock, file: r.file, path: r.path, usage: { totalTokens: 0 }, intent,
+    };
+  }
+
+  /* ── 对话轨（★ 2026-10-03f 新增，修"永远回答会上提到了什么"）──
+   * ▎成员在跟"小明"本人说话（你是谁 / 你能做什么 / 你怎么不动了 / 寒暄）。
+   *   这类问题**没有"会议证据"可言**——走下面的检索型 answer() 只会拿到
+   *   "他自己刚问的那句字幕"当证据，于是模型复述一遍、用户听到一句废话。
+   *   所以在取字幕之前就分叉，交给 answerChat()（它不要求"只能依据会议材料"）。 */
+  if (intent === 'chat') {
+    const chatBrain = getRoomBrain(roomNumber);
+    const contextLine = `当前会议实况：${members.length} 人在线，已开约 ${dur} 分钟；`
+      + `AI 助理${room && room.aiBot ? '在场' : '不在场（成员可点控制坞「AI」邀请）'}；`
+      + `服务端神经语音${serverVoiceReady() ? '可用' : '不可用（此时 AI 的声音由浏览器朗读）'}。`;
+    /* 形状约束只从 systemExtra 这一个口子进去（原来还顺手拼进 contextLine，
+       于是同一段话在系统提示里出现两遍——重复的指令不会更准，只会让下一次改动漏改一处）。 */
+    const cr = await chatBrain.answerChat(q, { contextLine, onDelta, onPhase, systemExtra: speakShapeLine(opts.spoken) });
+    return {
+      text: withMockMark(cr),
+      mock: cr.mock, usage: cr.usage, ms: cr.ms, reason: cr.reason,
+      hits: [], usedHits: 0, totalDocs: 0, turns: cr.turns, intent,
     };
   }
 
@@ -3057,13 +4947,17 @@ async function aiBrain(roomNumber, question, onDelta, onPhase) {
     }
   }
 
-  const r = await brain.answer(q, entries, { extraContext, onDelta, onPhase, topK: 6 });
+  const r = await brain.answer(q, entries, {
+    extraContext, onDelta, onPhase, topK: 6,
+    /* ★ 2026-10-09 语音问答那一路把答案"写成适合念的样子"（与对话轨同一个来源，见 speakShapeLine） */
+    systemExtra: speakShapeLine(opts.spoken),
+  });
   if (process.env.AI_DEBUG_SCOPE) {
     console.log(`[scope-debug] answer since=${brain.since ? new Date(brain.since).toISOString() : 0} 全档=${entries.length} 范围内=${r.totalDocs} scoped=${r.scoped}`);
   }
 
   return {
-    text: (r.mock && AI.aiEnabled() === false ? '[Mock] ' : '') + r.text,
+    text: withMockMark(r),
     mock: r.mock, usage: r.usage, ms: r.ms, reason: r.reason,
     hits: r.hits, usedHits: r.usedHits, totalDocs: r.totalDocs, turns: r.turns, intent,
     scoped: r.scoped, allDocs: r.allDocs,
@@ -3083,19 +4977,57 @@ async function aiBrain(roomNumber, question, onDelta, onPhase) {
  * ══════════════════════════════════════════════════════════════ */
 const AI_OP_STEP_MS = Number(process.env.AI_OP_STEP_MS) || 600;
 const AI_WARM_MS = (Number(process.env.AI_WARM_SEC) || 600) * 1000;
-/* ★ 09-28 追问窗口（多轮对话的关键）：
- *   AI 答完一句之后的 20s 内，大家继续说话**不必再喊"小明"**——这才是"对话"，
- *   而不是"每句都要先喊名字的命令"。窗口内的话会作为追问继续喂给同一个会话记忆
- *   （brain.js 的 turns 记忆），所以"它刚才说的第三点再展开"这类指代能接得住。
- *   可用 config.aiChatWindowSec 调（0 = 关掉追问窗口，退回纯唤醒词模式）。 */
-const AI_CHAT_WINDOW_MS = Math.max(0, (Number(CONFIG.aiChatWindowSec) || 20) * 1000);
+/* ★ 09-28 追问窗口（多轮对话）→ ★ 2026-10-06 夜二 **默认关掉**（用户点名：
+ *   「这是一个正常的会议，如果不提到小明的名字，小明不应该说话，只有叫到小明的时候
+ *    小明才会说话思考回答」）。
+ * ▎为什么原设计在真实会议里是错的：追问窗口的隐含前提是"这是一场和 AI 的对话"——
+ *   你一句我一句、别人不插话。而正常会议的麦克风是**常开**的：喊过一次「小明」之后，
+ *   每次应答都把窗口往后推 20s，于是只要有人不停说话，窗口就**永远不关**，
+ *   AI 把整场会都当成对自己说的。现场证据（房间 286716）：21 条转写里 4 条提到名字，
+ *   AI 却答了 18 次，「拍卖啊！」「咳咳。」「爱丽。」全被接话。
+ * ▎判据的形状：**"刚才有人叫过我"不是"现在这句话是对我说"的证据**。
+ *   要 AI 接话就叫名字——这是用户在会议里控制它开口的唯一开关，也是它的礼貌。
+ * ▎机制保留、默认 0：想要连续对话（比如单独和它讨论纪要）时把
+ *   `config.aiChatWindowSec` 设回 20 即可，一行配置切回旧行为。 */
+const AI_CHAT_WINDOW_MS = Math.max(0, (
+  process.env.AI_CHAT_WINDOW_SEC !== undefined ? Number(process.env.AI_CHAT_WINDOW_SEC)
+    : (CONFIG.aiChatWindowSec === undefined || CONFIG.aiChatWindowSec === null ? 0 : Number(CONFIG.aiChatWindowSec))
+) * 1000);
+/* ★ 2026-10-06 夜二 分段续接窗口（与上面的追问窗口**不是一回事**，别合并）：
+ *   分段窗口 2s，「小明，把纪要生成一下」常被切成「小明。」+「把纪要生成一下。」两条，
+ *   纯唤醒模式下后半句没有名字 → 会被判成"普通发言"而没人接（= 用户报的"喊它它不理"）。
+ *   ▸ 与追问窗口的三条区别，正是它不会变成"接管整场会"的原因：
+ *     ① **只在"上一轮它只听到名字"时开**（答完一句完整提问不算）；
+ *     ② **一次性**：接住一条就作废，后续再说话必须重新叫名字；
+ *     ③ **不顺延**：接话本身不再给它续命。
+ *   所以它的语义是"把被机器切断的那一句话说完"，而不是"接下来 20 秒它都在线"。 */
+/* ★ 2026-10-07 单位修正（真跑抓出来的产品缺陷）：这一行原来是
+ *     `Math.max(2000, Number(...) || 6) * 1000`
+ *   —— 那个 2000 是**按毫秒写的下限**，可整表达式后面又乘了 1000，
+ *   于是 config 里的 6 秒被算成 `max(2000,6)*1000 = 2,000,000ms ≈ 33 分钟`。
+ *   ▸ 用户侧的表现正是他最反感的那件事：**只要有人只喊了一声「小明」**（或者分段把
+ *     「小明，帮我记一下…」切出只含名字的碎片），这个"续接窗"就开着 33 分钟——
+ *     期间谁说什么它都当成"那半句终于说完了"而接话。日志实证（ASR_DEBUG 打点）：
+ *     `tailUntil剩余=1981680`，而设计值是 6000。
+ *   ▸ 判据：**下限与单位必须写在同一侧**。凡是 `max(A, x) * 1000` 这种形状，
+ *     先问 A 的单位是不是也乘了一遍 1000（这条与坑 91"尺子拿错样本校准"同族，
+ *     只是这次错的不是阈值而是单位本身）。
+ *   ▸ 修法：秒与毫秒分成两个常量，下限按**秒**写（2 秒）。 */
+const AI_ASK_TAIL_SEC = Math.max(2, (
+  process.env.AI_ASK_TAIL_SEC !== undefined && process.env.AI_ASK_TAIL_SEC !== ''
+    ? Number(process.env.AI_ASK_TAIL_SEC)
+    : (CONFIG.aiAskTailSec === undefined || CONFIG.aiAskTailSec === null ? 6 : Number(CONFIG.aiAskTailSec))
+));
+const AI_ASK_TAIL_MS = AI_ASK_TAIL_SEC * 1000;
 
 /* ★ 2026-10-02 应答节流参数 + 文本归一化（重复句闸与 AI 回声闸**共用同一个归一化**，
  *   两处各写一份正则迟早漂移——同一个概念只能有一个来源，见 AGENTS 坑 47）。 */
 const AI_ASR_ANSWER_MIN_MS = Math.max(0, Number(process.env.AI_ASR_ANSWER_MIN_MS) || 3500);
-function normAsrText(s) {
-  return String(s || '').replace(/[\s，,。.、！!？?；;：:“”"'‘’]/g, '');
-}
+/* ★ 2026-10-05 归一化实现**全部搬去 Asr.normAsrText**（唯一来源）：本函数只做委托。
+ *   ▎搬家的原因：句内归并（Asr.mergeTranscript）也要同一口径的归一化，而它住在 asr.js——
+ *     如果这里再留一份，就是"同一概念两处实现"（坑 47 的经典形状）；历史上这里是
+ *     唤醒词家族形近字（鸣/名/铭→明）+ 抹标点空白，现由 asr.js 逐字等价实现。 */
+function normAsrText(s) { return Asr.normAsrText(s); }
 
 /* ★ 09-27c 服务端唤醒+回答（从分段循环抽出成公共函数——真实管线与自测共用）：
  *   转写文本含「小明」（或在其追问窗口内）→ aiBrain 自动回答；状态机 thinking→speaking→idle 全演。
@@ -3105,15 +5037,78 @@ function normAsrText(s) {
  *      每接一次话就把窗口往后推，形成连续的"聊得起来"的对话；
  *   ③ 归属：字幕与问答都用说话人的**昵称**（memberDisplayName），AI 的上下文里才知道是谁说的。
  */
-async function asrWakeAndAnswer(roomNumber, memberId, text, speakerName) {
+/* ★ 2026-10-07 第 5 参 `capTs` = **引发这次应答的那条字幕的定稿时刻**，随答案一起广播（`trig`）。
+ * ▎为什么要这个字段：自测里"这句闲聊有没有被接话"原先按"时间邻近"判——
+ *   闲聊句定稿后 7s 内出现一次应答就算违规。可应答的耗时是 LLM 决定的（2~5s，
+ *   还要算上生成纪要），于是**上一句正儿八经的提问的答案**完全可能晚到 7s 以上，
+ *   落进闲聊句的时间窗里被错判成"它接了闲聊"。本轮把整句重转的等待去掉之后，
+ *   时序一变，这条断言就红了——红的是归因方式，不是产品（坑 93 同一条：
+ *   一个配错的数差点骗我去修一个不存在的问题）。
+ * ▸ 正解是把"谁引发了这次应答"变成**事实**随答案带出来，而不是让读的人去猜窗口。 */
+async function asrWakeAndAnswer(roomNumber, memberId, text, speakerName, capTs) {
   const room = rooms.get(roomNumber);
   if (!room || !room.aiBot) return;                       // 助理不在场就不接话（它得有"嘴"）
   const clean = String(text || '').trim();
   if (clean.length < 2) return;
   const now = Date.now();
   const woken = Asr.shouldWake(clean);
-  const followUp = !woken && Asr.isFollowUp(room.aiChatUntil, now);
+  const chatWin = !woken && Asr.isFollowUp(room.aiChatUntil, now);
+  /* 分段续接（见上面 AI_ASK_TAIL_MS 的三条区别）：一次性，用完立刻作废。 */
+  const splitTail = !woken && !chatWin && !!room.aiAskTailUntil && now < room.aiAskTailUntil;
+  if (splitTail) room.aiAskTailUntil = 0;
+  const followUp = chatWin || splitTail;
+  /* ★ 2026-10-07 「它为什么开口」第一次能被一眼读出来（ASR_DEBUG 下每条都打）。
+   *   ▎为什么值得加：本轮撞到"没叫它的那句闲聊被接了话"，而三个判据（woken / 追问窗 /
+   *     分段续接窗）在日志里全是隐性的——只能靠读代码反推。这类"礼仪类"缺陷最难查，
+   *     因为它不报错、界面也正常，只有把判据摊开才看得见（坑 76 同一条纪律）。 */
+  if (process.env.ASR_DEBUG) {
+    console.log(`[asr-speak] ${speakerName || memberId} 判据 woken=${woken} chatWin=${chatWin} tail=${splitTail}`
+      + ` chatUntil剩余=${room.aiChatUntil ? room.aiChatUntil - now : '无'} tailUntil剩余=${room.aiAskTailUntil ? room.aiAskTailUntil - now : '无'}`
+      + ` 句=${JSON.stringify(clean.slice(0, 24))}`);
+  }
   if (!woken && !followUp) return;                        // 既没叫名字、也不在追问窗口 → 只是普通发言
+  /* ★ 2026-10-04 光叫名字没说事 → **不答，但应一声**（等后半句）。
+   * ▎为什么放在在途锁之前：一个碎片不该占用在途锁、也不该被算成"AI 答了一次"，
+   *   否则后半句到达时正好撞上锁被拒（少答一句），而计数还虚高。
+   * ▎为什么这里可以顺延窗口而前面那条纪律说"被丢弃的噪音不顺延"：
+   *   光有名字**不是噪音**，那是用户在叫它——只是分段把话切在了半句上。
+   *   顺延一次（20s）换来的是"随后那半句被当追问接住"，
+   *   不顺延就会出现另一种难受：喊了它，它一声不吭。 */
+  if (woken && Asr.isNameOnly(normAsrText(clean))) {
+    if (AI_CHAT_WINDOW_MS > 0) room.aiChatUntil = now + AI_CHAT_WINDOW_MS;
+    /* ★ 2026-10-06 夜二 无论这次有没有真的应出声，都先挂上"半句续接"——
+     *   分段把「小明，把纪要生成一下」切成两条是**转写侧**的事实，
+     *   不该因为朗读在忙而丢掉后半句（丢掉 = 用户喊了它、它整句都不理）。 */
+    room.aiAskTailUntil = now + AI_ASK_TAIL_MS;
+    bump(COLLAB.throttled, 'name-only');
+    logEvent('debug', 'ai-wake-name-only', { roomNumber, member: memberId });
+    if (process.env.ASR_DEBUG) console.log(`[asr-wake] ${speakerName || memberId} 只叫了名字，等后半句`);
+    /* ★ 2026-10-05c 只叫名字也要"答应一声"（用户体感："喊它它不理 = AI 不作答"）：
+     *   isNameOnly 闸防的是"拿半句话去触发完整 RAG 回答"，不是"装聋"。折中：
+     *   短应答「我在，你说」——零 LLM、零检索、固定短语轮换（确定性计数器，
+     *   不用随机数），说完顺延追问窗口，用户的下一句走追问路拿完整回答。
+     *   ▸ 节流：AI 正在作答/朗读时不插嘴；10 秒内反复喊名字只应答一次
+     *     （应答本身把窗口续上，连喊不会变成机关枪）。 */
+    if (!room.aiAnswering && (!room.lastNameOnlyAckTs || now - room.lastNameOnlyAckTs > 10000)) {
+      room.lastNameOnlyAckTs = now;
+      const acks = ['我在，你说。', '嗯，我在听。', '你说，我记着呢。'];
+      room.nameOnlyAckIdx = ((room.nameOnlyAckIdx || 0) + 1) % acks.length;
+      const ack = acks[room.nameOnlyAckIdx];
+      /* ★ 自我回声防护：ack 的声音从扬声器出来会被麦克风收回去，而追问窗口刚被打开——
+       *   不登记为"最近答案"的话，回声会作为追问进 aiBrain = AI 应答自己的应答。
+       *   与完整回答同一条回声闸口径（45s 窗 + 归一化包含判据）。 */
+      room.aiLastAnswer = { norm: normAsrText(ack), ts: now };
+      emitBotSay(roomNumber, ack);
+      speakAnswerForRoom(roomNumber, ack).catch(() => {});
+      io.to(roomNumber).emit('ai-state', { state: 'speaking', text: ack });
+      setTimeout(() => {
+        const r = rooms.get(roomNumber);
+        if (r && !r.aiAnswering) io.to(roomNumber).emit('ai-state', { state: 'idle' });
+      }, 1800);
+      logEvent('info', 'ai-wake-ack', { roomNumber, member: memberId });
+    }
+    return;
+  }
   /* ★ 2026-10-02 应答风暴的下游三道闸（上游见 finalizeUtterance 的重复句闸）：
          *   ① **在途锁**：一次回答还在生成/朗读时，不再开第二路——两路 ai-stream 交错进同一个
          *      气泡、两路 TTS 互相掐，是"对话很混乱"的直接观感来源。宁可少答一句，不能同时答两句。
@@ -3131,6 +5126,9 @@ async function asrWakeAndAnswer(roomNumber, memberId, text, speakerName) {
   }
   if (AI_CHAT_WINDOW_MS > 0) room.aiChatUntil = now + AI_CHAT_WINDOW_MS; // 窗口顺延（只在这次真的接话时）
   COLLAB.answers += 1;   // ★ 过了所有闸、这次**真的**要答了才计数（"AI 今天答了几次话"的口径）
+  /* 同一次记账按"为什么答"分类：被叫到名字 / 免唤醒续接（追问窗口或分段半句）。
+     两者必须分开量——混在一起就查不出"没人叫它却开口"（规矩违反是静默的）。 */
+  COLLAB.answerVia[woken ? 'wake' : 'follow-up'] += 1;
 
   const who = speakerName || memberDisplayName(roomNumber, memberId);
   logEvent('info', 'asr-wake-answer', { roomNumber, member: memberId, via: woken ? 'wake' : 'follow-up' });
@@ -3138,8 +5136,15 @@ async function asrWakeAndAnswer(roomNumber, memberId, text, speakerName) {
   room.aiAnswering = true; // ★ 2026-10-02 在途锁（下面的"三道闸"注释解释了为什么要锁）
   try {
     /* 追问时把"是谁在问"带进问题里：brain 的会话记忆是房间级的，
-     * 模型只有知道说话人，才能答对"我刚才说的那个"这类指代。 */
-    const question = followUp ? `（${who} 继续说）${clean}` : clean;
+     * 模型只有知道说话人，才能答对"我刚才说的那个"这类指代。
+     * ▸ ★ 2026-10-06 夜二 **唤醒路**把提问收窄到"叫它的那一小句"（Asr.wakeClause）：
+     *   分段累积会把几句不相干的话并进同一条字幕，旧写法把整条丢给模型，
+     *   于是它真的去检索「大木车」并认真回答——用户看到的就是"我没让它管这事"（= 答非所问）。
+     *   ▸ 收窄的只是**喂给模型的问题**；会议记录 / 看板 / RAG 语料仍是整条字幕，
+     *     "有人说了什么"与"他在要求什么"是两个概念（坑 47：一个概念一个来源，但这里本就是两个概念）。
+     *   ▸ 追问路不收窄：那条本身就是被分段切断的半句，再切就丢了请求。 */
+    const ask = woken && !followUp ? (Asr.wakeClause(clean) || clean) : clean;
+    const question = followUp ? `（${who} 继续说）${clean}` : ask;
     /* ★ 09-30d 语音应答流式化（"语音体验还是差"的最大感知项）：
      * ▎原实现等 aiBrain 完整返回才广播——说完话到看到回答首字要 5s（段）+ 3s（转写）
      *   + 2~4s（LLM 全文）≈ 10s+，全是干等；
@@ -3161,14 +5166,30 @@ async function asrWakeAndAnswer(roomNumber, memberId, text, speakerName) {
       voice.feed(streamed);
     }, (phase) => {
       io.to(roomNumber).emit('ai-state', { state: 'thinking', phase }); // 阶段透传（检索中/换说法/整理答案）
-    });
+      /* ★ 2026-10-09 语音问答这一路**一定会被念出口**，所以把 spoken 传进去：
+       *   让模型把结论压进第一句（配合流水线那侧"首句整句念、后续不拦腰切"）。
+       *   @ai 打字那一轨不传——它只进气泡，没人用耳朵听。 */
+    }, { spoken: true });
     io.to(roomNumber).emit('ai-stream', {
       id: streamId, delta: '', done: true, mock: !!r.mock,
+      trace: aiTraceParts(r).join(' · '),   // ★ 2026-10-04 与 @ai 通路披露一致（原来这里没有）
       hitList: r.evidence || [],
     });
     io.to(roomNumber).emit('ai-state', { state: 'speaking', text: r.text });
     io.to(roomNumber).emit('chat-message', {
-      from: 'ai-bot', name: '🤖 AI 小明', text: r.text, ts: answerTs, streamId: undefined,
+      from: 'ai-bot', name: 'AI 小明', text: r.text, ts: answerTs,
+      /* ★ 2026-10-04 真缺陷：这里原先把这个字段**显式置空**。
+       *   前端靠 streamId 判断"这一轮的增量已经渲染过了"（aiStreamDone），
+       *   拿不到它就当作一条新消息再插一条气泡——于是**同一句答案在聊天里出现两遍**，
+       *   而且两条的名字还不一样：流式那条用客户端写死的「AI 助理」，
+       *   终态这条用服务器发的「AI 小明」。用户看到的就是一只机器人有两个名字、
+       *   同一句话刷屏两次。 @ai 打字通路一直是带 streamId 的，两条通路本应同构。 */
+      streamId,
+      /* ★ 2026-10-07 因果记账：trig = 引发这次应答的那条字幕的定稿时刻
+       *   （判据与为什么需要它，见 asrWakeAndAnswer 上方那段——自测据此判
+       *   "闲聊句有没有被接话"，不再拿 7 秒时间窗猜，窗口会把上一问的迟到答案错记到它头上）。 */
+      trig: capTs || null,
+      ai: aiAnswerMeta(r),
       // ★ 2026-10-01：服务端 TTS 链路（Qwen 本地/Edge）会送音频 → 前端别用浏览器 TTS 搶读；
       //   合成失败时服务器补发 ai-tts-fail，前端回落浏览器朗读（文字永远不丢）。
       tts: serverVoiceReady() ? 'server' : undefined,
@@ -3179,6 +5200,9 @@ async function asrWakeAndAnswer(roomNumber, memberId, text, speakerName) {
     try {
       ingestCaptions(roomNumber, [{
         ts: answerTs, from: 'ai-bot', name: 'AI 小明', text: String(r.text).slice(0, 500), asr: false,
+        /* ★ 2026-10-05 夜二：标成 bot，看板据此跳过（AI 的话不该被抽成"决定/待办"，
+           更不能反过来被 AI 自己播报成"一条没人认领的行动项"）。账本仍留全量给 RAG。 */
+        bot: true,
       }]);
     } catch (e) { /* 账本失败不影响应答 */ }
     /* ★ 2026-10-02 记下"AI 刚刚说过什么"，给两处下游用：
@@ -3226,6 +5250,7 @@ async function asrWakeAndAnswer(roomNumber, memberId, text, speakerName) {
  *   都在模块里修掉了，此处只保留"拿到 runner 之后怎么用"。 */
 let WHISPER = null;          // probe 出来的 whisper runner（null = 本机不可用）
 let whisperProbed = false;
+let whisperRetries = 0;
 async function probeWhisper() {
   if (whisperProbed) return WHISPER;
   whisperProbed = true;
@@ -3234,6 +5259,18 @@ async function probeWhisper() {
   } catch (e) {
     WHISPER = null;
   }
+  /* ★ 2026-10-04h 探测失败不再终身定性：机器越用越慢（python 冷 import 实测 47s+）
+   *   时，启动那一瞬的探测会超时 → 兜底耳朵整个生命周期消失 → "用一段时间就停了"。
+   *   现在失败后**每 60s 后台重试**（最多 10 趟），翻绿那一刻自动把兜底接回来；
+   *   前端字幕模式不受影响（qwen-local 主引擎在时根本用不到兜底）。 */
+  if (!WHISPER && whisperRetries < 10) {
+    whisperRetries += 1;
+    setTimeout(() => {
+      console.log(`🔁 whisper 兜底探测失败，60s 后第 ${whisperRetries}/10 次重试（机器慢时冷 import 可能要 1 分钟+）`);
+      whisperProbed = false;
+      probeWhisper().catch(() => {});
+    }, 60000);
+  }
   if (WHISPER) {
     /* ★ 2026-10-02 这行日志改口径：它原来无条件打 whisper，而实际引擎可能是 qwen-local
      *   ——用户照着日志读，得出的结论就是"根本没切过去，还在用 whisper"（本轮用户原话）。
@@ -3241,9 +5278,9 @@ async function probeWhisper() {
      *   真正在转写的是 serverAsrEngineLabel() 说的那个，日志必须说真话。 */
     const primary = serverAsrEngineLabel();
     if (primary === 'whisper') {
-      console.log(`🎙 服务端转写（ASR）已开启：${WHISPER.label}（模型 ${Asr.DEFAULT_MODEL}，每 ${Asr.DEFAULT_SEGMENT_SEC}s 一段写入字幕账本，AI 小明能听懂会议内容了）`);
+      console.log(`🎙 服务端转写（ASR）已开启：${WHISPER.label}（模型 ${Asr.DEFAULT_MODEL}，每 ${resolveAsrSegmentSec()}s 一段写入字幕账本，AI 小明能听懂会议内容了）`);
     } else {
-      console.log(`🎙 服务端转写（ASR）已开启：主引擎 = ${primary}（每 ${Asr.DEFAULT_SEGMENT_SEC}s 一段写入字幕账本）；whisper 已探测到，仅作兜底（${WHISPER.label}）`);
+      console.log(`🎙 服务端转写（ASR）已开启：主引擎 = ${primary}（每 ${resolveAsrSegmentSec()}s 一段写入字幕账本）；whisper 已探测到，仅作兜底（${WHISPER.label}）`);
     }
   } else {
     console.log('🎙 服务端转写（ASR）未开启：未检测到 whisper。安装： pip install -U openai-whisper （重启生效）；此时前端才回退浏览器识别');
@@ -3946,7 +5983,7 @@ function broadcastRoomState(roomNumber) {
   //   它没有 socket/媒体，muted/camOff 都是"是"（它不推流，只"听"：见下方音频管线）
   if (room.aiBot) {
     members.push({
-      id: 'ai-bot', name: '🤖 AI 小明', isBot: true, avatar: 'ai',
+      id: 'ai-bot', name: 'AI 小明', isBot: true, avatar: 'ai',
       owner: false, muted: true, camOff: true, sharing: false, hand: false, caption: true,
     });
   }
@@ -4090,6 +6127,12 @@ function destroyRoom(roomNumber, reason) {
   if (room.netLevelTimer) clearInterval(room.netLevelTimer);
   if (room.talkTimer) clearInterval(room.talkTimer);
   if (room.ttlTimer) clearTimeout(room.ttlTimer);
+  /* ★ 2026-10-06 房间动作的回执看门狗一起收走（房都没了，"没人执行"这件事无从谈起）。
+   *   不收的话它 4 秒后自己也会因 rooms.has() 为假而静默退出，但"定时器全清"
+   *   是 destroyRoom 的既有约定（netLevel/talk/ttl 三颗都在这儿清）。 */
+  for (const [key, timer] of pendingRoomActionAcks) {
+    if (key.startsWith(`${roomNumber}|`)) { clearTimeout(timer); pendingRoomActionAcks.delete(key); }
+  }
   // ★ N2：房间销毁时 bot 若在场 → 终稿纪要（异步，读的账本都在文件/闭包里，不依赖 room）
   if (room.aiBot) {
     if (room.minutesTimer) { clearInterval(room.minutesTimer); room.minutesTimer = null; }
@@ -4098,6 +6141,20 @@ function destroyRoom(roomNumber, reason) {
   }
   rooms.delete(roomNumber);
   remoteCtl.delete(roomNumber);
+  /* ★ 2026-10-07 第 51 步：房间销毁 = 这场会的共享文件一起清掉。
+   * ▎为什么删而不是留：它们是"**这场会**的共享材料"，不是网盘。留着有两个真实的坏处——
+   *   ① 房间号会回收复用，下一场会打开面板可能看到上一场会的文件（隐私）；
+   *      （列表已经按 createdAt 过滤过，但那只是"看不见"，字节还躺在盘上）
+   *   ② 教学服务器磁盘有限，而没人会去清（挂一周就是几十 GB）。
+   * ▎宽限期（默认 60s）内房间还没销毁，所以"出去倒杯水回来"文件都还在——
+   *   真正的销毁点在 TTL 到期，这一条不会误伤短暂掉线。
+   * ▎删除失败不阻塞房间销毁（磁盘问题不该让内存结构泄漏）。 */
+  try {
+    const nFiles = Files.removeRoom(roomNumber);
+    if (nFiles > 0) console.log(`📁 房间 ${roomNumber} 的 ${nFiles} 个共享文件已随房间清理`);
+  } catch (e) {
+    logEvent('warn', 'files-cleanup-failed', { roomNumber, reason: String(e && e.message).slice(0, 160) });
+  }
   stopAiAudioPipeline(roomNumber); // ★ 09-19：房间销毁 → AI 管线全拆（防 ffmpeg/Transport 泄漏）
   disposeRoomBrain(roomNumber);    // ★ 09-24e：智能体（检索索引 + 会话记忆）同步释放，防内存慢性泄漏
   disposeRoomBoard(roomNumber);    // ★ 09-25：看板同步释放（它是会议级状态，房间没了就该没了）
@@ -4335,6 +6392,23 @@ io.on('connection', (socket) => {
     if (avatar) socket.avatar = avatar; // ★ 09-26：头像随身份绑定（room-state 广播用）
     socket.role = role || 'guest';      // ★ 09-27e G6-②：角色随身份绑定（owner 仍以 room.ownerId 为准）
   };
+  /* ★ 2026-10-09 第 52 步：bindIdentity 的反面。
+   * ▎"撤销这条连接的登录身份"是一个概念，而原先它散在两处：登出要清四个字段、
+   *   续期失败只回一句错误（连接上的身份原封不动）——于是客户端显示"游客"、
+   *   服务器仍然按"成员"放行录制，两边各说各话（坑 47）。
+   * ▸ 收成一处之后，两个调用点（auth-logout / auth-refresh 判失败）行为必然一致。
+   * ▸ owner 不受影响是**有意**的：房主由 room.ownerId 判定，与登录态无关
+   *   （09-29 那条"没登录的建房者也是 owner"），退出不等于把房子拆了。 */
+  const dropIdentity = (why) => {
+    const had = socket.username;
+    socket.username = null;
+    socket.displayName = null;
+    socket.avatar = null;
+    socket.role = 'guest';
+    if (socket.roomNumber) broadcastRoomState(socket.roomNumber);
+    logEvent('info', 'auth-drop-identity', { by: why, username: had || 'guest' });
+    return had;
+  };
   socket.on('auth-register', ({ username, password, displayName, avatar: avatarKey } = {}, callback) => {
     if (!callback) return;
     if (!validUsername(username)) return fail(callback, '用户名需 2~16 位（中英文/数字/下划线）');
@@ -4424,8 +6498,44 @@ io.on('connection', (socket) => {
   socket.on('auth-refresh', ({ username, token } = {}, callback) => {
     if (!callback) return;
     const u = store.getUser(username);
-    if (!u || !validToken(token, username)) return fail(callback, '登录态已失效，请重新登录');
+    if (!u || !validToken(token, username)) {
+      /* ★ 2026-10-09 票失效必须**同时**撤销这条连接的身份。
+       *   原来这里只回一句错误，连接上的 socket.role 仍是 member/admin——
+       *   客户端已经退回游客显示，服务器却还按老身份放行录制与删除，
+       *   两边各说各话（而"我退出了却还能录像"这种差别没人能一眼看出）。 */
+      if (socket.username) dropIdentity('refresh-expired');
+      return fail(callback, '登录态已失效，请重新登录');
+    }
     ok(callback, { expiresAt: authTokens.get(token).expiresAt });
+  });
+
+  /* ★ 2026-10-09 登出：把 bindIdentity 那条"只进不出"的路补上出口。
+   * ▎审计发现的缺口（本轮补的三件事之一，用户报"没有退出登录的效果"）：
+   *   `bindIdentity` 会把 username/displayName/avatar/role 绑到 socket 上，而全文件
+   *   **没有任何一处把它们清回去**（唯一的 null 赋值发生在连接刚建立那一次）。
+   *   于是前端就算清了 localStorage，这条连接在服务器仍然"是那位用户"——
+   *   成员列表昵称、文件署名（`byName`）、AI 的 `memberDisplayName()` 全都照旧，
+   *   用户看到的就是"我退出了，可别人还认得我"。
+   * ▎三件事按顺序做，缺一件都是半吊子：
+   *   ① 作废这张票——**只作废本连接自己用的那张**：拿别人的 token 来调这个接口就把它删掉，
+   *      等于任何人都能踢任何人下线（DoS），所以先比 username；
+   *   ② 清 socket 身份（roleOf 会立刻从 member/admin 落回 guest，未登录的治理权一并收回）；
+   *   ③ 广播 room-state（别人眼里我的昵称当场回退成"成员 xxxx"）。
+   * ▎人**不离开房间**：退出登录 ≠ 离开会议。游客本来就可以在场（09-16 就是这么设计的），
+   *   把"退出"做成踢人会让用户不敢点，那才是这个功能真正的失败模式。 */
+  socket.on('auth-logout', ({ token } = {}, callback) => {
+    const held = token && authTokens.get(token);
+    /* ★ 传进来的票**不是自己这张** → 什么都不做，直接拒。
+     *   两个理由：① 删别人的票就是"用一次退出把管理员踢下线"的 DoS 入口；
+     *   ② 也不该顺手把"自己"退掉——客户端拿着一个错票说明它自己都糊涂了，
+     *     悄悄撤销身份会让人找不到北（判据：一条请求最坏要"无副作用"，不是"顺带做点别的"）。 */
+    if (held && held.username !== socket.username) {
+      logEvent('warn', 'auth-logout-ignored', { by: socket.username, target: held.username });
+      return fail(callback, '这张票不属于当前连接');
+    }
+    if (held) authTokens.delete(token);            // held 为空 = 票已过期/不存在，本地照样退回游客
+    dropIdentity('logout');
+    ok(callback, { ok: true });
   });
 
   /* ---- 公共函数：真正把一个连接放进房间（创建/加入的"后半段"共用）---- */
@@ -4498,6 +6608,22 @@ io.on('connection', (socket) => {
       socket.emit('board-state', { entries: room.boardLedger.slice(-BOARD_LEDGER_MAX), ts: Date.now() });
     }
 
+    /* ★ 2026-10-07 第 51 步：共享文件清单 + 当前视角补发给新人（只发给他自己，同一条纪律）。
+     *   ▎没有这一步的话，"中途进会的人打开文件面板是空的"——而列表明明有东西，
+     *     他只会得出"这功能坏了"的结论（坑 76 的用户版：机制在，但他没收到）。
+     *   ▸ 空清单也照发：前端要靠这条消息把面板从"加载中"切成"这场会还没有文件"，
+     *     只在有内容时发的话，空房间的面板会永远停在转圈。 */
+    socket.emit('files-state', {
+      files: Files.listFiles(roomNumber, { since: room.createdAt }),
+      view: room.fileView || null,
+      limits: {
+        maxFileBytes: FILE_LIMITS.maxFileBytes,
+        maxRoomBytes: FILE_LIMITS.maxRoomBytes,
+        maxCount: FILE_LIMITS.maxCount,
+      },
+      ts: Date.now(),
+    });
+
     // ② 通知老成员"来新人了"（老成员不用现在做什么，等他 produce 时会收到 new-producer）
     socket.to(roomNumber).emit('new-member', { id: socket.id });
 
@@ -4512,9 +6638,25 @@ io.on('connection', (socket) => {
 
   /* ---- 房间相关事件（从 Mesh 版复制，逻辑几乎没变）---- */
 
-  socket.on('create-room', async ({ password } = {}, callback) => {
+  socket.on('create-room', async ({ password, roomNumber: want } = {}, callback) => {
     if (socket.roomNumber) { if (callback) return fail(callback, '已在房间里'); return; }
-    const roomNumber = generateRoomNumber();
+    /* ★ 2026-10-04h 续会识别：服务器重启后用户重进同一房间号继续开会时，
+     *   若把 createdAt 设成"现在"，Brain 的检索范围（下界=房间创建时刻）会把
+     *   **重启前的字幕全部挡在界外**——AI 对半场会突然失忆（跨会议防串味的边界
+     *   误伤了"重启续会"）。判据：账本里该房间号的最近一条字幕距今 ≤30 分钟，
+     *   且与它连续（相邻间隔 ≤10 分钟）的时间线起点 = 本场会的真实开始时刻。
+     *   ▸ 这条边界同时保证了"号码被别的会复用"依然防得住：真正的新一场会
+     *     距离上一场的字幕早已超过 30 分钟，时间线回溯不会跨过去。
+     *   ▸ 配套：create-room 接受**指定房号**（客户端退房后会把原号填回输入框，
+     *     用户点「创建房间」= 原号续开）。号被占用就明确拒绝，绝不静默换号。 */
+    let roomNumber = generateRoomNumber();
+    const wanted = String(want || '').trim();
+    if (wanted) {
+      if (!/^\d{6}$/.test(wanted)) { if (callback) return fail(callback, '房间号需为 6 位数字'); return; }
+      if (rooms.has(wanted)) { if (callback) return fail(callback, `房间 ${wanted} 已存在（还开着），直接加入即可`); return; }
+      roomNumber = wanted;
+    }
+    const createdAt = meetingStartFromLedger(roomNumber) || Date.now();
     rooms.set(roomNumber, {
       password: password || null,
       members: new Set(),
@@ -4522,12 +6664,19 @@ io.on('connection', (socket) => {
       ownerId: socket.id,         // ★ D4：房主（建房的这个人）——踢人权限只在他手里
       audioObserver: null,        // ★ D2：说话人检测观察者（第一路音频 Producer 出现时创建）
       producerOwner: new Map(),   // ★ D2/D4：producerId -> socketId（把"某路媒体"翻译回"某个人"）
-      createdAt: Date.now(),      // ★ 09-13 观测面板：房间创建时间（算会议时长用）
+      createdAt,                  // ★ 09-13 观测面板；★ 2026-10-04h 重启续会时=时间线回溯起点
+      resumed: createdAt !== Date.now(),   // 是"续会"（面板/日志可如实标注）
       talk: new Map(),            // ★ 09-13 发言时长统计：socketId -> 累计发言秒数（D2 延伸）
       boardLedger: [],            // ★ 2026-10-03 白板笔迹账本（服务器权威副本，见 board-record）
+      /* ★ 2026-10-07 第 51 步：共享文件的"当前视角"——谁在看哪一份、第几页、滚到哪儿了。
+       *   存服务器而不是纯广播的理由：晚进房/刚刷新的人需要**当前值**，
+       *   而广播只有变化那一刻（与 board-state / room-state 同一条做法）。
+       *   ▸ 文件**字节**不在内存里，在 sfu/files/<房号>/blob/（账本 index.json）——
+       *     所以服务器重启后文件还在，只是"这场会看不看得到"由 createdAt 的下界决定。 */
+      fileView: null,
     });
-    console.log(`🆕 新房间已创建：${roomNumber}（创建者 ${socket.id}）${password ? '🔒 已设密码' : ''}`);
-    logEvent('info', 'room-created', { roomNumber, by: socket.id, hasPassword: !!password });
+    console.log(`🆕 新房间已创建：${roomNumber}（创建者 ${socket.id}）${password ? '🔒 已设密码' : ''}${createdAt !== Date.now() ? ` · ♻️ 识别为重启续会（会议起点回溯到 ${new Date(createdAt).toLocaleTimeString()}）` : ''}`);
+    logEvent('info', 'room-created', { roomNumber, by: socket.id, hasPassword: !!password, resumed: createdAt !== Date.now() });
     socket.emit('room-created', { roomNumber });
     await joinRoom(roomNumber);
     // ★ 09-24 C4：ack 也带上自己的 roomToken（前端即便没接 room-members 也能拿到）
@@ -5231,6 +7380,13 @@ io.on('connection', (socket) => {
     const action = String(msg.action || '');
     if (!ROOM_ACTIONS[action] || !msg.ok) return;
     bump(COLLAB.roomApplied, action);
+    /* ★ 2026-10-06 撤销这一房的看门狗：回执到 = 客户端真的做了 = 没什么可报的。
+     *   ▎为什么在这里 clearTimeout 而不是等到点再比计数：看门狗只在"没人回执"时才是
+     *     证据；一旦有人回执，这条等待已经完结，留着定时器只会让下一次同动作的判断
+     *     读到陈旧状态（坑 90 同一条：一个时间戳/一条等待只能回答一个问题）。 */
+    const key = `${socket.roomNumber}|${action}`;
+    const timer = pendingRoomActionAcks.get(key);
+    if (timer) { clearTimeout(timer); pendingRoomActionAcks.delete(key); }
   });
 
   /* ★ 2026-10-03 第 38 步：客户端上报"看见答案 → 听见它开口"的实测毫秒数。
@@ -5254,6 +7410,19 @@ io.on('connection', (socket) => {
    *   刷新后可能少一笔；但白板是协作草图，不是合同文本，
    *   为它上一套两阶段提交是拿错的东西去换对的代价（延迟与复杂度）。
    *   真正的权威记录在 sfu/boards/*.jsonl，内存账本只负责"给新人补发画布"。 */
+  /* ★ 2026-10-04f 白板笔迹的**信令兜底**（与聊天双路径同一先例：at-least-once + 客户端
+   *   msgId 去重）。为什么要兜：SCTP 数据通道对晚到者/消费竞态**时灵时不灵**
+   *   （真浏览器 e2e 实测：B 端字幕走信令一直能到、白板走 SCTP 时而 0 像素）——
+   *   聊天为此早已双发，白板此前只有一条路，晚到的人会**永久错过笔迹**。
+   *   服务器只做中继（校验房间 + 原样广播 payload，客户端 handleBoardMessage
+   *   的既有校验/去重兜底），不落账本——账本仍由 board-record（画完的整笔）负责。 */
+  socket.on('board-signal', (msg = {}) => {
+    const roomNumber = socket.roomNumber;
+    if (!roomNumber || !rooms.get(roomNumber)) return;
+    if (!msg || typeof msg !== 'object' || msg.type !== 'board') return;
+    io.to(roomNumber).emit('board-signal', { from: socket.id, payload: msg });
+  });
+
   socket.on('board-record', (msg = {}) => {
     const roomNumber = socket.roomNumber;
     const room = roomNumber && rooms.get(roomNumber);
@@ -5281,6 +7450,67 @@ io.on('connection', (socket) => {
       if (room.boardLedger.length > BOARD_LEDGER_MAX) room.boardLedger.splice(0, room.boardLedger.length - BOARD_LEDGER_MAX);
       appendBoardLine(roomNumber, { ts: Date.now(), by: socket.id, op: 'stroke', color: s.color, n: s.pts.length });
     }
+  });
+
+  /* ★ 2026-10-07 第 51 步：共享文件的信令面（HTTP 只管字节，这里管"谁知道发生了什么"）
+   *     files-list    取清单（面板打开时 / 手动刷新）
+   *     files-delete  删一个文件
+   *     files-view    我在看哪一份、第几页、滚到哪儿了（"跟随主讲"的数据源）
+   *
+   * ▎删除为什么走**信令**而不是 HTTP DELETE：HTTP 那一层只有房间令牌，
+   *   而房间令牌是**房间级**的、不绑成员身份——它答不出"这个请求是不是上传者本人发的"。
+   *   信令这一层有 socket（= 有身份、有角色），所以"房主/管理员/上传者本人才能删"
+   *   这条判据只能在这里做。同一个功能的两半（字节走 HTTP、权限走信令）是刻意分的。
+   * ▸ 诚实边界：`byId` 是上传时客户端**自报**的（HTTP 头），所以"上传者本人"这一档
+   *   严格说是"自报为上传者的人"。要做实就得把房间令牌绑到成员（令牌里加 memberId），
+   *   这里如实停在"房主/管理员是硬判据、本人是软判据"，不吹成完整的权限模型。
+   * ▎三条都用 ok/fail helper（它们自带 typeof 守卫，见坑 33：浏览器端"不带回调"的 emit
+   *   碰上无守卫的 callback 调用 = 整台服务器崩溃）。 */
+  socket.on('files-list', (payload = {}, callback) => {
+    const roomNumber = socket.roomNumber;
+    const room = roomNumber && rooms.get(roomNumber);
+    if (!room) return fail(callback, '先进入房间再看共享文件');
+    ok(callback, {
+      files: Files.listFiles(roomNumber, { since: room.createdAt }),
+      view: room.fileView || null,
+      limits: { maxFileBytes: FILE_LIMITS.maxFileBytes, maxRoomBytes: FILE_LIMITS.maxRoomBytes, maxCount: FILE_LIMITS.maxCount },
+    });
+  });
+
+  socket.on('files-delete', (payload = {}, callback) => {
+    const roomNumber = socket.roomNumber;
+    const room = roomNumber && rooms.get(roomNumber);
+    if (!room) return fail(callback, '先进入房间');
+    const name = String((payload && payload.name) || '');
+    const list = Files.listFiles(roomNumber, { since: room.createdAt });
+    const entry = list.find((f) => f.name === name);
+    /* 判据用"本场会的清单"而不是"盘上有没有"：房间号回收复用时，
+     * 上一场会的文件在盘上还在，但不该被这一场会的人删掉（与下载路由同一条边界）。 */
+    if (!entry) return fail(callback, '这个文件不在本场会议的清单里');
+    const role = roleOf(socket, room);
+    const mine = !!(entry.byId && entry.byId === socket.id);
+    if (role !== 'owner' && role !== 'admin' && !mine) {
+      bump(COLLAB.files, 'rejected');
+      return fail(callback, '只有房主、管理员或上传者本人能删这个文件');
+    }
+    if (!rateLimit(`files-del:${socket.id}`, 30, 60000)) return fail(callback, '删得太快了，歇一会儿再删');
+    if (!Files.removeFile(roomNumber, name)) return fail(callback, '删除失败（文件已经不在盘上了）');
+    bump(COLLAB.files, 'delete');
+    logEvent('info', 'file-deleted', { roomNumber, name, by: socket.displayName || socket.id, role });
+    console.log(`🗑️ [${roomNumber}] ${socket.displayName || '某位成员'} 删除了共享文件「${name}」`);
+    /* 全房正在看的就是这一份时，把"当前视角"清空——
+     * 否则跟随的人会一直盯着一块"文件不存在"的空白，还以为是自己网断了。 */
+    if (room.fileView && room.fileView.name === name) setRoomFileView(roomNumber, socket, null);
+    broadcastFiles(roomNumber, 'remove', socket.displayName || null, name);
+    ok(callback, { ok: true, name });
+  });
+
+  socket.on('files-view', (payload = {}) => {
+    const roomNumber = socket.roomNumber;
+    const room = roomNumber && rooms.get(roomNumber);
+    if (!room) return;
+    if (!rateLimit(`files-view:${socket.id}`, 200, 10000)) return;   // 滚动很密，给个上限防刷
+    setRoomFileView(roomNumber, socket, payload && typeof payload === 'object' ? payload : null);
   });
 
   /* ★ 09-24 体验修复：以前 bot 不在房里的回答是冷冰冰的一句 fail(……需要先点 AI 助理按钮)。
@@ -5319,27 +7549,11 @@ io.on('connection', (socket) => {
     /* ★ 09-24e：done 帧把"检索过程"一起送给前端（流式路径的增量期还不知道检索结果，
      *   等 aiBrain 返回才有）。前端在 done 时把它插进气泡——这样流式与一次性两条路径
      *   的信息披露完全一致（否则只有非流式能看到证据链，等于两条路径两种可信度）。 */
-    const traceParts = [];
-    if (r.totalDocs) {
-      /* ★ 09-25：把检索范围写清楚——"本场会议 N 条"与"全档 M 条"（M>N 说明存档里还有
-       *   房间号复用前 / 更早的会议记录）是两种不同强度的证据，用户有权知道。 */
-      traceParts.push(r.scoped && r.allDocs > r.totalDocs
-        ? `📚 本场检索 ${r.totalDocs} 条字幕取 ${(r.hits || []).length} 条（全档 ${r.allDocs} 条）`
-        : `📚 检索 ${r.totalDocs} 条字幕取 ${(r.hits || []).length} 条`);
-    }
-    if (r.turns > 1) traceParts.push(`💬 第 ${r.turns} 轮`);
-    /* ★ 09-25：把"多查询改写"写进证据链。它是**答案可信度的一部分**——
-     *   "我第一遍没找到，是靠把问题改写成别的说法才找到的"与"我直接就找到了"，
-     *   是两种不同的确定程度；静默处理等于偷偷降低了透明度。 */
-    if (r.rewrites) {
-      traceParts.push(`🔄 原问法召回不足（覆盖率 ${r.rewrites.topCoverBefore}），`
-        + `已用 ${r.rewrites.used} 条改写查询融合检索`);
-    }
-    if (r.intent && r.intent !== 'question') {
-      traceParts.push(`🎯 ${({ minutes: '生成纪要', recap: '回顾', operator: '远程操作' })[r.intent] || r.intent}`);
-    }
+    /* ★ 2026-10-04：证据链文案与 ai 元信息都改成调用公共实现（见文件头 aiTraceParts / aiAnswerMeta）。
+     *   原来这两段在 @ai 通路与语音通路各内联一份，语音那份漏了 streamId 与 trace，
+     *   于是同一句答案在聊天里出现两条、名字还不一致（用户截图抓出来的）。 */
     io.to(roomNumber).emit('ai-stream', {
-      id: streamId, delta: '', done: true, mock: !!r.mock, trace: traceParts.join(' · '),
+      id: streamId, delta: '', done: true, mock: !!r.mock, trace: aiTraceParts(r).join(' · '),
       // ★ 09-25：流式路径也要带证据原话（否则两条路径的信息披露不一致 = 两种可信度）
       hitList: r.evidence || [],
     });
@@ -5349,25 +7563,13 @@ io.on('connection', (socket) => {
       Math.min(12000, 2000 + (r.text || '').length * 90));
     const answerTs = Date.now();
     io.to(roomNumber).emit('chat-message', {
-      from: 'ai-bot', name: '🤖 AI 小明', text: r.text, ts: answerTs, streamId,
+      from: 'ai-bot', name: 'AI 小明', text: r.text, ts: answerTs, streamId,
       tts: serverVoiceReady() ? 'server' : undefined, // ★ 同上：服务端语音标记
       /* ★ 09-24e：把"这条答案是怎么来的"一起广播出去——检索自几千条字幕里的哪几条、
        *   这是第几轮追问、意图是什么。**智能不该是玄学**：用户能看到 AI 真的去查了会议记录，
        *   而不是凭空编了一段话。这也是最有力的"AI 不是空壳"的现场证据。
        * ★ 09-25 增 scoped/allDocs：证据的**时间范围**同样属于可信度信息。 */
-      ai: {
-        mock: !!r.mock, tokens: (r.usage && r.usage.totalTokens) || 0,
-        file: r.file || null, path: r.path || null,
-        intent: r.intent || null, turns: r.turns || 0,
-        hits: (r.hits || []).length, usedHits: r.usedHits || 0, totalDocs: r.totalDocs || 0,
-        scoped: !!r.scoped, allDocs: r.allDocs || 0,
-        /* ★ 09-25：把**答案真正的依据**原话一起发给前端（此前只发条数，且固定取检索命中）。
-         *   ▎`r.evidence` 已经是"哪个来源驱动了答案就展示哪个"（见 aiBrain 里的说明）——
-         *     注入了看板证据就是那些条目，否则才是检索命中的字幕。
-         *     用户能真正核对"AI 是照着我说的/看板上的哪句话回答的"：
-         *     **可验证从口号变成事实**（光有数字仍然只能选择相信）。 */
-        hitList: r.evidence || [],
-      },
+      ai: aiAnswerMeta(r),
     });
     speakAnswerForRoom(roomNumber, r.text, answerTs); // ★ 09-30c：服务端神经语音（可用时）
     logEvent('info', 'ai-ask', {
@@ -5406,7 +7608,7 @@ io.on('connection', (socket) => {
         : await buildMinutes(socket.roomNumber, { type, since });
       const label = type === 'final' ? '终稿' : (type === 'merge' ? '跨段归并' : '分段');
       io.to(socket.roomNumber).emit('chat-message', {
-        from: 'ai-bot', name: '🤖 AI 小明',
+        from: 'ai-bot', name: 'AI 小明',
         text: `📋 ${label}纪要已生成：${r.path}${r.mock ? '（[Mock] 本地模板）' : ''}`
           + (type === 'merge' ? `（归并了 ${r.sources} 份分段纪要）` : ''),
         ts: Date.now(),
@@ -5581,9 +7783,10 @@ io.on('connection', (socket) => {
     if (socket[slot]) return fail(callback, `${direction} Transport 已存在`);
 
     const transport = await router.createWebRtcTransport({
-      listenIps: ANNOUNCED_IP
-        ? [{ ip: LISTEN_IP, announcedIp: ANNOUNCED_IP }]
-        : [{ ip: LISTEN_IP }],
+      /* K1（2026-10-09）：固定端口入口存在时走 `webRtcServer`（整个 Worker 共用一个
+       * UDP+TCP 口号），否则退回原来的 `listenIps`（每条 Transport 在端口段里随机要一对）。
+       * 判据只写在 transportListenOptions() 一处，这里只问它要结论（坑 47）。 */
+      ...transportListenOptions(room),
       enableUdp: true,
       enableTcp: true,
       preferUdp: true,
@@ -5944,7 +8147,7 @@ io.on('connection', (socket) => {
   // ★ 09-30：打印的网址必须"能点"——0.0.0.0 是**监听**语义，不是**访问**语义，
   //   打给用户看的一律 localhost（本机打开）；局域网/跨机地址单独一行给真实 IP。
   const listenOn = 'localhost';
-  const lanIpForPrint = ANNOUNCED_DECISION.ip || detectLocalIps()[0] || null;
+  const lanIpForPrint = ANNOUNCED_DECISION.ip || (Nets.pickPrimaryIp() || {}).ip || null;
   // ★ 可交付体验：端口被占时给"人话"指引，而不是一屏堆栈（常见于 start-lan 已启动、
   //   又手动 npm run start:sfu 的双开场景）
   const friendlyPortError = (port) => (err) => {
@@ -5989,13 +8192,26 @@ io.on('connection', (socket) => {
     try {
       // 项目根的 models/（server.js 自己在 sfu/ 下，所以必须上跳一级——与 scripts/test-qwen.js 同写法）
       const MODELS_DIR = path.join(__dirname, '..', 'models');
-      const asrModelDir = path.join(MODELS_DIR, 'qwen3-asr-0.6b');
       const ttsModelDir = path.join(MODELS_DIR, 'qwen3-tts-0.6b');
-      if (fs.existsSync(asrModelDir)) process.env.QWEN_ASR_MODEL = process.env.QWEN_ASR_MODEL || asrModelDir;
+      /* ★ 2026-10-09 ASR 那一半的判据搬进模块（resolveModelDir），这里只留 TTS：
+       *   原来两边各写一份路径，独立脚本拿不到那份知识就只能抄——抄的就是第二个来源。
+       *   搬完之后 server 与 bench:asr-golden 走同一个函数，路径写法只有一处可改。 */
+      process.env.QWEN_ASR_MODEL = process.env.QWEN_ASR_MODEL || QwenLocalAsr.resolveModelDir();
       if (fs.existsSync(ttsModelDir)) process.env.QWEN_TTS_MODEL = process.env.QWEN_TTS_MODEL || ttsModelDir;
     } catch (e) { /* 绑定失败不影响主流程 */ }
     // 模型加载是"几分钟"的重活：只触发、不等待（未就绪期间链路自动走 whisper/Edge/浏览器兜底）
-    if (process.env.QWEN_TTS_MODEL) {
+    /* ★ 2026-10-05 夜（用户点名"千问的用不到就删掉"）：**不再默认预热本地 Qwen3-TTS**。
+     * ▎取证：2026-10-05 全天 `ai-tts` 事件 157 条，engine 全是 edge（微软晓晓），
+     *   **千问那一轨一次都没被用到**——它只在 `aiTtsLocalWait:true` 时才抢实时播报，
+     *   而实测 GPU 上 RTF≈4.1（合成比播放慢 4 倍，见《性能测试报告.md》与 bench:tts），
+     *   开着它只会白占 ~1.5GB 显存 + 启动多等 ~20s。
+     * ▎所以：默认**不加载**；要自持音色时 `config.json` 写 `"aiTtsLocalWait": true`
+     *   （或 `AI_TTS_LOCAL_WAIT=1`）就照旧预热并接管。代码与模型都留着（删模型是
+     *   不可逆动作，等用户点头再动）；这行日志会说实话，不再假装"已预热可用"。 */
+    if (process.env.QWEN_TTS_MODEL && !localTtsWaitEnabled()) {
+      console.log('🔇 本地 Qwen3-TTS 未加载（实测全天播报 0 次用到它：Edge 音色可达时它轮不上，'
+        + '而 CPU/GPU 上合成比播放慢）——省 ~1.5GB 显存。要用自持音色：config.json 的 aiTtsLocalWait:true');
+    } else if (process.env.QWEN_TTS_MODEL) {
       /* ★ 2026-10-02 warm() 现在会**如实返回成败**（以前恒 undefined，
        *   于是探测超时被误判成"没装"的时候，这里照样打 🔥 已预热 = 假绿）。 */
       QwenTts.warm().then((okBoot) => {
@@ -6006,24 +8222,54 @@ io.on('connection', (socket) => {
           return;
         }
         console.log(localTtsWaitEnabled()
-          ? '🔥 Qwen3-TTS 本地 worker 已预热（AI 回答用自持音色朗读）'
-          : '🔥 Qwen3-TTS 本地 worker 已预热，但**实时播报默认仍走浏览器朗读**'
-            + '（本机 CPU 实测合成一句要 44s——好声音换来的是"它半天不出声"）；'
-            + '想用自持音色：config.json 里加 "aiTtsLocalWait": true 或环境变量 AI_TTS_LOCAL_WAIT=1');
+          ? `🔥 Qwen3-TTS 本地 worker 已预热（${QwenTts.device === 'cuda' ? 'GPU 加速' : 'CPU'}，AI 回答用自持音色朗读）`
+          : `🔥 Qwen3-TTS 本地 worker 已预热（${QwenTts.device === 'cuda' ? 'GPU 加速' : 'CPU'}），但**实时播报默认仍走浏览器朗读**`
+            + (QwenTts.device === 'cuda'
+              ? '（GPU 上合成多快由 bench:tts 实测决定——RTF<1 才值得把 aiTtsLocalWait 打开）'
+              : '（本机 CPU 实测合成一句要 44s——好声音换来的是"它半天不出声"）；'
+                + '想用自持音色：config.json 里加 "aiTtsLocalWait": true 或环境变量 AI_TTS_LOCAL_WAIT=1'));
         /* 广播的判据与发音频的判据**必须是同一个**（serverVoiceReady，坑 47）：
          * 早先这里无条件 enabled:true，会造出"页面让位、服务器不发"的两头静音。 */
         io.emit('ai-tts-state', { enabled: serverVoiceReady(), engine: 'qwen-local' });
       }).catch(() => {});
     }
-    if (asrEngineMode() === 'qwen-local' && process.env.QWEN_ASR_MODEL) {
-      getQwenLocalAsr().warm().then((okBoot) => {
+    /* ★ 2026-10-03f 这一处原先把 getQwenLocalAsr() 的返回值**直接 .warm()**——对可能为 null
+     *   的对象调方法。触发条件正是文档推荐的排障配法 ASR_QWEN_LOCAL=0（坑 76 显存争用时用），
+     *   实测：uncaughtException → 优雅退出 → 服务器启动即自杀，日志里只留一行栈。
+     *   ▎讽刺点在于这条配法本身是为"别再抢显存"写的——排障工具把服务弄死了。
+     *   ▸ 修法不是加个 `?.` 就完事：拿不到实例时**必须说一句人话**，否则下一个人来这里
+     *     加日志找"为什么没字幕"，会以为是模型问题而不是自己被关掉了。
+     *   ▸ 注释里刻意不写那句原始调用形式——它会被本文件末尾那条负向断言当成"代码还在"
+     *     抓到（10-03a 的"注释里也别写 alert("是同一条教训）。 */
+    const qAsrWarm = getQwenLocalAsr();
+    /* ★ 2026-10-07 H1：多人会议的容量档（必须在预热**之前**配，池子一旦建好就不热改）。
+     *   ▎为什么要显式配、不给默认 2：`bench:asr-multi` 实测两个 worker 能把同延迟下的
+     *     并发人数近似翻倍（8 路 p95 2.80s→约 1.8s 那一档），但一个 worker 常驻 ≈1.9GB 显存，
+     *     而这台 8GB 卡上还跑着浏览器与 whisper 兜底——**默认加倍会把别人的机器推到 OOM**，
+     *     而显存吃紧的后果不是报错而是"引擎静默回落 CPU"（10-04e 实测过一整轮假红）。
+     *   ▸ env `ASR_QWEN_WORKERS` 优先于 `config.asrQwenWorkers`，两者都不给 = 1（今天的行为）。
+     *   ▸ 取值判据不在这里写：`resolveWorkers()` 是 worker 池模块里的**唯一实现**，
+     *     doctor 的显存预算体检调同一个函数——两处各写一份优先级，就会出现
+     *     "体检说配了 2 个、服务器实际起了 1 个"这种没人会去怀疑的矛盾（坑 47）。 */
+    if (qAsrWarm && typeof qAsrWarm.configure === 'function') {
+      qAsrWarm.configure({ workers: qAsrWarm.resolveWorkers(process.env.ASR_QWEN_WORKERS, CONFIG.asrQwenWorkers) });
+    }
+    if (asrEngineMode() === 'qwen-local' && qAsrWarm) {
+      qAsrWarm.warm().then((okBoot) => {
         if (!okBoot) {
           console.log('⚠️ Qwen3-ASR 本地 worker 未能启动——字幕转写自动落 whisper 常驻 worker（功能不降级）');
           return;
         }
-        console.log('🔥 Qwen3-ASR 本地 worker 已预热（语音片段将用 qwen-local 转写）');
+        console.log(`🔥 Qwen3-ASR 本地 worker 已预热（${qAsrWarm.device === 'cuda' ? 'GPU 加速' : 'CPU'}，模型加载 + 首次空推理——第一句字幕不再付 11s 的推理图初始化）`);
         releaseFallbackAsr(); // ★ 2026-10-03 主引擎上线，兜底那套模型就该让位（见 releaseFallbackAsr 注释）
       }).catch(() => {});
+    } else if (asrEngineMode() === 'qwen-local') {
+      /* ▎刻意**不**在这里断言"字幕会落 whisper / 没有转写"：此刻 WHISPER 探测还没收敛
+       *   （异步），这么写就会打出一行与两行后那句"🎙 服务端转写已开启：whisper.exe"
+       *   自相矛盾的日志——本项目为这类"过期声明"付过太多次学费（坑 67/71）。
+       *   权威口径只有那一行 ASR 启动日志和 /config.json，这里只说"为什么这条路没走"。 */
+      console.log(`ℹ️ 配置里引擎是 qwen-local，但本次不启用（${qwenLocalState().why}）——`
+        + '实际用哪个引擎以下面那行 🎙 服务端转写 与 /config.json 为准');
     }
     /* ★ 2026-10-03 改回"无论主引擎是谁都预热 whisper"，并让它在主引擎就绪后自动释放。
      *   原先这里在 qwen-local 下直接跳过预热，省下的是常驻内存、付出的是**开机第一分钟
@@ -6183,30 +8429,58 @@ async function runAsrSelfTest() {
    *   测试自己留下的痕迹必须无论成败都收走，否则回归结果依赖"上一次跑没跑干净"。 */
   let cleanupSelfTest = null;
   try {
-    // ① 等 ffmpeg 与 whisper 探测收敛（两个都是启动期异步探测）
+    // ① 等 ffmpeg 与"任意一种转写能力"收敛（两个都是启动期异步探测）
     for (let i = 0; !FFMPEG_OK && i < 30; i++) await sleep(100);
     if (!FFMPEG_OK) throw new Error('ffmpeg 不可用');
-    for (let i = 0; !WHISPER && i < 100; i++) await sleep(100);
-    if (!WHISPER) throw new Error('whisper 不可用（语音闭环没有耳朵）');
-    // ② TTS 合成一句带唤醒词的中文（与 scripts/test-asr.js 同款做法）
+    /* ★ 2026-10-05 夜二 实修（本机现场：whisper 探测被抢显存的并发拖慢 → 自测直接报
+     *   "whisper 不可用（语音闭环没有耳朵）"，而**耳朵其实是 qwen-local**，它 3 秒后就绪了）。
+     *   ▎这是坑 67 家族的第 N 次复发：把"某一条路此刻没探到"当成"这个能力不存在"。
+     *     09-30c 换引擎之后，"有没有耳朵"的权威判据已经是 aiAsrCapableNow()
+     *     （whisper ∨ 常驻 worker ∨ qwen-local worker ∨ 模型目录在位），
+     *     而这条自测的前置条件一直没跟着改——它等的是 `!WHISPER` 这个**过时的信号**。
+     *   ▸ 修法不是放宽，是**改用同一个谓词**（坑 47：一个概念一个来源），
+     *     并把等待上限写清楚（探测在冷机器上可能要 45s+，见 10-04i 的重试策略）。 */
+    for (let i = 0; !aiAsrCapableNow() && i < 100; i++) await sleep(100);
+    if (!aiAsrCapableNow()) {
+      throw new Error('没有任何可用的转写引擎（whisper 与 qwen-local 都不在岗）——语音闭环没有耳朵');
+    }
+    // ② TTS 合成**两句**：一句带唤醒词、一句是没叫它的日常闲聊（与 scripts/test-asr.js 同款做法）
+    /* ★ 2026-10-06 夜二 加"闲聊句"的原因（用户原话：「如果不提到小明的名字，小明不应该说话」）：
+     *   这条自测原来只有"同一句带名字的话说两遍"，于是**它测不出"没叫它也答话"**——
+     *   旧行为下第二句闲聊会落进 20s 追问窗口被接走，`botReplies <= 2` 照样绿。
+     *   ▸ 现在音频里明确放一句**不含名字**的话，并断言它被转写出来了（正向对照：
+     *     没有这条，"它没接话"可能只是"没听见"，那是坑 65 说的假绿），
+     *     同时应答次数仍必须 ≤ 带名字的句子数（2）——多答一次就红。
+     *   ▸ 这条断言在旧代码上必红（追问窗口会把闲聊接走），在新代码上绿：A/B 成立。 */
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'asr-live-'));
-    const wav = path.join(dir, 'speech.wav');
-    const sentence = '小明，帮我记一下明天下午三点的评审会。';
-    const ps = [
-      'Add-Type -AssemblyName System.Speech',
-      '$s = New-Object System.Speech.Synthesis.SpeechSynthesizer',
-      "$zh = $s.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Culture.Name -like 'zh*' } | Select-Object -First 1",
-      "if (-not $zh) { throw 'no-zh-voice' }",
-      '$s.SelectVoice($zh.VoiceInfo.Name)',
-      '$fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)',
-      `$s.SetOutputToWaveFile('${wav.replace(/'/g, "''")}', $fmt)`,
-      `$s.Speak('${sentence}')`,
-      '$s.Dispose()',
-    ].join('; ');
-    await execFileP('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps],
-      { timeout: 60000, windowsHide: true });
-    if (!fs.existsSync(wav) || fs.statSync(wav).size < 10000) throw new Error('TTS 合成失败（无中文音色？）');
-    console.log(`🧪 [TEST_ASR] TTS 语音就绪（${(fs.statSync(wav).size / 1024).toFixed(0)}KB）：${sentence}`);
+    /* ★ 2026-10-06 夜二 两句都引用**唯一实现**（scripts/voice-fixture.js）：
+       真浏览器 e2e 用的是同一对句子，各写一份的话改了这边忘了那边，红的是"另一个测试"。 */
+    const FXS = require(path.join(__dirname, '..', 'scripts', 'voice-fixture.js'));
+    const namedSentence = FXS.FIXTURE_SENTENCES[0];
+    const chatterSentence = FXS.FIXTURE_CHATTER;   // 没叫它的那句闲聊
+    /* 下面判"闲聊句有没有被转写出来"用的是 /天气|拍卖/ 这类**从这句话里取的词**——
+       换了 FIXTURE_CHATTER 记得同步这里，否则正向对照会假失败（报错信息里会提示账本原文）。 */
+    const synth = async (text, file) => {
+      const ps = [
+        'Add-Type -AssemblyName System.Speech',
+        '$s = New-Object System.Speech.Synthesis.SpeechSynthesizer',
+        "$zh = $s.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Culture.Name -like 'zh*' } | Select-Object -First 1",
+        "if (-not $zh) { throw 'no-zh-voice' }",
+        '$s.SelectVoice($zh.VoiceInfo.Name)',
+        '$fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)',
+        `$s.SetOutputToWaveFile('${file.replace(/'/g, "''")}', $fmt)`,
+        `$s.Speak('${text}')`,
+        '$s.Dispose()',
+      ].join('; ');
+      await execFileP('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps],
+        { timeout: 60000, windowsHide: true });
+      if (!fs.existsSync(file) || fs.statSync(file).size < 10000) throw new Error('TTS 合成失败（无中文音色？）');
+      console.log(`🧪 [TEST_ASR] TTS 语音就绪（${(fs.statSync(file).size / 1024).toFixed(0)}KB）：${text}`);
+      return file;
+    };
+    const wav = await synth(namedSentence, path.join(dir, 'speech.wav'));
+    const wavChatter = await synth(chatterSentence, path.join(dir, 'chatter.wav'));
+    const sentence = namedSentence;
     // ③ 独立 Router + 收流 PlainTransport（comedia=true：等 ffmpeg 先发 RTP）
     const router = await worker.createRouter({ mediaCodecs });
     const ingest = await router.createPlainTransport({
@@ -6222,6 +8496,22 @@ async function runAsrSelfTest() {
         encodings: [{ ssrc: 33333333 }],
       },
     });
+    /* ★ 2026-10-05 soak 模式（TEST_ASR_SOAK=1）的 UDP 中继：
+     *   ▎comedia PlainTransport 只认**第一个发包者的 addr:port**（坑 65）——耐久相位
+     *     每轮语音都要新起一个 ffmpeg（= 新源端口），直推的话第二轮起整批被丢弃，
+     *     断言会红成"没进账本"，而根因在传输层不在识别层。
+     *   ▸ 中继持有一个固定源端口的 socket：所有 ffmpeg 都发给它、它转发给 ingest
+     *     → 无论多少轮/多少进程，comedia 看到的源永远是同一个。 */
+    let relay = null;
+    let rtpDest = `rtp://127.0.0.1:${ingest.tuple.localPort}`;
+    if (process.env.TEST_ASR_SOAK === '1') {
+      relay = require('dgram').createSocket('udp4');
+      relay.on('error', () => { /* 中继失败不拖垮自测（每次 send 另有 try 兜底） */ });
+      await new Promise((res) => relay.bind(0, '127.0.0.1', res));
+      relay.on('message', (msg) => { try { relay.send(msg, ingest.tuple.localPort, '127.0.0.1'); } catch (e) { /* 已关 */ } });
+      rtpDest = `rtp://127.0.0.1:${relay.address().port}`;
+      console.log(`🧪 [SOAK] RTP 中继就绪：ffmpeg → 127.0.0.1:${relay.address().port} → ingest:${ingest.tuple.localPort}（comedia 源端口固定）`);
+    }
     // ④ 造一个最小房间（真实房间的"人说话"就是生产出这路 producer，此处等价）
     const selfRoom = {
       roomNumber: '999999', router, ownerId: 'selftest-member',
@@ -6240,8 +8530,22 @@ async function runAsrSelfTest() {
     const { io: Client } = require('socket.io-client');
     const probe = Client(`http://127.0.0.1:${PORT}`, { transports: ['websocket'], reconnection: false });
     const botReplies = [];
+    /* ★ 2026-10-06 计数只数**真应答**：AI 入会时那条「🎧 已接入…正在聆听」也是
+    *   chat-message(from='ai-bot')，它不是对任何问题的回答。
+    *   ▎为什么这条必须改：旧写法 `botReplies.length <= 2` 里有一条名额**永远被致辞占着**，
+    *     于是"2s 分段把一句话切成两截、两截各自成句"这种正常场景就会撞红线
+    *     （实测 3 条 = 致辞 + 2 答，而 2 答都在窗口内、没有刷屏）。
+    *   ▎更要紧的是另一头：`>= 1` 那条**正向对照**（"它真的接话了"）在旧写法里永远不会红——
+    *     致辞恒存在。它自称证明了唤醒链路，实际什么都没证（坑 65/76 的自测版）。
+    *   ▸ 同一类修正 10-04e 已在 e2e 做过一次（气泡匹配排除入会致辞），这次补自测这一处。 */
+    const isGreeting = (m) => /已接入.*正在聆听|大家好，我是会议 AI 助理/.test(String((m && m.text) || ''));
+    /* ★ 2026-10-06 「没有任何客户端执行它」那条 ⚠️ 也不是**应答**，它是系统自查的广播。
+     *   计数如果把它算进 botReplies，`<= 2` 那条红线就会被一条"自测夹具不点界面"造成的
+     *   告警顶掉——症状与"AI 刷屏"一模一样，而真相是"这个客户端没有 UI"（坑 72 同族：
+     *   别让测试设施自己的痕迹被数成被测对象的产出）。 */
+    const isNoopNotice = (m) => /^⚠️ 我发出了/.test(String((m && m.text) || ''));
     if (process.env.TEST_ASR_DEBUG) probe.onAny((ev, ...args) => console.log(`🧪 [probe] ${ev}`, JSON.stringify(args).slice(0, 120)));
-    probe.on('chat-message', (m) => { if (m && m.from === 'ai-bot' && m.text) botReplies.push(m); });
+    probe.on('chat-message', (m) => { if (m && m.from === 'ai-bot' && m.text && !isGreeting(m) && !isNoopNotice(m)) botReplies.push(m); });
     /* ★ 2026-10-02 顺手把"嘴"也纳入断言：音频段与失败通知都要有落点。
      *   用户报的"后边它回答没有说话"最难查的地方在于——**它到底有没有试图说话**，
      *   日志里看不出来。现在这条自测替这个问题兜底（见下面语音交付断言）。 */
@@ -6253,7 +8557,22 @@ async function runAsrSelfTest() {
      *   latMs 字段，而"字段有没有真的带上"这件事，冒烟只能验客户端、信令验不到管线
      *   ——只有这条自测跑的是真转写路径。断言写在下面 PASS 之前（坑 56 的指标版）。 */
     const captions = [];
-    probe.on('asr-caption', (c) => captions.push({ at: Date.now(), latMs: c && c.latMs, interim: !!(c && c.interim), text: String((c && c.text) || '').slice(0, 30) }));
+    probe.on('asr-caption', (c) => captions.push({ at: Date.now(), latMs: c && c.latMs, fin: c && c.fin, interim: !!(c && c.interim), text: String((c && c.text) || '').slice(0, 30) }));
+    /* ★ 2026-10-05 soak 相位的"语音→实体动作"证据（问题⑤：AI 操控房间实体的端到端）。
+     *   ▎为什么收在这个自测里：detectRoomAction → room-control 广播这段以前只有桩上的
+     *     单元断言（smoke），真正"说一句话→全房收到 room-control"的通路没人跑过；
+     *     而 soak 的句子表里有三条带动作的指令，顺路就能把这条链路钉死。 */
+    const roomControls = [];
+    probe.on('room-control', (m) => {
+      roomControls.push({ at: Date.now(), action: m && m.action, byName: m && m.byName });
+      /* ★ 2026-10-06 自测客户端**扮演一个正常执行的页面**：收到动作就回执 ok:true。
+       *   ▎为什么：服务器有"说了没做"看门狗（4s 内没有任何客户端回执就当众补一句 ⚠️）。
+       *     这个 probe 是个没有界面的 socket 客户端，不装一下就会在每个带动作的句子上
+       *     触发一次告警——告警内容对它自己倒是真的（确实没人执行），但它会把
+       *     "语音→实体动作"这条链的证据搅浑。真正"没人执行该怎么办"由 test:sfu
+       *     用两个客户端分别断言（一个回执→不响，一个不回执→响）。 */
+      if (m && m.action) { try { probe.emit('room-control-ack', { action: m.action, ok: true }); } catch (e) { /* 不影响自测 */ } }
+    });
     await new Promise((resolve, reject) => {
       probe.on('connect', resolve);
       probe.on('connect_error', () => reject(new Error('自测客户端连接失败')));
@@ -6270,12 +8589,29 @@ async function runAsrSelfTest() {
      * ▎为什么需要：默认流程里语音在第 10 秒就推进去，而 Qwen worker 要 ~55s 加载，
      *   于是自测永远只看到 [ASR/常驻]（whisper 兜底）——用户问"是不是还在用 whisper"
      *   时，我们拿不出"qwen-local 真的在转写"的证据。这个开关让自测能等到引擎就位，
-     *   把"配置生效"这件事变成可断言的（坑 57：探测/配置必须能被下游证伪）。 */
-    if (process.env.TEST_ASR_WAIT_WARM === '1') {
+     *   把"配置生效"这件事变成可断言的（坑 57：探测/配置必须能被下游证伪）。
+     * ★ 2026-10-09 这条等待改成**默认开、可用 =0 关掉**。起因是全量回归里这条自测
+     *   红在正向对照（"没叫它的那句一条定稿都没有"），核日志才发现那一路走的是
+     *   whisper 兜底（前两段转写 8.8s/10.9s，🔥 Qwen 就位那行出现在它们之后）——
+     *   也就是说**它测的不是用户配置的那台引擎**（他的 config 写的是 qwen-local）。
+     *   ▸ "要额外加一个环境变量才测到真配置"本身就是陷阱：下一个人（包括凌晨四点的我）
+     *     一定会忘，而忘了之后红点会指向错误的方向（坑 57/10-06 那条：跑保真度类测试
+     *     之前先确认引擎与用户配置一致）。
+     *   ▸ 等不到也照样跑完，但**把"这次是哪台引擎"写进日志与结论**——
+     *     "降级路径的正常形态"不该被读成"产品回退"（坑 76 的另一面）。 */
+    const warmBudgetMs = process.env.TEST_ASR_WAIT_WARM === '0' ? 0 : 180000;
+    if (warmBudgetMs > 0) {
       const wl = getQwenLocalAsr();
       const t0w = Date.now();
-      while (wl && !wl.alive && Date.now() - t0w < 180000) await sleep(1000);
+      while (wl && !wl.alive && Date.now() - t0w < warmBudgetMs) await sleep(1000);
       console.log(`🧪 [TEST_ASR] 本地 Qwen ASR 状态：${wl && wl.alive ? '已就绪（本段将由 qwen-local 转写）' : '未就绪（将走 whisper 兜底）'}（等了 ${((Date.now() - t0w) / 1000).toFixed(0)}s）`);
+    } else {
+      console.log('🧪 [TEST_ASR] ⚠️ TEST_ASR_WAIT_WARM=0：不等主引擎预热，这段可能整条跑在兜底引擎上');
+    }
+    /* 喂音频那一刻主引擎接不接得住活——判据用生产那一个谓词（坑 47：不许另写一份"就绪"）。 */
+    const engineReadyAtFeed = asrPrimaryReady();
+    if (!engineReadyAtFeed) {
+      console.log('🧪 [TEST_ASR] ⚠️ 喂音频时主引擎**未就位** ⇒ 本次结论只代表降级路径（引擎退回 whisper 兜底时的时序与分段形态都不同）');
     }
     // ⑤.5 把 TTS 语音与静音拼成一条测试音频：**说 → 停 6s → 再说 → 停 3s**
     //   ▎为什么要"一条流、一次推完"而不是分几次推：ingest 用的是 comedia PlainTransport，
@@ -6290,10 +8626,43 @@ async function runAsrSelfTest() {
       return b.slice(i + 8, i + 8 + size);
     };
     const speechPcm = pcmOf(wav);
+    /* ★ 2026-10-06 TEST_ASR_ATTENUATE_DB=-N：把整段语音**按 dB 压低**，模拟"坐得远的笔记本麦"
+     *   （10-05d 从真实会议日志量到的就是 -56~-65 dBFS 峰值）。
+     *   ▎为什么要这个开关：G2 那条判据（"此刻有没有人说话"从绝对 -50 改成跟着噪声底走）
+     *     在单元层面已经钉死，但"安静麦克风会不会被切成碎句"是**整条链路**的行为——
+     *     只有把真音频压到那个电平推上真管线，才能证明"改前碎成 N 条 / 改后 1 条"。
+     *     拿合成/受控数据下结论可以，但必须让被测路径本身去跑（坑 65/76）。 */
+    const attenDb = Number(process.env.TEST_ASR_ATTENUATE_DB) || 0;
+    const speechForPipe = (() => {
+      if (!attenDb) return speechPcm;
+      const g = Math.pow(10, attenDb / 20);   // 负数 = 衰减
+      const out = Buffer.from(speechPcm);
+      for (let i = 0; i + 1 < out.length; i += 2) {
+        out.writeInt16LE(Math.round(out.readInt16LE(i) * g), i);
+      }
+      let peak = 0;
+      for (let i = 0; i + 1 < out.length; i += 2) peak = Math.max(peak, Math.abs(out.readInt16LE(i)));
+      console.log(`🧪 [TEST_ASR] 语音已衰减 ${attenDb} dB（模拟安静麦克风）⇒ 峰值 ≈ ${(20 * Math.log10(peak / 32768)).toFixed(1)} dBFS`);
+      return out;
+    })();
     const silencePcm = (ms) => Buffer.alloc(Math.round(16000 * 2 * ms / 1000)); // 16k/mono/16bit
+    const chatterPcm = pcmOf(wavChatter);
+    const chatterForPipe = (() => {
+      if (!attenDb) return chatterPcm;
+      const g = Math.pow(10, attenDb / 20);
+      const out = Buffer.from(chatterPcm);
+      for (let i = 0; i + 1 < out.length; i += 2) out.writeInt16LE(Math.round(out.readInt16LE(i) * g), i);
+      return out;
+    })();
     const merged = path.join(dir, 'merged.wav');
     (() => {
-      const body = Buffer.concat([speechPcm, silencePcm(6000), speechPcm, silencePcm(3000)]);
+      /* 说（带名字）→ 停 6s → 说（**没叫它**的闲聊）→ 停 6s → 再说（带名字）→ 停 3s
+       * ▸ 闲聊夹在两次唤醒中间，正是真实会议的形态：喊它一次、它答完，会上其他人继续说话。
+       *   旧代码此时窗口还热着（每次应答都往后推 20s），闲聊必被接走。 */
+      const body = Buffer.concat([
+        speechForPipe, silencePcm(6000), chatterForPipe, silencePcm(6000),
+        speechForPipe, silencePcm(3000),
+      ]);
       const head = Buffer.alloc(44);
       head.write('RIFF', 0); head.writeUInt32LE(36 + body.length, 4); head.write('WAVE', 8);
       head.write('fmt ', 12); head.writeUInt32LE(16, 16); head.writeUInt16LE(1, 20); head.writeUInt16LE(1, 22);
@@ -6302,7 +8671,8 @@ async function runAsrSelfTest() {
       head.write('data', 36); head.writeUInt32LE(body.length, 40);
       fs.writeFileSync(merged, Buffer.concat([head, body]));
     })();
-    console.log(`🧪 [TEST_ASR] 测试音频已拼接：说 ${(speechPcm.length / 32000).toFixed(1)}s + 停 6s + 再说 + 停 3s`);
+    console.log(`🧪 [TEST_ASR] 测试音频已拼接：说 ${(speechPcm.length / 32000).toFixed(1)}s（带名字）`
+      + ` + 停 6s + 说 ${(chatterPcm.length / 32000).toFixed(1)}s（没叫它） + 停 6s + 再说 + 停 3s`);
     /* ★ 2026-10-03 自测隔离（一条"假红"查出来的）：字幕账本按 <房间>-<UTC日期> 一天一个文件、
      *   append-only，而这条自测固定用房间 999999 —— 于是**上一次跑剩下的条目会被这一次读进去**。
      *   实测后果：本轮只产出 2 条字幕，断言却数出 4 条（前一次失败运行留下的 2 条也算进来），
@@ -6315,18 +8685,30 @@ async function runAsrSelfTest() {
     const capFile = path.join(CAPTIONS_DIR, `cap-999999-${day}.jsonl`);
     const runStartTs = Date.now();
     try { fs.rmSync(capFile, { force: true }); } catch (e) { /* 本来就没有 */ }
+    /* ★ 2026-10-05 清理函数**提前登记**（此前只在 ⑧ 赋值——凡在它之前 must() 抛错，
+     *   账本与临时目录都留在磁盘上污染下一轮，正是"失败运行越跑越脏"的另一半）。
+     *   ▸ 中继也要关：它占着一个 UDP 端口，不关会一直留着。 */
+    cleanupSelfTest = () => {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* 忽略 */ }
+      try { fs.rmSync(capFile, { force: true }); } catch (e) { /* 忽略 */ }
+      try { if (relay) relay.close(); } catch (e) { /* 忽略 */ }
+    };
     // ⑥ ffmpeg 把这条音频推进来（payloadType/SSRC 与上面约定一致）
+    //   ★ 2026-10-05 推送目标统一走 `rtpDest`：soak 模式下它是中继端口——初始这条
+    //     也必须走中继，否则 comedia 先记住直推的源端口，之后所有中继包整批被丢（坑 65 反例）。
     const sender = require('child_process').spawn(FFMPEG_BIN, [
       '-loglevel', 'error',
       '-re', '-i', merged,
       '-c:a', 'libopus', '-b:a', '48k',
       '-payload_type', '96', '-ssrc', '33333333',
-      '-f', 'rtp', `rtp://127.0.0.1:${ingest.tuple.localPort}`,
+      '-f', 'rtp', rtpDest,
     ], { stdio: ['ignore', 'ignore', 'pipe'] });
     sender.stderr.on('data', (d) => console.log(`🧪 [源] ${d.toString().trim()}`));
     await sleep(2000);
     // ⑦ 轮询字幕账本：等 asr:true 且含语义关键词的条目（转写 5s 段 + worker 应在 60s 内出结果）
-    const deadline = Date.now() + 90000;
+    // ★ 2026-10-04h 窗口 90s→240s：冷启动链（探测 45s/趟 + 兜底 worker 模型加载）在慢机器上
+    //   可能要 2 分钟+——段已排队等引擎就绪（不丢），窗口要给够，否则把"晚到"误判成"没跑通"。
+    const deadline = Date.now() + 240000;
     let hit = null;
     while (Date.now() < deadline && !hit) {
       try {
@@ -6362,7 +8744,15 @@ async function runAsrSelfTest() {
           .filter((e) => e && e.asr === true && Number(e.ts) >= runStartTs);
       } catch (e) { return []; }
     };
-    await sleep(12000); // 让流的后半段（6s 静音 + 第二次发声 + 3s 静音）走完转写与成句
+    /* ★ 2026-10-06 夜二 原来这里是固定 `sleep(12000)`。加了闲聊段之后整条音频约 27s，
+     *   固定等待会在闲聊句**还没转写出来**时就去数账本——于是"AI 没接闲聊"会绿在
+     *   "还没到"而不是"闸门把它挡下"（坑 65 的假绿 + 坑 96 的"量具跟自己的时间赛跑"）。
+     *   ▸ 改成"等到该出现的出现为止"，再补 4s 让迟到段落账，上限断言才不会被骗。 */
+    const settleDeadline = Date.now() + 90000;
+    const chatterSeen = (list) => list.filter((e) =>
+      !/小明|评审|三点|三點|下午|记|記/.test(String(e.text || '')) && /天气|拍卖/.test(String(e.text || '')));
+    while (Date.now() < settleDeadline && !chatterSeen(countAsr()).length) await sleep(1000);
+    await sleep(4000);
     const allAsr = countAsr();
     /* ★ 2026-10-02 **正向对照必须先跑**（坑 65 在我自己的测试里复发，第二轮就撞上了）：
      *   有一次实跑得到「ASR 0 条 / 应答 0 次」，而下面每一条断言都是"等于 0 / 小于等于 2"，
@@ -6370,6 +8760,10 @@ async function runAsrSelfTest() {
      *   判据：**断言"某量为 0"之前，必须先证明"输入真的进去了"。**
      *   这里要求至少一条字幕真的带上所说的那句话，否则直接红并说明可能断在哪一环。 */
     const heardSpeech = allAsr.filter((e) => /小明|评审|三点|三點|下午|记|記/.test(String(e.text || '')));
+    const namedAsr = allAsr.filter((e) => /[小晓笑孝筱][明鸣名铭茗米民]/.test(String(e.text || '')));
+    /* ★ 2026-10-06 夜二 本次新加的关键用例：**没叫它的那一句**先证明它真被转写出来了。
+     *   ▸ 没有这条前置，"AI 没接闲聊"完全可能是"根本没听见"——那正是坑 65 的假绿形状。 */
+    const chatterAsr = allAsr.filter((e) => !namedAsr.includes(e) && /天气|拍卖/.test(String(e.text || '')));
     must(heardSpeech.length >= 1,
       `前置条件不成立：推了一段"说→停→再说"的真语音，账本里却**一条相关的都没有**（ASR 共 ${allAsr.length} 条）` +
       ' —— 链路没跑通时"零字幕/零刷屏"那组断言全部是假绿。' +
@@ -6380,24 +8774,119 @@ async function runAsrSelfTest() {
     must(botReplies.length >= 1,
       `推了带「小明」的语音却**一次都没应答**（应答 0 条 = 唤醒/追问窗口那条链断了，` +
       '而下面的"≤2 次刷屏"断言会在零应答时无条件通过）');
-    const offTopic = allAsr.filter((e) => !/小明|评审|三点|三點|下午|记|記/.test(String(e.text || '')));
+    /* ★ 2026-10-06 夜二 **计数器本身也要被验**：这轮的规矩靠 watch 读 `answerVia` 两本账来守，
+     *   而"日志打对了、计数器接错地方"这种缺陷不会让任何功能变红，只会让告警永远不响
+     *   （坑 41/56/83 同一条：测不到不等于通过）。
+     *   ▸ 断的是**恒等式**而不是具体次数：分段有时会把「小明，帮我记一下…」切成
+     *     「小明。」+后半句，那种情况下 follow-up=1 是**合法形态**（半句续接），
+     *     拿"必须为 0"去断就会时不时红一条与产品无关的（假红也伤人，坑 91）。 */
+    must(COLLAB.answerVia.wake >= 1,
+      `answerVia.wake 应 ≥1（被叫到名字真的记进了"合规"那本账；实际 ${COLLAB.answerVia.wake}）`);
+    must(COLLAB.answers === COLLAB.answerVia.wake + COLLAB.answerVia['follow-up'],
+      `恒等式：answers(${COLLAB.answers}) 必须等于 wake(${COLLAB.answerVia.wake})`
+      + ` + follow-up(${COLLAB.answerVia['follow-up']}) —— 少记一类，watch 的判据就失真`);
+    const offTopic = allAsr.filter((e) => !namedAsr.includes(e) && !chatterAsr.includes(e)
+      /* ★ 2026-10-06 夜二 G1 的判据从"关键词白名单"换成"字组覆盖率"（真跑抓出来的口径错）：
+       *   这轮模型把句尾的「评审会」听成了「**庭**审会」——关键词表里没有它，于是被算成
+       *   "与所说内容无关的字幕 = 静音幻觉"。那不是幻觉，是**听岔**（另一个问题，另一条账）。
+       *   ▸ 判据应当问"这句话是不是我们放过的那两句话的一部分"（覆盖 ≥ 一半字组），
+       *     而不是"我有没有把模型可能写出的每个错字都列全"——白名单永远会漏下一个错字，
+       *     而漏掉的那个必然以假红的形式消耗下一次排查（坑 53/105 同一条：判据要尺度无关）。
+       *     真幻觉（「请用简体中文输出。」「请不吝点赞订阅转发」）覆盖率≈0，仍然照红。 */
+      && !(() => {
+        const said = normAsrText(namedSentence + chatterSentence);
+        const n = normAsrText(String(e.text || ''));
+        if (n.length < 3) return true;              // 两字以下的碎片没有统计意义，不判幻觉（坑 53）
+        let hit = 0, total = 0;
+        for (let i = 0; i + 1 < n.length; i++) { total++; if (said.includes(n.slice(i, i + 2))) hit++; }
+        return total > 0 && hit / total >= 0.5;
+      })());
     if (process.env.TEST_ASR_DEBUG) console.log('🧪 [回归] 全部 ASR 条目：', allAsr.map((e) => e.text));
     must(offTopic.length === 0,
       `G1 出现 ${offTopic.length} 条与所说内容无关的字幕（静音幻觉没消除）：` +
       JSON.stringify(offTopic.slice(0, 3).map((e) => String(e.text).slice(0, 24))));
+    /* ★ 2026-10-06 夜二「不叫它就不接话」的**正向对照**：闲聊句必须出现在账本里，
+     *   否则下面那条"应答次数不超过带名字的句子数"会在"什么都没听见"时假绿。 */
+    const chatterHint = engineReadyAtFeed
+      ? '（喂音频时主引擎已就位 ⇒ 这段确实由配置的引擎转写过）'
+      : '（⚠️ 喂音频时主引擎**未就位** ⇒ 本次跑在兜底引擎上：慢引擎会把相邻句子粘成一条，'
+        + '闲聊句因此没有自己的定稿——这是降级路径的正常形态，不是产品回退；'
+        + '去掉 TEST_ASR_WAIT_WARM=0 这个开关、让 qwen-local 就位之后再判）';
+    must(chatterAsr.length >= 1,
+      '前置条件不成立：没叫它的那句「今天天气真不错，拍卖啊。」一条字幕都没转写出来'
+      + ' —— 此时"AI 没接它"证明不了任何事（坑 65）。查 asrSegmentSec/能量闸/音频是否整段推完'
+      + chatterHint);
     must(!allAsr.some((e) => /请用?[简体使][^，,]{0,8}输出|以下是普通话/.test(String(e.text || ''))),
       'G1 账本里出现提示词回显（本轮事故的原句「请用简体中文输出。」）——清洗没生效');
-    must(allAsr.length <= 2,
-      `G2 这条"说→停→再说"的音频产出 ${allAsr.length} 条字幕（>2 = 静音段或重复句又在刷屏）`);
-    must(botReplies.length <= 2,
-      `G2 AI 应答 ${botReplies.length} 次（>2 = 应答风暴没刹住；修复前实测 8+ 次）`);
+    must(allAsr.length <= 8,
+      `G2 这段"说→停→闲聊→停→再说"的音频产出 ${allAsr.length} 条字幕（>8 = 静音段或重复句又在刷屏；`
+      + `音频里只有 3 段人声，8 已经留了一倍余量）`);
+    /* ★ 2026-10-06 夜二 本轮的主断言：**没叫它名字的那一句，不许被接话**。
+     * ▎判据为什么按"闲聊句的时间窗"而不是"应答总次数 ≤ 带名字的句子数"（我第一版写的就是后者）：
+     *   分段会把「小明，帮我记一下…」切成「小明。」+「帮我记一下…」，
+     *   而"被切掉的半句"按设计**就是要答**（`AI_ASK_TAIL_MS`，否则用户会觉得喊它它不理）——
+     *   那条计数式断言会把这一条合法的续接也算成违规，红得没有道理（判据错，不是代码错）。
+     * ▎现在问的是它本来该问的那件事：**这次应答是不是由那句闲聊引发的**。
+     *   ★ 2026-10-07 判据从"时间邻近"换成"因果"：应答要等 LLM（2~5s，还要算生成纪要），
+     *     而闲聊句定稿之后 7s 这个窗口，完全可能罩住**上一句正经办过的提问**的答案——
+     *     本轮把整句重转的等待去掉之后时序一变，这条就红了，红得毫无道理：
+     *     产品没接闲聊，是量具把别人的答案记到了它头上（坑 93 同一条：
+     *     一个配错的归因会派人去修一个不存在的问题）。
+     *   ▸ 服务器现在随每条答案带 `trig`（引发它的那条字幕的定稿时刻），于是这一问
+     *     有了事实可查；只有对**没有** trig 的老答案才退回时间窗（宁缺勿假红）。
+     * ▎A/B 已实测可红：`AI_CHAT_WINDOW_SEC=20`（旧行为）跑同一段音频 → 本条红；
+     *   默认（纯唤醒）→ 绿。量具读得出 0，它报的"在 1"才是证据（坑 98 同一条）。 */
+    const chatterAt = chatterAsr.length ? Math.min(...chatterAsr.map((e) => Number(e.ts) || 0)) : 0;
+    const causal = botReplies.filter((m) => m.trig && chatterAt && Math.abs(m.trig - chatterAt) <= 2);
+    const legacyWindow = botReplies.filter((m) => !m.trig && chatterAt
+      && (m.ts || 0) >= chatterAt && (m.ts || 0) <= chatterAt + 7000
+      && !namedAsr.some((e) => Math.abs((Number(e.ts) || 0) - chatterAt) <= 7000));
+    const repliedToChatter = causal.length + legacyWindow.length;
+    must(!repliedToChatter,
+      `不叫它就不该说话：那句没带名字的「${chatterSentence}」引来了 ${repliedToChatter} 次应答`
+      + `（服务器把它标记成由这条字幕引发，trig 对得上）。`
+      + `带名字的字幕 ${namedAsr.length} 条 / 应答 ${botReplies.length} 次`);
+    must(botReplies.length >= 1,
+      `正向对照：这段音频里有 ${namedAsr.length} 条带名字的字幕，AI 却一次都没答`
+      + ' —— 那"它没接闲聊"也证明不了什么（坑 65）');
+    must(botReplies.length <= 4,
+      `G2 AI 应答 ${botReplies.length} 次（>4 = 应答风暴没刹住；修复前实测 8+ 次。`
+      + `音频里有 3 段人声，其中一段还是被分段切断的半句，4 已经留了余量）`);
     /* ★ 2026-10-02 "它答应了却没声音"的断言：一条回答**要么有音频、要么有失败通知**，
      *   两者都没有就是当初那种无头状态（服务器以为自己在念、浏览器以为该它念）。
-     *   Qwen/Edge 都不用时走的是"浏览器朗读"分支（tts 字段为空），那也算有交代。 */
+     *   Qwen/Edge 都不用时走的是"浏览器朗读"分支（tts 字段为空），那也算有交代。
+     * ★ 2026-10-06 这条断言原来在"推完音频固定等 12s"之后**当场读**，于是它会假红：
+     *   ▎服务端那句"发不出音频"是流水线收尾时才说的，收尾要等合成任务落地
+     *     （Edge 内部超时曾经写死 12s，排队还会更久）——答案上屏到通知到达实测过 1.3s，
+     *     也实测过超过 12s。同一份代码，红与绿取决于"这一轮 Edge 是快坏还是坏死"，
+     *     这就是坑 80 说的**会移动的失败**：红的位置不稳，就别去改产品代码。
+     *   ▸ 判据改成"等到有交代为止，最多 25s"——上限仍是一个会真的失败的值，
+     *     只是不再拿一个固定的睡眠时间去赌异步的到达时刻。
+     *     25s 这个数：快引擎侧的决定上限 8s + 排队余量；慢引擎（显式开 aiTtsLocalWait）
+     *     由配置自己负责，本机回归不开那个开关。 */
+    if (botReplies.some((m) => m.tts === 'server')) {
+      const tWait = Date.now();
+      while (!aiAudios.length && !ttsFails.length && Date.now() - tWait < 25000) await sleep(500);
+      if (aiAudios.length || ttsFails.length) {
+        console.log(`🧪 [TEST_ASR] 语音交付判定等待 ${((Date.now() - tWait) / 1000).toFixed(1)}s`);
+      }
+    }
     must(botReplies.length === 0 || aiAudios.length > 0 || ttsFails.length > 0
       || !botReplies.some((m) => m.tts === 'server'),
-      `AI 声明了服务端语音（tts:'server'）却既没发 ai-audio 也没发 ai-tts-fail —— 前端会两头都不出声`);
-    const answerAt = botReplies.length ? (botReplies[0].ts || 0) : 0;
+      `AI 声明了服务端语音（tts:'server'）却**既没发 ai-audio、也没在 25s 内发 ai-tts-fail** `
+      + '—— 前端会两头都不出声（这条等待现在由客户端的 20s 保险丝兜住，见 client.js 的 fallBackToBrowserTts，'
+      + '但服务器仍然必须自己说清楚）');
+    /* ★ 2026-10-05 夜三 配对要配到**那条答案**，不是 botReplies[0]。
+     *   入会致辞也是 chat-message(from=ai-bot)，它比真答案早十几秒——原先拿 [0] 的 ts
+     *   当"答案上屏"，打印出来的「答案上屏→听到首段 23.5s」量的其实是"致辞→下一轮音频"，
+     *   一个谁都不该拿去下结论的数（坑 44"按时间戳配而不是按顺序抓第一条"的自测版）。
+     *   判据：取**首段音频到达之前**最后一条应答的 ts（那段音频就是它合成的）。 */
+    const answerAt = (() => {
+      if (!botReplies.length) return 0;
+      const first = aiAudios.length ? aiAudios[0].at : (ttsFails.length ? ttsFails[0] : 0);
+      const prior = botReplies.filter((m) => !first || (m.ts || 0) <= first);
+      return (prior.length ? prior[prior.length - 1] : botReplies[0]).ts || 0;
+    })();
     /* ★ 2026-10-03 字幕延迟读数的端到端证据：定稿那条 asr-caption 必须带上可信的 latMs。
      *   ▎为什么在这里验而不是在信令回归里验：信令测试跑不到真转写管线，冒烟测试跑不到服务器
      *     ——"字段有没有真的算出来并带上"这条接线只有自测能证（坑 56 的指标版）。
@@ -6408,11 +8897,37 @@ async function runAsrSelfTest() {
     must(finals.length >= 1,
       `账本里有 ${allAsr.length} 条字幕，客户端却没收到任何定稿 asr-caption —— 字幕广播断在管线之后`);
     const withLat = finals.filter((c) => Number.isFinite(c.latMs) && c.latMs >= 300 && c.latMs <= 30000);
-    must(withLat.length >= 1,
-      `定稿字幕都没带上可信的 latMs（拿到 ${JSON.stringify(finals.map((c) => c.latMs))}）` +
-      ' —— 界面那个「⏱ X.Xs」延迟读数会永远空着，而没有任何一处会报错');
+    /* ★ 2026-10-05 夜三 判据补一条"可解释的 0"，否则降级路径会被报成缺陷。
+     *   ▎本轮实测撞上的场景：qwen worker 还在预热、这几句走的是 whisper 兜底，
+     *     单段推理 8~10s **大于** 6s 的时长保险丝 → 每句都以 max-age 定稿，
+     *     而 max-age 定稿发生在"人还在说"的时刻，latMs 按坑 90 的规矩诚实归零。
+     *     于是这条断言红了——它把"降级路径的正常形态"说成"延迟读数丢了"。
+     *   ▸ 正确判据要分清两件事：**要么量到可信读数，要么每条定稿都写明为什么量不到**（fin）。
+     *     两者都没有才是无头状态（界面 ⏱ 永远空着、没人知道是慢还是坏）。 */
+    must(withLat.length >= 1 || finals.every((c) => c.fin),
+      `定稿既没有可信 latMs、也没带定稿原因 fin（拿到 `
+      + `${JSON.stringify(finals.map((c) => ({ latMs: c.latMs, fin: c.fin })))}）`
+      + ' —— 界面那个「⏱ X.Xs」会永远空着，而没有任何一处说明为什么');
+    console.log(`🧪 [TEST_ASR] 定稿原因分布：`
+      + finals.map((c) => c.fin || '?').join(' / ')
+      + (withLat.length ? '' : '（全部为时长闸切断，故本轮无延迟读数——引擎是兜底 whisper 还是 qwen 见上面那行）'));
+    /* ★ 2026-10-06 安静麦克风档（设了 TEST_ASR_ATTENUATE_DB 才生效）：必须以 `silence` 定稿。
+     *   ▎A/B 实测（衰减 55 dB ⇒ 峰值 ≈ -55.7 dBFS，正是 10-05d 从真实会议日志里量到的电平）：
+     *     旧的绝对阈值（ASR_VOICE_ADAPT=0）→ 定稿原因 `gap`、⏱ "本轮未采到"（语音从没被认出"在说"）
+     *     自适应噪声底（默认）             → 定稿原因 `silence`、⏱ 量得出数
+     *   ▸ 没有这条断言，"安静麦克风"就只是一个口头承诺过的场景（坑 76：机制要留下触发证据）。 */
+    if (Number(process.env.TEST_ASR_ATTENUATE_DB)) {
+      must(finals.length >= 1 && finals.every((c) => c.fin === 'silence'),
+        `安静麦克风档（衰减 ${process.env.TEST_ASR_ATTENUATE_DB} dB）的定稿原因必须全是 silence，`
+        + `实际是 ${JSON.stringify(finals.map((c) => c.fin || '?'))}`
+        + ' —— 退回 gap 就说明"有没有人说话"又变回绝对 dBFS 阈值了（安静的人会被切成碎句）');
+      must(withLat.length >= 1,
+        '安静麦克风档必须至少量到一条可信的 ⏱ 延迟读数（读不到 = 判据没跟上，用户侧就是"字幕慢而没人知道多慢"）');
+    }
     console.log(`🧪 [TEST_ASR] 字幕延迟实测：定稿 ${finals.length} 条 · 说完→上字幕 `
-      + withLat.map((c) => `${(c.latMs / 1000).toFixed(1)}s`).join(' / '));
+      + (withLat.length
+        ? withLat.map((c) => `${(c.latMs / 1000).toFixed(1)}s`).join(' / ')
+        : '本轮未采到（见上一行定稿原因）'));
     console.log(`🧪 [TEST_ASR] 语音交付：音频 ${aiAudios.length} 段 / 失败通知 ${ttsFails.length} 次` +
       (aiAudios.length
         ? `（分段数=${aiAudios[0].total}，答案上屏→听到首段 ${((aiAudios[0].at - answerAt) / 1000).toFixed(1)}s` +
@@ -6423,6 +8938,209 @@ async function runAsrSelfTest() {
           : ''));
     console.log(`🧪 [TEST_ASR] 回归 PASS —— 正解命中 ${heardSpeech.length} 条（证明音频真进去了）、` +
       `静音期零字幕、重复句零刷屏（ASR ${allAsr.length} 条 / 应答 ${botReplies.length} 次）`);
+    /* ★ 2026-10-04 每次跑都把"并发到底发生了没有"打出来（坑 76）。
+     *   ▎为什么写在 PASS 行下面而不是只在 /metrics 里：/metrics 要 admin token，
+     *     而这条自测每次都有人盯着终端看——把结论放在眼前，别人才会去看它。
+     *   ▸ peak=1 不是失败，是**诊断结论**："这条管线在这台机器上实际仍是串行"
+     *     （GPU 转一段 0.3~0.6s，而分段窗口有 2s，一段早转完了下一段还没到）。
+     *     以前这件事只能靠读代码猜，而读代码只能得出"改了"，得不出"发生了"。 */
+    console.log(`🧪 [TEST_ASR] 转写并发：启动 ${COLLAB.seg.launched} 段、` +
+      `同时在途峰值 ${COLLAB.seg.peak}（上限 ${Math.max(1, Math.min(2, Number(process.env.ASR_PIPE_CONCURRENCY) || 2))}）、` +
+      `因达上限跳过的轮数 ${COLLAB.seg.blocked}` +
+      (COLLAB.seg.peak >= 2 ? ' —— 并发真的发生过' : ' —— 这台机器上仍是串行，并发是余量不是日常'));
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * ★ 2026-10-05 耐久相位（TEST_ASR_SOAK=1）：问题①「不要一段时间就停了」的时间维度证据
+     *
+     * ▎为什么必须多这一相位：上面的主相位只跑"一条音频、一次推完"——它能证明
+     *   "链路能通"，**证明不了"它一直通"**。而用户报的恰恰是时间维度的问题：
+     *   跑一阵子之后录音进程静音退场、或被系统端口冲突打崩、或自愈后接不回音频
+     *   —— 这些在单次推送里全部看不见（前几轮调试就吃过这个亏：两次自愈都发生在
+     *   音频结束之后，"自愈后还能不能转写"从未被真正验证过）。
+     *
+     * ▎这一相位做什么：每隔几十秒说一句新的（6 句轮转，其中 3 句是房间指令），
+     *   每句都必须：进字幕账本 + 带可信 latMs；全程对着**结构化日志**
+     *   （app-<日期>.jsonl 的 asr-recorder-respawn / asr-recorder-gave-up）对账。
+     *   轮间隔拉开到 30s+，刻意跨过录音进程的"静音退场"边界——自愈必然发生，
+     *   于是"自愈后还能转写"变成可断言的事实而不是推断。
+     *
+     * ▎传输层前提：comedia 只认第一个发包者的端口（坑 65），每轮新起的 ffmpeg
+     *   必须统一走 UDP 中继（见上面 relay 块），否则第二轮起整批丢包。
+     * ═══════════════════════════════════════════════════════════════════ */
+    if (process.env.TEST_ASR_SOAK === '1') {
+      const bursts = Math.max(2, Number(process.env.TEST_ASR_SOAK_BURSTS) || 6);
+      const gapMs = Math.max(16000, Number(process.env.TEST_ASR_SOAK_GAP_MS) || 30000);
+      const soakSentences = [
+        '小明，把白板打开。',          // → room-control board-open（语音→实体动作，问题⑤的端到端）
+        '小明，这场会的进度怎么样了？',  // → 追问/检索轨
+        '小明，切到演讲者视图。',        // → room-control view-speaker
+        '小明，下个季度有什么风险？',    // → 看板/检索轨
+        '小明，把白板关掉。',          // → room-control board-close
+        '小明，今天就聊到这里。',        // → 对话轨（收尾句，避开所有动作/纪要关键词）
+      ];
+      const soakStartTs = Date.now();
+      const repliesBefore = botReplies.length;
+      let capsBefore = countAsr().length;
+      const latSeen = [];
+      let latExplained = 0;     // ★ 2026-10-05 夜三 "latMs 没量到但 fin 说清了为什么"的轮数
+      const burstTexts = [];   // ★ 2026-10-05 每轮实际入库的文本（收紧断言：chop 复发的第一现场）
+      let captured = 0; let misses = 0;
+      const writeWav = (file, body) => { // 与 ⑤.5 同一套 PCM16/16k/mono 头
+        const head = Buffer.alloc(44);
+        head.write('RIFF', 0); head.writeUInt32LE(36 + body.length, 4); head.write('WAVE', 8);
+        head.write('fmt ', 12); head.writeUInt32LE(16, 16); head.writeUInt16LE(1, 20); head.writeUInt16LE(1, 22);
+        head.writeUInt32LE(16000, 24); head.writeUInt32LE(32000, 28);
+        head.writeUInt16LE(2, 32); head.writeUInt16LE(16, 34);
+        head.write('data', 36); head.writeUInt32LE(body.length, 40);
+        fs.writeFileSync(file, Buffer.concat([head, body]));
+      };
+      const synth = async (file, text) => {
+        const script = [
+          'Add-Type -AssemblyName System.Speech',
+          '$s = New-Object System.Speech.Synthesis.SpeechSynthesizer',
+          "$zh = $s.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Culture.Name -like 'zh*' } | Select-Object -First 1",
+          "if (-not $zh) { throw 'no-zh-voice' }",
+          '$s.SelectVoice($zh.VoiceInfo.Name)',
+          '$fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)',
+          `$s.SetOutputToWaveFile('${file.replace(/'/g, "''")}', $fmt)`,
+          `$s.Speak('${text.replace(/'/g, "''")}')`,
+          '$s.Dispose()',
+        ].join('; ');
+        await execFileP('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { timeout: 60000, windowsHide: true });
+      };
+      console.log(`🧪 [SOAK] 耐久相位开始：${bursts} 轮语音（轮间隔 ${Math.round(gapMs / 1000)}s，第 3 轮后拉长到 60s 故意跨过一次自愈）`);
+      for (let i = 0; i < bursts; i++) {
+        const text = soakSentences[i % soakSentences.length];
+        const rawWav = path.join(dir, `soak-${i}-raw.wav`);
+        const soakWav = path.join(dir, `soak-${i}.wav`);
+        try {
+          await synth(rawWav, text);
+          if (!fs.existsSync(rawWav) || fs.statSync(rawWav).size < 10000) throw new Error('产物过小');
+        } catch (e) {
+          misses += 1;
+          console.log(`🧪 [SOAK] 第 ${i + 1}/${bursts} 轮：TTS 合成失败（${e.message}），记一次 miss`);
+          if (misses >= 3) break;
+          await sleep(gapMs); continue;
+        }
+        /* 前导静音 2s：若此刻录音进程正好在自愈窗口里（退场→重启约 1s），
+         *   丢的也只是静音而不是话音（话音从第 2 秒才开始）。
+         * 尾静音 1.2s：触发 silenceConfirmed 成句（FLUSH_MS=1200）。 */
+        writeWav(soakWav, Buffer.concat([silencePcm(2000), pcmOf(rawWav), silencePcm(1200)]));
+        const bts = Date.now();
+        const sp = require('child_process').spawn(FFMPEG_BIN, [
+          '-loglevel', 'error',
+          '-re', '-i', soakWav,
+          '-c:a', 'libopus', '-b:a', '48k',
+          '-payload_type', '96', '-ssrc', '33333333',
+          '-f', 'rtp', rtpDest,
+        ], { stdio: ['ignore', 'ignore', 'pipe'] });
+        sp.stderr.on('data', (d) => { if (process.env.TEST_ASR_DEBUG) console.log(`🧪 [SOAK源] ${String(d).trim().slice(0, 120)}`); });
+        await Promise.race([
+          new Promise((res) => { sp.on('exit', res); sp.on('error', res); }),
+          sleep(30000).then(() => { try { sp.kill(); } catch (e) { /* 已退 */ } }),
+        ]);
+        // 轮询：本轮的条目必须"条数变多 且 ts>=本轮起点"（双条件——防上一轮的迟到条目冒充本轮）
+        const bDeadline = Date.now() + 45000;
+        let got = false;
+        while (Date.now() < bDeadline && !got) {
+          const list = countAsr();
+          got = list.length > capsBefore && list.some((e) => Number(e.ts) >= bts);
+          if (!got) await sleep(500);
+        }
+        if (got) {
+          captured += 1;
+          capsBefore = countAsr().length;
+          const entry = [...countAsr()].reverse().find((e) => Number(e.ts) >= bts);
+          burstTexts[i] = entry ? String(entry.text || '') : '';
+          const finals2 = captions.filter((c) => !c.interim && c.at >= bts);
+          const cred = finals2.filter((c) => Number.isFinite(c.latMs) && c.latMs >= 300 && c.latMs <= 30000);
+          if (cred.length) latSeen.push(cred[cred.length - 1].latMs);
+          else if (finals2.some((c) => c.fin)) latExplained += 1;
+          console.log(`🧪 [SOAK] 第 ${i + 1}/${bursts} 轮 ✓ 「${text}」→ 进账本（第 ${capsBefore} 条）` +
+            `\n🧪 [SOAK]    ↳ 实收：「${burstTexts[i]}」` +
+            (cred.length ? `，latMs ${(cred[cred.length - 1].latMs / 1000).toFixed(1)}s`
+              : finals2.some((c) => c.fin) ? `，无延迟读数（定稿原因 ${finals2.map((c) => c.fin).join('/')}）`
+                : '，⚠️ 该轮既没 latMs 也没定稿原因'));
+        } else {
+          misses += 1;
+          console.log(`🧪 [SOAK] 第 ${i + 1}/${bursts} 轮 ✗ 「${text}」45s 内没进账本`);
+          if (misses >= 3) { console.log('🧪 [SOAK] 连续 3 轮失败，中止耐久相位（下面的断言会给出结论）'); break; }
+        }
+        if (i < bursts - 1) await sleep(i === 2 ? Math.max(60000, gapMs) : gapMs);
+      }
+      /* ── 对账：自愈/放弃的**事实**只写在结构化日志里（内存里没有），必须读文件 ── */
+      const soakReplies = botReplies.length - repliesBefore;
+      const ctlSeen = roomControls.filter((c) => c.at >= soakStartTs);
+      const capsAll = countAsr();
+      const lastCapAt = capsAll.length ? Math.max(...capsAll.map((e) => Number(e.ts) || 0)) : 0;
+      const soakDay = new Date(soakStartTs).toISOString().slice(0, 10);
+      const endDay = new Date().toISOString().slice(0, 10);
+      const respawns = []; const gaveUps = [];
+      for (const d of [...new Set([soakDay, endDay])]) {
+        let lines = [];
+        try { lines = fs.readFileSync(path.join(LOGS_DIR, `app-${d}.jsonl`), 'utf8').split('\n').filter(Boolean); } catch (e) { continue; }
+        for (const line of lines) {
+          try {
+            const e = JSON.parse(line);
+            if (String(e.roomNumber) !== '999999' || !(Date.parse(e.ts) >= soakStartTs)) continue;
+            if (e.event === 'asr-recorder-respawn') respawns.push(e);
+            else if (e.event === 'asr-recorder-gave-up') gaveUps.push(e);
+          } catch (e) { /* 坏行跳过 */ }
+        }
+      }
+      const lastRespawnAt = respawns.length ? Math.max(...respawns.map((e) => Date.parse(e.ts))) : 0;
+      console.log(`🧪 [SOAK] 耐久报告：进账本 ${captured}/${bursts} 轮 · 自愈 ${respawns.length} 次 · 永久放弃 ${gaveUps.length} 次` +
+        ` · 语音→实体动作 ${ctlSeen.length} 次（${[...new Set(ctlSeen.map((c) => c.action))].join('/') || '无'}）` +
+        ` · AI 应答 ${soakReplies} 次 · 说完→上字幕 ${latSeen.map((m) => (m / 1000).toFixed(1) + 's').join(' / ') || '（无）'}`);
+      for (const e of respawns) {
+        console.log(`🧪 [SOAK] ├ 自愈 @+${((Date.parse(e.ts) - soakStartTs) / 1000).toFixed(0)}s：` +
+          `活了 ${Math.round((e.livedMs || 0) / 1000)}s code=${e.code} ${e.idle ? '静音退场' : '异常'} backoff=${e.backoff}ms` +
+          (e.stderr ? ` · stderr「${String(e.stderr).slice(0, 100)}」` : ''));
+      }
+      for (const e of gaveUps) console.log(`🧪 [SOAK] ├ ✗ 永久放弃 @+${((Date.parse(e.ts) - soakStartTs) / 1000).toFixed(0)}s：${JSON.stringify(e).slice(0, 200)}`);
+      /* 断言组（每一条都对着真实事件/日志，结论都在上面的报告行里可见）：
+       *   ① 零永久放弃 —— "一段时间就停了"的原病不复发的硬证据；
+       *   ② 轮轮进账本 —— 长跑里耳朵一直在线（miss 就说明有路音频没听见）；
+       *   ③ latMs 覆盖 captured —— 延迟读数在长跑里也没丢；
+       *   ④ 自愈 ≥1 —— 跨越了静音退场边界（否则这条耐久相位的靶子根本没被碰到）；
+       *   ⑤ 最后一条字幕晚于最后一次自愈 —— "自愈后还能转写"的核心证据（端口/SDP 复用成立）；
+       *   ⑥ 房间指令至少命中一条 —— 语音→room-control 的端到端（问题⑤）。 */
+      must(gaveUps.length === 0,
+        `耐久相位出现 ${gaveUps.length} 次 asr-recorder-gave-up（录音进程永久放弃）——「一段时间就停了」复发`);
+      must(misses === 0, `耐久相位 ${misses}/${bursts} 轮语音 45s 内没进字幕账本（长跑中途断链）`);
+      must(latSeen.length + latExplained === captured,
+        `${captured} 轮进账本，其中 ${latSeen.length} 轮带可信 latMs、${latExplained} 轮带定稿原因，`
+        + '其余的既没读数也没解释 —— 延迟读数在长跑里丢了（丢得不明不白）');
+      must(respawns.length >= 1,
+        '耐久相位录音进程一次都没自愈——静音退场→重启这条链路没被验证到（要么 ffmpeg 没退场，要么退场没日志）');
+      must(capsAll.length > 0 && lastCapAt > lastRespawnAt,
+        `最后一次自愈（@+${((lastRespawnAt - soakStartTs) / 1000).toFixed(0)}s）之后账本再无新字幕 —— 自愈了但耳朵没接回来（端口/SDP 没复用）`);
+      must(ctlSeen.length >= 1, '耐久相位的房间指令一句都没触发 room-control（语音→实体动作这条链断了）');
+      /* ★ 2026-10-05 收紧（chop 修复的靶心断言）：
+       *   第 1 轮「把白板打开」曾因尾字被闸/碎片逻辑吃掉而只入库「把白板打。」——
+       *   动作没触发、问题⑤看起来像"AI 操作实体实现得不行"。现在直接断"实收文本里
+       *   '白板'与'打开'必须同时在"（比断精确整句宽松：ASR 允许标点/语气词差异，
+       *   但绝不允许把动词吃掉），并按已跑轮数定向断对应动作真的到达了客户端。 */
+      const norm = (s) => String(s || '').replace(/[，。！？、,.!?\s]/g, '');
+      const ranIdx = Math.min(bursts, soakSentences.length);
+      if (captured >= 1 && burstTexts[0] !== undefined) {
+        must(/白板/.test(norm(burstTexts[0])) && /打开/.test(norm(burstTexts[0])),
+          `第 1 轮实收文本「${burstTexts[0]}」缺「白板」或「打开」——尾字被吃（chop 复发，问题⑤的输入端）`);
+        must(ctlSeen.some((c) => c.action === 'board-open'),
+          `第 1 轮「把白板打开」没触发 board-open（实收动作：${[...new Set(ctlSeen.map((c) => c.action))].join('/') || '无'}）`);
+      }
+      if (ranIdx >= 3) {
+        must(ctlSeen.some((c) => c.action === 'view-speaker'),
+          '第 3 轮「切到演讲者视图」没触发 view-speaker（规则路由对"演讲者"同义词失手）');
+      }
+      if (ranIdx >= 5) {
+        must(ctlSeen.some((c) => c.action === 'board-close'),
+          '第 5 轮「把白板关掉」没触发 board-close（"关"字被"打开"规则跨词命中或尾字丢失）');
+      }
+      must(soakReplies >= Math.max(1, bursts - 2),
+        `耐久相位 ${bursts} 轮语音只应答了 ${soakReplies} 次（少于 ${Math.max(1, bursts - 2)}）`);
+      console.log(`🧪 [SOAK] PASS —— ${captured} 轮语音全部进账本 · 自愈 ${respawns.length} 次后仍在转写 · 0 次永久放弃`);
+    }
 
     // ⑧ 收尾：先断 RTP 源（管线会在 producerclose 后自动退场），再清测试痕迹
     try { probe.disconnect(); } catch (e) { /* 忽略 */ }
@@ -6431,11 +9149,8 @@ async function runAsrSelfTest() {
     producer.close();
     await sleep(500);
     rooms.delete(selfRoom.roomNumber);
-    /* 收尾登记（不是立刻执行）：断言若在它之前抛错，catch 里同样会跑一遍 */
-    cleanupSelfTest = () => {
-      try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* 忽略 */ }
-      try { fs.rmSync(capFile, { force: true }); } catch (e) { /* 忽略 */ }
-    };
+    /* ★ 2026-10-05：这里**不再重新赋值** cleanupSelfTest——提前登记的那一版已含 relay.close()，
+     *   再赋一次会把它覆盖成"忘了关中继"的版本（成功路径反而漏一个 UDP 端口）。只调用+置空。 */
     cleanupSelfTest();
     cleanupSelfTest = null;
     if (!hit) throw new Error('90s 内字幕账本未出现 asr 转写（管线某段断了，看上方聆听/转写日志）');
@@ -6505,7 +9220,10 @@ async function gracefulShutdown(signal) {
   //    服务器重启后新管线可能分到同一端口，收不到流表现为"AI 全程听不见"，实测踩中）
   try {
     for (const [, set] of aiAudioPipes) {
-      for (const pipe of set) { try { pipe.proc && pipe.proc.kill(); } catch (e) { /* 忽略 */ } }
+      // ★ 2026-10-05：ASR 支线的录音进程挂在 stop() 闭包里（自愈重生，没有静态 proc 可杀）
+      for (const pipe of set) {
+        try { if (typeof pipe.stop === 'function') pipe.stop(); else if (pipe.proc) pipe.proc.kill(); } catch (e) { /* 忽略 */ }
+      }
     }
     aiAudioPipes.clear();
   } catch (e) { /* 忽略 */ }
@@ -6513,7 +9231,9 @@ async function gracefulShutdown(signal) {
   process.on('exit', () => {
     try {
       for (const [, set] of aiAudioPipes) {
-        for (const pipe of set) { try { pipe.proc && pipe.proc.kill(); } catch (e) { /* 忽略 */ } }
+        for (const pipe of set) {
+          try { if (typeof pipe.stop === 'function') pipe.stop(); else if (pipe.proc) pipe.proc.kill(); } catch (e) { /* 忽略 */ }
+        }
       }
     } catch (e) { /* 忽略 */ }
   });

@@ -45,20 +45,43 @@ def main():
     #     所以服务端实时播报默认仍走浏览器朗读，本地音色要显式开 aiTtsLocalWait
     #     ——判据与取舍写在 sfu/server.js 的 localTtsWaitEnabled 注释里。
     #   ▸ 想回退/对比：QWEN_TTS_DTYPE=float32。
-    dt_name = (os.environ.get("QWEN_TTS_DTYPE") or "bfloat16").strip().lower()
-    dtype = getattr(torch, dt_name, torch.float32)
+    # ★ 2026-10-03d GPU 优先（与 qwen_asr_worker.py 同一套逻辑）：本机有 RTX 4060(8GB)
+    #   但装的 CPU 版 torch——上面"CPU 合成 44s/句"的账是 torch 没用上 GPU 时的账。
+    #   换 cu130 版 torch 后 GPU bf16 合成，RTF 若降到 1 以下，`aiTtsLocalWait`（本地
+    #   神经音色实时播报）就从"显式开关的实验项"变成"真正可用的选项"——实测数据说话。
+    #   ▸ 逃生舱：QWEN_TTS_DEVICE=cpu 强制走 CPU（回到 02 实测的 CPU 档）。
+    import torch as _torch
+    dev = (os.environ.get("QWEN_TTS_DEVICE") or "").strip().lower()
+    if dev == "cpu":
+        device = "cpu"
+    elif dev == "cuda" or (dev == "" and _torch.cuda.is_available()):
+        device = "cuda"
+    else:
+        device = "cpu"
+    dt_name = (os.environ.get("QWEN_TTS_DTYPE")
+               or ("bfloat16")).strip().lower()
+    dtype = getattr(_torch, dt_name, _torch.float32)
 
     try:
         model = Qwen3TTSModel.from_pretrained(
             args.model,
             dtype=dtype,
-            device_map="cpu",
+            device_map=device,
         )
     except Exception as e:
-        print(json.dumps({"fatal": "load_model: %s" % e}, ensure_ascii=False), flush=True)
-        return 1
+        # GPU 加载失败（显存被占/驱动问题）→ 自动回落 CPU 重试一次，别让音色整条起不来
+        if device == "cuda":
+            try:
+                device = "cpu"
+                model = Qwen3TTSModel.from_pretrained(args.model, dtype=dtype, device_map=device)
+            except Exception as e2:
+                print(json.dumps({"fatal": "load_model: %s / cpu重试: %s" % (e, e2)}, ensure_ascii=False), flush=True)
+                return 1
+        else:
+            print(json.dumps({"fatal": "load_model: %s" % e}, ensure_ascii=False), flush=True)
+            return 1
 
-    print(json.dumps({"ready": True, "model": args.model, "dtype": dt_name}, ensure_ascii=False), flush=True)
+    print(json.dumps({"ready": True, "model": args.model, "dtype": dt_name, "device": device}, ensure_ascii=False), flush=True)
 
     speaker = os.environ.get("QWEN_TTS_SPEAKER", "Vivian")
     language = os.environ.get("QWEN_TTS_LANGUAGE", "Chinese")
