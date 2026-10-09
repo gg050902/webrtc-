@@ -202,6 +202,42 @@ function fixDomainHomophones(t) {
   return s;
 }
 
+/* ★ 2026-10-10（B3-①）句尾"回声短句"折叠（纯函数，test-asr 逐条断言）。
+ * ▎触发这件事的不是我的想象，是**真人金标准表**：`bench:asr-golden` 在 far 档转出
+ *   「服务器起负载了，把 GPU 显存先降下来。降下来。」——模型把刚说完的尾巴又复读了一遍。
+ *   10-07 那次整句重转的反噬（「…明天下午三点的评审」→「…评审**器真不错,拍麦亚。**」）
+ *   是同一个家族：**自回归模型在句尾容易把最后一个词组再说一遍**。
+ * ▎为什么这条判据是"安全"的那一类（与改别字完全不同）：
+ *   折叠掉的这一份，**紧挨着的前一份里已经原样存在了** ⇒ 这是**保内容**的改写，
+ *   不像同音字纠正那样可能把真话改脏。最坏情况只是"某人真的强调了一遍"，
+ *   而字幕仍然完整显示那句内容一次。
+ * ▎规则（三条同时成立才折）：
+ *   1 回声段自己是一个完整短句：前面隔着**句末标点**（。！？!?），段长 2~16 字；
+ *   2 它是前一句结尾的**真后缀**（前一句严格更长——所以「同意。同意。」这种
+ *     两个相等短句的强调**不动**，那是说话人在重复，不是模型在复读）；
+ *   3 只处理**句尾**那一个回声（不递归折叠中间的重复——中间复读是修辞，句尾复读是故障）。
+ * ▎为什么不做"没有标点"的那种（「先降下来降下来。」）：中文里「非常非常」「好好」
+ *   这类叠词是合法表达，折叠会**丢字**；不对称的代价（丢字比留一个复读更伤）
+ *   决定了这里宁可少修（坑 109 同一条）。 */
+function foldTailEcho(text) {
+  const raw = String(text || '');
+  if (!raw) return raw;
+  /* 按句末标点切，但**保留标点**在前一段末尾（lookbehind），这样最后一段就是"尾巴" */
+  const parts = raw.split(/(?<=[。！？!?])/).filter((p) => p.trim());
+  if (parts.length < 2) return raw;
+  const last = parts[parts.length - 1];
+  const prev = parts[parts.length - 2];
+  /* 去掉标点与空白后再比（回声段常常自带尾标点：「降下来。」） */
+  const strip = (s) => s.replace(/[。！？!?，,、；;：:\s]/g, '');
+  const echo = strip(last);
+  const before = strip(prev);
+  if (echo.length < 2 || echo.length > 16) return raw;
+  if (before.length <= echo.length) return raw;          // 相等 = 强调，不动（见上）
+  if (!before.endsWith(echo)) return raw;
+  /* 折叠：丢掉最后一个回声段，并保证前一句的句末标点还在 */
+  return parts.slice(0, -1).join('').trim();
+}
+
 function cleanTranscript(raw) {
   let t = String(raw || '').replace(/\s+/g, ' ').trim();
   if (!t) return '';
@@ -220,6 +256,10 @@ function cleanTranscript(raw) {
   t = t.replace(/^(.{2,20}?)([，,。.\s]*)\1(?![\w])/, '$1');
   // ★ 2026-10-05 夜三 会议动作词的别字（只动"贴着动作词"的那一种，见 fixDomainHomophones 的实测注释）
   t = fixDomainHomophones(t);
+  /* ★ 2026-10-10（B3-①）句尾回声折叠。**放在这里而不是放在定稿/重转那两处**：
+   *   分段转写、整句重转、以及 review:meeting 的回扫走的都是这一个入口——
+   *   写在调用方就会漏掉一条路（坑 47；而"漏一条路"的症状正是"有时糊有时不糊"）。 */
+  t = foldTailEcho(t);
   // 擦干净后只剩标点/单字 → 当作没有内容（唤醒与账本都不需要这种条目）
   if (t.replace(/[\s，,。.、！!？?：:;；…~\-]/g, '').length < 2) return '';
   return t;
@@ -388,6 +428,15 @@ function createVoiceTracker(opt = {}) {
     /* 两条安全线暴露出去：诊断与自测要说清"现在是被钳住的还是跟着噪声底走的" */
     get sensitiveFloor() { return SENSITIVE_FLOOR; },
     get deafCeil() { return DEAF_CEIL; },
+    /* ★ 2026-10-10（B2）把这把尺子的**生效参数**交出来，而不是让外部工具再抄一份默认值。
+     *   ▎为什么这条是承重的而不是便利：`bench:voice-floor` 要拿"现状 silentDb"与几个变体对比，
+     *   而 -80/-30/8/60/0.2 这些数原先只活在函数体内部——工具自己写一份"现状"就意味着
+     *   **它对比的可能是我以为的现状**（生产改了、量具没改，报告会继续替旧参数辩护）。
+     *   与 `modelGainDb()` / `asrMinPeakDb()` 同一条纪律：一个概念一个来源（坑 47）。 */
+    get params() {
+      return { absDb, marginDb, minSamples, windowSize, quantile, silentDb, loudCap: LOUD_CAP,
+        sensitiveFloor: SENSITIVE_FLOOR, deafCeil: DEAF_CEIL };
+    },
   };
 }
 
@@ -989,6 +1038,7 @@ module.exports = {
   isNameOnly,     // ★ 2026-10-04 光叫名字没说事（碎片唤醒不应答，但顺延追问窗口）
   assertRunner,
   cleanTranscript,   // ★ 2026-10-02 静音幻觉清洗（纯函数，test:asr 逐条断言）
+  foldTailEcho,      // ★ 2026-10-10 句尾回声折叠（B3-①；cleanTranscript 里已生效，导出是为了单测与真实账本回扫）
   fixDomainHomophones, // ★ 2026-10-05 夜三 会议动作词别字（既要→纪要，只在贴动作词时改）
   noiseRiffReason,   // ★ 2026-10-05 夜二 同音字免疫的噪声 riff 判据（返回命中理由或 ''）
   isFragmentOf,      // ★ 2026-10-03 分段碎片的"同一句话"判据（方向性 bigram 覆盖）

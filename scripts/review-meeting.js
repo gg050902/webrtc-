@@ -62,6 +62,8 @@ const T = {
   rmsGapBadMs: Number(process.env.REVIEW_RMS_GAP_MS) || 5000,
   rmsBlockBytes: Number(process.env.REVIEW_RMS_BLOCK_BYTES) || 4096,
   minRmsSamples: 3,
+  /* 窗被判有声的比例超过它 ⇒ "这个房间几乎没有安静态"（要结合 fin 分布一起判，不单独当结论） */
+  voicedNeverSilent: Number(process.env.REVIEW_VOICED_NEVER) || 0.9,
 };
 
 /* ────────── 读账本 ────────── */
@@ -236,6 +238,16 @@ function analyzeRoom(caps, events) {
   const rmsPipe = rmsNums('afterByteMs');
   const rmsGap = rmsArr.map((e) => Number(e.gapMaxMs) || 0).sort((a, b) => a - b);
   const rmsBytes = rmsArr.map((e) => Number(e.bytesMax) || 0).sort((a, b) => a - b);
+  /* ★ 2026-10-10（H8c）同一行事件里带着"这把尺此刻停在哪"：floor 中位 / 生效阈值 / 有声占比。
+   *   voiced 比例（voiced/lines）才是"这个房间分不分得开"的直接读数：
+   *   接近 1 = 每一窗都判"有人在说话" ⇒ `silenceConfirmed` 永不成立 ⇒ 句子只能等保险丝 ⇒ blob。
+   *   （10-07 那次 blob 的机理；当时只能靠 ASR_DEBUG 现场摊开看，现在账本里有数了。） */
+  const rmsVoicedShare = rmsArr.map((e) => {
+    const l = Number(e.lines); const v = Number(e.voiced);
+    return (Number.isFinite(l) && l > 0 && Number.isFinite(v)) ? v / l : null;
+  }).filter((x) => x !== null).sort((a, b) => a - b);
+  const rmsFloor = rmsArr.map((e) => Number(e.floorMed)).filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+  const rmsThr = rmsArr.map((e) => Number(e.voiceThr)).filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
 
   /* ⑦ 应答与播报 */
   const count = (name) => events.filter((e) => e.event === name).length;
@@ -328,6 +340,9 @@ function analyzeRoom(caps, events) {
     rmsN: rmsFirst.length, rmsFirst, rmsPipe: rmsPipe, rmsPipeN: rmsPipe.length,
     rmsGapMax: rmsGap[rmsGap.length - 1] || 0,
     rmsBytesMax: rmsBytes[rmsBytes.length - 1] || 0,
+    /* ★ H8c：这把尺停在哪 + 有多少窗被判有声（都从同一行事件来，不另找数据源） */
+    rmsVoicedShare, rmsFloorMed: rmsFloor.length ? rmsFloor[Math.floor(rmsFloor.length / 2)] : null,
+    rmsThrMed: rmsThr.length ? rmsThr[Math.floor(rmsThr.length / 2)] : null,
     wake: count('asr-wake-answer'), wakeAck: count('ai-wake-ack'), nameOnly: count('ai-wake-name-only'),
     busyDrop: count('ai-answer-busy-drop'), dupDropped: count('asr-dup-dropped'), echoDropped: count('asr-ai-echo-dropped'),
     answerFailed: count('ai-answer-failed'),
@@ -357,6 +372,9 @@ function eventsForRoom(events, room) {
 
 /* ────────── 结论：每条都带样本量，样本不足就直说 ────────── */
 function fmtSec(ms) { return (ms / 1000).toFixed(ms >= 10000 ? 1 : 2) + 's'; }
+/* 比例与分贝的写法各留一处（同一份报告里"64%"与"0.643"混着出现，读者会怀疑自己在看两个指标）。 */
+const pct1 = (x) => (Number.isFinite(x) ? `${(x * 100).toFixed(0)}%` : '—');
+const fmtDb1 = (x) => (Number.isFinite(x) ? x.toFixed(1) : '—');
 function verdictLines(m) {
   const L = [];
   const add = (level, label, text) => L.push({ level, label, text });
@@ -411,6 +429,27 @@ function verdictLines(m) {
           : slow ? `音频进来后第一行仍要 >${T.rmsPipeWarnMs}ms ⇒ 冷启动宽限要核对`
             : hasPipe ? '逐行交付，H2 的"成块"假设在这一台上不成立（已结案）'
               : '逐行交付（这一版服务器还没交"管道"那一格，只看空档与单次字节）'));
+  }
+  /* ★ 2026-10-10（H8c）这个房间**分不分得开**——它是"要不要动阈值"的唯一正当依据。
+   *   ▸ 有声占比（voiced/lines）接近 1 的两种读法必须分清，否则这一行会被误读：
+   *       ① 真有人在连续讲（开会正常形态，尤其念稿/发言接发言）⇒ 判"分不开"是错的；
+   *       ② 静音期也判有声 ⇒ `silenceConfirmed` 永不成立 ⇒ 句子等 10s 保险丝 ⇒ blob。
+   *     ⇒ 所以这行**只报数 + 给下一步**，不自己充当结论；结论要把这一行与「字幕形态」
+   *       （长条 %）和定稿原因分布（fin=silence 占比）**放在一起**读（坑 105：每条结论都带样本量）。
+   *   ▸ 阈值中位 == −42 意味着"被钳位硬线接管"（自适应没在起作用），这本身是可操作的读数。 */
+  if (m.rmsVoicedShare.length >= T.minRmsSamples) {
+    const share = quantile(m.rmsVoicedShare, 0.5);
+    const clamped = m.rmsThrMed !== null && Math.abs(m.rmsThrMed - (-42)) < 0.05;
+    add(share > T.voicedNeverSilent ? 'warn' : 'info', '房间可分性',
+      `窗被判有声 中位 ${pct1(share)} / 最差 ${pct1(m.rmsVoicedShare[m.rmsVoicedShare.length - 1])}`
+      + `（n=${m.rmsVoicedShare.length} 代）· 噪声底中位 ${fmtDb1(m.rmsFloorMed)}dB · 阈值中位 ${fmtDb1(m.rmsThrMed)}dB`
+      + (clamped ? ' ⇒ 阈值被 −42 硬线钳住（自适应此刻没起作用）' : '')
+      + (share > T.voicedNeverSilent
+        ? ' ⇒ **几乎没有"安静窗"**：静音确认可能长期不成立（要跟「字幕形态」与 fin 分布一起判，别单看这行）'
+        : ''));
+  } else {
+    add('unknown', '房间可分性',
+      `样本 ${m.rmsVoicedShare.length} 代（<${T.minRmsSamples} 不下结论）——重启 3001 之后每代录音进程才会记这条`);
   }
   add('info', '能量闸',
     `跳过 ${m.skipped} 段：纯静音(<-70dB) ${m.bands.dead} · 噪声底 ${m.bands.floor} · `
@@ -685,6 +724,21 @@ function selftest() {
   ok(/logEvent\('info', 'asr-rms-arrival'/.test(srvSrcRms)
     && /firstMs: rmsSeen\.firstAtMs, firstByteMs: rmsSeen\.firstByteAtMs/.test(srvSrcRms),
     '自检 G2f：服务器真的写 asr-rms-arrival，且字段名与复盘读的一致');
+  /* G3 ★「房间可分性」也按同一条纪律自检（仪表自己必须能红，否则它只是装饰，坑 107）。
+   *   ▸ 三个方向各一条：几乎没有安静窗（warn）/ 一半窗是安静的（info，不许跟着喊）/
+   *     阈值正好压在 −42 硬线上（要说出"自适应此刻没起作用"——这才是可操作信息）。 */
+  const sepNever = verdictLines(analyzeRoom(oneCap, arr(5, { lines: 100, voiced: 98 }))).find((l) => l.label === '房间可分性');
+  ok('自检 G3a：98% 的窗被判有声 ⇒ warn 并说"静音确认可能长期不成立"',
+    sepNever.level === 'warn' && /98%/.test(sepNever.text) && /静音确认/.test(sepNever.text), sepNever.text);
+  const sepOk = verdictLines(analyzeRoom(oneCap, arr(5, { lines: 100, voiced: 52 }))).find((l) => l.label === '房间可分性');
+  ok('自检 G3b：一半窗是安静的 ⇒ 只报事实（info），不许乱报"分不开"（误报的告警等于没有告警）',
+    sepOk.level === 'info' && /52%/.test(sepOk.text) && !/长期不成立/.test(sepOk.text), sepOk.text);
+  const sepClamp = verdictLines(analyzeRoom(oneCap, arr(5, { voiceThr: -42, floorMed: -44 }))).find((l) => l.label === '房间可分性');
+  ok('自检 G3c：阈值中位正好压在 −42 硬线 ⇒ 明说"自适应此刻没起作用"',
+    /-42/.test(sepClamp.text) && /钳住/.test(sepClamp.text), sepClamp.text);
+  const sepFew = verdictLines(analyzeRoom(oneCap, arr(2))).find((l) => l.label === '房间可分性');
+  ok('自检 G3d：样本 <3 代报 ❔（这条数据是 10-10 才开始记的，老账本里根本没有）',
+    sepFew.level === 'unknown' && /重启 3001/.test(sepFew.text), sepFew.text);
   /* 这条是**报告自己抓出来的**：第一版把计数当数组打（`${m.crashRespawn.length}`），
    * 于是每一场会都印"其中崩溃 undefined"——一个 undefined 混进结论，读者只会整行都不再信。
    * 判据：结论文本里不许出现 undefined / NaN / [object。 */

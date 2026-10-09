@@ -3420,11 +3420,12 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
        *     maxBytes     = 单次 stdout 事件最大字节（正常突发实测 2018B；判"成块"的线在 4096B） */
       const rmsSeen = { lines: 0, voice: 0, minDb: 0, maxDb: -999,
         events: 0, firstAtMs: -1, firstByteAtMs: -1, afterByteMs: -1,
-        maxGapMs: 0, maxBytes: 0, lastAt: 0 };
+        maxGapMs: 0, maxBytes: 0, lastAt: 0, floors: [] };
       const resetRmsSeen = () => {
         rmsSeen.lines = 0; rmsSeen.voice = 0; rmsSeen.minDb = 0; rmsSeen.maxDb = -999;
         rmsSeen.events = 0; rmsSeen.firstAtMs = -1; rmsSeen.firstByteAtMs = -1;
         rmsSeen.afterByteMs = -1; rmsSeen.maxGapMs = 0; rmsSeen.maxBytes = 0; rmsSeen.lastAt = 0;
+        rmsSeen.floors.length = 0;
       };
       let flushDbgTs = 0;   // ★ 诊断日志节流（ASR_DEBUG 用）
       let gateDbgTs = 0;    // ★ 2026-10-05 成句闸状态行的节流（同上）
@@ -3598,6 +3599,9 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
            *   "刚才那个人被判有声/无声用的是哪条线"）。 */
           COLLAB.input.voiceThr = Math.round(vd.thresholdDb * 10) / 10;
           COLLAB.input.floorDb = vd.floorDb == null ? null : Math.round(vd.floorDb * 10) / 10;
+          /* ★ 2026-10-10（H8c）把噪声底**序列**留下（上限 512 个读数 ≈ 4 分钟），
+           *   退出时取中位进事件账本——单帧读数会被一次咳嗽/翻页带跑，中位才代表这台机器。 */
+          if (Number.isFinite(vd.floorDb) && rmsSeen.floors.length < 512) rmsSeen.floors.push(vd.floorDb);
           if (vd.voiced) { lastVoiceTs = Date.now(); rmsSeen.voice += 1; }
         });
         curRec.on('exit', (code) => {
@@ -3617,6 +3621,21 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
               afterByteMs: rmsSeen.afterByteMs,
               gapMaxMs: rmsSeen.maxGapMs, bytesMax: rmsSeen.maxBytes,
               lines: rmsSeen.lines, events: rmsSeen.events, voiced: rmsSeen.voice,
+              /* ★ 2026-10-10（B2 / H8c）把**这把尺此刻停在哪**一起记账。
+               *   ▎为什么必须一起记：10-06 之后"有没有人在说话"是跟着本机噪声底走的自适应线，
+               *     而 /metrics 那两格只反映"此刻最新一路的最新一帧"——散会就没了。
+               *     今天量真人金标准量到一件更要紧的事：这个人停下来之后房间**并不安静**
+               *     （近档末尾窗的 RMS 中位 −36.8 dBFS，而阈值 −54.6）⇒
+               *     "尾窗被判有声 64%" 衡量的是**这个房间的可分性**，不是判据好坏。
+               *     下一次要动 margin/分位/钳位线，依据只能是真实会议里 floor 与阈值的分布，
+               *     而这条事件就是那份数据的唯一来源（没有它，这个决定下次还是靠猜）。
+               *   ▸ floor 记的是本代的**中位**（不是最后一帧）：单帧读数会被一次翻页/咳嗽带跑。 */
+              floorMed: (() => {
+                const f = rmsSeen.floors.slice().sort((x, y) => x - y);
+                return f.length ? Math.round(f[Math.floor(f.length / 2)] * 10) / 10 : null;
+              })(),
+              voiceThr: Math.round(voiceTrack.thresholdDb * 10) / 10,
+              voicedPct: rmsSeen.lines ? Math.round((rmsSeen.voice / rmsSeen.lines) * 100) : 0,
               livedMs: Date.now() - recBornAt,
             });
           }
