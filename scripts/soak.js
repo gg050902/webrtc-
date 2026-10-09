@@ -119,6 +119,36 @@ const rss0 = process.memoryUsage().rss;
   const tokenP = new Promise((resolve) => {
     socket.once('room-members', (p) => resolve((p && p.roomToken) || ''));
   });
+  /* ★ 2026-10-10（B6，被我自己撞出来的）：soak 原来**没有"连不上"这条路**。
+   *   ▎现场：我直接跑了 `npm run soak -- --minutes 8`（没给 SOAK_URL，默认指 3001），
+   *     而那一刻 3001 上没有服务器。socket.io 的 `reconnection:true` 让它**无限重连**，
+   *     `await request('create-room')` 的 ack 永远不来 ⇒ 脚本就挂在那一行，
+   *     心跳文件里只留下开头那一条"🌙 soak 启动"，**零报错、零输出、看起来还在跑**。
+   *     我因此白等了 4 分钟才去看进程表。这是今晚那条主题的同一种病：
+   *     **只有正向（等事件到）没有反向（等不到时怎么办）**——与坑 66/94 一家，
+   *     只是这次的对象是长跑工具自己。
+   *   ▸ 修法是"开场先证明连得上"，而不是把后面的等待都加超时：
+   *     一个明确的失败出口 + 一句能照着做的下一步；退出码 2 与"跑完但 FAIL"分开，
+   *     因为这两种情况下一步动作完全不同（查服务器 vs 查产品）。
+   *   ▸ 为什么仍然保留 reconnection:true：**长跑中途掉线重连**正是被测行为之一
+   *     （state.reconnects 那本账就是为它设的），不能为了开场诊断把它关掉。 */
+  const CONNECT_BUDGET_MS = Math.max(3000, Number(process.env.SOAK_CONNECT_MS) || 15000);
+  let lastConnErr = '';
+  socket.on('connect_error', (e) => { lastConnErr = String((e && e.message) || e).slice(0, 120); });
+  const connectedP = new Promise((r) => { if (socket.connected) r(true); else socket.once('connect', () => r(true)); });
+  const gotConn = await Promise.race([connectedP, new Promise((r) => setTimeout(() => r(false), CONNECT_BUDGET_MS))]);
+  if (!gotConn) {
+    const msg = `❌ ${CONNECT_BUDGET_MS / 1000}s 内连不上 ${URL_BASE}`
+      + `（最近一次连接错误：${lastConnErr || '没收到错误，可能是端口上根本没监听'}）\n`
+      + '   ⇒ soak 不自己起服务器。先起：`npm run start:sfu`（默认 3001），\n'
+      + '     或者指到回归用的那台隔离实例：`SOAK_URL=http://localhost:3023 npm run soak -- --minutes 8`\n'
+      + '   ⇒ 这条退出**不算跑过**：长跑的结论必须由一次真的跑完的 soak 给出（坑 105：没证据不许报通过，也不许报失败）。';
+    heartbeat(msg.split('\n')[0]);
+    console.error(msg);
+    try { socket.close(); } catch (e) { /* 已经连不上，关不掉无所谓 */ }
+    process.exit(2);
+  }
+  heartbeat(`✅ 已连上 ${URL_BASE}，开始建房`);
   await request('create-room', {});
   const { roomNumber } = await createdP;
   const roomToken = await tokenP;
