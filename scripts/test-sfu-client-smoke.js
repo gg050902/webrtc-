@@ -3487,16 +3487,33 @@ const emit = (ev, payload) => {
    *   它报出来的绿灯与本轮改动毫无关系。这类"新增的东西没人检查它存不存在"的缺陷，
    *   正好用一条遍历文件的断言封死（同坑 76："机制存在 ≠ 机制生效"的检验要能自动化）。
    * ▎两种形式都算合格：① `no-store` 拉源码比对指纹；② 直接问页面全局函数在不在
-   *   （check:think 用的是这种——它其实更强，因为它量的是**真跑起来的那一份**）。 */
+   *   （check:think 用的是这种——它其实更强，因为它量的是**真跑起来的那一份**）。
+   * ▸ ★ 2026-10-10 加第三种合格形态：**这台根本不开浏览器**（`scripts/check-scripts.js` 是静态审计，
+   *   没有"页面加载了哪一版"这件事可问，要它写版本指纹就是让判据问一个不存在的问题）。
+   *   ▸ 但**豁免必须是文件自己声明的**，而且要当场核对声明是不是真的——
+   *     只在断言里按文件名/关键词猜"哪些是静态的"，下一个不开浏览器的检查就会撞红（今晚就是这样红的），
+   *     而随便写一句"我是静态的"就能逃过指纹检查，这条红线就废了。两头都堵：
+   *     声明了静态 ⇒ 必须真的碰不到浏览器（不出现 cdp/headless/launch/navigate）。 */
   {
     const dir = path.join(__dirname);
     const list = fs.readdirSync(dir).filter((f) => /^check-.*\.js$/.test(f) && f !== 'check-all.js');
-    const naked = list.filter((f) => {
+    const STATIC_DECL = /静态审计[^\n]{0,40}不开浏览器/;
+    const BROWSER_TOUCH = /cdp|headless|launch\(|Page\.navigate|remote-debugging/;
+    const naked = [];
+    const declaredStatic = [];
+    for (const f of list) {
       const s = fs.readFileSync(path.join(dir, f), 'utf8');
-      return !/cache:\s*'no-store'/.test(s) && !/typeof\s+\w+\s*===?\s*"function"/.test(s);
-    });
-    ok('2026-10-04 每条界面检查都有版本指纹（共 ' + list.length + ' 条）',
-      list.length >= 13 && naked.length === 0, naked.length ? '没指纹的：' + naked.join(',') : '');
+      if (STATIC_DECL.test(s)) { declaredStatic.push(f); continue; }
+      if (!/cache:\s*'no-store'/.test(s) && !/typeof\s+\w+\s*===?\s*"function"/.test(s)) naked.push(f);
+    }
+    ok('2026-10-04 每条界面检查都有版本指纹（共 ' + list.length + ' 条，其中声明"静态审计·不开浏览器"的 ' + declaredStatic.length + ' 条）',
+      list.length >= 13 && naked.length === 0,
+      naked.length ? '没指纹的：' + naked.join(',') : '');
+    /* 反向对照（没有这一条，"声明"就成了万能逃生舱）：真碰浏览器的文件不许用这句话躲过去。 */
+    const lying = declaredStatic.filter((f) =>
+      BROWSER_TOUCH.test(fs.readFileSync(path.join(dir, f), 'utf8')));
+    ok('2026-10-10 声明"静态审计·不开浏览器"的文件必须真的不开浏览器（谎报就红——否则这条豁免会把红线掏空）',
+      lying.length === 0, lying.length ? '声明了却碰浏览器：' + lying.join(',') : declaredStatic.join(',') || '（没有声明者）');
   }
 
 

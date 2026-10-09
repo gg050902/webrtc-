@@ -52,6 +52,7 @@
     "test:quiet-mic": "node scripts/test-quiet-mic.js",
     "review:meeting": "node scripts/review-meeting.js",
     "review:office": "node scripts/review-office.js",
+    "test:scripts": "node scripts/check-scripts.js",
     "test:office": "node scripts/review-office.js --selftest",
     "test:review": "node scripts/review-meeting.js --selftest",
     "bench:asr": "node scripts/bench-asr-accuracy.js",
