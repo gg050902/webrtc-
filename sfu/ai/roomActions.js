@@ -189,18 +189,10 @@ function detectRoomActions(q) {
    *   ▸ 带**请求标记**的问句照样执行——「能不能把白板打开？」「帮我把字幕关掉好吗？」
    *     形式是问句，语义是命令，这类占用户说法的大多数（礼貌请求），不能误杀。
    *   ▸ 判据尾词只认 吗/呢（中文疑问尾），并允许后面跟 ？?。 或直接到句尾。 */
-  const QUESTION_RE = /[吗呢]\s*[？?。！]?\s*$/;
-  const REQUEST_MARKER_RE = /(能不能|可不可以|可以|帮我|帮忙|麻烦|请|帮我们|替我|好吗|行吗|行不行|来)/;
-  /* ★ 2026-10-08 泛化补齐时被一句真说法逼出来的第二条例外：「能看下文件清单吗」——
-   *   形式是问句、语义是请求，而它**不带**上面任何一个礼貌标记词，只有一个光杆的"能"。
-   * ▸ 为什么不直接把 能 加进上面那张表：那会把「能力打开白板吗」也当成请求——
-   *   那里"能"后面站着的是"力"（名词的一部分），不是情态动词。
-   * ▸ 所以要的是**句首 + 能/能否 + 紧跟一个动作动词**这个完整形状，并用 (?!力) 挡住名词化说法。
-   *   漏一句用户可以重说一遍，错一句是当着全房把界面改了（代价不对称，与坑 106 末段同一条取舍）。
-   *   正反两条都钉在 test:asr 的 FILES_GEN 里。 */
-  /* 句首 + 能 + +紧跟动作动词 = 礼貌请求（(?!力) 挡住 + 能力 + 这种名词化开头，见 test:asr 的 GEN_REFUSE）*/
-  const POLITE_ASK_RE = /^(?:能|能否)(?!力)[^。，,]{0,3}(?:看|打开|开启|开|关闭|关掉|关|切|换|调出|调|显示|撤|收|放|帮)/;
-  if (QUESTION_RE.test(s.trim()) && !REQUEST_MARKER_RE.test(s) && !POLITE_ASK_RE.test(s.trim())) return [];
+  /*   ▸ ★ 2026-10-10 C3：这条判据搬进 `passesQuestionGate`（唯一实现），
+   *     回指撤销要用**同一把尺**——两处各写一份，就会出现"问句在撤销那条路上被执行了"（坑 47）。
+   *     原来这里的三条正则（QUESTION / REQUEST_MARKER / POLITE_ASK）与它的理由都搬过去了。 */
+  if (!passesQuestionGate(s)) return [];
   const hits = [];
   for (const [action, re] of ROOM_ACTION_RULES) {
     const m = ruleMatch(re, s);
@@ -357,7 +349,154 @@ function detectOutOfScopeCommand(q) {
 /** 拒绝话术里要能看见"那我到底能干什么"——能力清单从表本身生成，不另写一份（坑 47）。 */
 const ROOM_ACTION_CAPABILITIES = Object.values(ROOM_ACTIONS).map((a) => a.cn).join('、');
 
+/* ═════════════════════════════════════════════════════════════════════════
+ * ★ 2026-10-10 C3：回指撤销 ——「刚才那个再关回去」「撤销刚才那步」「恢复成之前的样子」
+ * ═════════════════════════════════════════════════════════════════════════
+ * ▎为什么单独一档：用户第五次说"AI 操控实体还是实现的不行"之后，0.11/0.12 把"一句说法
+ *   → 一个动作"的泛化缺口从 54% 打到 0%，但**回指**从来不在那张表里——
+ *   它不是一个动词，是"最近做了什么"这个**状态**。规则表再宽也接不住"那个"，
+ *   因为"那个"的所指不在句子里，在房间里刚刚发生过的事里。
+ * ▎边界（与整张表同一条纪律）：撤销的只能是**房间级共享状态**，
+ *   而且只能是**我自己（或通过我）替全房做过的那几件**。
+ *   人手动点按钮改变的界面状态，服务器看不见 ⇒ 栈里没有 ⇒ 明确说出来（不装听得懂），
+ *   否则用户会得到一句自信的"已经关回去了"而什么都没发生（坑 82：过期声明比缺失更糟）。
+ * ▸ 两类话分开判：**取反**（撤销/关回去/恢复原样）与**重复**（再来一遍/重新做一次）——
+ *   同一个"刚才那个"配不同动词是两件相反的事，做成同一个就是做错方向（比少做更糟）。 */
+const ACTION_INVERSE = {
+  'board-open': 'board-close', 'board-close': 'board-open',
+  'captions-on': 'captions-off', 'captions-off': 'captions-on',
+  'view-speaker': 'view-grid', 'view-grid': 'view-speaker',
+  'files-open': 'files-close', 'files-close': 'files-open',
+};
+/* 不可逆的两条：清空掉的笔迹没有"之前"可以回去（白板不提供第二次撤销）。
+ *   ▸ 判据不给"沉默"，给**一句人话的理由**（坑 124：有意不接也要写成语句）。 */
+const ACTION_IRREVERSIBLE = {
+  'board-clear': '白板上的笔迹已经没了，这一步撤不回来',
+  'board-undo': '「撤销一笔」再撤销一次等于把那笔还回去——白板没有这个操作',
+};
+/* 句子里点了哪一类界面（"把刚才那个**字幕**关回去"要能只动字幕那一族）。
+ *   ▸ 只按**族**筛，不按动作筛：用户说的是"那个字幕"，不是"captions-on"。 */
+const UNDO_FAMILY_RE = [
+  [/字幕|字幕|自幕/, 'captions'],
+  [/白板|画板|画布/, 'board'],
+  [/视图|宫格|九宫|演讲|主讲|平铺|大画面/, 'view'],
+  [/文件|资料|文档|材料/, 'files'],
+];
+/* 回指：所指不在句子里，所以必须有一个"往回看"的标记 */
+const ANAPHORA_RE = /(刚才|刚刚|刚才是|之前|上次|上一次|那会儿|原先|原来|方才|刚才那|这一下|那一波)/;
+/* 取反意图——**分三层，顺序就是语义**（缺哪一层都是泛化电池打红之后补上的，见下面的实测）：
+ *   ▸ 强撤销词：撤销/撤回/恢复/关回去/算我没说/undo…（自带"撤回"语义，怎么都不会读错方向）
+ *   ▸ 重复词：再来一遍/重新打开…（与取反**相反**的两个动作）
+ *   ▸ 光杆关闭词：关掉/收起/隐藏…——用户心里"撤销刚才那个"就等于"把它关了"，
+ *     这类说法一个撤销词都没有，是第一版漏得最多的一族（6/20）。
+ *   ▎为什么"重复"排在"光杆关闭"**之前**判：「把刚才那个重新打开」里的"打开"既是开启又是
+ *     重复短语的一部分——先判关闭就会把它读成"关掉刚才那个"，**做错方向比不做更糟**
+ *     （与 10-06 那条「别切宫格，把白板打开」的教训同形）。
+ *   ▸ 「不要了/不用了」只在**已经有回指标记**的句子里才算撤销意图
+ *     （没有"刚才/之前"时它属于原来的规则表，如「字幕不要了」）。 */
+const UNDO_STRONG_RE = /(撤销|撤消|撤回|退回|退回去|回退|恢复|还原|改回来|变回去|倒回去|关回去|收回去|收起去|反悔|取消|作废|回到[^。，,]{0,3}(那样|那样儿|原样|之前)|当作?没做|算我没说|就当我没说|当我没说|别那样|不要了|不用了|\bundo\b|\brevert\b)/;
+const UNDO_REPEAT_RE = /(再来一遍|重新来一遍|再做一次|重新做一次|再来一次|重新打开|重新开启|照刚才那样再来|照那样再来|再来一回)/;
+const UNDO_CLOSE_RE = /(关掉|关了|关闭|收起来|收起|收一下|隐藏|停掉|去掉|撤掉|撤了|不要|不用|关一下|收了)/;
+/* 笔迹类宾语交给既有 board-undo 规则：「撤销刚才那一**笔」**不是回指撤销，是撤销一笔 */
+const STROKE_RE = /(一笔|一比|那笔|这一笔|笔画|画错|写错|那一划|那一道)/;
+/* 数量词：撤销"那两步"要真撤两步 */
+const UNDO_COUNT_RE = /(一|两|二|三|3|2)\s*(步|件事|件事情|个动作|下|个操作)/;
+const COUNT_MAP = { 一: 1, 两: 2, 二: 2, 三: 3, '2': 2, '3': 3 };
+
+function passesQuestionGate(s) {
+  /* 与 detectRoomActions 里那条同判据（问一件事 ≠ 命令一件事）；
+   *   抽成一个函数是因为两处各写一份就会漂（坑 47），而漂的那一份会以
+   *   「刚才是不是有人把字幕关了？」被当成命令执行的形式出现。 */
+  const t = s.trim();
+  const REQUEST_MARKER_RE = /(能不能|可不可以|可以|帮我|帮忙|麻烦|请|帮我们|替我|好吗|行吗|行不行|来)/;
+  /* 句首 + 能 + 紧跟动作动词 = 礼貌请求（(?!力) 挡住「能力打开白板」这种名词化开头）。 */
+  const POLITE_ASK_RE = /^(?:能|能否)(?!力)[^。，,]{0,3}(?:看|打开|开启|开|关闭|关掉|关|切|换|调出|调|显示|撤|收|放|帮)/;
+  const QUESTION_RE = /[吗呢]\s*[？?。！]?\s*$/;
+  if (QUESTION_RE.test(t) && !REQUEST_MARKER_RE.test(t) && !POLITE_ASK_RE.test(t)) return false;
+  /* ★ 2026-10-10 C3 补的一刀：**"A-not-A"式问句没有 吗/呢，也没有问号要求**。
+   *   ▎现场：回指撤销的电池里「刚才是不是有人关了字幕？」被接成"把字幕关掉"——
+   *     而这条问句**同时**也是原规则表的一个漏口（「是不是把字幕关了」里"把字幕关"就够命中
+   *     captions-off 了），只是以前没有测试去问这一句。有人在**核对**发生过什么，
+   *     AI 伸手把界面改了——这跟"做错方向"是同一种病（少做可以补，做错要人改回来）。
+   *   ▸ 例外照旧留给礼貌请求：「是不是可以打开字幕？」带"可以"，那是在请求，不是核对。 */
+  const A_NOT_A_RE = /是不是|有没有|是否|有没有人|是谁[把给]/;
+  if (A_NOT_A_RE.test(t) && !REQUEST_MARKER_RE.test(t) && !POLITE_ASK_RE.test(t)) return false;
+  return true;
+}
+
+/**
+ * 这句话是不是在"回指刚才那件事"？是则给出取反/重复 + 几步 + 族别；不是返回 null。
+ * @returns {null|{mode:'invert'|'repeat', k:number, family:string|null}}
+ */
+function detectUndoAnaphora(q) {
+  let s = String(q || '');
+  for (const [re, to] of ACTION_HOMOPHONE) s = s.replace(re, to);
+  if (!ANAPHORA_RE.test(s)) return null;                 // 没有"往回看"的标记就不是回指
+  if (STROKE_RE.test(s)) return null;                    // 「撤销刚才那一笔」交给 board-undo
+  if (!passesQuestionGate(s)) return null;               // 「刚才是不是有人关了字幕？」是核对，不是命令
+  const invert = UNDO_STRONG_RE.test(s);
+  /* 三层：强撤销词 > 重复词 > 光杆关闭词。三者都没有才交回原来的规则表去判。 */
+  const mode = invert ? 'invert' : (UNDO_REPEAT_RE.test(s) ? 'repeat' : (UNDO_CLOSE_RE.test(s) ? 'invert' : null));
+  if (!mode) return null;
+  let k = 1;
+  const m = s.match(UNDO_COUNT_RE);
+  if (m && COUNT_MAP[m[1]]) k = COUNT_MAP[m[1]];
+  if (/都|全部|几个|几个动作/.test(s) && !m) k = 2;      // 「把刚才那些都关回去」至少两步
+  const fam = UNDO_FAMILY_RE.find(([re]) => re.test(s));
+  /* 「撤销刚才那个，再来一遍」这种自我矛盾的话：强撤销词赢（宁可少做一次，
+   *   也不要反过来做第二次）——所以模式在上三层里已经定了，这里不再重判。 */
+  return { mode, k, family: fam ? fam[1] : null };
+}
+
+const familyOf = (action) => String(action || '').split('-')[0];
+
+/**
+ * 拿"我替这个房间做过的动作"这条栈，把回指落成具体动作列表。
+ * @param {Array<{action:string, ts:number}>} stack 越新越靠后（服务器维护，上限几条）
+ * @param {{mode:string,k:number,family:string|null}} hint
+ * @returns {{kind:'do',actions:string[],targets:string[]}|{kind:'empty'}|{kind:'irreversible',cn:string}}
+ */
+function resolveUndo(stack, hint) {
+  const list = Array.isArray(stack) ? stack.filter((e) => e && ROOM_ACTIONS[e.action]) : [];
+  const pool = hint && hint.family ? list.filter((e) => familyOf(e.action) === hint.family) : list;
+  if (!pool.length) return { kind: 'empty' };
+  const take = pool.slice(-Math.max(1, (hint && hint.k) || 1)).reverse();   // 新的先处理
+  const items = [];
+  /* ★ 一族只认**最近那一条**（这是被自己的断言抓回来的）：
+   *   第一版只按"逆动作相同就去重"，于是栈里连着"开字幕 → 关字幕"这两步
+   *   会被解成 [关字幕, 开字幕] ——同时广播两个相反的动作。
+   *   物理上讲得通的读法只有一个：撤销是回到"这一族最近一次动作之前"的状态，
+   *   而一个界面在同一时刻只能是开或关，不存在"撤两步撤出两个方向"。 */
+  const seenFamily = new Set();
+  for (const e of take) {
+    const fam = familyOf(e.action);
+    if (seenFamily.has(fam)) continue;
+    seenFamily.add(fam);
+    const of = ROOM_ACTIONS[e.action].cn;
+    if (hint.mode === 'repeat') { items.push({ action: e.action, of }); continue; }
+    if (ACTION_IRREVERSIBLE[e.action]) {
+      /* 不可逆就**整条不做**：做一半（把能撤的撤了、该说的没说）比全不做更难解释。
+       *   ▸ 但要说清是哪一条挡住了——用户下一句就能改口"那把字幕关回去就行"。 */
+      return { kind: 'irreversible', cn: ACTION_IRREVERSIBLE[e.action], blocked: of };
+    }
+    const inv = ACTION_INVERSE[e.action];
+    if (!inv) continue;                                   // 表没配全（新动作忘了配逆操作）→ 跳过不猜
+    items.push({ action: inv, of });
+  }
+  if (!items.length) return { kind: 'empty' };
+  /* actions 给执行用，targets 只给回话用；两者**由同一份 items 派生**，
+   *   不各算一遍（先前我按 indexOf 配对，一旦去重就错配成"撤回刚才的「开启实时字幕」"
+   *   其实撤的是白板——配错对象的回话比不回话更误导，坑 47）。 */
+  return {
+    kind: 'do', items,
+    actions: items.map((x) => x.action),
+    targets: items.map((x) => x.of),
+  };
+}
+
 module.exports = {
   ROOM_ACTIONS, ROOM_ACTION_RULES, ACTION_HOMOPHONE, detectRoomAction, detectRoomActions, isNegatedPhrase,
   OUT_OF_SCOPE_RULES, detectOutOfScopeCommand, ROOM_ACTION_CAPABILITIES,
+  /* ★ 2026-10-10 C3 回指撤销（三个都是纯函数：栈由服务器交出来，判据在这里） */
+  ACTION_INVERSE, ACTION_IRREVERSIBLE, detectUndoAnaphora, resolveUndo, passesQuestionGate,
 };

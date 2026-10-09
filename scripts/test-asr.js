@@ -1696,6 +1696,110 @@ function writeWav(file, samples) {
   }
 
 
+  /* ══ ⑯ ★ 2026-10-10（C3）回指撤销：「刚才那个再关回去」 ══
+   * ▎这一档与前面所有档的根本不同：**宾语不在句子里**。规则表再宽也接不住"那个"，
+   *   因为"那个"指的是"刚才发生过什么"这个**状态**。所以它需要的不是更多动词，
+   *   而是一条房间级动作栈（挂在 room 上，随房间销毁）。
+   * ▎泛化率仍然按坑 106 的量法：**先让电池打红再补**。第一跑 20 句只接住 14 句（70%），
+   *   缺的六种形状与补的三层判据写在 roomActions.js 的 UNDO_* 注释里。 */
+  const RUM = require('../sfu/ai/roomActions.js');
+  const STACK = [{ action: 'board-open', ts: 1 }, { action: 'captions-on', ts: 2 }, { action: 'view-grid', ts: 3 }];
+  const undoDo = (s, stack) => {
+    const h = RUM.detectUndoAnaphora(s);
+    return h ? RUM.resolveUndo(stack || STACK, h) : null;
+  };
+  /* 20 句从未进过任何表的取反说法（第一跑 14/20，逐句补上来的） */
+  const UNDO_GEN = [
+    '刚才那个再关回去', '把刚才那个撤回来', '撤销刚才那步', '恢复成之前的样子', '回到刚才那样',
+    '刚才那个不要了', '把刚才那一下取消掉', '刚才开的那个帮我关掉', '你刚才弄的那个收回去', 'undo 刚才那个',
+    '刚才那个撤回吧', '刚才那个算我没说', '把刚才做的撤销', '刚才那个退回去', '刚才你开的那个字幕关了吧',
+    '把刚才那个白板收起来', '之前开的那个恢复原样', '刚才那个操作反悔了', '刚才那些都关回去', '把刚才那两步撤回',
+  ];
+  ok('⑯.1 回指取反的泛化电池 20 句全部解析成动作（漏的那 6 种形状见 roomActions 的 UNDO_* 注释）',
+    UNDO_GEN.every((s) => { const r = undoDo(s); return r && r.kind === 'do' && r.actions.length >= 1; }),
+    UNDO_GEN.filter((s) => { const r = undoDo(s); return !r || r.kind !== 'do'; }).join(' | '));
+  ok('⑯.2 逆操作映射对：最近一条是"切到宫格" ⇒ 撤回就是"切到演讲者视图"',
+    JSON.stringify(undoDo('撤销刚才那步').actions) === '["view-speaker"]');
+  ok('⑯.3 "那两步"要真撤两步（新的先处理，各自取逆）',
+    JSON.stringify(undoDo('把刚才那两步撤回').actions) === '["view-speaker","captions-off"]');
+  ok('⑯.4 族别筛选：点名"字幕"就不许动白板/视图（撤错对象比不撤更糟）',
+    JSON.stringify(undoDo('刚才你开的那个字幕关了吧').actions) === '["captions-off"]'
+      && undoDo('把刚才那个白板收起来').actions[0] === 'board-close');
+  ok('⑯.5 重复类说法与取反类**方向相反**，各走各的（做错方向比不做更糟）',
+    RUM.detectUndoAnaphora('刚才那个再来一遍').mode === 'repeat'
+      && RUM.detectUndoAnaphora('把刚才那个重新打开').mode === 'repeat'
+      && RUM.detectUndoAnaphora('撤销刚才那步').mode === 'invert'
+      && JSON.stringify(undoDo('照刚才那样再做一次').actions) === '["view-grid"]');
+  /* 四条反向对照——每一条都是一句**真人会说但不该动界面**的话 */
+  ok('⑯.6 反向对照：「刚才是不是有人关了字幕？」是**核对**，不许把字幕关掉（A-not-A 问句）',
+    undoDo('刚才是不是有人关了字幕？') === null && RUM.detectRoomActions('刚才是不是有人关了字幕？').length === 0);
+  ok('⑯.6b 反向对照：「是不是可以打开字幕？」是礼貌请求，照旧要执行（不能把问句一律压掉）',
+    RUM.detectRoomActions('是不是可以打开字幕？').includes('captions-on'));
+  ok('⑯.7 反向对照：「撤销刚才那一笔」是白板的 board-undo，不是回指撤销（有"一笔"就让路）',
+    undoDo('撤销刚才那一笔') === null && RUM.detectRoomActions('撤销刚才那一笔').includes('board-undo'));
+  ok('⑯.8 反向对照：没有回指词就不是回指（「把白板打开」仍走规则表，撤销路径不许抢）',
+    RUM.detectUndoAnaphora('把白板打开') === null && RUM.detectRoomActions('把白板打开').length === 1);
+  ok('⑯.9 不可逆的动作**整条不做**并给出理由（做一半比全不做更难解释，坑 124）',
+    (() => {
+      const r = undoDo('撤销刚才那步', [{ action: 'board-clear', ts: 1 }]);
+      return r.kind === 'irreversible' && /笔迹已经没了/.test(r.cn) && r.blocked === '清空白板';
+    })());
+  ok('⑯.10 栈是空的 ⇒ 判 empty（服务器那句回话要说明"人手动点的我看不见"，不许静默也不许交给 LLM 编）',
+    undoDo('刚才那个撤回来', []).kind === 'empty');
+  ok('⑯.11 同族连着开关两次 ⇒ 只撤一次（房间级状态幂等，广播两条一样的=让用户看见两句一样的回话）',
+    JSON.stringify(undoDo('把刚才那些都关回去', [{ action: 'captions-on' }, { action: 'captions-off' }, { action: 'captions-on' }]).actions) === '["captions-off"]');
+  /* ★ 这条是 ⑯.11 的**病根版**（我第一版只按"逆动作相同"去重，于是"开字幕→关字幕"这两步
+     被解成 [关, 开] ——同时广播两个相反的动作）。一族只认最近一条才是物理上说得通的读法。 */
+  ok('⑯.11b 反向对照：撤销一个"开→关"的对子**不许同时广播两个相反动作**（一族只认最近一条）',
+    JSON.stringify(undoDo('把刚才那两步撤回', [{ action: 'captions-on' }, { action: 'captions-off' }]).actions) === '["captions-on"]');
+  ok('⑯.12 actions/targets 由同一份 items 派生（我第一版按 indexOf 配对，去重后就错配成"撤回刚才的「开启字幕」"其实撤的是白板）',
+    (() => {
+      const r = undoDo('把刚才那些都关回去', [{ action: 'board-open' }, { action: 'captions-on' }, { action: 'captions-on' }]);
+      return r.items.every((it, i) => it.action === r.actions[i] && it.of === r.targets[i]);
+    })());
+  /* ── 接线：判据在纯函数里，但"服务器真的用栈去解、真的广播逆操作"必须另有断言 ── */
+  {
+    const srv = fs.readFileSync(path.join(__dirname, '..', 'sfu', 'server.js'), 'utf8');
+    const code = srv.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    ok('⑯.13 房间级动作栈挂在 room 上（不另开全局 Map = 少一条要记得清的账，坑 20 的根治法）且有上限',
+      /room\.actionStack = room\.actionStack \|\| \[\]/.test(code)
+        && /room\.actionStack\.push\(\{ action, byName/.test(code)
+        && /room\.actionStack\.length > 8\) room\.actionStack\.shift\(\)/.test(code));
+    ok('⑯.14 撤销排在规则表**之后**（显式说法优先，否则会把 board-undo 抢掉）',
+      code.indexOf('const roomActions = detectRoomActions(q)') < code.indexOf('const undoHint = detectUndoAnaphora(q)'));
+    ok('⑯.15 栈从 room.actionStack 取、逆操作走**同一条 applyRoomAction**（不新造信令，客户端零改动）',
+      /resolveUndo\(\(room && room\.actionStack\) \|\| \[\], undoHint\)/.test(code)
+        && /applyRoomAction\(roomNumber, it\.action\)/.test(code));
+    ok('⑯.16 三种落不上动作的形态都有话（irreversible / do 但房间没了 / empty），不许沉默',
+      /undo\.kind === 'irreversible'/.test(code) && /这个房间已经不在了/.test(code) && /手动.*点的按钮服务器看不见/.test(code));
+    ok('⑯.17 触发计数两本账接上（done / refused）——"没跑"与"跑了但都拒了"必须分得开（坑 76）',
+      /COLLAB\.roomUndo\.done \+= 1/.test(code) && /COLLAB\.roomUndo\.refused \+= 1/.test(code)
+        && /roomUndo: \{ done: 0, refused: 0 \}/.test(code));
+    ok('⑯.18 /metrics 两行 + /api/rooms 同源（锚行首读法可用，坑 74）',
+      /L\.push\(`sfu_room_undo_total \$\{COLLAB\.roomUndo\.done\}`\)/.test(code)
+        && /L\.push\(`sfu_room_undo_refused_total \$\{COLLAB\.roomUndo\.refused\}`\)/.test(code)
+        && /roomUndo: COLLAB\.roomUndo/.test(code));
+    ok('⑯.19 每条回指都落一条结构化事件（事后要能回答"它到底撤了哪一件"）',
+      /logEvent\('info', 'room-undo'/.test(code) && /logEvent\('info', 'room-undo-refused'/.test(code));
+    /* ★ 本批真浏览器跑出来的**另一条缺陷**（不在计划里，是文本断言顺手抓的）：
+       规则路由（房间动作 / 越界拒绝 / 回指撤销）一个 ai-stream 增量都不发，
+       而客户端看到 done 就把随后同 streamId 的 chat-message 当重复丢掉
+       ⇒ 聊天里是一条"只有意图徽标的空气泡"。修法必须在服务端补流，
+       **不能放开客户端去重**——放开就会让流式答案重新出现两条（10-04 那条老账原样复发）。
+       所以这里两侧各钉一条：两个入口都补 + 去重那行还在。 */
+    ok('⑯.20 一次性答案补进流里，且 @ai 与语音**两条路都补**（只补一条就是半迁移，坑 57）',
+      /function streamFillText\(roomNumber, streamId, r, streamedAny\)/.test(code)
+        /* 数**调用点**而不是数名字：定义那一行也以同样的前缀开头，按名字数会得到 3。 */
+        && (code.match(/^\s*streamFillText\(roomNumber, streamId, r,/gm) || []).length === 2
+        && /let streamedAny = false/.test(code) && /streamedAny = true/.test(code)
+        && /streamFillText\(roomNumber, streamId, r, !!streamed\)/.test(code));
+    const cli = fs.readFileSync(path.join(__dirname, '..', 'sfu', 'public', 'client.js'), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    ok('⑯.21 反向对照：客户端"同 streamId 的终态去重"那行必须还在（放开它=流式答案出两条气泡的老账）',
+      /if \(streamId && aiStreamDone\.has\(streamId\)\) return;/.test(cli));
+  }
+
+
   console.log(`\n结果: ${pass} 通过, ${fail} 失败, ${skip} 跳过`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error('异常:', e); process.exit(1); });

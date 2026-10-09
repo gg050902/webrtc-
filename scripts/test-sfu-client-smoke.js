@@ -4174,6 +4174,31 @@ const emit = (ev, payload) => {
       JSON.stringify({ status: child.status, err: String(child.stderr || '').split('\n')[0] }));
   }
 
+  /* ★ 2026-10-10 C3：服务器能发出的意图枚举 与 客户端那张"给人看的文案表"必须对得上。
+   *   ▎为什么用断言而不是收成一处：一个在 `sfu/server.js`、一个在浏览器里的 `client.js`，
+   *     跨运行时做不到单一来源（与"三张唤醒表逐字比对"是同一条做法，坑 91 末段）。
+   *   ▎触发它的现场：新增 `room-undo` 之后，气泡徽标直接印出内部 id「🎯 room-undo」——
+   *     用户读到的是一句像坏了的英文。漏配文案不会让任何功能变红，只会让界面少个人话。
+   *   ▸ 兜底 `|| ai.intent` 有意保留：将来加新意图忘了配文案，宁可露原词也不要露空。 */
+  {
+    const fs2 = require('fs');
+    const path2 = require('path');
+    const srvSrc = fs2.readFileSync(path2.join(__dirname, '..', 'sfu', 'server.js'), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    const intents = new Set();
+    const re = /intent: '([a-z-]+)'/g;
+    let mm;
+    while ((mm = re.exec(srvSrc)) !== null) intents.add(mm[1]);
+    const chipSrc = clientSrc.replace(/\/\*[\s\S]*?\*\//g, '');
+    ok('C3 结构红线：服务器每个 intent 枚举在客户端徽标表里都有人话文案（漏配不会让功能变红，只会让界面露出内部 id）',
+      intents.has('room-undo') && intents.has('room-action')
+        && [...intents].every((it) => chipSrc.includes(`'${it}':`) || it === 'question' || it === 'chat'
+          || /^(minutes|recap|operator|search|followup)$/.test(it)),
+      `服务器侧意图：${[...intents].join(', ')}`);
+    ok('C3 反向对照：徽标兜底仍然露出原词而不是露空（露空比一个英文 id 更误导）',
+      /\)\[ai\.intent\] \|\| ai\.intent \}/.test(chipSrc));
+  }
+
   if (problems.length) {
     console.log(`\n⚠️ 捕获到 ${problems.length} 个运行时异常：`);
     problems.forEach((p, i) => console.log(`\n--- 异常 ${i + 1} ---\n${p}`));

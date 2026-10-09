@@ -89,8 +89,25 @@ const STATE = `JSON.stringify((() => {
   };
 })())`;
 
-async function run(cdp, text, verify, label, waitMs = 2500) {
-  const before = JSON.parse(await cdp.evaluate(STATE, 5000).catch(() => '{}'));
+/* 回话文本探针：**只在聊天区里找**，且只当辅助证据用。
+ *   ▸ 判据的主锤永远是上面的状态差（界面动没动）；文本这条只是把"它有没有把话说清楚"
+ *     钉住——回话措辞单独绿不算功能生效（坑 41/56 那条老账），单独红也不算功能坏。 */
+async function chatHas(cdp, needle, label) {
+  const expr = `(() => { const el = document.getElementById('chatList');
+    return el && (el.textContent || '').indexOf(${JSON.stringify(needle)}) >= 0 ? 1 : 0; })()`;
+  const got = await waitJs(cdp, expr, 6000, `回话含「${needle}」`);
+  const hit = got === '1' || got === 1;
+  if (!hit) {
+    /* 红了要说清"那现在聊天区里到底是什么"——只报"没找到"会让人去猜是文本不对还是气泡没渲染
+     *   （本轮第一次跑三条文本断言全红，靠这一行才看出问题在探针不在产品）。 */
+    const tail = await cdp.evaluate(`(() => { const el = document.getElementById('chatList');
+      return el ? String(el.textContent || '').slice(-260) : '(没有 #chatList)'; })()`, 6000).catch((e) => '读不到：' + e.message);
+    console.log(`   ↳ 现场（聊天区末尾 260 字）：${String(tail).replace(/\s+/g, ' ')}`);
+  }
+  chk(hit, `${label}（聊天区里出现「${needle}」）`);
+}
+
+async function run(cdp, text, verify, label, waitMs = 2500) {  const before = JSON.parse(await cdp.evaluate(STATE, 5000).catch(() => '{}'));
   await say(cdp, text);
   const deadline = Date.now() + 12000;
   let ok = false, after = null;
@@ -234,6 +251,38 @@ async function run(cdp, text, verify, label, waitMs = 2500) {
   await cdp.evaluate(`(() => { setFilesOpen(false); return 1; })()`).catch(() => {});
   await sleep(600);
   await shot(cdp, '泛化说法后.jpg');
+
+  /* ★ 2026-10-10 ③d 回指撤销（C3）：「刚才那个再关回去」——**宾语不在句子里，在刚才发生过的事里**。
+   *   ▎为什么必须进真浏览器：test:asr 那 20 句泛化电池证明"服务器把回指解成了某个动作 id"，
+   *     但"页面真的朝那个方向动了一次"只有这里量得到；而方向这一件事（取反 vs 重复）
+   *     恰恰是**做错方向比不做更糟**的那一类——所以两条各断一次，且都用状态差判，不用回话措辞判。
+   *   ▸ 重复那条的判据形状很关键：再做一次 = 状态**不变**，而误判成取反 = 状态翻转。
+   *     单看"它回话说做了"永远分不出这两件事。 */
+  console.log('③d ★ 回指撤销（取反 / 重复 / 不可逆）在真浏览器里各落地一次…');
+  /* 前提先把栈摆成"最近一条 = 关字幕"：撤销它就该**开回来**——
+   *   方向断言这样才有区分度（读成"重复"就会保持关着，读成"取反"才会开）。
+   *   ▸ 上一版我拿"已经关着"的状态去做「把字幕关掉」当前提，那条前提自己就永远不会成立，
+   *     红了之后回头看是我的现场没摆对，不是产品错（坑 55：测边界状态前先确认你在的那个状态）。 */
+  await run(cdp, '把字幕打开', (b, a) => b.capOn === false && a.capOn === true, '回指前提①·AI 开字幕');
+  await run(cdp, '把字幕关掉', (b, a) => a.capOn === false, '回指前提②·AI 关字幕（栈顶=关闭实时字幕）');
+  await run(cdp, '刚才那个再关回去', (b, a) => b.capOn === false && a.capOn === true,
+    '★ 回指取反：撤掉最近的"关字幕" ⇒ 字幕**开回来**（撤的是最近那件，不是最早那件）');
+  await chatHas(cdp, '已把刚才那步撤回', '回话说清了"撤的是哪一件"');
+  /* 重复类：栈顶此刻是上一步撤回来的"开字幕" ⇒ 再来一遍 = 保持开着。
+   *   若误读成取反，字幕会被关掉 —— 所以"状态不变"就是这条判据的正面证据。 */
+  await run(cdp, '照刚才那样再来一遍', (b, a) => a.capOn === true,
+    '★ 回指重复：「再来一遍」不许把字幕关掉（判据=状态不变；读成取反这里当场红）');
+  await chatHas(cdp, '又做了一遍', '重复类的回话与取反类不同（两条路各有自己的话）');
+  /* 不可逆：清空过的白板没有"之前"可回去，必须**明着说不撤回来**，且不许动界面 */
+  await run(cdp, '把白板打开', (b, a) => a.boardOpen === true, '回指前提·开白板');
+  await run(cdp, '把白板清空', (b, a) => a.boardOpen === true, '回指前提·清空白板');
+  const irBefore = JSON.parse(await cdp.evaluate(STATE, 5000).catch(() => '{}'));
+  await say(cdp, '刚才那个撤回来');
+  await sleep(4000);
+  const irAfter = JSON.parse(await cdp.evaluate(STATE, 5000).catch(() => '{}'));
+  chk(irBefore.boardOpen === true && irAfter.boardOpen === true,
+    '不可逆的撤销**整条不做**（清空白板撤不回，界面保持原状——做一半比全不做更难解释）');
+  await chatHas(cdp, '撤不回来', '不可逆要给出理由并点名是哪一条挡住了（不许沉默，坑 124）');
 
   console.log('④ 无关指令不误触发（说一句闲话，白板/字幕/文件面板都别动）…');
   const before = JSON.parse(await cdp.evaluate(STATE, 5000).catch(() => '{}'));

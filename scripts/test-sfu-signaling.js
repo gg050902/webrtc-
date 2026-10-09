@@ -1343,6 +1343,21 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
      // 不带这句原文，红了只能靠猜：抓到的是哪条 ai-bot 消息？（入会致辞/主动提醒也是 from='ai-bot'，
      //   与 test:asr-live 那条"计数把致辞算成应答"同族——先让报错自己交代它抓到了什么）
      `抓到：${rcMsg ? JSON.stringify(String(rcMsg.text).slice(0, 70)) : '（9s 内没有任何 ai-bot 消息）'}`);
+  /* ★ 2026-10-10（C3 的真浏览器文本断言抓到的空气泡缺陷）：规则路由一个增量都不发，
+   *   而客户端看到 done 就把随后同 streamId 的 chat-message 当重复丢掉 ⇒ 聊天里只剩一条
+   *   "只有意图徽标的空气泡"。上面的 rcMsg 断言为什么没抓到它？因为它读的是 **chat-message 的载荷**，
+   *   而载荷一直是有字的——缺的是"字有没有被送进气泡"。**服务端断言测不到客户端渲染契约**（坑 63 家族），
+   *   所以这里断的是流本身：一次性答案必须在 done 之前把全文作为增量补进流里。 */
+  const rcStreamT0 = Date.now();
+  const rcStreamDeltas = [];
+  const rcStreamHandler = (p) => { if (p && p.delta && p.id && String(p.id).startsWith('ai-')) rcStreamDeltas.push(p.delta); };
+  A.s.on('ai-stream', rcStreamHandler);
+  A.s.emit('ai-ask', { question: '把字幕关掉' });
+  await sleep(2500);
+  A.s.off('ai-stream', rcStreamHandler);
+  ok('2026-10-10 一次性答案（规则路由，不经 LLM）也把全文补进 ai-stream ⇒ 聊天气泡不再是空气泡',
+     rcStreamDeltas.join('').length > 0 && /字幕/.test(rcStreamDeltas.join('')),
+     `流里收到的增量：${JSON.stringify(rcStreamDeltas.join('').slice(0, 60))}`);
   const rcT1 = Date.now();
   const rcCloseP = new Promise((resolve) => {
     const h = (m) => { if (m && m.from === 'ai-bot' && m.ts >= rcT1) { A.s.off('chat-message', h); resolve(m); } };

@@ -1434,6 +1434,7 @@ async function snapshotRooms() {
       throttled: COLLAB.throttled,
       roomControl: COLLAB.roomControl,
       roomApplied: COLLAB.roomApplied,
+      roomUndo: COLLAB.roomUndo,   // ★ 2026-10-10 C3 回指撤销 {done, refused}（与 /metrics 同两本账）
       board: COLLAB.board,
       files: COLLAB.files,   // ★ 2026-10-07 第 51 步：共享文件的上传/删除/同步/被拒计数
       /* ★ 2026-10-06 输入侧健康（口径见 COLLAB.input 上方注释）。快照里补一个"多久没听到声音"，
@@ -1512,6 +1513,12 @@ const COLLAB = {
   gainApplied: 0,
   throttled: {},      // reason -> n（被哪道闸拦下：dup / echo / inflight / interval / name-only）
   roomControl: {},    // action -> n（服务器发出的房间动作）
+  /* ★ 2026-10-10 C3「刚才那个再关回去」的触发账（坑 76：机制没有计数就分不清"没跑"与"跑了没生效"）。
+   *   done    = 回指解析成动作并广播出去了；
+   *   refused = 识别成回指但**明确告诉用户为什么不做**（不可逆 / 栈是空的）。
+   *   ▸ refused 高不是故障：它恰恰说明"我没瞎做"。但如果 done 恒 0 而用户反复说"刚才那个"，
+   *     就是栈那条路断了（旧页面 / 房间重建后栈丢失 / 动作表没配逆操作）。 */
+  roomUndo: { done: 0, refused: 0 },
   roomApplied: {},    // action -> n（客户端回执"我真的执行了"）—— 与上面的差 = 说了没做
   board: { stroke: 0, undo: 0, clear: 0, rejected: 0 },
   /* ★ 2026-10-07 第 51 步：共享文件的账。
@@ -1796,6 +1803,13 @@ function buildMetrics(snap) {
   for (const [a, n] of Object.entries(COLLAB.roomApplied)) {
     L.push(`sfu_room_control_applied_total{action="${a}"} ${n}`);
   }
+  /* ★ 2026-10-10 C3 回指撤销两本账（判据在 sfu/ai/roomActions.js，栈挂在 room 上）。
+   *   ▸ 两条分开数的理由：`refused` 不是失败——"清空白板撤不回来"就是正确答案；
+   *     真正要看的是 **done 恒 0 而用户反复说"刚才那个"**，那才是这条链路断了。 */
+  help('sfu_room_undo_total', 'counter', 'Anaphoric undo requests that resolved into a room action ("把刚才那个关回去")');
+  L.push(`sfu_room_undo_total ${COLLAB.roomUndo.done}`);
+  help('sfu_room_undo_refused_total', 'counter', 'Anaphoric undo requests answered with an explicit reason (irreversible / empty stack) instead of an action');
+  L.push(`sfu_room_undo_refused_total ${COLLAB.roomUndo.refused}`);
   help('sfu_board_records_total', 'counter', 'Whiteboard archive operations accepted by the server, by op');
   for (const k of ['stroke', 'undo', 'clear', 'rejected']) {
     L.push(`sfu_board_records_total{op="${k}"} ${COLLAB.board[k]}`);
@@ -5062,7 +5076,8 @@ function setAiBot(roomNumber, on, opts = {}) {
  *     '不要字幕了'、'来一张白板'）——正是用户反复反馈的'AI 操控实体还是不行'。
  *     抽成纯函数才能拿 48 句电池穷举断言（同 rdDecideFps / Asr.mergeTranscript）。
  *   ▎边界（只碰房间级共享状态）与顺序（'关'排在'开'前判）的纪律都写在那文件头。 */
-const { ROOM_ACTIONS, detectRoomAction, detectRoomActions, detectOutOfScopeCommand, ROOM_ACTION_CAPABILITIES } = require('./ai/roomActions');
+const { ROOM_ACTIONS, detectRoomAction, detectRoomActions, detectOutOfScopeCommand, ROOM_ACTION_CAPABILITIES,
+  detectUndoAnaphora, resolveUndo } = require('./ai/roomActions');
 
 /* ★ 2026-10-06 「这条动作在这个房间里等谁的回执」的台账：`房间号|动作` -> 定时器句柄。
  *   ▎为什么按房间挂而不是比全局计数：COLLAB.roomApplied 是**全服**一个数，
@@ -5080,6 +5095,15 @@ function applyRoomAction(roomNumber, action, byName) {
   if (!room) return { ok: false, why: 'no-room' };
   io.to(roomNumber).emit('room-control', { action, byName: byName || 'AI 小明', ts: Date.now() });
   bump(COLLAB.roomControl, action);
+  /* ★ 2026-10-10 C3「刚才那个再关回去」的**所指**就记在这里：房间级动作栈。
+   *   ▸ 记在**发出**这一刻，不记在客户端回执之后——回执只证明"有人执行了"，
+   *     而用户说的"刚才那个"指的是"你们替我做了这件事"这个意图；
+   *     万一页面旧到不回执，撤销那条路会永久空转（与"读不到≠读到空"同一条纪律）。
+   *   ▸ 上限 8 条：回指最多撤三步，留更多只会让"刚才"指向一件很久以前的事。
+   *   ▸ 挂在 room 上、随房间一起销毁（不另开全局 Map = 少一条要记得清的账，坑 20 的根治法）。 */
+  room.actionStack = room.actionStack || [];
+  room.actionStack.push({ action, byName: byName || 'AI 小明', ts: Date.now() });
+  if (room.actionStack.length > 8) room.actionStack.shift();
   logEvent('info', 'room-control', { roomNumber, action, by: byName || 'ai-bot' });
   console.log(`🎛 [room-control] ${roomNumber} · ${byName || 'AI 小明'} → ${spec.cn}`);
   /* ★ 2026-10-06 「说了没做」要**当场自己发现并说出来**。
@@ -5171,6 +5195,21 @@ function speakShapeLine(spoken) {
     + '不要写文件路径、括号补充、列举腔或 markdown——那些念出来是噪音，看文字就够了。';
 }
 
+/* ★ 2026-10-10（C3 的真浏览器文本断言抓出来的）一次性答案要把文字**补进流里**。
+ * ▎症状：`@ai 把白板打开` 这类"规则直接办、不经过 LLM"的路由，聊天里是一条
+ *   **只有意图徽标的空气泡**——实测文本长这样：`AI 小明 AILLM🎯 room-action`，一个字的答案都没有。
+ * ▎为什么以前看不见：文字其实到了两处之一（`ai-state` 的 speaking 帧带全文 → AI 格子的逐字字幕有），
+ *   所以"它在说话"的观感是有的；缺的是**聊天台账**——导出、回看、晚进房补帧、
+ *   以及今天这三条文本断言，全都依赖那条气泡。
+ * ▎机制：客户端看到 `done` 帧就把随后同 streamId 的 chat-message 当重复丢掉（09-24 为
+ *   "两条同名气泡"立的去重）。规则路由一个增量都没发 → 气泡是空的 → 终态又被去重 → 空着。
+ * ▸ 修法在**服务端补齐流**（流是气泡的唯一来源），不去放开客户端的去重——
+ *   放开就会让流式答案重新出现两条（10-04 那条老账原样复发）。 */
+function streamFillText(roomNumber, streamId, r, streamedAny) {
+  if (streamedAny || !r || !r.text) return;
+  io.to(roomNumber).emit('ai-stream', { id: streamId, delta: String(r.text), done: false });
+}
+
 async function aiBrain(roomNumber, question, onDelta, onPhase, opts = {}) {
   const room = rooms.get(roomNumber);
   const members = room ? [...room.members] : [];
@@ -5207,6 +5246,48 @@ async function aiBrain(roomNumber, question, onDelta, onPhase, opts = {}) {
       text, mock: false, intent: 'room-action',
       action: roomActions[0], actions: roomActions, usage: { totalTokens: 0 },
     };
+  }
+  /* ── ⓪b ★ 2026-10-10 C3「刚才那个再关回去」：回指撤销 ──
+   * ▎为什么排在规则表**之后**：显式说法优先（「撤销刚才那一笔」有"一笔"，那是白板撤一笔，
+   *   不是撤回我上一个动作）；只有规则表一条没接住时，才轮到"这句话的宾语不在句子里、
+   *   而在刚才发生过的事里"这一读法。顺序错了就会把 board-undo 抢掉。
+   * ▎为什么要专门做这一档：用户第五次说"AI 操控实体还是实现的不行"，0.11/0.12 把泛化缺口
+   *   打到 0%，剩下的就是**回指**——它不是一个动词，是"最近做了什么"这个状态，
+   *   规则表再宽也接不住"那个"。回指接不住的后果与以前一样：落到 LLM，回一句漂亮话，界面不动。
+   * ▸ 三种落不上动作的形态都**说明白**，不许沉默、也不许交给 LLM 编（坑 124：有意不接也要写成语句）。 */
+  const undoHint = detectUndoAnaphora(q);
+  if (undoHint) {
+    const undo = resolveUndo((room && room.actionStack) || [], undoHint);
+    if (undo.kind === 'do') {
+      const said = [];
+      undo.items.forEach((it, i) => {
+        const r = applyRoomAction(roomNumber, it.action);
+        if (r.ok) said.push(`「${it.of}」→ ${r.cn}`);      // 说清"撤回的是哪一件、现在变成了什么"
+      });
+      COLLAB.roomUndo.done += 1;
+      logEvent('info', 'room-undo', {
+        roomNumber, mode: undoHint.mode, k: undoHint.k, family: undoHint.family || null,
+        did: undo.actions.join(','), of: undo.targets.join(','),
+      });
+      if (said.length) {
+        return {
+          text: `${undoHint.mode === 'repeat' ? '照刚才那样又做了一遍' : '已把刚才那步撤回'}：${said.join('，')}。`,
+          mock: false, intent: 'room-undo', action: undo.actions[0], actions: undo.actions,
+          usage: { totalTokens: 0 },
+        };
+      }
+    }
+    const why = undo.kind === 'irreversible'
+      ? `「${undo.blocked}」撤不回来——${undo.cn}。`
+      : undo.kind === 'do'
+        ? '这个房间已经不在了，我没法替大家改界面。'      // 房间在 applyRoomAction 之前就没了
+        : '我在这个房间里没留下可撤回的动作记录——「刚才那个」我不知道指哪一件。'
+          + '（谁**手动**点的按钮服务器看不见，我只记得你们通过我下达的那些。）';
+    COLLAB.roomUndo.refused += 1;
+    logEvent('info', 'room-undo-refused', {
+      roomNumber, kind: undo.kind, mode: undoHint.mode, family: undoHint.family || null,
+    });
+    return { text: why, mock: false, intent: 'room-undo', usage: { totalTokens: 0 } };
   }
   /* ★ 2026-10-05 越界请求要**明着拒绝**，不许滑进 LLM 变成一句漂亮的答非所问。
    *   ▎为什么这算"操控实体行不行"的一半：用户说"把摄像头关掉"，以前落到 LLM，
@@ -5522,6 +5603,10 @@ async function asrWakeAndAnswer(roomNumber, memberId, text, speakerName, capTs) 
        *   让模型把结论压进第一句（配合流水线那侧"首句整句念、后续不拦腰切"）。
        *   @ai 打字那一轨不传——它只进气泡，没人用耳朵听。 */
     }, { spoken: true });
+    /* ★ 2026-10-10 与 @ai 通路同一条补流：喊"小明，把白板打开"走的是规则路由，
+     *   一个增量都没有 ⇒ 不补这一句，聊天里就是一条空气泡（而语音那一侧还会念出来，
+     *   于是"它说了话但记录里没有"——台账缺口比看不见的空气泡更贵）。 */
+    streamFillText(roomNumber, streamId, r, !!streamed);
     io.to(roomNumber).emit('ai-stream', {
       id: streamId, delta: '', done: true, mock: !!r.mock,
       trace: aiTraceParts(r).join(' · '),   // ★ 2026-10-04 与 @ai 通路披露一致（原来这里没有）
@@ -7937,7 +8022,9 @@ io.on('connection', (socket) => {
      *   增量先行保证手感，终态兜底保证不丢——和字幕"容忍丢 / 问答不容忍丢"同一套双路哲学。 */
     io.to(roomNumber).emit('ai-stream', { id: streamId, delta: '', done: false, start: true, mock: AI.aiEnabled() === false });
     io.to(roomNumber).emit('ai-state', { state: 'thinking', phase: 'retrieving' }); // ★ 09-26 动态头像；09-30 带阶段
+    let streamedAny = false;   // ★ 2026-10-10 见 streamFillText：一个增量都没发 ⇒ 终态要补进流里
     const r = await aiBrain(roomNumber, question, (delta) => {
+      streamedAny = true;
       io.to(roomNumber).emit('ai-stream', { id: streamId, delta, done: false });
     }, (phase) => {
       /* ★ 09-30：把 brain 的真实阶段透传给界面（检索中 / 换说法再找 / 整理答案）。
@@ -7952,6 +8039,7 @@ io.on('connection', (socket) => {
     /* ★ 2026-10-04：证据链文案与 ai 元信息都改成调用公共实现（见文件头 aiTraceParts / aiAnswerMeta）。
      *   原来这两段在 @ai 通路与语音通路各内联一份，语音那份漏了 streamId 与 trace，
      *   于是同一句答案在聊天里出现两条、名字还不一致（用户截图抓出来的）。 */
+    streamFillText(roomNumber, streamId, r, streamedAny);
     io.to(roomNumber).emit('ai-stream', {
       id: streamId, delta: '', done: true, mock: !!r.mock, trace: aiTraceParts(r).join(' · '),
       // ★ 09-25：流式路径也要带证据原话（否则两条路径的信息披露不一致 = 两种可信度）

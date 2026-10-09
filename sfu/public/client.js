@@ -2333,8 +2333,15 @@ function appendChat(text, sender, isMe, via, name, ai) {
     }
     if (ai && ai.turns > 1) chips.push({ i: ICONS.bubble, t: `第 ${ai.turns} 轮对话` });
     if (ai && ai.intent && ai.intent !== 'question') {
+      /* ★ 2026-10-10：这张表以前缺 `room-action` / `room-undo` 两个键 ⇒ 徽标直接印出内部 id
+       *   （真浏览器截图里看到的是「🎯 room-undo」）。**给用户看的界面不许漏服务器内部的枚举名**——
+       *   它读起来像坏了，而实际只是没翻译（与坑 82 同族：看不懂的标签等于没说）。
+       *   ▸ 兜底仍然留 `|| ai.intent`：将来加新意图忘了配文案时，宁可露原词也不要露空
+       *     （露空会让人以为 AI 什么都没理解，比一个英文 id 更误导）。 */
       chips.push({ i: ai.intent === 'chat' ? ICONS.bubble : ICONS.target,
-        t: ({ minutes: '生成纪要', recap: '回顾', operator: '远程操作', chat: '直接回答（没查会议记录）' })[ai.intent] || ai.intent });
+        t: ({ minutes: '生成纪要', recap: '回顾', operator: '远程操作', chat: '直接回答（没查会议记录）',
+          'room-action': '替你操作会议', 'room-undo': '撤回刚才那步',
+          'room-action-denied': '这条不在我能做的范围' })[ai.intent] || ai.intent });
     }
     if (ai && ai.rewrites) chips.push({ i: ICONS.loop, t: '换过说法再找' });
     const traceHtml = chips.length

@@ -402,6 +402,9 @@ function analyzeRoom(caps, events) {
     fileCleanupFailed: events.filter((e) => e.event === 'files-cleanup-failed'),
     tts: ttsEvents.length, engines, ttsFailed: count('ai-tts-failed'), ttsBudget: count('ai-tts-budget'),
     control: count('room-control'), controlNoop: count('room-control-noop'),
+    /* ★ 2026-10-10 C3 回指撤销两本账（与 /metrics 的 sfu_room_undo_total 同一来源：都是事件计数，
+     *   不在这里另判一次"什么算回指"——判据只有 roomActions.js 那一个地方，坑 47）。 */
+    undoDone: count('room-undo'), undoRefused: count('room-undo-refused'),
     members: new Set(asrCaps.map((e) => e.from)).size,
   };
 }
@@ -532,6 +535,7 @@ function verdictLines(m) {
     m.control || m.controlNoop
       ? `下达 ${m.control} 次 · 没有任何客户端执行 ${m.controlNoop} 次`
         + (m.controlNoop ? '（多半是页面还是旧版：让用户硬刷新 Ctrl+F5，或地址后加 ?nosw=1 打开一次）' : '')
+        + ` · 回指撤销「刚才那个再关回去」成功 ${m.undoDone || 0} 次 / 明确拒做 ${m.undoRefused || 0} 次`
       : '这场会没有下达房间动作');
   /* ★ 这一行是"规则改了会不会误伤真人"的哨兵（样本量口径同坑 105：话太少不下结论）。
    *   正常形态是**极少数**几句被读成指令，而那几句确实是祈使句（"帮我开白板再白板这画"）；
@@ -759,9 +763,35 @@ function selftest() {
   ]);
   const deadLine = verdictLines(dead).find((l) => l.label === '听觉进程');
   ok('自检 G：听觉进程永久放弃要报 bad', deadLine.level === 'bad');
+  /* G4 ★ 2026-10-10 C3：回指撤销那两本账要进「AI 操控实体」这一行。
+   *   ▸ 为什么在真会里必须看得见它：回指撤销有两种"没做"（不可逆 / 栈是空的），
+   *     它们的正确表现就是**界面不动**——没有这一行，用户报"我说刚才那个它没反应"时，
+   *     报告里只有一条"下达 0 次"，看不出它到底是没听懂、听懂了但拒做、还是做了没生效。 */
+  const undoEv = (event, n) => Array.from({ length: n }, (_, i) =>
+    ({ ts: new Date(t0 + i * 1000).toISOString(), event, member: 'm1' }));
+  const undoM = analyzeRoom([cap(0, '一句足够长的正常字幕内容', { fin: 'silence', lat: 1500 })], [
+    ...undoEv('room-control', 3), ...undoEv('room-undo', 2), ...undoEv('room-undo-refused', 1),
+  ]);
+  const undoLine = verdictLines(undoM).find((l) => l.label === 'AI 操控实体');
+  /* 只有下达、没有回指：这一行的两本账必须是 0，而不是"没有这一栏"——
+   *   读的人正是靠这两个 0 判断"用户这场会没说过回指"与"说了但服务器不认"。 */
+  const undoOnly = analyzeRoom([cap(0, '一句足够长的正常字幕内容', { fin: 'silence', lat: 1500 })], undoEv('room-control', 3));
+  ok('自检 G4：回指撤销的成功/拒做两本账进「AI 操控实体」那一行（"没反应"要分得开是哪种没做）',
+    undoM.undoDone === 2 && undoM.undoRefused === 1 && /成功 2 次 \/ 明确拒做 1 次/.test(undoLine.text),
+    undoLine.text);
+  /* 两条判据分开写：上一条把 detail 误当第二个参数塞进 .test()，语法当场炸（自己写坏的）。 */
+  const onlyCtrlText = verdictLines(undoOnly).find((l) => l.label === 'AI 操控实体').text;
+  ok('自检 G4b：有下达但没有回指事件时，两本账各报 0（"没人说过"与"说了没接住"要分得开）',
+    /成功 0 次 \/ 明确拒做 0 次/.test(onlyCtrlText), onlyCtrlText);
+  /* 完全没有下达记录的健康场次，这一行仍是"这场会没有下达房间动作"——不许被新加的那半句
+   *   改口成"0 次"：0 会让读的人以为"说过但没做"，那是另一种误导（坑 82）。 */
+  const goodCtrlText = verdictLines(good).find((l) => l.label === 'AI 操控实体').text;
+  ok('自检 G4c：这场会压根没下达过动作时保持"没有下达"的说法，不冒充成两个 0',
+    /没有下达房间动作/.test(goodCtrlText), goodCtrlText);
   /* G3 ★ 2026-10-10 C2「尾巴抢跑」那行的三种形态各自要分得开。
-   *   ▸ 反向对照最重要：**0 次放行必须报 ❔ 而不是 ✅**——这条开关默认关，
-   *     "没跑"是它的常态，把它报成"没问题"就等于下一次真出问题时没人起疑（坑 105）。 */
+   *   ▸ 反向对照最重要：**0 次放行必须报 ❔ 而不是 ✅**——"没跑成"有两种完全不同的原因
+   *     （那台服务器没重启 / worker 一直忙所以这次本来就不该重转），报成"没问题"就等于
+   *     下一次真出问题时没人起疑（坑 105）。 */
   const rushOn = analyzeRoom([cap(0, '一句足够长的正常字幕内容', { fin: 'silence', lat: 1500 })], [
     { ts: new Date(t0).toISOString(), event: 'asr-tail-rush', member: 'm1', chars: 14, sinceVoice: 1580 },
     { ts: new Date(t0 + 5000).toISOString(), event: 'asr-tail-rush', member: 'm1', chars: 12, sinceVoice: 1620 },
