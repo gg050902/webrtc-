@@ -231,7 +231,39 @@ function analyzeRoom(caps, events) {
    *     也出现过 **20230**（那一代没人说话）——同一个名字差 20 倍。
    *     我第一版就是拿着它差点去修"冷启动 20 秒"这个不存在的瓶颈（坑 75 的指标版：
    *     一个指标如果不代表它名字所说的那件事，它就会把人引向错误的诊断）。 */
-  const rmsArr = events.filter((e) => e.event === 'asr-rms-arrival');
+  /* ★ 2026-10-10（C1）样本单位是**代**，不是事件行数。
+   *   ▎为什么要去重：这一行原来只在录音进程**退出时**写一条 ⇒ 会议进行中读不到任何样本
+   *     （今晚 e2e 那间房跑的就是新代码，报告仍写「样本 0 代」）。现在活着时每 ~60s 也写一条，
+   *     于是一场长会同代会给出多条读数。**p90 / 中位必须按代算**——
+   *     否则同一代的中间态会被重复计数几十次，把分布整个撑歪（坑 105 的另一种形状：
+   *     分母不是我要数的那个东西）。
+   *   ▸ 取哪一条：有 `final` 用 final（那是这一代的全集）；只有 live 就取该代最后一条 live
+   *     —— "没散会也要能读到"这件事正是靠这半句成立的。
+   *   ▸ 老服务器没有 `gen` 字段：按 member 折叠成一条，宁可少数几代，也不把一条会数成一堆代。 */
+  const rmsArr = (() => {
+    const byGen = new Map();
+    for (const e of events.filter((x) => x.event === 'asr-rms-arrival')) {
+      /* 老服务器没有 gen 字段 ⇒ 按事件本身算样本（键带上 ts）。
+       * ▸ 为什么宁可放过而不是一律折叠：把"没有 gen"当成"同一个 gen"折叠，
+       *   会把老日志里 5 代读成 1 代——那是一台**读数变少**的仪表，
+       *   而它报出来的每一行看起来都完全正常（坑 105 的反方向：不是白报通过，是白报样本不足）。 */
+      const key = e.gen == null
+        ? `nogen|${e.member || '?'}|${e.ts || ''}`
+        : `${e.member || '?'}|${e.gen}`;
+      const prev = byGen.get(key);
+      const better = !prev
+        || (prev.final !== true && e.final === true)
+        || (!!prev.final === !!e.final && Number(e.ts || 0) >= Number(prev.ts || 0));
+      if (better) byGen.set(key, e);
+    }
+    return [...byGen.values()];
+  })();
+  /** 有多少代是"没散会就读到了"（C1 的目的本身；一条都没有就说明滚动落账没跑起来） */
+  /** 有多少代是"没散会就读到了"（C1 的目的本身；一条都没有就说明滚动落账没跑起来）。
+   *   ▸ 判据要的是**显式的 live 标记**，不是"没有 final"——老服务器那批只在退出时写，
+   *     既没有 final 也没有 live，用"非 final"去数就会把老账本报成"5 代未散会即有读数"，
+   *     一句听起来很正常的假话（坑 82：过期/错误声明比缺失更伤人，因为它让人以为新仪表在工作）。 */
+  const rmsLiveGens = rmsArr.filter((e) => e.live === true).length;
   const rmsNums = (key) => rmsArr.map((e) => Number(e[key]))
     .filter((v) => Number.isFinite(v) && v >= 0).sort((a, b) => a - b);
   const rmsFirst = rmsNums('firstMs');
@@ -338,6 +370,9 @@ function analyzeRoom(caps, events) {
      *   rmsN 是"有几代交出了 RMS 行"，rmsPipeN 是"其中有几个能算出管道耗时"——
      *   后者可能更小（老服务器没写 firstByteMs、或锚点还没扫到就退了），所以分开报、不硬凑。 */
     rmsN: rmsFirst.length, rmsFirst, rmsPipe: rmsPipe, rmsPipeN: rmsPipe.length,
+    /* ★ C1：有多少代是"没散会就读到了"。一条都没有 = 滚动落账没跑起来
+     *   （那这场会要等散会才有样本，正是 C1 要消灭的形态）。 */
+    rmsLiveGens,
     rmsGapMax: rmsGap[rmsGap.length - 1] || 0,
     rmsBytesMax: rmsBytes[rmsBytes.length - 1] || 0,
     /* ★ H8c：这把尺停在哪 + 有多少窗被判有声（都从同一行事件来，不另找数据源） */
@@ -424,6 +459,7 @@ function verdictLines(m) {
       `管道 中位 ${hasPipe ? fmtSec(quantile(m.rmsPipe, 0.5)) : '—'} / p90 ${hasPipe ? fmtSec(quantile(m.rmsPipe, 0.9)) : '—'}`
       + `（第一个非空分段→第一条 RMS 行，n=${m.rmsPipeN}）· 行间隔最大 ${m.rmsGapMax}ms · 单次事件最大 ${m.rmsBytesMax}B · `
       + `首行(含等人开口) 中位 ${fmtSec(quantile(m.rmsFirst, 0.5))}（n=${m.rmsN} 代）⇒ `
+      + `${m.rmsLiveGens > 0 ? `其中 ${m.rmsLiveGens} 代**未散会即有读数**（滚动落账在跑）` : '全部为退出时的终值（会议进行中读不到——C1 要修的就是这个）'} · `
       + (blk ? '**管道成块交付仍在**（H2 复现，要动 stdout 那条路）'
         : gapBad ? '行与行之间出现长空档 ⇒ 静音判定会跟着卡（查 ffmpeg 是否还在收 RTP）'
           : slow ? `音频进来后第一行仍要 >${T.rmsPipeWarnMs}ms ⇒ 冷启动宽限要核对`
@@ -593,6 +629,22 @@ function verdictLines(m) {
       add(rej.length ? 'warn' : 'ok', '共享文件', txt);
     }
   }
+  /* ★ 2026-10-10（C1 的第二半）没有字幕账本的那场会，**"计数为 0"的 ✅ 一律降成 ❔**。
+   *   ▎为什么：这场会的字幕条目是 0，于是"噪声幻觉 0 条 / 唤醒应答 0 次 / 播报 0 段"
+   *     全部结构性地必然成立——它们是 ✅ 的那一刻，报告就在谎报"这场没问题"（坑 105）。
+   *     而"这场为什么没字幕"恰恰是这份报告最该回答的问题，所以补进来的每一行都必须
+   *     把"我没有证据"说清楚，而不是把"我没记录"说成"一切正常"。
+   *   ▸ 只降"按计数为 0 判好"的那几行；`听觉进程`（真事件：31 次重生 0 次放弃）与
+   *     `RMS 到达`（真样本）不动——那些是有证据的，降级它们同样是错（把有信息的一起噤声）。 */
+  if (m.noLedger) {
+    const vacuous = new Set(['噪声幻觉入账', '唤醒与应答', '播报', 'AI 操控实体', '共享文件']);
+    for (const l of L) {
+      if (vacuous.has(l.label) && l.level === 'ok') {
+        l.level = 'unknown';
+        l.text = '这场没有字幕账本，0 条/0 次只说明"没记录"，不说明"没发生" · ' + l.text;
+      }
+    }
+  }
   return L;
 }
 
@@ -724,6 +776,62 @@ function selftest() {
   ok(/logEvent\('info', 'asr-rms-arrival'/.test(srvSrcRms)
     && /firstMs: rmsSeen\.firstAtMs, firstByteMs: rmsSeen\.firstByteAtMs/.test(srvSrcRms),
     '自检 G2f：服务器真的写 asr-rms-arrival，且字段名与复盘读的一致');
+  /* ★ G2g/G2h/G2i（2026-10-10 C1）"会议进行中也要有样本"这件事本身要能红。
+   *   ▸ 为什么值得三条：C1 的起因就是这条仪表**在真实跑着的会里读不到数**——
+   *     e2e 那间房用的就是新代码，报告仍写「样本 0 代」，因为读数只在进程退出时写。
+   *     "装了仪表"与"仪表在场景里读得到"是两件事（坑 76），所以这次把**读得到**本身钉成断言。
+   *   ▸ 三条各钉一个方向：同代多条要折叠成一个样本（分母不能是事件行数）/
+   *     有 final 必须优先取 final（否则 p90 被中间态污染）/
+   *     只有 live 也算样本（这正是 C1 的目的），且报告里要写明"未散会即有读数"。 */
+  const genEv = (gen, over) => Object.assign(
+    { ts: new Date(t0 + gen * 1000).toISOString(), event: 'asr-rms-arrival', member: 'm1', gen,
+      firstMs: 995, firstByteMs: 900, afterByteMs: 95, gapMaxMs: 315, bytesMax: 959,
+      lines: 76, events: 20, voiced: 50, livedMs: 22000, live: true }, over || {});
+  const rmsOneGen = analyzeRoom(oneCap, [
+    genEv(3, { bytesMax: 900 }), genEv(3, { final: true, bytesMax: 4200 }),   // 同代：中间态 + 终值
+    genEv(4, { final: true }), genEv(5),
+  ]);
+  const rmsOneGenLine = verdictLines(rmsOneGen).find((l) => l.label === 'RMS 到达');
+  ok('自检 G2g：同代多条只算**一个样本**（3 代事件 ⇒ n=3 代），且终值优先于中间态',
+    /n=3 代/.test(rmsOneGenLine.text) && /4200B/.test(rmsOneGenLine.text), rmsOneGenLine.text);
+  ok('自检 G2h：未散会也有读数这件事要**写在报告里**（不写就等于没人知道滚动落账在不在跑）',
+    /未散会即有读数/.test(rmsOneGenLine.text), rmsOneGenLine.text);
+  /* 真实生产里终值那条不带 live 标记（见 server.js 的 Object.assign({final:true}, …)），
+   * 所以夹具也要照那个形状造——否则测的是我给 fixture 编的字段，不是服务器写的字段。 */
+  const rmsAllFinal = verdictLines(analyzeRoom(oneCap, [
+    genEv(1, { final: true, live: false }), genEv(2, { final: true, live: false }), genEv(3, { final: true, live: false }),
+  ])).find((l) => l.label === 'RMS 到达');
+  ok('自检 G2i：全是退出时终值的报告要**明说**"会议进行中读不到"（C1 要消灭的形态）',
+    /未散会即有读数/.test(rmsAllFinal.text) === false && /退出时的终值/.test(rmsAllFinal.text), rmsAllFinal.text);
+  /* 老服务器（没有 gen 字段）不许被折叠成一个样本——那是"读数变少"的仪表，
+   * 而它每一行看起来都完全正常（坑 105 的反方向）。 */
+  const rmsLegacy = verdictLines(analyzeRoom(oneCap, arr(5))).find((l) => l.label === 'RMS 到达');
+  ok('自检 G2j：老服务器的事件没有 gen 字段 ⇒ 一条都不许折叠（5 行仍报 n=5 代）',
+    /n=5 代/.test(rmsLegacy.text), rmsLegacy.text);
+  /* ★ G2j2 与它配对的另一半：老服务器**只在退出时写**，所以"未散会即有读数"这句
+   *   对老账本必须是假。第一版我用"没有 final 就算 live"，于是这份老账本被报成
+   *   "5 代未散会即有读数"——新仪表听起来在工作，其实没有（判据要读显式标记，不读"缺省的反面"）。 */
+  ok('自检 G2j2：老账本（既无 gen 也无 live）不许被报成"未散会即有读数"',
+    !/未散会即有读数/.test(rmsLegacy.text) && /退出时的终值/.test(rmsLegacy.text), rmsLegacy.text);
+  ok('自检 G2k（C1 生产侧接线）：服务器既有滚动落账也有退出终值，且共用同一个快照函数',
+    /logEvent\('info', 'asr-rms-arrival', Object\.assign\(\{ live: true \}, snap\)\)/.test(srvSrcRms)
+    && /Object\.assign\(\{ final: true \}, rmsArrivalFields\(\)\)/.test(srvSrcRms)
+    && /maybeLogRmsLive\(\)/.test(srvSrcRms));
+  /* ★ G2l（C1 的第二半）"只有事件、没有字幕账本"的那场会：**0 不能报成 ✅**。
+   *   这条自检判的是 analyzeRoom 之外的一层——verdictLines 的降级规则，
+   *   所以它给的是合成 m（不走 analyzeRoom），以免把"有没有这一行"和"降级对不对"混成一件事。 */
+  const noLedgerM = Object.assign(analyzeRoom([], arr(5)), { noLedger: true });
+  const nl = verdictLines(noLedgerM);
+  const nlVac = nl.filter((l) => ['噪声幻觉入账', '唤醒与应答', '播报', 'AI 操控实体'].includes(l.label));
+  ok('自检 G2l：没有字幕账本时，"计数为 0"的那几行必须降成 ❔ 并说清"没记录≠没发生"（坑 105）',
+    nlVac.length === 4 && nlVac.every((l) => l.level === 'unknown' && /没记录/.test(l.text)),
+    nlVac.map((l) => `${l.label}=${l.level}`).join(' '));
+  /* 反向对照：同一次跑的 `RMS 到达` 与 `听觉进程` 不许被一起降级——
+   * 它们是**真事件给的证据**，把有信息的一起噤声是另一种撒谎。 */
+  ok('自检 G2l2：有真事件的行不许被一起降级（RMS 到达 / 听觉进程 仍要有判词）',
+    nl.find((l) => l.label === 'RMS 到达').level === 'ok'
+    && nl.find((l) => l.label === '听觉进程').level === 'ok',
+    nl.filter((l) => ['RMS 到达', '听觉进程'].includes(l.label)).map((l) => `${l.label}=${l.level}`).join(' '));
   /* G3 ★「房间可分性」也按同一条纪律自检（仪表自己必须能红，否则它只是装饰，坑 107）。
    *   ▸ 三个方向各一条：几乎没有安静窗（warn）/ 一半窗是安静的（info，不许跟着喊）/
    *     阈值正好压在 −42 硬线上（要说出"自适应此刻没起作用"——这才是可操作信息）。 */
@@ -991,12 +1099,44 @@ function main() {
     if (m.asrCaps === 0) continue;                 // 这场会没有服务端转写，不占版面
     rooms.push({ room: f.room, day: f.day, m });
   }
+  /* ★ 2026-10-10（C1 的第二半）：**只有事件、没有字幕账本**的房间里，那一场也必须有行。
+   *   ▎为什么要补：这份报告原先按"字幕账本文件"列房间，而"这个人为什么没字幕"恰恰是
+   *     **一条字幕都没有**的那种房间——最需要看 RMS 到达 / 听觉进程 / 能量闸的那一场，
+   *     在报告里直接不存在。（我自己撞上的：asr-live 收尾会删掉自己的账本，于是刚验证成功的
+   *     滚动落账在 `review:meeting --room 999999` 里什么都查不到。）
+   *   ▸ 只捞"带 ASR 遥测事件"的房间，不是所有出现过的房号：否则自测房号会淹掉真人场。
+   *   ▸ 这种房间的每一行仍然走同一套判据 ⇒ 样本不够就是 ❔，**不许因为"没字幕"就报通过**（坑 105）。 */
+  const TELEMETRY = new Set(['asr-rms-arrival', 'asr-recorder-respawn', 'asr-recorder-gave-up']);
+  const haveRooms = new Set(rooms.map((r) => r.room));
+  const knownDays = new Set(files.map((f) => f.room + f.day));
+  const evRooms = new Map();          // room → { day, ts, evs[] }
+  for (const e of eventsAll) {
+    if (!TELEMETRY.has(e.event) || !e.roomNumber) continue;
+    const day = String(e.ts || '').slice(0, 10).replace(/-/g, '');
+    if (!day) continue;
+    if (haveRooms.has(e.roomNumber) || knownDays.has(e.roomNumber + day)) continue;
+    const cur = evRooms.get(e.roomNumber) || { day, ts: 0, evs: [] };
+    cur.evs.push(e);
+    /* 日期跟"最后一条事件"走，不是第一条：asr-live 这类自测房号会被反复复用，
+     * 报头写 10-08 而实际读数是今天 04:4x 的话，人第一反应会是"这报告在翻旧账"。 */
+    const at = Date.parse(e.ts) || 0;
+    if (at >= cur.ts) { cur.ts = at; cur.day = day; }
+    evRooms.set(e.roomNumber, cur);
+  }
+  for (const [room, v] of evRooms) {
+    const m = analyzeRoom([], v.evs);
+    m.noLedger = true;
+    rooms.push({ room, day: v.day, m });
+  }
   rooms.sort((a, b) => b.m.asrCaps - a.m.asrCaps);
   const shown = top ? rooms.slice(0, top) : rooms;
 
   if (asJson) { console.log(JSON.stringify({ days, thresholds: T, rooms: shown }, null, 2)); return; }
 
-  console.log(`\n════ 真实会议复盘（最近 ${days} 天，${shown.length}/${rooms.length} 场有服务端转写）════`);
+  console.log(`\n════ 真实会议复盘（最近 ${days} 天，${shown.length}/${rooms.length} 场有服务端转写`
+    + (shown.some((r) => r.m.noLedger)
+      ? `；其中 ${shown.filter((r) => r.m.noLedger).length} 场**只有事件没有字幕账本**——那正是"这个人为什么没字幕"要查的房间` : '')
+    + '）════');
   console.log(`   阈值：停摆 ≥${Math.round(T.stallMs / 1000)}s 且期间到段 ≥${T.stallMinSegments} · `
     + `延迟结论需 ≥${T.minLatencySamples} 条 silence 定稿 · 碎片 ≤${T.fragChars} 字 · `
     + `闸门档位 旧${T.gateOld}dB / 今${T.gateNow}dB`);
@@ -1009,7 +1149,8 @@ function main() {
   for (const r of shown) {
     const mins = (r.m.spanMs / 60000).toFixed(1);
     console.log(`\n── 房间 ${r.room}（${r.day.slice(4, 6)}-${r.day.slice(6, 8)}）：`
-      + `${r.m.asrCaps} 条定稿 / ${r.m.caps} 条入账 / ${r.m.members} 人说话 / 字幕跨度 ${mins} 分钟`);
+      + `${r.m.noLedger ? '**账本已被清掉或这场没出字幕**，以下结论只来自事件' : `${r.m.asrCaps} 条定稿 / ${r.m.caps} 条入账`}`
+      + ` / ${r.m.members} 人说话 / 字幕跨度 ${(r.m.spanMs / 60000).toFixed(1)} 分钟`);
     for (const l of verdictLines(r.m)) {
       if (l.level in tally) tally[l.level]++;
       console.log(`   ${ICON[l.level] || '·'} ${l.label}：${l.text}`);
