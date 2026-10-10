@@ -23,6 +23,7 @@
  *     npm run test:review                    自检：拿合成账本验"这台量具准不准"
  */
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const Asr = require('../sfu/ai/asr.js');
 const RoomActions = require('../sfu/ai/roomActions.js');   // ★ 指令回扫复用生产那两个判据（坑 47）
@@ -1436,12 +1437,149 @@ function selftest() {
   const tinyRoom = analyzeRoom([cap(0, FIXTURE_SENTENCES[0]), cap(1, '两句')], []);
   ok('自检 M：定稿太少时报 unknown，不硬判', whoLine(tinyRoom).level === 'unknown');
 
+  /* ══ 自检 MD（2026-10-10 D5 的那半）：报告自动落 markdown ══
+   *   ▎判据要问的是"这份 md 有没有把终端上说的每句话都带过去"，
+   *     而不是"有没有生成一个文件"——后者一个空文件也能满足（假绿，坑 65/105 同族）。 */
+  {
+    const realDir = path.join(ROOT, 'sfu', 'reviews');
+    const realBefore = fs.existsSync(realDir) ? fs.readdirSync(realDir).length : -1;
+    const mdGood = toMarkdown([{ room: '603646', day: '20261006', m: good }], { days: 2, thresholds: T });
+    const lines = verdictLines(good);
+    /* 计数只用一个正则。extra 那一份原先多写了一个**空的分支**（把 ❌ 打成了 ||），
+     *   于是它把表格每一行都算进去，打印出「表格行 21 / 结论 19」这种自相矛盾的数——
+     *   判据是对的、**诊断信息是错的**，而下一个人查红时读的正是这行数字。 */
+    const rowRe = /^\| .* \| (✅|⚠️|❌|❔|·)/gm;
+    const mdRows = (mdGood.match(rowRe) || []).length;
+    ok('自检 MD1：每一行结论都进了表格（表格行数 == verdictLines 条数，一条都不许吞）',
+      /^## 房间 603646/m.test(mdGood)
+      && lines.every((l) => mdGood.includes('| ' + l.label + ' |'))
+      && mdRows === lines.length,
+      `结论 ${lines.length} 条 · 表格行 ${mdRows}`);
+    ok('自检 MD2：合计那行的四个数与逐条级别一致（报告自己不能前后不呼应）',
+      (() => {
+        const c = { ok: 0, warn: 0, bad: 0, unknown: 0 };
+        lines.forEach((l) => { if (l.level in c) c[l.level]++; });
+        const m = /✅ (\d+) · ⚠️ (\d+) · ❌ (\d+) · ❔ (\d+)/.exec(mdGood);
+        return !!m && Number(m[1]) === c.ok && Number(m[2]) === c.warn
+          && Number(m[3]) === c.bad && Number(m[4]) === c.unknown;
+      })(), mdGood.split('\n').find((l) => /^✅ \d+ ·/.test(l)) || '(没有合计行)');
+    ok('自检 MD3：❔ 明写"不是通过"（这份报告的原则不许在导出时丢掉）',
+      /❔ 不是"通过"/.test(mdGood));
+    /* 读数里出现竖线（档位串、A|B 形式）时必须转义，否则 markdown 表格被劈成两列——
+     *   表现不是报错，是**那一行之后的列全错位**，人只会以为报告写坏了。 */
+    const pipeRoom = analyzeRoom(goodCaps, []);
+    const mdPipe = toMarkdown([{ room: '1', day: '20261006', m: pipeRoom }], { days: 1, thresholds: T });
+    ok('自检 MD4：读数里的竖线被转义（不转义会把表格劈成两列，且没有任何报错）',
+      !/(^|\| )[^|\n]*\|[^|\n]*\|[^|\n]*\|[^|\n]*\|[^|\n]*\|/m.test(
+        (mdPipe.match(/^\| 语音连续性 .*$/m) || [''])[0]) || !(mdPipe.match(/^\| 语音连续性 .*$/m) || []).length,
+      (mdPipe.match(/^\| 语音连续性 .*$/m) || ['(无该行)'])[0].slice(0, 70));
+    const mdEmpty = toMarkdown([], { days: 2, thresholds: T });
+    /* ▸ 这条第一版写成 `!/一切正常|✅/.test(mdEmpty)`，结果**红在自己的说明文字上**——
+     *   我在空态里写了一句"这一格刻意不写『一切正常』"，判据把那五个字也读了进去
+     *   （坑 154：判据不许读自己的说明/夹具）。改成查真正的结构：
+     *   空态里不许出现"合计行"，也不许出现任何一行表格结论。 */
+    ok('自检 MD5：没有会议时那份 md 明写"没有可复盘"，且不给出任何看起来像结论的东西',
+      /没有可复盘/.test(mdEmpty) && !/^✅ \d+ ·/m.test(mdEmpty) && !/^\| .* \| (✅|⚠️|❌|❔)/m.test(mdEmpty),
+      mdEmpty.split('\n').filter((l) => l.trim()).slice(-1)[0] || '(空)');
+    /* 真写一次文件，但写到临时目录；写完读回来比字节（坑 156：写完必须读回来断言大小） */
+    const tmpDir = path.join(os.tmpdir(), `review-selftest-${process.pid}`);
+    const w = writeMarkdown([{ room: '603646', day: '20261006', m: good }], { days: 2, thresholds: T }, tmpDir);
+    const back = fs.readFileSync(w.file, 'utf8');
+    ok('自检 MD6：写出去的文件读回来与内容一致（字节数对得上，不是 0 字节占位）',
+      back.includes('## 房间 603646') && Buffer.byteLength(back) === w.bytes && w.bytes > 500,
+      `${path.basename(w.file)} · ${w.bytes}B`);
+    const realAfter = fs.existsSync(realDir) ? fs.readdirSync(realDir).length : -1;
+    ok('自检 MD7：隔离自证——自检一个字节都没往真实 sfu/reviews/ 里写',
+      realAfter === realBefore, `真实目录 前=${realBefore} 后=${realAfter}`);
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) { /* 收不掉不致命 */ }
+  }
+
   const pass = R.filter(Boolean).length;
   console.log(`\n自检结果: ${pass} 通过, ${R.length - pass} 失败`);
   return pass === R.length ? 0 : 1;
 }
 
 /* ────────── 主流程 ────────── */
+/* ══ ★ 2026-10-10（计划 0.12 的 D5 里不依赖真会的那半）：报告自动落一份 markdown ══
+ * ▎为什么要落盘：这份报告是"这套语音到底能不能用"的**唯一权威证据**（10-06 立这条的理由是
+ *   受控自测的数字与真人会议两次给出相反答案），而它以前只打在终端上——
+ *   写论文/答辩时要引用它，就得有人当场复制粘贴。
+ *   ▸ 又是坑 40 那条老账：**"记得做"是纪律，纪律会被忘掉**。所以默认就写，不留 `--md` 开关
+ *     （留了开关等于没有：需要它的那天，没人记得加）。
+ * ▎文件名带时间戳、**不覆盖**：这份东西的性质是证据，同一天的两次运行可能落在不同的机器状态上
+ *   （10-06 那条"跑了三次都过不是稳定性证据"），覆盖会毁掉对比。
+ * ▎目录可以整体搬走（`REVIEW_DIR`），自检用临时目录 ⇒ 绝不往真实 sfu/reviews/ 里写东西
+ *   （与账号类测试必须用临时库、金标准必须用临时 GOLDEN_DIR 是同一条纪律，坑 72/143）。 */
+const REVIEW_DIR = process.env.REVIEW_DIR || path.join(ROOT, 'sfu', 'reviews');
+const LEVEL_CN = { ok: '✅ 通过', warn: '⚠️ 警告', bad: '❌ 不合格', unknown: '❔ 样本不足', info: '· 观察' };
+
+/** 把若干场会的结论拼成一份 markdown（纯函数：不碰 fs、不碰终端）。 */
+function toMarkdown(shown, meta) {
+  const m = meta || {};
+  const L = [];
+  L.push('# 真实会议复盘（智能多人视频会议系统 · 语音链路可用性）');
+  L.push('');
+  L.push(`- 生成时间：${new Date().toISOString()}`);
+  L.push(`- 数据来源：\`sfu/captions/*.jsonl\`（字幕账本）+ \`sfu/logs/app-*.jsonl\`（结构化事件）`);
+  L.push(`- 覆盖范围：最近 ${m.days || '?'} 天，共 ${shown.length} 场有服务端转写的会议`);
+  L.push(`- 命令：\`npm run review:meeting\`（本报告由它自动生成，无需手工复制）`);
+  L.push('');
+  if (m.thresholds) {
+    const T = m.thresholds;
+    L.push(`> 判据阈值：停摆 ≥${Math.round(T.stallMs / 1000)}s 且期间到段 ≥${T.stallMinSegments} 段 · `
+      + `延迟结论需 ≥${T.minLatencySamples} 条 \`fin=silence\` 定稿 · 碎片 ≤${T.fragChars} 字 · `
+      + `能量闸档位 旧 ${T.gateOld} dB / 今 ${T.gateNow} dB`);
+    L.push('');
+  }
+  if (!shown.length) {
+    L.push('**没有可复盘的会议**：要么这几天没开过会，要么服务器还没开始落字幕账本。');
+    L.push('');
+    L.push('（这一格刻意不写"一切正常"——没有样本不是通过的证据。）');
+    return L.join('\n') + '\n';
+  }
+  const tally = { ok: 0, warn: 0, bad: 0, unknown: 0 };
+  for (const r of shown) {
+    const mins = (r.m.spanMs / 60000).toFixed(1);
+    L.push(`## 房间 ${r.room}（${r.day.slice(4, 6)}-${r.day.slice(6, 8)}）`);
+    L.push('');
+    L.push(r.m.noLedger
+      ? `**这场会只有事件、没有字幕账本**（账本被清掉或这场没出字幕）——正是"这个人为什么没字幕"要查的形状。`
+      : `- 定稿 **${r.m.asrCaps}** 条 / 入账 ${r.m.caps} 条 · 说话人数 ${r.m.members} · 字幕跨度 ${mins} 分钟`);
+    L.push('');
+    L.push('| 结论 | 级别 | 读数 |');
+    L.push('| --- | --- | --- |');
+    for (const l of verdictLines(r.m)) {
+      if (l.level in tally) tally[l.level]++;
+      /* 表格单元里的竖线要转义，否则一行结论会把 markdown 表格劈成两列（读数里常有 | 分隔的档位）。 */
+      const cell = String(l.text || '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
+      L.push(`| ${l.label} | ${LEVEL_CN[l.level] || l.level} | ${cell} |`);
+    }
+    L.push('');
+  }
+  L.push('## 合计');
+  L.push('');
+  L.push(`✅ ${tally.ok} · ⚠️ ${tally.warn} · ❌ ${tally.bad} · ❔ ${tally.unknown}`);
+  L.push('');
+  L.push('> **❔ 不是"通过"**，是"样本不足以下结论"。这份报告的原则是：没有证据就不许报绿灯（坑 105）。');
+  L.push('>');
+  L.push('> 「谁在说话」那一行按 fixture 句子把场次标为 自测场 / 混合场 / 真人场（定稿 <5 条报 ❔）。'
+    + '这是**启发式**：真会里有人复述同一句也可能被标。');
+  L.push('>');
+  L.push('> 本报告只说"账本里发生了什么"。真人开麦的体感、以及账本之外的失败（比如页面根本没刷新），它看不见。');
+  L.push('');
+  return L.join('\n');
+}
+
+function writeMarkdown(shown, meta, dirOverride) {
+  const dir = dirOverride || REVIEW_DIR;
+  const md = toMarkdown(shown, meta);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const file = path.join(dir, `review-${stamp}.md`);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, md);
+  return { file, bytes: Buffer.byteLength(md) };
+}
+
 function main() {
   const argv = process.argv.slice(2);
   if (argv.includes('--selftest')) process.exit(selftest());
@@ -1530,7 +1668,19 @@ function main() {
   console.log('   「谁在说话」按 fixture 句子把场次标为 自测场 / 混合场 / 真人场（定稿 <5 条报 ❔）。'
     + '\n   这是**启发式**：真会里有人复述同一句也可能被标；要只看某一场用 --room <房间号>。'
     + '\n   这份报告只说"账本里发生了什么"。真人开麦的体感、以及账本之外的失败（比如页面根本没刷新），它看不见。\n');
+
+  /* ★ 2026-10-10（D5 的那半）：**自动**落一份 markdown，不留 `--md` 开关。
+   *   ▸ 留开关 = 需要它的那天没人记得加（坑 40：纪律会被忘掉）。
+   *   ▸ 写不出去只警告、不让整条命令失败：终端报告已经打完了，
+   *     为一件"顺手归档"的事把复盘判成失败，会让人下次不敢跑它。 */
+  try {
+    const w = writeMarkdown(shown, { days, thresholds: T });
+    console.log(`📄 已自动写一份 markdown：${path.relative(ROOT, w.file)}（${w.bytes} 字节）`
+      + '\n   论文/答辩直接引用它，不用手工复制终端；同一天的两次运行都会留下各自的文件（证据不覆盖）。\n');
+  } catch (e) {
+    console.log(`⚠️ markdown 没写出去（${(e && e.message) || e}）——终端报告照常，请自己留一份。\n`);
+  }
 }
 
-module.exports = { analyzeRoom, verdictLines, readJsonl, eventsForRoom, T };
+module.exports = { analyzeRoom, verdictLines, readJsonl, eventsForRoom, toMarkdown, writeMarkdown, T };
 if (require.main === module) main();
