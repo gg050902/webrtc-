@@ -2471,15 +2471,12 @@ function sendChat() {
     text,
     name: myDisplayName || undefined, // ★ 09-16：昵称随 SCTP 消息带出去
   };
-  let viaSctp = false;
-  if (chatDataProducer && !chatDataProducer.closed) {
-    try {
-      chatDataProducer.send(JSON.stringify(msg)); // mediasoup-client 的 send：字符串直接走 SCTP
-      viaSctp = true;
-    } catch (err) {
-      log(`⚠️ SCTP 发送失败（退回信令）：${err.message}`);
-    }
-  }
+  /* ★ 2026-10-10：五处 `.send(` 收进 sendOnDc 一处（判据只写一次）。
+   *   这一处原来有 try/catch，行为本来就对；换过去是为了**下次加第六处时不会再漏守卫**——
+   *   复制旁边那段写法的人不会去读注释，而"旁边的写法"有五种就会剩下四种错的（坑 47）。
+   *   ▸ 顺手删掉旧代码里那个 `viaSctp`：它被赋值过、**从来没被读过**（聊天气泡的 🛰️
+   *     路径徽标是另一处按"这条消息从哪条路到达"决定的）。留着它只会让人以为这里有分支。 */
+  sendOnDc(chatDataProducer, msg, '聊天');
   socket.emit('chat-message', { text, msgId: msg.msgId }); // 兜底路（服务器广播含自己，self 显示走这条）
   chatInput.value = '';
 }
@@ -6194,17 +6191,27 @@ for (const btn of reactBar.querySelectorAll('.react-btn')) {
 }
 function sendReact(emoji) {
   if (!myRoom) return;
-  if (!chatDataProducer || chatDataProducer.closed) {
+  /* ★ 2026-10-10：守卫从 `!dp || dp.closed` 换成 dcOpen()（同一个 connecting 洞，见 sendOnDc 上面那段）。
+   *   表情回应只有 SCTP 这一条路，所以这里的话术是"没发出去"而不是"慢一点"——
+   *   它必须仍然是**说出来**的：否则用户按了按钮、屏幕上飞了 emoji（spawnFlyingEmoji 在下一行），
+   *   别人那边却什么都没发生，这是"界面在撒谎"的最小样本。 */
+  if (!dcOpen(chatDataProducer)) {
     showToast('数据通道未就绪，回应没发出去', 'info');
     return;
   }
   const t = liveReactTarget();
   renderReactChip(); // 顺手把可能已到期的定向状态同步到界面
-  chatDataProducer.send(JSON.stringify({
+  const sent = sendOnDc(chatDataProducer, {
     type: 'react', emoji,
     to: t ? t.id : undefined, // 定向头：接收端各自过滤（广播语义下的应用层私聊）
     msgId: `${socket.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-  }));
+  }, '回应');
+  if (!sent) {
+    /* 上面 dcOpen 说"能发"而这里发失败 = 就在这一瞬间频道变了（关掉了）。
+     *   这时候**不许**让本地飞屏留下来冒充成功——先把话说清楚再决定画不画。 */
+    showToast('数据通道刚好断了，回应没发出去', 'warn');
+    return;
+  }
   spawnFlyingEmoji(emoji); // mediasoup 不会把消息回给发送者，自己的先飞起来
   if (t) {
     showToast(`已回应 ${t.name}：${emoji}`, 'info');
@@ -6461,14 +6468,61 @@ function handleAnnotMessage(from, message) {
   } catch (e) { /* 坏消息不炸整条频道 */ }
 }
 
+/* ══ ★ 2026-10-10 「往 SCTP 频道发一条」的唯一一条路（SCTP 发送判据收口）══
+ * ▎为什么现在才收口：全项目五处 `.send(` 各写一遍守卫，而守卫的判据是
+ *   `!dp || dp.closed`——**这个判据挡不住真正会踩到的那个状态**。
+ *   证据在打包好的 vendor 里读得清清楚楚（mediasoup-client 3.x 的 DataProducer）：
+ *     · `get closed()` 只反映"有没有人调过 close()"（`this._closed`），
+ *     · `send(data)` 里**只**在 `_closed` 时抛自己的 InvalidStateError，
+ *       否则直接 `this._dataChannel.send(data)` 转发（sfu/public/vendor/mediasoup-client.js:3146 一带），
+ *     · 于是频道还在 `connecting`（刚 produce、SCTP 关联没建完）时，
+ *       抛的是**浏览器**那句 `Failed to execute 'send' on 'RTCDataChannel':
+ *       RTCDataChannel.readyState is not 'open'` —— 报错里的接口名是 RTCDataChannel，
+ *       不是 DataProducer，这就是"谁抛的"的指纹。
+ *   而 `closed === false` 在 connecting 阶段成立 ⇒ 旧守卫形同虚设。
+ * ▎现场证据：`npm run check:all` 里 check:board 报"页面脚本异常：Uncaught"、
+ *   check:console 同时抓出那句 RTCDataChannel 抛错，两条尺指向同一根因。
+ * ▎比抛错更糟的一半在**顺序**上：sendBoard 里那条 `board-signal` 信令兜底
+ *   写在 `.send()` **之后**——于是"通道还没开"这一路既炸出未捕获异常、
+ *   又一条兜底都没发出去；而 10-04f 加这条兜底的理由正是"晚到的人永久错过笔迹"。
+ *   一条防"时灵时不灵"的机制，在它最该起作用的那个时刻不工作（坑 76 的形状：
+ *   机制在 ≠ 机制生效；这里是"机制在，但被前一行挡住了"）。
+ * ▸ 判据只写这一处；调用方只问"发出去了吗"，兜底/提示/静默各自决定。
+ *   `dp.readyState` 不存在时（冒烟桩里那种简化对象）按"能发"处理，
+ *   因为**桩的缺字段不该变成产品的功能消失**（坑 83 的反面：桩缺能力会让分支永久不测，
+ *   桩多给能力则会掩盖问题——这里选择让桩走通主路，另用一条专门用例测 connecting）。 */
+function dcOpen(dp) {
+  if (!dp || dp.closed) return false;
+  return !dp.readyState || dp.readyState === 'open';
+}
+function sendOnDc(dp, payload, tag) {
+  if (!dcOpen(dp)) return false;
+  try {
+    dp.send(typeof payload === 'string' ? payload : JSON.stringify(payload));
+    return true;
+  } catch (e) {
+    log(`⚠️ ${tag}：SCTP 发送失败（${e && e.message}）——按"没发出去"处理`);
+    return false;
+  }
+}
+
+let annotSctpWarned = false;   // 「这一笔没发出去」只提一次（每帧一条就是噪音）
 function sendAnnot(toScreenOwner, op, p) {
-  if (!annotDataProducer || annotDataProducer.closed) return; // 标注频道没就绪就静默放弃
-  annotDataProducer.send(JSON.stringify({
+  /* ★ 2026-10-10：原来是 `if (!dp || dp.closed) return;` + 裸 `.send()`——
+   *   `connecting` 阶段照样同步抛 DOMException（白板那处是同一个病，见 sendBoard 上面那段）。
+   *   批注只有 SCTP 这一条路（没有信令兜底：批注是"贴在某人屏幕上"的临时笔迹，
+   *   为它再造一条信令路 = 多一份要维护的账，而丢一笔的代价远小于白板丢一笔）。
+   *   ▸ 所以这里的修法不是加兜底，是**不炸 + 说实话**：静默放弃会让用户以为自己画错了，
+   *     而"这一笔别人看不见"是必须当场说出来的事实（10-05b 那条"门口静默丢弃"同一条纪律）。 */
+  if (!sendOnDc(annotDataProducer, {
     type: 'annot', msgId: `${socket.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     to: toScreenOwner, op,
     x: p ? p.x : undefined, y: p ? p.y : undefined,
     color: myAnnotColor,
-  }));
+  }, '批注') && !annotSctpWarned) {
+    annotSctpWarned = true;
+    showToast('批注通道还没就绪，这一笔只有你看得见', 'info');
+  }
 }
 
 /* ---- 绘制原语：坐标归一化（0~1）→ 当前画布 CSS 像素 ---- */
@@ -7293,8 +7347,16 @@ socket.on('board-signal', ({ from, payload } = {}) => {
   if (from === socket.id) return;               // 自己发的本地已经画过
   handleBoardMessage(from, payload);
 });
+let boardSctpWarned = false;   // 「这一场走信令」只提一次（每帧一条就是噪音）
 function sendBoard(op, p, batch) {
-  if (!boardDataProducer || boardDataProducer.closed) return;
+  /* ★ 2026-10-10 这里原来第一行是 `if (!boardDataProducer || boardDataProducer.closed) return;`
+   *   ——**判据错在两个地方**，而它们叠起来正好是用户报的那句"白板时灵时不灵"：
+   *   ① 它把"没有 SCTP 频道"当成"什么都不能发"，可这条消息明明还有信令那条路；
+   *   ② `closed=false` 挡不住 `connecting`，于是频道刚建好那几百毫秒里
+   *     `.send()` 同步抛 DOMException —— 抛出在**兜底那两行之前**，
+   *     结果是"既炸了、又一条都没发出去"。
+   *   ▸ 现在：主路发不出去就继续走兜底（与聊天 D+1 同款双路径 + msgId 去重，
+   *     多收到一份会被 dedup 掉，所以双发是安全的）。 */
   const payload = {
     type: 'board', msgId: `${socket.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     op, color: boardColor,
@@ -7307,12 +7369,22 @@ function sendBoard(op, p, batch) {
   if (batch && batch.length) {
     payload.pts = batch.map((q) => [Number(q.x.toFixed(3)), Number(q.y.toFixed(3))]);
   }
-  boardDataProducer.send(JSON.stringify(payload));
+  const viaSctp = sendOnDc(boardDataProducer, payload, '白板');
   /* ★ 2026-10-04f 信令兜底双发（与聊天 D+1 同款纪律）：SCTP 对晚到者/竞态时灵时不灵，
-   *   笔迹丢一条就是"别人屏幕上少半笔"且无法补——宁可双发由 msgId 去重。 */
+   *   笔迹丢一条就是"别人屏幕上少半笔"且无法补——宁可双发由 msgId 去重。
+   *   ▸ 它现在**无条件跑**：主路成功也发（双发本来就是既定语义，去重负责收尾），
+   *     主路失败更得发。判据不写在这里，写在 sendOnDc 一处。 */
   try {
     if (socket.connected) socket.emit('board-signal', payload);
   } catch (e) { /* 兜底失败不影响主路 */ }
+  if (!viaSctp && socket.connected) {
+    /* 界面说实话：这条路只剩信令时说出来，别让人以为"笔迹丢了是我的操作问题"。
+     *   一次性提示（同一场会只提一次），否则每帧一条就是噪音（坑 82 的动效版）。 */
+    if (!boardSctpWarned) {
+      boardSctpWarned = true;
+      log('🖌️ 白板数据通道还没就绪，这一场先走信令那条路（笔迹照常同步，只是慢一点）');
+    }
+  }
   /* ★ 2026-10-03 持久化：**只有"本地动作"走到这里**（远端收到的笔迹走 handleBoardMessage
    *   → applyBoardOp，不经过 sendBoard），所以在这里顺手报给服务器不会重复记账。
    *   只报三件事：画完的一笔（带全部点）、撤销、清空——**中间的 draw 点不报**，
@@ -8468,18 +8540,16 @@ function emitCaption(text) {
       log(`🤖 ${AI_NICKNAME} 听到你叫它了，正在组织回答…`);
     }
   }
-  if (!chatDataProducer || chatDataProducer.closed) return; // SCTP 不在（没进房/重连中）→ 只显示本地
-  try {
-    chatDataProducer.send(JSON.stringify({
-      type: 'caption',
-      from: socket.id,
-      name: myDisplayName || undefined,
-      text,
-    }));
-  } catch (err) {
-    // 字幕容忍丢：发送失败只记日志，绝不为它造兜底路（与聊天双路径形成对照）
-    log(`⚠️ 字幕广播失败（丢弃，不影响本地显示）：${err.message}`);
-  }
+  /* 字幕容忍丢：SCTP 不在/没开/发失败都只记一行日志，**绝不为它造兜底路**
+   *   （与聊天的双路径形成对照——可靠性按内容价值定价，09-17b 立的口径）。
+   *   ★ 2026-10-10：原来这里也有一个 `!dp || dp.closed` + try/catch，行为是对的，
+   *   换成 sendOnDc 只为"判据只写一处"。 */
+  sendOnDc(chatDataProducer, {
+    type: 'caption',
+    from: socket.id,
+    name: myDisplayName || undefined,
+    text,
+  }, '字幕');
 }
 
 // 收到别人的字幕：同样入账本 + 字幕条（字幕条永远显示"最近说话的人"）

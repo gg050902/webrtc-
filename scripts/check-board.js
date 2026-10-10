@@ -99,13 +99,38 @@ require('./inject-check.js').assertCompiles(__filename, { DRAW, EXPORT });
   })()`);
   ok('量的是本轮代码（含导出与共用绘制函数，不是 SW 缓存）', fp === true);
 
-  /* 进房：游客点「游客进入」→ 预览页 → 创建房间 */
+  /* 进房：游客点「游客进入」→ 预览页 → 创建房间
+   * ▸ ★ 2026-10-10（D3）：这里原来是 `sleep(600)` + `sleep(2500)` 之后读一次 myRoom。
+   *   全量回归里它读到空 ⇒ 下面四条断言一起塌（房间号、导出文件名、刷新补回、重绘），
+   *   而报出来的样子像"白板坏了"。真相是**进房这一趟往返没跑完就被读了**——
+   *   机器忙时 2.5s 不够，机器闲时刚好够，于是表现为"会移动的失败"（坑 80/87），
+   *   并且和它上游那条真缺陷（SCTP connecting 时 .send() 抛错）混在一起，两条病互相掩护。
+   *   ▸ 正解还是那一条纪律：**轮询条件 = 断言条件本身**（拿到 6 位房号），
+   *     上限 12s；超时不抛错，把最后读数交给断言报红——"进不了房"本来就是它要报的失败。 */
   await cdp.evaluate(`(function(){ const g=document.getElementById('authGuestBtn'); if (g) g.click(); return 'ok'; })()`);
-  await sleep(600);
+  /* 点「创建房间」之前先等**预览页真的出来了**：这是那一步的前提（旧写法睡 600ms 赌它）。
+   *   ▸ 用编程式 .click() 绕过遮挡本身就是坑 119 说的那种"走后门"，
+   *     所以这里至少把前提量出来，并把它当成一条断言——前提不成立时报的是"没到预览页"，
+   *     而不是后面那句莫名其妙的"拿不到房间号"。 */
+  const pjDeadline = Date.now() + 6000;
+  let pjVisible = false;
+  for (;;) {
+    pjVisible = await cdp.evaluate(`(function(){ const p=document.getElementById('prejoin'); return !!(p && !p.classList.contains('hidden')); })()`) === true;
+    if (pjVisible || Date.now() > pjDeadline) break;
+    await sleep(200);
+  }
+  ok('前提：点「游客进入」之后预览页真的出现了（不睡固定 600ms 赌它）', pjVisible,
+    `用了 ${Date.now() - (pjDeadline - 6000)}ms`);
   await cdp.evaluate(`(function(){ document.getElementById('createBtn').click(); return 'ok'; })()`);
-  await sleep(2500);
-  const room = await cdp.evaluate(`(function(){ return String(myRoom || ''); })()`);
-  ok(`游客进房拿到房间号 = ${room || '(无)'}`, /^\d{6}$/.test(room));
+  const roomDeadline = Date.now() + 12000;
+  let room = '';
+  for (;;) {
+    room = String(await cdp.evaluate(`(function(){ return String(myRoom || ''); })()`) || '');
+    if (/^\d{6}$/.test(room) || Date.now() > roomDeadline) break;
+    await sleep(300);
+  }
+  ok(`游客进房拿到房间号 = ${room || '(无)'}（轮询到拿到为止，不睡固定 2.5s）`,
+    /^\d{6}$/.test(room), `用了 ${Date.now() - (roomDeadline - 12000)}ms`);
 
   const strokes = await cdp.evaluate(DRAW);
   await sleep(700);

@@ -62,10 +62,28 @@ const HOVER_STATE = `(function () {
   };
 })()`;
 
+/* ★ 2026-10-10 D3：把"两层文字交接"那一读的表达式抽成常量，并在调用处**轮询到停住**。
+ *   ▎为什么：这条在全量回归里红过三次（10-04b 写着"根因未定论"、10-06 夜二写着唯一那条红），
+ *   而我每次看到的都是同一个形状：`hover 不透明=0.86`——差 0.04 就过。
+ *   0.86 不是"效果坏了"，是**过渡还没跑完就被读了一次**（读的是动画中间帧）。
+ *   这正是坑 96/104 的"量具在跟自己的动画赛跑"，也正是坑 120 说的
+ *   "轮询条件必须等于断言条件"。治法不是把阈值从 0.9 放宽（那会连真坏掉一起放过去），
+ *   而是读到它停住为止——判据一个字不放松。
+ *   ▸ 上限 2.5s：这条过渡是 0.4s 级，2.5s 还没停 = 真有毛病，此时按最后一次读数报失败，
+ *     并把"用了多久"打出来，下次再红能一眼分清"没停"与"停在不该停的地方"。 */
+const CLIP = `(function(){
+  const b = document.getElementById('pjEnterBtn');
+  const base = b.querySelector('.pill-rise__label:not(.pill-rise__label--hover)');
+  const hov = b.querySelector('.pill-rise__label--hover');
+  const br = b.getBoundingClientRect(); const xr = base.getBoundingClientRect(); const hr = hov.getBoundingClientRect();
+  return { baseAboveTop: xr.bottom <= br.top + 2, hovInPlace: Math.abs(hr.top - br.top) < br.height,
+           hovOpacity: Number(getComputedStyle(hov).opacity) };
+})()`;
+
 /* ★ 2026-10-09 注入浏览器之前先让同一个引擎读一遍这些串。
  *   模板字符串**内部**的注释里只要出现反引号，模板就被提前截断——源文件语法没错、node --check 全过，
  *   错在拼出来的那段代码；到浏览器里炸的时候，本脚本一条断言都没跑到（详见 scripts/inject-check.js 头部）。 */
-require('./inject-check.js').assertCompiles(__filename, { GEOM, HOVER_STATE });
+require('./inject-check.js').assertCompiles(__filename, { GEOM, HOVER_STATE, CLIP });
 
 (async () => {
   const cdp = new Cdp({ headless: true, startUrl: START_URL });
@@ -214,17 +232,18 @@ require('./inject-check.js').assertCompiles(__filename, { GEOM, HOVER_STATE });
   /* 原文字是**被 overflow:hidden 裁掉的**（原组件就这么做的），不是靠淡出——
    *   第一版拿 opacity 去断言，红了才发现是我对标错了机制。这里改成量几何：
    *   基础层整体涨到按钮上边缘之外 = 被裁没，克隆层回到原位。 */
-  const clip = await cdp.evaluate(`(function(){
-    const b = document.getElementById('pjEnterBtn');
-    const base = b.querySelector('.pill-rise__label:not(.pill-rise__label--hover)');
-    const hov = b.querySelector('.pill-rise__label--hover');
-    const br = b.getBoundingClientRect(); const xr = base.getBoundingClientRect(); const hr = hov.getBoundingClientRect();
-    return { baseAboveTop: xr.bottom <= br.top + 2, hovInPlace: Math.abs(hr.top - br.top) < br.height,
-             hovOpacity: Number(getComputedStyle(hov).opacity) };
-  })()`);
-  ok('两层文字完成交接：原文字被裁出按钮外、克隆层回到原位淡入',
+  const clipDeadline = Date.now() + 2500;
+  let clip = await cdp.evaluate(CLIP);
+  let clipTook = 0;
+  while (clip && !(clip.baseAboveTop === true && clip.hovInPlace === true && clip.hovOpacity > 0.9)
+    && Date.now() < clipDeadline) {
+    await sleep(150);
+    clip = await cdp.evaluate(CLIP);
+  }
+  clipTook = Date.now() - (clipDeadline - 2500);
+  ok('两层文字完成交接：原文字被裁出按钮外、克隆层回到原位淡入（轮询到停住，不读过渡中间帧）',
     clip.baseAboveTop === true && clip.hovInPlace === true && clip.hovOpacity > 0.9,
-    `base 已裁出=${clip.baseAboveTop} hover 不透明=${clip.hovOpacity.toFixed(2)}`);
+    `base 已裁出=${clip.baseAboveTop} hover 不透明=${clip.hovOpacity.toFixed(2)}（用了 ${clipTook}ms）`);
   ok('上涨色取自 token（朱砂，不是写死的十六进制字面量）',
     /rgb\(185, 58, 38\)/.test(after.fill), after.fill);
 

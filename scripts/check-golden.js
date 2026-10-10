@@ -190,26 +190,73 @@ function portBusy(p) {
     ok('④ 两档距离都在且默认档被标成 pressed（清单是前端唯一的状态来源）',
       after.segs.length === 2 && after.pressed.filter((x) => x === 'true').length === 1, after.segs);
 
-    /* ⑤ 真点「录」→ 等 1.6s → 真点「停止」→ 页面进度出现"已存"并带峰值 */
-    const clickRec = await ev(cdp, `(() => {
-      const b = document.querySelector('#list button.rec');
-      if (!b) return { nofn: true };
-      b.click();                      // 真点击（不是程序里调 toggle：那样测不到按钮与状态的一致性）
-      return { label: b.textContent };
-    })()`);
-    await sleep(1700);
-    await ev(cdp, `(() => { const b = document.querySelector('#list button.rec'); if (b) b.click(); return 'stopped'; })()`);
-    /* 轮询到"已存"出现为止 —— 轮询条件必须等于断言条件本身（坑 120） */
+    /* ⑤ 真点「录」→ 说满 2.6s → 真点「停止」→ 页面进度出现"已存"并带峰值
+     * ▸ ★ 2026-10-10：这里原来只录 1.7s，且**只试一次**。
+     *   全量回归负载下抓到一次 ffmpeg 报 `invalid as first byte of an EBML number`
+     *   ——浏览器在极短录音下只交出一个残缺容器头（字节数不为 0，所以旧那道 `!blob.size` 拦不住），
+     *   页面于是停在"❌ 转码失败 + 一串 ffmpeg 乱码"。单独跑 12/12、全量跑红 5 条，
+     *   差的不是代码是**录音长度**（坑 80 会移动的失败 + 坑 82 界面说的话不可执行）。
+     *   ▸ 两处一起改才站得住：
+     *     ① 产品侧（golden.html）给"没成形"一条明确的、带下一步的提示，不再把它上传；
+     *     ② 检查侧把录音长度当作**输入参数**给足（2.6s），并且允许像真人那样重来一次
+     *       ——重录本身就是这条链路的一部分（同 id 覆盖那条真缺陷就是重录路径抓到的，坑 140）。
+     *     录音时长是这条用例的输入，不是被测对象的属性，所以这里写常数没问题（坑 158 管的是后者）。 */
     let prog = '';
-    for (let i = 0; i < 30; i++) {
-      prog = await ev(cdp, `(document.getElementById('progress')||{}).textContent || ''`);
-      if (/已存|❌/.test(prog)) break;
-      await sleep(500);
+    let lastErr = '';
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const clickRec = await ev(cdp, `(() => {
+        const b = document.querySelector('#list button.rec');
+        if (!b) return { nofn: true };
+        b.click();                      // 真点击（不是程序里调 toggle：那样测不到按钮与状态的一致性）
+        return { label: b.textContent };
+      })()`);
+      await sleep(2600);
+      await ev(cdp, `(() => { const b = document.querySelector('#list button.rec'); if (b) b.click(); return 'stopped'; })()`);
+      /* 轮询到"已存"出现为止 —— 轮询条件必须等于断言条件本身（坑 120） */
+      for (let i = 0; i < 30; i++) {
+        prog = await ev(cdp, `(document.getElementById('progress')||{}).textContent || ''`);
+        if (/已存|❌|没录成形/.test(prog)) break;
+        await sleep(500);
+      }
+      lastErr = prog;
+      if (/已存/.test(prog)) break;
     }
     const m = /峰值 (-?\d+(?:\.\d+)?) dBFS/.exec(prog);
     ok('⑤ 真录一条 → 上传 → 页面自己报出"已存 + 峰值 dBFS"（不是停在"上传中"）',
-      !!m && /已存/.test(prog), prog);
-
+      !!m && /已存/.test(prog), lastErr);
+    /* ★ 2026-10-10 ⑤b 改成**真探针**（原来写成 `/再点一次|说满/.test(prog) || /已存/.test(prog)`，
+     *   而成功路径下 prog 恒是"已存…" ⇒ 这条结构上不可能红 = 装饰，不是判据（坑 115/123）。
+     * ▸ 现在真的去录一段极短的（点「录」立刻点「停」），断言的是那条**用户永远看不到
+     *   服务器内部错误**的边界：
+     *     · 页面自己拦下来 → 必须给出"再点一次/说满 2 秒"这种可执行的下一步；
+     *     · 万一浏览器那次给的是完整容器 → 正常走上传，也只能是"已存"或一句人话；
+     *     · **绝不允许**出现"转码失败 / EBML / invalid as first byte"这类把 ffmpeg 的
+     *       呕吐物当提示的文案——那既看不懂，也等于让人以为链路坏了（坑 82 的文案版）。
+     * ▸ A/B：把 golden.html 那道 `blob.size < 1200` 摘掉 ⇒ 这条当场红，红字里就是
+     *   那句 EBML 乱码（这正是全量回归第一次抓到它的样子）。 */
+    await ev(cdp, `(() => { const b = document.querySelector('#list button.rec'); if (b) b.click(); return 'quick-start'; })()`);
+    await sleep(120);
+    await ev(cdp, `(() => { const b = document.querySelector('#list button.rec'); if (b) b.click(); return 'quick-stop'; })()`);
+    let quick = '';
+    for (let i = 0; i < 20; i++) {
+      quick = await ev(cdp, `(document.getElementById('progress')||{}).textContent || ''`);
+      if (/已存|❌|没录成形|转码/.test(quick)) break;
+      await sleep(400);
+    }
+    ok('⑤b 极短录音不许把服务器转码错误丢给用户看（要么页面自己拦下并给下一步，要么正常"已存"）',
+      !/转码失败|EBML|invalid as first byte|退出码/.test(quick)
+      && (/再点一次|说满/.test(quick) || /已存/.test(quick)),
+      quick.slice(0, 110));
+    /* 探针之后重新录一条正经的，后面 ⑥⑦⑧ 量的必须是"完整那一句"，
+     *   不然 ⑥ 的 fmt.bytes>3000 会因为这条极短录音而红——那是探针污染判据，不是产品坏了。 */
+    await ev(cdp, `(() => { const b = document.querySelector('#list button.rec'); if (b) b.click(); return 'redo'; })()`);
+    await sleep(2600);
+    await ev(cdp, `(() => { const b = document.querySelector('#list button.rec'); if (b) b.click(); return 'redo-stop'; })()`);
+    for (let i = 0; i < 30; i++) {
+      prog = await ev(cdp, `(document.getElementById('progress')||{}).textContent || ''`);
+      if (/已存|❌|没录成形/.test(prog)) break;
+      await sleep(500);
+    }
     /* ⑥ 磁盘侧对账：账本里有这条，wav 存在，且真的是 16k/单声道/16bit */
     const manifestPath = path.join(GOLDEN_TMP, 'manifest.jsonl');
     const rec = fs.existsSync(manifestPath)
@@ -225,16 +272,21 @@ function portBusy(p) {
     ok('⑥b 账本记的是**页面上那句**期望文本（管道测的是链路，文本必须来自句子清单而不是假麦克风）',
       !!rec && /评审会|纪要|白板|小明|压测/.test(rec.text || ''), rec && rec.text);
 
-    /* ⑦ 服务器回的峰值 == 我们自己量那份 wav 的峰值（同一个函数、同一个概念） */
+    /* ⑦ 服务器回的峰值 == 我们自己量那份 wav 的峰值（同一个函数、同一个概念）
+     * ▸ 峰值取**当下这条进度**里的数（⑤b 探针之后又重录过一次），
+     *   沿用 ⑤ 那次的读数 = 拿两次不同录音比大小，量具自己制造差异
+     *   （摘掉体积闸的那次变异就是这样牵出第二条不相干的红）。 */
     const peakFromDisk = rec ? require('../sfu/ai/asr.js').measureWavLevel(path.join(GOLDEN_TMP, rec.wav)).peakDb : null;
-    const peakShown = m ? Number(m[1]) : null;
+    const peakNow = /峰值 (-?\d+(?:\.\d+)?) dBFS/.exec(prog);
+    const peakShown = peakNow ? Number(peakNow[1]) : (m ? Number(m[1]) : null);
     ok('⑦ 页面显示的峰值与磁盘上实测的是同一个数（都出自 Asr.measureWavLevel）',
       Number.isFinite(peakFromDisk) && Number.isFinite(peakShown) && Math.abs(peakFromDisk - peakShown) < 0.2,
       `shown=${peakShown} disk=${peakFromDisk === null ? null : peakFromDisk.toFixed(2)}`);
 
-    /* ⑧ 重录同一句：账本里该 id 有且只有一条，且文件还在（今天真被这条抓出一个删错文件的缺陷） */
+    /* ⑧ 重录同一句：账本里该 id 有且只有一条，且文件还在（今天真被这条抓出一个删错文件的缺陷）
+     *   ▸ 录音长度与 ⑤ 同一个理由（残缺容器头不上传之后，这一句也要给足时长才谈得上"重录成功"）。 */
     await ev(cdp, `(() => { const b = document.querySelector('#list button.rec'); if (b) b.click(); return 'again'; })()`);
-    await sleep(1500);
+    await sleep(2600);
     await ev(cdp, `(() => { const b = document.querySelector('#list button.rec'); if (b) b.click(); return 'stop2'; })()`);
     for (let i = 0; i < 30; i++) {
       prog = await ev(cdp, `(document.getElementById('progress')||{}).textContent || ''`);

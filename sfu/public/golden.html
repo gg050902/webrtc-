@@ -231,6 +231,19 @@
       rec = null;
       const blob = new Blob(chunks, { type: mr.mimeType || 'audio/webm' });
       if (!blob.size) { $('progress').textContent = '录到 0 字节：可能是麦克风权限被拒'; return; }
+      /* ★ 2026-10-10 不再把一个"没成形"的录音上传出去。
+       * ▎为什么：真跑全量回归时抓到一次 ffmpeg 报 `invalid as first byte of an EBML number`
+       *   —— 浏览器在极短录音下只交出一个**残缺的容器头**（不报错、字节数还不为 0），
+       *   于是页面停在"❌ 转码失败"，用户看到一服务器吐回来的乱码，
+       *   不知道下一步该干什么（而这句正是"我改了你怎么还不行"的另一半：其实只需要再录一次）。
+       * ▸ 判据用体积下限：一秒钟 opus 大约 2KB，容器头本身 ~几百字节。
+       *   下限取 **1200**：低于它必然不是一句能用的话，而模型也吃不下——
+       *   在这道口拦下来，比让 ffmpeg 替我们报错更说得清（也省一次上传）。
+       *   不拦的情况照常走：这条只是把"明显没录到东西"从"转码失败"里分出来。 */
+      if (blob.size < 1200) {
+        $('progress').textContent = '这一句没录成形（只有 ' + blob.size + ' 字节，多半是按下就松开了）——再点一次「录 → 停」，中间说满 2 秒';
+        return;
+      }
       recBtn = null;
       $('progress').textContent = '上传与转码中…';
       try {

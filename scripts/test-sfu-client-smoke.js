@@ -242,6 +242,8 @@ const rec = {
   roomControlAcks: [],      // ★ 2026-10-06：room-control-ack 的载荷（要验"回执报的是状态成没成"）
   logouts: [],              // ★ 2026-10-09 第 52 步：auth-logout 的载荷（退出必须把票带出去）
   chatSignals: [],          // ★ 2026-10-09：chat-message 信令兜底那一路的载荷（双路径要两条都看得见）
+  boardSignals: [],         // ★ 2026-10-10：board-signal 兜底载荷（要验"主路发不出去时兜底真的跑了"）
+  dataProducers: [],        // ★ 2026-10-10：所有建出来的数据通道桩（测试要能把某一条改成 connecting）
 };
 class FakeProducer {
   constructor(id, appData) { this.id = id; this.appData = appData; this.closed = false; }
@@ -253,11 +255,29 @@ class FakeConsumer {
   async resume() {} close() {}
 }
 /* ★ D+1：数据通道桩——send 记录消息；DataConsumer 的 on('message') 把回调交给 rec，
- *   测试里就能"冒充 mediasoup 送来一条 SCTP 消息"驱动 handleDataMessage。 */
+ *   测试里就能"冒充 mediasoup 送来一条 SCTP 消息"驱动 handleDataMessage。
+ * ★ 2026-10-10 补两件事，为的是让"频道还没 open"那条分支第一次可测（坑 83 的反面用法）：
+ *   ① 记下 label 并把自己推进 rec.dataProducers —— 否则测试拿不到那个对象，
+ *      "把白板频道设成 connecting"这件事根本做不到；
+ *   ② send() 在 readyState!=='open' 时**照浏览器那样同步抛**
+ *      （真实链路里 mediasoup-client 的 send 只判自己有没有 close 过，
+ *      然后把调用转给底层 RTCDataChannel —— 抛错的是浏览器，报错里的接口名就是它。
+ *      桩不模仿这一句，客户端的守卫就永远测不到，代码写错也不会红）。 */
 class FakeDataProducer {
-  constructor(id) { this.id = id; this.closed = false; }
-  send(str) { rec.sctpSends.push(str); }
-  close() { this.closed = true; }
+  constructor(id, label) {
+    this.id = id; this.label = label || ''; this.closed = false; this.readyState = 'open';
+    rec.dataProducers.push(this);
+  }
+  send(str) {
+    if (this.readyState !== 'open') {
+      const e = new Error(`Failed to execute 'send' on 'RTCDataChannel': RTCDataChannel.readyState is not 'open'`);
+      e.name = 'InvalidStateError';
+      throw e;
+    }
+    if (this.throwOnSend) throw new Error('桩：故意让这一次 send 失败（模拟瞬间断开）');
+    rec.sctpSends.push(str);
+  }
+  close() { this.closed = true; this.readyState = 'closed'; }
 }
 class FakeDataConsumer {
   constructor(id, params) {
@@ -284,7 +304,7 @@ class FakeTransport {
     rec.dataProduceCalls.push(opts);
     return new Promise((resolve) => {
       const h = this.handlers.producedata;
-      const finish = (arg) => resolve(new FakeDataProducer((arg && arg.id) || 'dp-local'));
+      const finish = (arg) => resolve(new FakeDataProducer((arg && arg.id) || 'dp-local', opts && opts.label));
       if (h) {
         h({ sctpStreamParameters: { streamId: 0, ordered: true }, label: opts.label, appData: opts.appData },
           (arg) => finish(arg), () => finish(null));
@@ -327,6 +347,9 @@ const socketStub = {
       return cb({ data: { granted: false, hostId: 'DEVICEGRANTHOST1', hostName: '🖥️ 客厅电脑' } });
     }
     if (ev === 'clipboard-sync') rec.clipboardSends++;
+    /* ★ 2026-10-10：兜底那条路的**载荷**也要看得见，只记事件名查不出"发的是不是同一条笔迹"
+     *   （msgId 去重靠的就是同一条；两条内容不一样就等于各画各的）。 */
+    if (ev === 'board-signal') rec.boardSignals.push(payload);
     if (ev === 'file-chunk') rec.fileChunks++;
     if (ev === 'file-offer') { rec.fileOffers++; rec.lastFileOffer = payload; }
     if (ev === 'remote-answer') rec.lastAllowAnswer = payload;
@@ -952,6 +975,122 @@ const emit = (ev, payload) => {
   const clearOpsBefore = rec.canvasOps;
   guard('F7 清空白板', () => rec.dataMessageHandler(JSON.stringify({ type: 'board', op: 'clear', color: '#2471a3' })));
   ok('F7 clear 处理不抛错（账本清空 + 重绘）', rec.canvasOps >= clearOpsBefore);
+
+  /* ---- ★ 2026-10-10 SCTP 频道还在 connecting 时：不许炸、更不许把兜底一起吞掉 ----
+   * ▎这是一条**真产品缺陷**的回归，不是补覆盖率：全量 check:all 里 check:board 报
+   *   "页面脚本异常：Uncaught"、check:console 同一趟抓出
+   *   `RTCDataChannel.readyState is not 'open'` —— 两把尺指向同一处：
+   *   客户端五处 `.send(` 的守卫都写成 `!dp || dp.closed`，而 mediasoup-client 的
+   *   DataProducer.send() 只在**自己 close 过**时拦，否则把调用转给底层
+   *   RTCDataChannel —— 频道处于 connecting（刚 produce、SCTP 关联还没建完）时
+   *   `closed` 是 false，守卫放行，浏览器同步抛。
+   * ▎比抛错更糟的一半在顺序：`board-signal` 那条信令兜底写在 `.send()` **之后**，
+   *   于是这一路既抛了异常、兜底又一条没发出去——而 10-04f 加兜底的理由
+   *   恰恰是"晚到的人永久错过笔迹"（坑 76：机制在 ≠ 机制在该起作用时跑得起来）。
+   * ▸ 三条各配一个变异，都能红（见本轮 A/B 记录）：
+   *   ① 把 dcOpen 的 readyState 判据摘掉 → 红在"落笔不抛错"；
+   *   ② 把 board-signal 挪回 send 之后并在前面加 `if (viaSctp)` → 红在"兜底真的跑了"；
+   *   ③ 让 sendOnDc 吃掉异常但返回 true → 红在"批注那条要说实话"。 */
+  {
+    const bdp = rec.dataProducers.find((p) => p.label === 'board');
+    const adp = rec.dataProducers.find((p) => p.label === 'annot');
+    const cdpChat = rec.dataProducers.find((p) => p.label === 'chat');
+    ok('2026-10-10 三条 SCTP 频道都建出来了（拿不到这三根句柄，下面几条就是在测空气）',
+      !!bdp && !!adp && !!cdpChat,
+      `board=${!!bdp} annot=${!!adp} chat=${!!cdpChat}`);
+    /* 一次"落笔/点按钮"跑完之后拿到的异常信息（null = 没抛）。
+     *   ▸ 为什么这里不用文件开头那个 guard()：它把异常收进 problems、返回 undefined，
+     *     而这几条断言要**就地**说清"是哪一步抛的、抛了什么"——
+     *     guard 的账要等到文件末尾才结算，那时候再报就查不出是哪一条了。 */
+    const runAndCatch = (fn) => { try { fn(); return null; } catch (e) { return String((e && e.message) || e); } };
+    const toastText = () => String(documentStub.getElementById('toast').textContent || '');
+    if (bdp && adp && cdpChat) {
+      /* ★ 先钉"桩自己会抛"这条前提（M1 变异教出来的，不写就等于留一个假绿面）：
+       *   客户端 dcOpen 里的 try/catch **单独也能**挡住抛错，所以"落笔不抛"这一条
+       *   并不能证明 readyState 判据有效——判据真正的价值是"发不出去要被**判出来**"
+       *   （于是兜底那条才跑得起来、界面才说得出话）。前提不成立时，
+       *   后面几条"没走主路"都只是巧合。这条断言量的就是桩有没有冒充浏览器。 */
+      let stubThrows = false;
+      try { bdp.readyState = 'connecting'; bdp.send('probe'); } catch (e) { stubThrows = true; }
+      bdp.readyState = 'open';
+      ok('2026-10-10 桩在 connecting 时**照浏览器那样抛**（不抛就是桩在冒充被测对象，后面几条全都作废）',
+        stubThrows);
+
+      /* ① 白板：connecting 落笔 */
+      const sendsBefore = rec.sctpSends.length;
+      const sigBefore = rec.boardSignals.length;
+      bdp.readyState = 'connecting';
+      const bc = documentStub.getElementById('boardCanvas');
+      const err1 = runAndCatch(() => {
+        bc.dispatch('pointerdown', { clientX: 70, clientY: 40, button: 0 });
+        bc.dispatch('pointermove', { clientX: 130, clientY: 80 });
+        bc.dispatch('pointerup', {});
+      });
+      bdp.readyState = 'open';
+      ok('2026-10-10 SCTP connecting：白板落笔不抛未捕获异常（旧写法在这里同步抛 DOMException）',
+        err1 === null, err1 || '');
+      ok('2026-10-10 SCTP connecting：白板笔迹没走主路（说明"没发出去"是被判出来的，不是碰巧没跑到）',
+        rec.sctpSends.length === sendsBefore, `多发了 ${rec.sctpSends.length - sendsBefore} 条`);
+      ok('2026-10-10 SCTP connecting：信令兜底真的跑了（这一条就是"晚到的人能不能看见这笔"）',
+        rec.boardSignals.length > sigBefore, `兜底新增 ${rec.boardSignals.length - sigBefore} 条`);
+      const lastSig = rec.boardSignals[rec.boardSignals.length - 1] || {};
+      ok('2026-10-10 兜底带的是同一条笔迹（type/op/msgId 齐全，收件端去重才有依据）',
+        lastSig.type === 'board' && !!lastSig.msgId && ['start', 'draw', 'end'].includes(lastSig.op),
+        JSON.stringify({ type: lastSig.type, op: lastSig.op, 有msgId: !!lastSig.msgId }));
+
+      /* ② 批注：只有 SCTP 一条路 ⇒ 发不出去必须**说出来**，不能静默（静默会让人以为自己画错了）。
+       *   动线与上面 F5 那组一致（开笔模式 → 落笔 → 收笔），复用同一批句柄；
+       *   区别只有"频道此刻是 connecting"——这正是真机上"刚开共享就画第一笔"的那几百毫秒。 */
+      adp.readyState = 'connecting';
+      const sigBefore2 = rec.sctpSends.length;
+      const err2 = annotCanvasEl
+        ? runAndCatch(() => {
+          if (annotPenBtn) annotPenBtn.dispatch('pointerdown', {});
+          annotCanvasEl.dispatch('pointerdown', { clientX: 20, clientY: 20, button: 0 });
+          annotCanvasEl.dispatch('pointermove', { clientX: 40, clientY: 44 });
+          annotCanvasEl.dispatch('pointerup', {});
+        })
+        : '没有批注画布（这条没跑到）';
+      ok('2026-10-10 SCTP connecting：批注落笔不抛未捕获异常', err2 === null, err2 || '');
+      ok('2026-10-10 SCTP connecting：批注这条路没硬塞给主路（发了几条 = ' + (rec.sctpSends.length - sigBefore2) + '）',
+        rec.sctpSends.length === sigBefore2);
+      adp.readyState = 'open';
+
+      /* ③ 表情回应：主路失败不许留下"本地飞屏"冒充成功 —— 界面不许撒谎 */
+      const flyBefore = createdEls.filter((e) => e.classList && e.classList.contains('react-fly')).length;
+      cdpChat.readyState = 'connecting';
+      const rBtn = createdEls.find((e) => e.className === 'react-btn' && e.dataset.emoji === '🎉');
+      const err3 = rBtn ? runAndCatch(() => rBtn.dispatch('click', {})) : '没有表情按钮';
+      const flyAfter = createdEls.filter((e) => e.classList && e.classList.contains('react-fly')).length;
+      ok('2026-10-10 SCTP connecting：点表情回应不抛异常', err3 === null, err3 || '');
+      ok('2026-10-10 回应没发出去时不留下飞屏冒充成功（"已回应"要等真发出去才算）',
+        flyAfter === flyBefore, `飞屏 ${flyBefore} → ${flyAfter}`);
+      ok('2026-10-10 发不出去这件事说在界面上（提示条里看得见原因）',
+        /未就绪|没发出去/.test(toastText()), toastText());
+      cdpChat.readyState = 'open';
+    }
+  }
+
+  /* ---- ★ 2026-10-10 结构红线：SCTP 发送判据只许写在一处 ----
+   *   ▎为什么钉这个：本轮修的是"同一个错误守卫被抄了五遍"。下次加第六条频道的人
+   *   一定会"照着旁边那段写"（这就是坑 47 说的漂移），所以把"别的地方不许直接 .send("
+   *   变成机器判据，而不是靠代码评审的记性。注释里保留旧写法作教训 ⇒ 只扫非注释行。
+   *   ▸ 本地读一份源码，不往后那行 `const clientSrc`（顶层调用有顺序依赖，
+   *     在 TDZ 里用它 = 整段静默不跑，本项目踩过四次）。 */
+  {
+    const srcNow = fs.readFileSync(path.join(__dirname, '..', 'sfu', 'public', 'client.js'), 'utf8');
+    const noComment = srcNow.split('\n').filter((l) => !/^\s*\*/.test(l) && !/^\s*\/\//.test(l)).join('\n');
+    const bareSends = noComment.match(/\w*DataProducer\.send\(/g) || [];
+    ok('2026-10-10 客户端不许再出现裸的 `xxxDataProducer.send(`（一律走 sendOnDc）',
+      bareSends.length === 0, bareSends.join(','));
+    ok('2026-10-10 全文件唯一那条 `.send(` 在 sendOnDc 里面（判据真的只有一处，不是被删光了）',
+      /function sendOnDc[\s\S]{0,400}?\bdp\.send\(/.test(noComment));
+    /* 顺序红线：兜底那条 emit 不许再挪回主路"成功之后"——本轮的真缺陷就是这个顺序。 */
+    const body = (srcNow.match(/function sendBoard\([\s\S]*?\n}/) || [''])[0];
+    ok('2026-10-10 白板兜底那条 emit 不在 `if (主路成功)` 里面（发不出去也必须双发）',
+      body.length > 0 && !/if\s*\(\s*viaSctp\s*\)[\s\S]{0,160}board-signal/.test(body),
+      body ? '' : '没找到 sendBoard 的函数体');
+  }
 
   /* ---- ★ 2026-10-04 白板导出 PNG（第 48 步）----
    * ▎"屏幕上的白板"与"导出的白板"必须**结构上不可能不一致**：
