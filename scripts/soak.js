@@ -14,6 +14,9 @@
 //   ADMIN_TOKEN=<token> npm run soak  # 可选：加上它才会顺带核对 /api/rooms 全景快照
 // ▎ADMIN_TOKEN 怎么拿：会议页用管理员账号登录 → 控制台 JSON.parse(localStorage.wb_auth).token
 // ▎退出码：0 = 全程零错误且归档对账一致；1 = 有错误/对账不平（CI 或睡前自检可用）。
+// ▎配了 TEST_SHUTDOWN_AFTER_MS 让服务器自己收尾时，那个值必须 ≥ **soak 时长 + 60s 宽限期 + 60s 余量**：
+//   收尾对账要等房间真的走完宽限（2026-10-10 C7 就是这么撞上的——服务器先退出 ⇒ 那一格只能报"读不到"，
+//   而旧写法会把它说成"文件还在"，把人支去查一条没坏的清理链路）。
 // ▎心跳落盘：sfu/logs/soak-<启动时刻>.log（每 10 分钟一行 + 结束报告），早上可回放整夜。
 const path = require('path');
 const fs = require('fs');
@@ -416,15 +419,24 @@ const rss0 = process.memoryUsage().rss;
     let cleanupOk = true;
     if (CHECK_CLEANUP) {
       const t0 = Date.now();
-      let exists = true;
+      let exists = true; let unreachable = false; let lastErr = '';
       while (Date.now() - t0 < CLEANUP_WAIT_MS) {
         await new Promise((r) => setTimeout(r, 3000));
         try {
           const res = await fetch(`${URL_BASE}/api/files?room=${roomNumber}`, { headers: ROOM_HEADERS });
           const j = await res.json().catch(() => ({}));
+          unreachable = false;
           exists = !!j.roomExists;
           if (!exists) break;
-        } catch (e) { exists = true; break; }
+        } catch (e) {
+          /* ★ 2026-10-10（C7 全量回归自己撞出来的）：**"读不到"不等于"还在"**。
+           *   旧写法 `exists = true; break;` 有两重错：① 把"连不上"说成"文件还在"，
+           *   会让人去查一条根本没坏的清理链路（坑 82/67：过期/错因的声明比缺失更糟）；
+           *   ② 顺手 break —— 预算 100s 被一次抖动提前花光，而宽限期本身就长，
+           *   于是"我改了你怎么还不行"那种红会周期性地自己回来。
+           *   现在：记成 unreachable、**继续等到预算用完**，最后如实报"读不到（服务器已经不在了？）"。 */
+          unreachable = true; lastErr = String((e && e.message) || e).slice(0, 60);
+        }
       }
       const waited = ((Date.now() - t0) / 1000).toFixed(0);
       const local = /localhost|127\.0\.0\.1/.test(URL_BASE);
@@ -434,8 +446,11 @@ const rss0 = process.memoryUsage().rss;
       const dir = path.join(process.env.SOAK_FILES_DIR || process.env.FILES_DIR
         || path.join(__dirname, '..', 'sfu', 'files'), String(roomNumber));
       const dirGone = !local || !fs.existsSync(path.dirname(dir)) ? null : !fs.existsSync(dir);
-      cleanupOk = !exists && dirGone !== false;
-      heartbeat(`房间销毁对账：等 ${waited}s → 房间里还有文件吗 ${exists ? '❌ 还在' : '✅ 已随房间销毁'}`
+      cleanupOk = !unreachable && !exists && dirGone !== false;
+      heartbeat(`房间销毁对账：等 ${waited}s → `
+        + (unreachable ? `❌ 读不到服务器（${lastErr}）——这**不是**"文件还在"，多半是那台自测服务器先退出了`
+          + `（TEST_SHUTDOWN_AFTER_MS 要给到"时长 + 宽限期 + 余量"以上）`
+          : `房间里还有文件吗 ${exists ? '❌ 还在' : '✅ 已随房间销毁'}`)
         + (dirGone === null ? '（本机目录查不到：服务器不在本机或 FILES_DIR 自定义，只按 HTTP 判）'
           : ` · 目录 ${dirGone ? '✅ 已删' : '❌ 残留在 ' + dir}`));
       if (!cleanupOk) state.errors++;
