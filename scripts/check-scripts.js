@@ -12,6 +12,8 @@
  *        或出现在回归清单/文档的跑法里。三者都不是 = 孤儿（它红了也不会有人看见）。
  *     ④ 头部许了"跑完/量完即删"这类**删掉的承诺**、又没登记成任何 npm 命令的文件，
  *        不许留在 `scripts/`（它常是改文件的那一类，误跑一次就要重回归）。
+ *     ⑤ 代码里用 `path.join(__dirname, 'x.py')` / `require('./x.js')` 指到的**本地文件必须存在**
+ *        （改名不会让任何 npm 命令变红，只会在跑到那一行时才炸——而那常常是几十秒模型加载之后）。
  *   ▸ ★ 这台仪表**证明不了**的事，写清楚免得被当成证明了：
  *     "可达"不等于"今晚被跑过"。没有任何一条命令会替我记录"哪个 test:* 今天跑过"，
  *     所以下面那一层只报**多久没人改过它**（观察，不判红）——真正的"今晚跑过什么"
@@ -88,6 +90,17 @@ function gitLastCommitDays(rel) {
   return Math.max(0, Math.round((Date.now() / 1000 - ts) / 86400));
 }
 
+/* 夹具豁免标记：本文件内嵌着"故意造出来的坏输入"（假路径、假承诺），第 ⑤ 层要跳过本文件。
+ *   ▸ 第 ⑤ 层第一次真跑就把自己判红了——它读到我自检夹具里那句 `path.join(__dirname, 'missing-helper.py')`。
+ *     这与坑 103 是同一件事（判据把自己的说明当证据），只是换了个载体：**夹具本来就该让 A.11 红，
+ *     不该让真跑红**。
+ *   ▸ 豁免是**声明式**的（这一行就是声明），A.12 有一条反向对照钉住"没声明的那份照样报"——
+ *     只有声明没有反向对照，这句话就成了万能逃生舱（与 check:files 那条"静态审计：不开浏览器"同一手法）。
+ *   ▸ 本文件自己的真实引用（`require('./assert-order-guard.js')`）不需要这一层来保：
+ *     它缺了的话 `--selftest` 在 require 那一刻就崩，跑不进第二行。*/
+const SELF_FIXTURE_TOKEN = '夹具豁' + '免标记';   // 拼出来：这一行本身不许被当成声明（自指）
+const SELF_FIXTURE_MARKER = new RegExp(SELF_FIXTURE_TOKEN);
+
 /**
  * 核心检查：返回 {rows, problems}。problems 非空 = 退出码 1。
  * @param {{scripts:object, files:string[], docs:string, lists:string[], exists?:function}} input
@@ -106,6 +119,7 @@ function inspect(input) {
     return c.status === 0 ? null : String(c.stderr || c.stdout).split('\n')[0];
   });
   const problems = [];
+  let localRefs = 0;   // 第 ⑤ 层看过的引用条数（覆盖面哨兵，见真跑那行输出）
   /* ① + ②：命令里指向的文件必须存在 */
   const referenced = new Set();
   const rows = [];
@@ -160,9 +174,35 @@ function inspect(input) {
     }
   }
 
-  /* ③ 孤儿：既没被 npm script 指到，也没被别的代码 require，也没出现在清单/文档里 */
+  /* 判"引用过 / 提到过"一律用**剥掉注释之后**的代码（坑 103：判据不许把自己的说明当证据）。 */
   const srcBlobs = {};
   for (const rel of files) srcBlobs[rel] = stripComments(read(rel));
+
+  /* ⑤ ★ 2026-10-10（C6 顺手加）脚本里"用路径拼出来的本地文件"也必须存在。
+   *   ▸ 为什么第 ① 层不够：那一层只看 npm 命令里的 `node x.js`，而 `spawn(exe,[path.join(__dirname,'x.py')])`
+   *     与 `require('./helper.js')` 都藏在代码里——改个名不会让任何命令变红，只会在
+   *     **跑到那一行的那一刻**才炸。最坏的例子就是今天这个：`asr-stream-probe.py` 如果被改名，
+   *     `bench:asr-stream` 要先把 torch + 模型加载 6~20 秒走完，才说一句"文件找不到"。
+   *   ▸ 只认**单段字面量**的拼法（`path.join(__dirname, 'a.py')` / `require('./a.js')`），
+   *     多段拼接与变量路径一律不猜——误伤的判据没人会维护（坑 110 那条纪律）。 */
+  if (!input.skipLocalRefs) {
+    const refRe = /path\.join\(\s*__dirname\s*,\s*['"]([^'"]+\.(?:js|cjs|mjs|py|json))['"]\s*\)|require\(\s*['"]\.\/([^'"]+\.(?:js|json))['"]\s*\)/g;
+    for (const rel of files) {
+      if (!exists(rel)) continue;
+      const src = srcBlobs[rel] || '';
+      /* 声明看**原文**（声明写在注释里，而 srcBlobs 是剥过注释的——只看代码就永远找不到它） */
+      if (SELF_FIXTURE_MARKER.test(read(rel))) continue;
+      let m2;
+      refRe.lastIndex = 0;
+      while ((m2 = refRe.exec(src)) !== null) {
+        const target = 'scripts/' + (m2[1] || m2[2]);
+        localRefs++;   // 覆盖面哨兵：这一层今晚到底看了几条引用。报了"0 问题"而一条都没看，是两种不同的干净
+        if (!exists(target)) problems.push(`${rel} 引用了不存在的本地文件：${target}（要等跑到那一行才发现，而那一行往往在几十秒的模型加载之后）`);
+      }
+    }
+  }
+
+  /* ③ 孤儿：既没被 npm script 指到，也没被别的代码 require，也没出现在清单/文档里 */
   /* require 的写法千奇百怪（'./x.js' / '../sfu/x'），所以按**文件名**判而不是拼路径：
    *   判据要能抓住"确实有人引用它"这件事，而不是精确到写法——写法漂了判据就失效（坑 53 同族）。 */
   const allCode = Object.values(srcBlobs).join('\n');
@@ -184,7 +224,7 @@ function inspect(input) {
     if (d >= 14) stale.push({ rel, days: d });
   }
   stale.sort((a, b) => b.days - a.days);
-  return { rows, problems, orphans, stale, gitMissing: !input.gitDays };
+  return { rows, problems, orphans, stale, localRefs, gitMissing: !input.gitDays };
 }
 
 /* ─────────────────────────── 自检（合成夹具，含反向对照） ─────────────────────────── */
@@ -296,6 +336,45 @@ function selftest() {
   ok('A.10 语法层覆盖到"没被任何命令引用"的脚本（test:tts 那类：红了三个月没人跑，首先得能加载）',
     i10.problems.some((p) => /语法不过/.test(p) && /orphan\.js/.test(p)), i10.problems.filter((p) => /语法不过/.test(p)).join(' | ') || '（没报）');
 
+  /* ⑤ 本地引用层：`path.join(__dirname,'x.py')` / `require('./x.js')` 指到的文件必须存在。
+   *   正向：a.js 引一个不存在的 .py ⇒ 报；反向：b.js 引一个**存在**的 ./a.js ⇒ 不许报。 */
+  const i11 = inspect(Object.assign({}, base, {
+    scripts: { x: 'node scripts/a.js', y: 'node scripts/b.js', z: 'node scripts/orphan.js' },
+    read: (rel) => ({
+      'scripts/a.js': "const p = path.join(__dirname, 'missing-helper.py');\n",
+      'scripts/b.js': "const X = require('./a.js');\n",
+      'scripts/orphan.js': '/* 只有一行注释：require(\'./注释里的.js\') 不算引用（注释已被剥掉） */\n',
+    }[rel] || ''),
+  }));
+  ok('A.11 `path.join(__dirname, …)` 指到的文件不存在必须报（改名不会让任何命令变红）',
+    i11.problems.some((p) => /不存在的本地文件/.test(p) && /missing-helper\.py/.test(p)),
+    i11.problems.filter((p) => /不存在的本地文件/.test(p)).join(' | ') || '（没报）');
+  ok('A.11b 反向对照：引用**存在**的文件不许报；注释里写的 require 也不算引用（剥完注释再判，坑 103）',
+    !i11.problems.some((p) => /scripts\/b\.js/.test(p) && /不存在的本地文件/.test(p))
+    && !/注释里的\.js/.test(i11.problems.join(' ')),
+    i11.problems.filter((p) => /不存在的本地文件/.test(p)).join(' | '));
+
+  /* 声明式豁免（第 ⑤ 层）：判据工具自己内嵌着夹具字符串（故意造出来的坏输入），
+   *   它**必须**能让 A.11 红，但**不该**让真跑红——第一次真跑就是被自己的夹具判红的（坑 103 换载体复发）。
+   *   所以豁免要声明、要能被反向对照钉住；漏声明 = 真跑红（吵），漏钉 = 掏空这条红线。 */
+  const i12 = inspect(Object.assign({}, base, {
+    scripts: { x: 'node scripts/a.js', y: 'node scripts/b.js', z: 'node scripts/orphan.js' },
+    read: (rel) => ({
+      'scripts/a.js': "/* 夹具豁免标记：本文件内嵌假路径，第 ⑤ 层跳过我 */\nconst p = path.join(__dirname, 'also-missing.py');\n",
+      'scripts/b.js': "const p = path.join(__dirname, 'still-missing.py');\n",
+    }[rel] || ''),
+  }));
+  ok('A.12 声明了夹具豁免的文件被跳过，而**没声明**的那份照样报（豁免不是万能逃生舱）',
+    !i12.problems.some((p) => /scripts\/a\.js/.test(p) && /不存在的本地文件/.test(p))
+    && i12.problems.some((p) => /scripts\/b\.js/.test(p) && /still-missing\.py/.test(p)),
+    i12.problems.filter((p) => /不存在的本地文件/.test(p)).join(' | ') || '（一条都没报）');
+
+  /* 覆盖面哨兵：报"没问题"的时候要知道自己看了几条。
+   *   i12 那批夹具里只有 b.js 那 1 条算数（a.js 声明豁免、orphan.js 的 require 写在注释里、被剥掉了），
+   *   所以 1 是**预期值**而不是"大于 0 就行"——把恒真的下界写成断言等于没写（坑 115）。 */
+  ok('A.13 覆盖面哨兵：这一层数到的引用条数正好等于预期的 1 条（漏算/多算都红）',
+    i12.localRefs === 1, `localRefs=${i12.localRefs}`);
+
   const fails = R.filter((x) => !x).length;
   console.log(`\n自检结果: ${R.length - fails} 通过, ${fails} 失败`);
   process.exit(fails ? 1 : 0);
@@ -313,7 +392,7 @@ function selftest() {
 
   const out = inspect({ scripts: pkg.scripts, files, docs, lists, gitDays: gitLastCommitDays });
   if (!QUIET) {
-    console.log(`npm scripts ${out.rows.length} 条 · scripts/*.js ${files.length} 个`);
+    console.log(`npm scripts ${out.rows.length} 条 · scripts/*.js ${files.length} 个 · 代码里拼出来的本地引用看了 ${out.localRefs} 条`);
     if (out.stale.length) {
       console.log('\n最近 14 天没被改动过的脚本（**观察，不判红**——没改不等于没跑）：');
       for (const s of out.stale.slice(0, 14)) console.log(`   ${String(s.days).padStart(3)} 天前  ${s.rel}`);

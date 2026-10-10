@@ -59,6 +59,7 @@
     "bench:asr-golden": "node scripts/bench-asr-golden.js",
     "bench:voice-floor": "node scripts/bench-voice-floor.js",
     "bench:asr-multi": "node scripts/bench-asr-multi.js",
+    "bench:asr-stream": "node scripts/bench-asr-stream.js",
     "bench:innerhtml": "node scripts/bench-innerhtml.js",
     "test:qwen": "node scripts/test-qwen.js",
     "test:ai-brain": "node scripts/test-ai-brain.js",
