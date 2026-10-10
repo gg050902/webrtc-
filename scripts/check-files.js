@@ -585,7 +585,7 @@ require('./inject-check.js').assertCompiles(__filename, { HIT_TEST });
               found.push(fp);
             }
           })(realDir, 0);
-          /* 按类别取样：九类各一份（真文件优先，缺的用夹具顶），剩余名额才给随手扫的 */
+          /* 按类别取样：每类各一份（真文件优先，缺的用夹具顶），剩余名额才给随手扫的 */
           const sel = await Shapes.selectByCategory(found, {
             probeMax: probeCap, extraMax: Math.max(cap, Shapes.CLASSES.length),
           });
@@ -664,7 +664,7 @@ require('./inject-check.js').assertCompiles(__filename, { HIT_TEST });
           /* ❔ 只在"连仓库夹具都拿不出来"时出现 ⇒ 那是仓库缺件，该红（不是用户没文件）。
            *   本机没有真文件只降到 ⚠️（夹具顶上），不红——但报告里必须看得见它只有夹具。 */
           const skippedCov = cov.filter((l) => l.mark === '❔');
-          ok(`C5 类别覆盖：九类形状各至少一份（真文件或夹具），缺件才报 SKIP（当前 真文件 ${realN} · 夹具 ${rows.length - realN}）`,
+          ok(`C5 类别覆盖：每类形状各至少一份（真文件或夹具），缺件才报 SKIP（当前 真文件 ${realN} · 夹具 ${rows.length - realN}）`,
             skippedCov.length === 0, skippedCov.length ? '彻底没样本的类别：' + skippedCov.map((l) => l.cn).join(' / ') : '');
         }
       }

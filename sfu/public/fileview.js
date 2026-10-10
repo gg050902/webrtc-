@@ -897,17 +897,41 @@
    *   裂图会被读成"功能坏了"，占位文字会被读成"这里有一张图，格式看不了"（坑 82）。 */
   const IMG_OK_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'avif', 'svg']);
 
-  /** 图片被上限裁掉时要**说一声**：占位方块只说明"这里曾有图"，说明不了"为什么没有"。
-   *  ▸ 不写这句的话，用户看到的就是一堆灰方块，而他会得出"这功能读不了我的 PPT"——
-   *    实际上文字、版式、其余图都在，只是超预算的图被换成了占位（与 legacyHtml 那条同纪律）。
+  /** 图/图形没能画出来时要**说一声**：占位方块只说明"这里曾有图"，说明不了"为什么没有"。
+   *  ▸ 不写这句的话，用户看到的就是一堆灰方块，而他会得出"这功能读不了我的 Word"——
+   *    实际上文字、版式、其余图都在（与 legacyHtml 那条同纪律）。
+   *  ▸ ★ 2026-10-10（用户第四次报"word 共享没实现"，拿他那份真 .docx 取证抓到的）：
+   *    原来这条说明**只管"被预算裁掉"那一种**。另外两种一个字的说明都没有：
+   *      · bad    = 浏览器根本不认的图片格式（EMF/WMF、把 .emf 改名成 .png 的）
+   *      · shapes = Word 的矢量图形（线条/文本框/公式对象，VML 或 DrawingML 画的），
+   *                 我们只还原文字，这类东西结构上就画不出来
+   *    那份 469KB 的论文模板里 49 处占位**全是这两类**，于是界面上一行解释都没有。
+   *    ▎三种原因分开写、分开计数（坑 125 的同一条：混进同一个数，那句"省略了 N 张"就在谎报原因）。
    *  ▸ 上限为什么是 16MB（解压后的图片字节，不是 HTML 长度）：base64 会再涨 4/3，
    *    实测量过 40MB 字符串插入 DOM 只要 142ms，所以卡的不是插入而是**内存与解码**；
    *    16MB 是"一份真 PPT 的绝大多数图都能进来"的那条线（本次那 7.5MB 的样本全放得下）。
    *  ▸ 2026-10-08 之前这条上限是**每页一份**，所以它从来没有作为"文档上限"生效过（坑 76）。 */
-  function imgSkippedNote(skipped) {
-    if (!skipped) return '';
-    return `<p class="fv-note fv-note-imgs">为流畅起见，这份文档省略了 ${skipped} 张内嵌图片（只保留占位）。`
+  function imgSkippedNote(budget) {
+    const b = budget || {};
+    const parts = [];
+    if (b.skipped) parts.push(`为流畅起见省略了 ${b.skipped} 处内嵌图片`);
+    if (b.bad) parts.push(`有 ${b.bad} 处图片是浏览器画不了的格式（EMF/WMF 这类图元文件）`);
+    if (b.missing) parts.push(`有 ${b.missing} 处图片引用在文档包里找不到对应文件（那份文件本身不完整）`);
+    if (b.shapes) parts.push(`有 ${b.shapes} 处 Word 图形与公式对象是矢量绘制的，在线不还原`);
+    if (!parts.length) return '';
+    return `<p class="fv-note fv-note-imgs">这份文档${parts.join('；')}。`
       + '文字与版式都在；要看完整图片，点右下角「下载」拿原文件即可。</p>';
+  }
+
+  /* 连续空白"占几行、什么时候改说一句『省略 N 行』"——**xlsx 与 docx 共用这一条判据**。
+   * ▎为什么要抽出来：折叠空白行这件事 10-09 就为 xlsx 写过了（一份 2000 行的表逐行画空行没意义），
+   *   而 docx 那条路径从来没做——用户那份论文模板有 **1198 个空段**（Word 拿空段当排版间距），
+   *   于是正文被推到第 48 屏，界面打开就是"一片空白 + 几个灰方块"，读起来等于"没实现"。
+   *   ▸ 阈值 6 沿用 xlsx 那条：≤6 个空行照原样占位（"第 12 行"这种指代还要对得上），
+   *     再多就压成一行说明——**少画几行不丢信息，全画出来才丢**（信息密度那条）。 */
+  const BLANK_PAD_MAX = 6;
+  function blankRunOf(n) {
+    return n <= 0 ? { pad: 0, omitted: 0 } : (n <= BLANK_PAD_MAX ? { pad: n, omitted: 0 } : { pad: 0, omitted: n });
   }
 
   /** 把一份文档里引用到的图片一次性抽成 data: URL（带上限，超限/不支持就返回 null → 占位文字）。
@@ -933,7 +957,10 @@
      *     那句"省略了 N 张"就在谎报原因（坑 47：一个概念一个来源）。
      *   ▸ 三条上限都能由调用方注入（maxImageEachBytes / maxImageDecodedBytes / maxImageEmittedBytes）：
      *     测试要能在几 KB 的夹具上把"超预算"这条路走一遍，而不是搬一份 16MB 的假图去撞生产上限。 */
-    const budget = o.budget || { decoded: 0, emitted: 0, skipped: 0, cache: new Map() };
+    const budget = o.budget || { decoded: 0, emitted: 0, skipped: 0, bad: 0, missing: 0, cache: new Map() };
+    /* 三种"没画出来"分开记账（skipped=被预算裁 / bad=格式画不了 / missing=包里找不到），
+     * 单位统一是**位置**（用户看到的第几处空着），imgSkippedNote 才敢把数直接说给人听。 */
+    const bump = (k) => { budget[k] = (budget[k] || 0) + 1; };
     const capEach = Number(o.maxImageEachBytes) > 0 ? Number(o.maxImageEachBytes) : MAX_IMG_EACH;
     const capDecoded = Number(o.maxImageDecodedBytes) > 0 ? Number(o.maxImageDecodedBytes) : MAX_IMG_DECODED;
     const capEmitted = Number(o.maxImageEmittedBytes) > 0 ? Number(o.maxImageEmittedBytes) : MAX_IMG_EMITTED;
@@ -941,34 +968,35 @@
     for (const rid of rids) {
       if (out.has(rid)) continue;
       const rel = rels.get(rid);
-      if (!rel || rel.external || !rel.target) { out.set(rid, null); continue; }
+      if (!rel || rel.external || !rel.target) { bump('missing'); out.set(rid, null); continue; }
       const part = resolveZipPath(baseDir, rel.target);
-      if (!part || !zip.has(part)) { out.set(rid, null); continue; }
+      if (!part || !zip.has(part)) { bump('missing'); out.set(rid, null); continue; }
       const ext = extOf(part);
-      if (!IMG_OK_EXT.has(ext)) { out.set(rid, null); continue; }
+      if (!IMG_OK_EXT.has(ext)) { bump('bad'); out.set(rid, null); continue; }
       const seen = budget.cache.get(part);
       if (seen) {
-        if (seen.bad) { out.set(rid, null); continue; }                 // 画不了的格式：不再解压，也不算"被裁"
-        if (seen.over) { budget.skipped++; out.set(rid, null); continue; }
-        if (budget.emitted + seen.size > capEmitted) { budget.skipped++; out.set(rid, null); continue; }
+        if (seen.bad) { bump('bad'); out.set(rid, null); continue; }      // 画不了的格式：不再解压，也不算"被裁"
+        if (seen.over) { bump('skipped'); out.set(rid, null); continue; }
+        if (budget.emitted + seen.size > capEmitted) { bump('skipped'); out.set(rid, null); continue; }
         budget.emitted += seen.size;
         out.set(rid, seen.url);                                          // 同一张图：解压与 base64 只做一次
         continue;
       }
       let bytes;
-      try { bytes = await zip.read(part); } catch (e) { out.set(rid, null); continue; }
-      if (!bytes || !bytes.length) { out.set(rid, null); continue; }
+      try { bytes = await zip.read(part); } catch (e) { bump('missing'); out.set(rid, null); continue; }
+      if (!bytes || !bytes.length) { bump('missing'); out.set(rid, null); continue; }
       /* 扩展名说是图片，但字节不认（真实世界有人把 .emf 改名成 .png 塞进 PPT）→ 占位。
        * ▸ 记成 bad 而不是 over：这两件事的**原因不同**，用户看到的说明也就不该同一句。 */
       const real = magicKind(bytes);
       if (real !== 'image' && !(ext === 'svg' && bytes[0] === 0x3c)) {
         budget.cache.set(part, { bad: true });
+        bump('bad');
         out.set(rid, null);
         continue;
       }
       if (bytes.length > capEach || budget.decoded + bytes.length > capDecoded) {
         budget.cache.set(part, { over: true });
-        budget.skipped++;
+        bump('skipped');
         out.set(rid, null);
         continue;
       }
@@ -978,7 +1006,7 @@
       budget.cache.set(part, { url, size: bytes.length });
       /* 到这里图是"能画的"，但 DOM 的字符预算可能已经用完 —— 这一处才叫"被裁掉" */
       if (budget.emitted + bytes.length > capEmitted) {
-        budget.skipped++;
+        bump('skipped');
         out.set(rid, null);
         continue;
       }
@@ -1080,13 +1108,24 @@
   }
 
 
-  /** 收集整棵树里出现的 r:embed / r:link（图片引用），供 collectImages 一次备料。 */
+  /** 收集整棵树里出现的图片引用，供 collectImages 一次备料。
+   *  ▸ 两条来源都要收，缺一条就是"图在包里躺着，界面上一片占位"：
+   *    · DrawingML：`a:blip r:embed / r:link`（Word 2007+ 的"插入图片"）
+   *    · **VML**：`v:imagedata r:id`（Word 2003 及"旧版格式/公式对象/艺术字"还在用，
+   *      中文论文模板尤其常见——它们封面上的校徽、横线、公式图整片是 `<w:pict>`）
+   *    ▎2026-10-10 用户那份 469KB 的《数学建模》论文模板就是这一条：包里有 5 张**真 JPEG**、
+   *      7 处 `v:imagedata` 指过去，而内核只认 `a:blip` ⇒ 一张都没备料 ⇒ 49 个灰方块。
+   *      这条以前没有任何断言，因为**我自己写的夹具只会造 a:blip**（坑 130：夹具测的是记忆不是能力）。 */
   function collectRids(node, out) {
     const res = out || [];
     for (const k of kidsOf(node || {})) {
       if (!isEl(k)) continue;
-      if (local(k.tag) === 'blip') {
+      const tag = local(k.tag);
+      if (tag === 'blip') {
         const rid = attr(k, 'embed') || attr(k, 'link');
+        if (rid) res.push(rid);
+      } else if (tag === 'imagedata') {
+        const rid = attr(k, 'id');
         if (rid) res.push(rid);
       }
       collectRids(k, res);
@@ -1109,33 +1148,52 @@
     const rels = await readRels(zip, 'word/_rels/document.xml.rels');
     const styleNumOf = await loadDocxStyles(zip);
     const numFmt = await loadNumbering(zip, styleNumOf);
-    const imgBudget = { decoded: 0, emitted: 0, skipped: 0, cache: new Map() };
+    const imgBudget = { decoded: 0, emitted: 0, skipped: 0, bad: 0, missing: 0, cache: new Map() };
     const images = await collectImages(zip, 'word', rels, collectRids(body), { ...o, budget: imgBudget });
 
-    const ctx = { rels, images, numFmt, styleNumOf, stats: { paragraphs: 0, tables: 0, images: 0, chars: 0, imagesSkipped: 0 } };
+    const ctx = { rels, images, numFmt, styleNumOf, stats: { paragraphs: 0, tables: 0, images: 0, chars: 0, imagesSkipped: 0, shapes: 0 } };
     const html = docxBlocks(elems(body), ctx);
     ctx.stats.imagesSkipped = imgBudget.skipped;
+    ctx.stats.imagesBad = imgBudget.bad;
+    ctx.stats.imagesMissing = imgBudget.missing;
     return {
-      html: (html || '<p class="fv-empty">（这份文档没有可提取的文字）</p>') + imgSkippedNote(imgBudget.skipped),
+      /* 说明行带**三种原因**各自的数（预算裁掉 / 格式画不了 / 矢量图形），一句里各说各的，
+       * 不合并成一个"省略了 N 张"（坑 125：混计就是在谎报原因）。 */
+      html: (html || '<p class="fv-empty">（这份文档没有可提取的文字）</p>')
+        + imgSkippedNote({ skipped: imgBudget.skipped, bad: imgBudget.bad, missing: imgBudget.missing, shapes: ctx.stats.shapes }),
       meta: ctx.stats,
     };
   }
 
-  /** 正文块序列 → HTML（w:p / w:tbl / w:sdt）。列表要"连续成组"，所以在这里攒。 */
+  /** 正文块序列 → HTML（w:p / w:tbl / w:sdt）。列表要"连续成组"，所以在这里攒。
+   *  ▸ ★ 2026-10-10：连续**空段**要折叠（判据与 xlsx 共用 blankRunOf）。
+   *    Word 拿空段落当排版间距用，一份真论文模板里 1609 段有 **1198 段是空的**——
+   *    照原样画出来，正文被推到第 48 屏，用户打开面板看到的是"一片空白 + 几个灰方块"，
+   *    于是他说"word 共享还是没有实现"。**信息都在，但被排版的噪音推到了看不见的地方**，
+   *    这类"没实现"不是功能缺陷，是呈现缺陷——而用户只会说成前者。 */
   function docxBlocks(nodes, ctx) {
     let out = '';
     let items = [];       // [{ ilvl, ordered, html }]
+    let pendingBlank = 0;
+    const drainBlank = () => {
+      if (!pendingBlank) return '';
+      const r = blankRunOf(pendingBlank);
+      pendingBlank = 0;
+      if (r.omitted) return `<p class="fv-blankrun">（Word 用空行排版，这里省略了 ${r.omitted} 个空行）</p>`;
+      return DOCX_BLANK_P.repeat(r.pad);
+    };
     const flushList = () => {
       if (!items.length) return;
       out += renderListItems(items);
       items = [];
     };
+    const flushAll = () => { flushList(); out += drainBlank(); };
     for (const n of nodes) {
       if (!isEl(n)) continue;
       const t = local(n.tag);
       if (t === 'sdt') {                                   // 内容控件（目录/占位符）：钻进去继续
         const content = child(n, 'sdtContent');
-        if (content) { flushList(); out += docxBlocks(elems(content), ctx); }
+        if (content) { flushAll(); out += docxBlocks(elems(content), ctx); }
         continue;
       }
       /* ★ 正文流里也会遇到"包一层的壳"：customXml（带自定义标记的段落包装）、
@@ -1143,7 +1201,7 @@
        *   块级整片消失——**Word 的目录(SDT 之外的老写法)与自定义 XML 内容控件就是这一类**。 */
       if (t === 'customXml' || t === 'AlternateContent') {
         const src = t === 'AlternateContent' ? (first(n, 'Choice') || first(n, 'Fallback')) : n;
-        if (src) { flushList(); out += docxBlocks(elems(src), ctx); }
+        if (src) { flushAll(); out += docxBlocks(elems(src), ctx); }
         continue;
       }
       if (t === 'p') {
@@ -1166,15 +1224,26 @@
           items.push({ ilvl: Math.min(3, parseInt(ilvl, 10) || 0), ordered: f !== 'bullet', html: docxRuns(n, ctx) || '&nbsp;' });
           continue;
         }
-        flushList();
-        out += docxParagraph(n, ctx);
+        /* 顺序要紧：先渲染这一段、再决定要不要折叠。反过来写（先 flush 再判）会让
+         * 每个空段都把前面攒着的空段冲出去 ⇒ 计数永远到不了阈值，折叠形同虚设（坑 76）。 */
+        const one = docxParagraph(n, ctx);
+        /* 空段不进 out，先进计数器——连续几十个才压成一行说明（见 docxBlocks 头部注释）。
+         * ▸ 判"空"用的是**渲染结果**而不是"有没有 w:t"：一段里只有线条/图片占位时，
+         *   它画出来是有东西的，不许被当成空行吞掉（吞掉信息比留白严重得多）。 */
+        if (one === DOCX_BLANK_P) { pendingBlank++; continue; }
+        flushAll();
+        out += one;
         continue;
       }
-      if (t === 'tbl') { flushList(); out += docxTable(n, ctx); continue; }
+      if (t === 'tbl') { flushAll(); out += docxTable(n, ctx); continue; }
     }
-    flushList();
+    flushAll();
     return out;
   }
+
+  /* 空段的那一份 HTML **只写一次**：docxBlocks 要靠"渲染结果等于它"来判空，
+   * 两处各写一份字符串，将来改一处就让折叠静默失效（坑 76/47）。 */
+  const DOCX_BLANK_P = '<p class="fv-blank">&nbsp;</p>';
 
   function docxParagraph(p, ctx) {
     ctx.stats.paragraphs++;
@@ -1191,7 +1260,7 @@
     const cls = [];
     if (align) cls.push(`fv-al-${align}`);
     if (/Quote|引用/i.test(style || '')) cls.push('fv-quote');
-    if (!inner) return '<p class="fv-blank">&nbsp;</p>';
+    if (!inner) return DOCX_BLANK_P;
     return `<p${cls.length ? ` class="${cls.join(' ')}"` : ''}>${inner}</p>`;
   }
 
@@ -1302,24 +1371,50 @@
     return s;
   }
 
-  /** w:drawing / w:pict 里的图片：按 r:embed 找关系，取预先备好的 data: URL。
+  /** w:drawing / w:pict 里的图片：按 r:embed（DrawingML）或 r:id（VML）找关系，取预先备好的 data: URL。
    *  ▎替代文字有两个来源：`wp:docPr`（Word 自己写的"说明文字"）与
-   *    `pic:cNvPr`（图形对象名）——只找前者会漏掉一批文件（真实文档里两者常常只有一个）。 */
+   *    `pic:cNvPr`（图形对象名）——只找前者会漏掉一批文件（真实文档里两者常常只有一个）。
+   *  ▸ 占位方块上那个词**要按原因分**（2026-10-10）：「图片取不到」与「这本来就不是图片」
+   *    是两种病，都写〔图片〕的话，用户会以为我们读图读坏了，而真相是那是条矢量线条。 */
   function docxDrawing(node, ctx) {
     /* 先问"这是不是一个文本框"——文本框里没有 blip，原先它会掉进下面的占位符分支，
      * 于是"框里的字"变成了〔图片〕。顺序就是判据：先内容，后占位。 */
     const tb = docxTextBoxText(node, ctx);
     if (tb) return `<span class="fv-txbx">${tb}</span>`;
     const blip = first(node, 'blip');
-    const rid = blip ? (attr(blip, 'embed') || attr(blip, 'link')) : '';
+    const vml = first(node, 'imagedata');
+    const rid = blip ? (attr(blip, 'embed') || attr(blip, 'link')) : (vml ? attr(vml, 'id') : '');
     const src = rid ? ctx.images.get(rid) : null;
     const pr = first(node, 'docPr') || first(node, 'cNvPr');
-    const label = attr(pr, 'descr') || attr(pr, 'name') || '';
+    const label = attr(pr, 'descr') || attr(pr, 'name') || attr(vml, 'title') || '';
     if (src) {
       ctx.stats.images++;
       return `<img class="fv-docimg" src="${src}" alt="${esc(label)}" loading="lazy">`;
     }
+    if (!rid && hasVecShape(node)) {
+      ctx.stats.shapes++;
+      return '<span class="fv-ph fv-ph-shape">〔图形〕</span>';
+    }
     return `<span class="fv-ph">〔图片${label ? `：${esc(label)}` : ''}〕</span>`;
+  }
+
+  /* Word 的矢量图元（VML 与 DrawingML 两套里的"形状"那一半）：线条、方框、箭头、组合、艺术字轮廓。
+   * ▸ 这些**不是图片**，是带坐标的绘制指令——在线还原要一个 VML 渲染器，我们只还原文字与图片，
+   *   所以它结构上画不出来。承认这一点，比塞一个"图片"占位过去更诚实（坑 82：假说明比缺失更糟）。 */
+  const VEC_SHAPE = new Set(['line', 'rect', 'roundrect', 'oval', 'arc', 'curve', 'group',
+    'shape', 'shapetype', 'wsp', 'snip1rect', 'textbox']);
+  function hasVecShape(node) {
+    let hit = false;
+    (function walk(n) {
+      if (hit || !n) return;
+      for (const k of kidsOf(n || {})) {
+        if (!isEl(k)) continue;
+        if (VEC_SHAPE.has(local(k.tag))) { hit = true; return; }
+        walk(k);
+        if (hit) return;
+      }
+    })(node);
+    return hit;
   }
 
   function docxTable(tbl, ctx) {
@@ -1599,15 +1694,16 @@
       }
       const firstRowIdx = rowAt.length ? rowAt[0] : 1;
       const lastRowIdx = rowAt.length ? rowAt[rowAt.length - 1] : 0;
-      const BLANK_PAD_MAX = 6;              // 连续空白行 ≤6 就照原样占位（保持"第 12 行"对得上）
+      /* 阈值不在这里写第二份：blankRunOf 是 docx 与 xlsx 共用的那一条判据（见文件里它的注释）。
+       * xlsx 这一侧多一层理由——≤6 行照原样占位是为了让"第 12 行"这种口头指代还对得上。 */
       meta.rows = 0;
       let pendingBlank = 0;
       const flushBlank = (buf) => {
         let out = buf;
         if (pendingBlank) {
-          if (pendingBlank <= BLANK_PAD_MAX) {
-            for (let i = 0; i < pendingBlank; i++) out += `<tr class="fv-blankrow"><td colspan="${cols}"></td></tr>`;
-          } else out += `<tr class="fv-blankrun"><td colspan="${cols}">省略 ${pendingBlank} 行空白</td></tr>`;
+          const r = blankRunOf(pendingBlank);
+          for (let i = 0; i < r.pad; i++) out += `<tr class="fv-blankrow"><td colspan="${cols}"></td></tr>`;
+          if (r.omitted) out += `<tr class="fv-blankrun"><td colspan="${cols}">省略 ${r.omitted} 行空白</td></tr>`;
           pendingBlank = 0;
         }
         return out;
@@ -1832,7 +1928,8 @@
     const ar = (cx / cy).toFixed(4);
     meta.imagesSkipped = imgBudget.skipped;
     return {
-      html: `<div class="fv-slides" style="--fv-slide-ar:${ar}">${cards.join('')}</div>` + imgSkippedNote(imgBudget.skipped),
+      html: `<div class="fv-slides" style="--fv-slide-ar:${ar}">${cards.join('')}</div>`
+        + imgSkippedNote({ skipped: imgBudget.skipped, bad: imgBudget.bad, missing: imgBudget.missing }),
       meta,
     };
   }

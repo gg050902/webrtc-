@@ -773,8 +773,15 @@ const ZLIB = { inflateRaw: (u) => new Uint8Array(zlib.inflateRawSync(Buffer.from
     const fake = await FV.pptxToHtml(FX.makePptx({ badImage: true }), ZLIB);
     ok('扩展名冒充图片（字节不是 PNG）→ 那一处画不了，但不记进"被预算裁掉"，也不牵连第二页的真图',
       fake.meta.images === 1 && fake.meta.imagesSkipped === 0
-      && fake.html.indexOf('fv-note-imgs') < 0 && fake.html.indexOf('〔图片〕') >= 0,
+      && fake.html.indexOf('〔图片〕') >= 0,
       JSON.stringify(fake.meta));
+    /* ★ 2026-10-10（用户第四次报"word 共享没实现"）：画不了的格式**以前一个字都不说**，
+     *   于是界面就是几个灰方块，用户只能自己猜"这功能坏了"。现在必须说，而且要说对原因：
+     *   说成"为流畅起见省略"就是谎报（那是预算那本账的话，坑 125）。 */
+    ok('格式画不了也要说一句（沉默的灰方块 = 用户自己编一个"功能坏了"的结论）',
+      /fv-note-imgs/.test(fake.html) && /画不了|格式/.test(fake.html), fake.html.slice(-260));
+    ok('★ 反向：格式那一句不许借用"为流畅起见"的措辞（两本账各有各的原因）',
+      !/为流畅起见/.test(fake.html));
     /* docx 走同一个预算对象（原来 docx 是单次调用，本来就是文档级；这里钉住"两条路同源"） */
     const dx = await FV.docxToHtml(FX.makeDocx(), { ...ZLIB, maxImageEmittedBytes: 1 });
     ok('docx 也用同一套预算（超了就报 skipped，不是静默少图）',
@@ -1041,6 +1048,69 @@ console.log('\n═══ Q. 另一个实现写的文件（真形状夹具 + 独�
       ok('两轨的 xlsx 也逐字符一致（百分比/货币/合并都在浏览器那一轨跑过）',
         bx.got === true && bx.v.html === x.html, bx.got ? '' : '没回话');
     }
+  }
+
+console.log('\n═══ R. VML 图元与空行折叠（2026-10-10 用户那份真论文模板逼出来的） ═══');
+  /* ▎为什么单列一组：用户第四次报"word 共享还是没有实现"，截图里那份 469KB 的
+   *   《数学建模》期末论文模板只画出 11 个灰方块、一行文字都看不见。拿**他那份文件**过一遍内核才看清：
+   *   ① 包里有 **5 张真 JPEG、7 处引用**，但引用走的是 **VML**（`w:pict` + `v:shape` + `v:imagedata r:id`），
+   *      而内核只认 DrawingML 的 `a:blip r:embed` ⇒ 一张都没备料 ⇒ 49 个占位、0 张图；
+   *   ② 1609 段里 **1198 段是空的**（Word 拿空段当排版间距），全部照原样画 ⇒ 正文被推到第 48 屏；
+   *   ③ 那 49 个占位**没有任何一行解释** ⇒ 用户只能自己得出"没实现"。
+   *   ▸ 三条都不是"解析器抛错"，是**有东西没画 + 画出来的被噪音埋了 + 不说为什么**。
+   *     我的夹具以前只会造 `a:blip`，所以 302 条断言全绿也照样漏（坑 130）。 */
+  {
+    const bytes = FX.makeDocx({ vml: true });
+    const r = await FV.docxToHtml(bytes, ZLIB);
+    const base = await FV.docxToHtml(FX.makeDocx({}), ZLIB);   // 同一份夹具，只是没有 VML 那三段
+    const h = r.html;
+    const n = (re) => (h.match(re) || []).length;
+    /* 期望值按"比不带 VML 的那份多几张"来写，不按绝对数写：
+     *   夹具以后再加图，绝对数会红得莫名其妙，而"多出来的那一张来自 VML"这句话一直成立。 */
+    ok('★ VML 的 `v:imagedata r:id` 也算图片引用：包里有图就该画出来（不是灰方块）',
+      r.meta.images === base.meta.images + 1 && n(/<img class="fv-docimg"/g) === r.meta.images,
+      `带 VML ${r.meta.images} 张 vs 不带 ${base.meta.images} 张 · meta ${JSON.stringify(r.meta)}`);
+    ok('★ 那条 VML 图片不再产出〔图片〕占位（这就是用户截图里那 11 个方块的成因）',
+      h.indexOf('〔图片〕') < 0);
+    ok('★ 纯矢量线条（v:line）如实叫〔图形〕，不冒充"图片取不到"（两种病两种说法）',
+      n(/〔图形〕/g) === 1 && r.meta.shapes === 1, `图形占位 ${n(/〔图形〕/g)} · meta ${JSON.stringify(r.meta)}`);
+    ok('★ 一句只含矢量线条的段落**不许被当成空段折叠掉**（判"空"看渲染结果，不看有没有 w:t）',
+      /fv-ph-shape/.test(h) && h.indexOf('<p class="fv-blank">&nbsp;</p><p class="fv-ph') < 0);
+    ok('说明行点名"矢量绘制不还原"，并且不借用"为流畅起见"那句（那是预算那本账的话）',
+      /fv-note-imgs/.test(h) && /矢量/.test(h) && !/为流畅起见/.test(h), (h.match(/<p class="fv-note[^"]*">[\s\S]{0,200}/) || [''])[0].replace(/<[^>]*>/g, ''));
+
+    /* 空行折叠：20 个连续空段 ⇒ 压成一行说明，一个空 `<p>` 都不留 */
+    ok('★ 连续 20 个空段折叠成一行"省略了 20 个空行"（正文不再被推到几十屏下）',
+      n(/class="fv-blankrun"/g) === 1 && /省略了 20 个空行/.test(h) && n(/class="fv-blank"/g) === 0,
+      `折叠行 ${n(/class="fv-blankrun"/g)} · 空段 ${n(/class="fv-blank"/g)}`);
+    ok('折叠之后"空行之后才有正文"这句话还在（省行数不许丢内容）',
+      h.indexOf('空行之后才有正文') > 0);
+    /* 反向：阈值以内照原样留白——Word 用一两个空段做段间距，全吞掉会把版式弄成挤在一起 */
+    const few = await FV.docxToHtml(FX.makeDocx({ blanks: 3 }), ZLIB);
+    ok('★ 反向对照：只空 3 段时照原样留 3 个空段、不出折叠行（阈值不许过头吞版式）',
+      (few.html.match(/class="fv-blank"/g) || []).length === 3
+      && few.html.indexOf('fv-blankrun') < 0,
+      `空段 ${(few.html.match(/class="fv-blank"/g) || []).length}`);
+    /* 两轨一致：VML 这条路以前只在 Node 走过，浏览器那一轨没测过就是没修完（坑 118） */
+    const vm = require('vm');
+    const src = fs.readFileSync(path.join(__dirname, '..', 'sfu', 'public', 'fileview.js'), 'utf8');
+    const ctx = vm.createContext({ setTimeout, clearTimeout, TextDecoder, console, DecompressionStream: globalThis.DecompressionStream });
+    vm.runInContext(src, ctx);
+    const within = (p, ms) => Promise.race([
+      p.then((v) => ({ got: true, v })),
+      new Promise((res) => setTimeout(() => res({ got: false }), ms)),
+    ]);
+    const br = await within(ctx.FV.docxToHtml(Array.from(bytes), { name: 'vml.docx' }), 12000);
+    ok('★★★ 浏览器那一轨（DecompressionStream）也解得出这份 VML 文件，且与 zlib 轨逐字符一致',
+      br.got === true && br.v.html === h, br.got ? `浏览器 ${br.v.html.length}B vs zlib ${h.length}B` : '12s 没回话');
+    /* 结构红线：判"空"的那一份 HTML 只许有一处定义（两处各写一遍，改一处就让折叠静默失效） */
+    const srcPlain = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    ok('★ 空段那份 HTML 字面量在源码里只出现一次（DOCX_BLANK_P 是单一来源，坑 47/76）',
+      (srcPlain.match(/class="fv-blank"/g) || []).length === 1,
+      String((srcPlain.match(/class="fv-blank"/g) || []).length));
+    ok('★ 空白折叠阈值只有一处定义（xlsx 与 docx 共用 blankRunOf，不各写一个 6）',
+      (srcPlain.match(/BLANK_PAD_MAX\s*=/g) || []).length === 1,
+      String((srcPlain.match(/BLANK_PAD_MAX\s*=/g) || []).length));
   }
 
 console.log('\n═══ M. 结构红线（防回退，不看行为看形状） ═══');

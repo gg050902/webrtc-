@@ -4136,6 +4136,15 @@ mark { background: var(--accent-muted); color: var(--fg); padding: 0 .18em; bord
   font-size: .85em; color: var(--fg-faint);
   border: 1px dashed var(--border-strong);
 }
+/* 〔图形〕与〔图片〕是两种原因（矢量绘制不还原 vs 图片取不到），样式也要分得开一点：
+   斜体 + 更淡的边框，让人一眼看出"这不是加载失败，是这东西本来就不是图片"。 */
+.fv-ph-shape { font-style: italic; border-style: dotted; }
+/* docx 那一侧的"省略 N 个空行"是段落，不是表格单元格——同一句话在两种载体里要长一样
+   （判据在 fileview 的 blankRunOf 里已经是一处，样式也不许各写一份风格）。 */
+p.fv-blankrun {
+  text-align: center; font-size: .8em; color: var(--fg-faint);
+  background: rgba(var(--fill-rgb), .3); letter-spacing: .04em; border-radius: 6px;
+}
 
 /* PPT：一页 = 一张固定长宽比的卡片，字号用 cqw（随卡片宽度缩放，不会"图小字不变"） */
 .fv-slides { display: flex; flex-direction: column; gap: 14px; align-items: center; }

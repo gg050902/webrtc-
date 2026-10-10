@@ -54,7 +54,7 @@ const DIRS = (() => {
 })();
 const MAX_FILES = Math.max(1, Number(argOf('--max', 25)) || 25);
 /* ★ C5：分类阶段"只看字节"的候选上限。它和 --max 是两件事：
- *   --max 管"渲染几份"（贵，每份要解析），--probe 管"为了凑齐九类形状允许读多少份的头部"（便宜）。
+ *   --max 管"渲染几份"（贵，每份要解析），--probe 管"为了凑齐各类形状允许读多少份的头部"（便宜）。
  *   两者分开是因为**覆盖面靠挑样本来，不靠渲染数量**——渲染 300 份同形状的 docx
  *   也不会让"旧版 .ppt"这一类多出一次证据。 */
 const PROBE_MAX = Math.max(MAX_FILES, Number(argOf('--probe', 400)) || 400);
@@ -150,7 +150,7 @@ async function selftest() {
     }
     /* 反向对照：普通 docx/xlsx/pptx 一份都不许被上面那些判据认成"特别形状"。
      *   没有这一组，`w:tbl` 的嵌套深度写成恒 ≥2、formatCode 正则写成 .* 之类都会一路全绿，
-     *   而"九类全覆盖"这句话就变成了一句装饰（坑 115：断言可以正确地保护一个错的期望）。 */
+     *   而"全覆盖"这句话就变成了一句装饰（坑 115：断言可以正确地保护一个错的期望）。 */
     const FX2 = require('./ooxml-fixture.js');
     yes('C5 反向：普通 docx 不算嵌套、不算坏 ZIP', await classify('plain.docx', FX2.makeDocx({})) === 'docx');
     yes('C5 反向：普通 xlsx 没百分号/币符 ⇒ 不进"百分比/货币"这一类', await classify('plain.xlsx', FX2.makeXlsx({})) === 'xlsx');
@@ -176,8 +176,10 @@ async function selftest() {
     yes('C5 反向：real=0 的类别永远拿不到 ✅（"没证据"与"通过"必须是两个不同的记号）',
       covA.every((l) => (l.mark === '✅' ? (covCounts[l.id] || 0) > 0 : true)),
       JSON.stringify(covA.filter((l) => l.mark === '✅').map((l) => l.id)));
-    /* 数量哨兵：类别清单被删到 9 项以下时，"覆盖 9/9"这句话就不再等于覆盖了什么。 */
-    yes('C5 类别清单仍是 9 项（少一类就是少一块证据，别让它在无声中缩水）', CLASSES.length === 9, String(CLASSES.length));
+    /* 数量哨兵：类别清单被删到 10 项以下时，"覆盖 N/N"这句话就不再等于覆盖了什么。
+     *   ▸ 2026-10-10 从 9 加到 10：用户那份论文模板暴露出 **VML 图元**这一整条代码路径
+     *     （`v:imagedata r:id`）以前没有任何一样东西盯过它——加一类就是把这次的教训钉在清单上。 */
+    yes('C5 类别清单仍是 10 项（少一类就是少一块证据，别让它在无声中缩水）', CLASSES.length === 10, String(CLASSES.length));
 
     /* ═══ P 组：selectByCategory（两个消费者共用的取样器；check:files 的 REAL_OFFICE_DIR 也走它）═══
      *   ▸ 磁盘与网络都不进来：readBytes / statSize 全部注入，测的是**取样逻辑**本身
@@ -197,26 +199,26 @@ async function selftest() {
     yes('P1 三类真样本各认出来（备注页 / 旧版 doc / 普通 docx 不进类别）',
       p1.counts['pptx-notes'] === 1 && p1.counts['legacy-doc'] === 1 && p1.counts.docx === 1,
       JSON.stringify(p1.counts));
-    /* 契约要说准：**九类各一份（真样本优先）**，剩余名额才给"随手扫的余量"。
+    /* 契约要说准：**每类各一份（真样本优先）**，剩余名额才给"随手扫的余量"。
      *   第一版我把它写成 `queue.length === 9`，而实跑是 10——那份多出来的 plain.docx 是
      *   extraMax=12 允许的第 1 个余量，行为是对的、我把它写成了错的期望（坑 115 的反向版本：
      *   断言保护了一个没想清楚的数）。现在分开数：类别样本 / 夹具兜底 / 余量。 */
-    yes('P2 队列 = 九类各一份（2 真 + 7 夹具兜底），第 4 份文件作为余量补到 10',
+    yes('P2 队列 = 十类各一份（2 真 + 8 夹具兜底），第 4 份文件作为余量补到 11',
       p1.queue.filter((q) => !q.fixture && Shapes.REQ.has(q.id)).length === 2
-      && p1.queue.filter((q) => q.fixture).length === 7
+      && p1.queue.filter((q) => q.fixture).length === 8
       && p1.queue.filter((q) => !Shapes.REQ.has(q.id)).length === 1
-      && p1.usedFixture.size === 7,
+      && p1.usedFixture.size === 8,
       `queue=${p1.queue.length} 真类别样=${p1.queue.filter((q) => !q.fixture && Shapes.REQ.has(q.id)).length} 夹具=${p1.usedFixture.size} 余量=${p1.queue.filter((q) => !Shapes.REQ.has(q.id)).length}`);
 
     /* 类别样本**不被 --max 挤掉**：上限只约束"随手扫的余量"。
-     *   挤掉的后果是让报告看起来"覆盖 9/9"，实际只渲染了 4 份——覆盖面被数量上限偷偷改动。 */
+     *   挤掉的后果是让报告看起来"覆盖 10/10"，实际只渲染了 4 份——覆盖面被数量上限偷偷改动。 */
     const p2 = await selectByCategory(Object.keys(fakeBytes), Object.assign({}, fakeOpt, { extraMax: 3 }));
-    yes('P3 反向对照：余量上限调到 3 也仍然渲染满九类（类别优先，上限只管余量）',
-      p2.queue.length === 9, String(p2.queue.length));
-    /* 零样本 ⇒ 九类全部 ⚠️夹具，且**没有一条 ✅**（这就是"没量到"与"通过"分开的那个记号）。 */
+    yes('P3 反向对照：余量上限调到 3 也仍然渲染满十类（类别优先，上限只管余量）',
+      p2.queue.length === 10, String(p2.queue.length));
+    /* 零样本 ⇒ 全部类别 ⚠️夹具，且**没有一条 ✅**（这就是"没量到"与"通过"分开的那个记号）。 */
     const p3 = await selectByCategory([], fakeOpt);
     const covEmpty = coverageLines(p3.counts, p3.usedFixture);
-    yes('P4 零真文件 ⇒ 九类都是 ⚠️夹具、零 ✅（报告必须一眼看出这轮没有用户文件）',
+    yes('P4 零真文件 ⇒ 每类都是 ⚠️夹具、零 ✅（报告必须一眼看出这轮没有用户文件）',
       covEmpty.every((l) => l.mark === '⚠️') && p3.probed === 0, JSON.stringify(covEmpty.map((l) => l.mark)));
     /* 夹具也拿不出来（仓库缺件）⇒ ❔SKIP，且这条要能让退出码变红（主循环里 skipped>0 ⇒ 1）。
      *   ▸ 这里改的是**共享数组里的一个元素**，所以必须 try/finally 复位——

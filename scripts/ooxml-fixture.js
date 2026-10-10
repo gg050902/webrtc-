@@ -214,6 +214,21 @@ function makeDocx(opts) {
   <w:tr><w:tc><w:p><w:r><w:t>外层下</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>&nbsp;</w:t></w:r></w:p></w:tc></w:tr>
 </w:tbl>` : ''}
 <w:p><w:hyperlink r:id="rId5"><w:r><w:t>外部链接</w:t></w:r></w:hyperlink></w:p>
+  ${o.vml ? /* ★ 2026-10-10：VML 那条路（`w:pict` + `v:shape` + `v:imagedata r:id`）。
+     ▎为什么必须有它：用户那份 469KB 的《数学建模》论文模板里，包中**有 5 张真 JPEG、7 处引用**，
+     而内核只认 DrawingML 的 `a:blip` ⇒ 一张都没备料 ⇒ 界面 49 个灰方块、一行解释都没有，
+     于是他说"word 共享还是没有实现"。这条形状以前**不在任何夹具里**，所以 302 条断言全绿
+     也照样漏（坑 130：自己写的夹具测的是记忆，不是能力）。
+     ▸ 一份里给三种：① VML 图片（该出 `<img>`）；② 纯矢量线条（该出〔图形〕、不该被当空段吞掉）；
+        ③ 连续 20 个空段（该折叠成一行"省略 N 个空行"，Word 拿空段当排版间距）。 */ `
+<w:p><w:r><w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml" id="校徽" style="WIDTH:80pt;HEIGHT:80pt" type="#_x0000_t75"><v:imagedata r:id="rId11" o:title="校徽" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/></v:shape></w:pict></w:r></w:p>
+<w:p><w:r><w:pict><v:line xmlns:v="urn:schemas-microsoft-com:vml" from="0,0" to="300,0" strokeweight="1.5pt"/></w:pict></w:r></w:p>
+${'<w:p/><w:p/><w:p/><w:p/><w:p/><w:p/><w:p/><w:p/><w:p/><w:p/><w:p/><w:p/><w:p/><w:p/><w:p/><w:p/><w:p/><w:p/><w:p/><w:p/>'}
+<w:p><w:r><w:t>空行之后才有正文</w:t></w:r></w:p>` : ''}
+  ${o.blanks ? /* 只测"折叠阈值"用：N 个连续空段（`<w:p/>` 是 Word 里最常见的空段写法）。
+     与上面的 vml 分开一个开关，因为**反向对照要的是"3 段不许折叠"**，
+     把它塞进 vml 那份里两条断言就分不开了（一条断言只问一个问题）。 */
+    Array.from({ length: Number(o.blanks) }, () => '<w:p/>').join('\n') + '\n<w:p><w:r><w:t>空行之后的正文</w:t></w:r></w:p>' : ''}
 <w:p><w:hyperlink r:id="rId6"><w:r><w:t>内部锚点</w:t></w:r></w:hyperlink></w:p>
 ${o.noImage ? '' : `<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="图一" descr="示意图"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="1" name="图一" descr="示意图"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rId10"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>`}
 <w:p><w:r><w:t xml:space="preserve">尾部保留空格  </w:t></w:r></w:p>
@@ -233,6 +248,7 @@ ${o.noImage ? '' : `<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.ope
 <Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/a_(b)" TargetMode="External"/>
 <Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="#_Toc123" TargetMode=""/>
 <Relationship Id="rId10" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+${o.vml ? '<Relationship Id="rId11" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image2.png"/>' : ''}
 </Relationships>`;
 
   const files = [
@@ -243,6 +259,10 @@ ${o.noImage ? '' : `<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.ope
     { name: 'word/_rels/document.xml.rels', data: rels },
   ];
   if (!o.noImage) files.push({ name: 'word/media/image1.png', data: PNG_1PX, store: true });
+  /* VML 那张图**必须用另一个 rid、另一个部件**：跟默认那张共用 rId10 的话，
+   * "只认 a:blip"的旧代码也能从备料表里蹭到图，R 组那条断言就白写了
+   * （坑 123：变异路径没被执行过的 A/B 也是假绿——这次是"变异根本没生效"）。 */
+  if (o.vml) files.push({ name: 'word/media/image2.png', data: PNG_1PX, store: true });
   return zipSync(files, o);
 }
 

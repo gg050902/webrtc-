@@ -55,6 +55,7 @@ const CLASSES = [
   { id: 'rtf-in-doc', cn: 'RTF 冒充 .doc（GBK 成对解码）', fix: rtfFixture, fixFrom: '我写的最小夹具' },
   { id: 'html-in-doc', cn: '网页冒充 .doc', fix: htmlFixture, fixFrom: '我写的最小夹具' },
   { id: 'docx-nested', cn: 'docx 表里套表（嵌套深度 ≥2）', fix: () => ({ p: null, name: 'nested.docx', bytes: require('./ooxml-fixture.js').makeDocx({ nested: true }) }), fixFrom: '我写的夹具（另一个 ZIP 实现打包）' },
+  { id: 'docx-vml', cn: 'docx 的 VML 图元（w:pict + v:imagedata，旧式图片与矢量线条）', fix: () => ({ p: null, name: 'vml.docx', bytes: require('./ooxml-fixture.js').makeDocx({ vml: true }) }), fixFrom: '我写的夹具（照用户那份真模板的形状做：VML 图片 + 纯线条 + 20 个空段）' },
   { id: 'xlsx-numfmt', cn: 'xlsx 百分比/货币格式（值 + 格式码）', fix: () => ({ p: null, name: 'money.xlsx', bytes: require('./ooxml-fixture.js').makeXlsx({ money: true }) }), fixFrom: '我写的夹具（另一个 ZIP 实现打包）' },
   { id: 'pptx-notes', cn: 'pptx 备注页（notesSlides 不许当观众页）', fix: () => ({ p: null, name: 'notes.pptx', bytes: require('./ooxml-fixture.js').makePptx({ notes: true }) }), fixFrom: '我写的夹具（另一个 ZIP 实现打包）' },
   { id: 'broken-zip', cn: '坏 ZIP（截断：中央目录没了）', fix: () => { const b = require('./ooxml-fixture.js').makeDocx({}); return { p: null, name: 'truncated.docx', bytes: b.slice(0, Math.floor(b.length / 2)) }; }, fixFrom: '我自己截断的夹具（故意坏）' },
@@ -91,6 +92,9 @@ async function classify(p, bytes) {
     const names = zip.names();
     if (names.includes('word/document.xml')) {
       const xml = String((await zip.text('word/document.xml')) || '');
+      /* VML 优先于"嵌套"：一份用旧式图元的论文模板往往也有表格，而**它踩的是另一条代码路径**
+       * （`v:imagedata r:id` vs `a:blip r:embed`）——类别要按"哪条路径没被覆盖"分，不按扩展名分。 */
+      if (/<v:imagedata|<w:pict\b/.test(xml)) return 'docx-vml';
       return xmlTagDepth(xml, 'w:tbl') >= 2 ? 'docx-nested' : 'docx';
     }
     if (names.includes('xl/workbook.xml')) {
