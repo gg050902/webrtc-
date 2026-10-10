@@ -8043,10 +8043,36 @@ function renderCapLatency(latMs, stage) {
   capLat.className = 'cap-lat' + (ms <= 3000 ? ' ok' : ms <= 6000 ? ' warn' : ' bad');
   const f = (v) => (v / 1000).toFixed(1);
   capLat.title = `说完一句话 → 字幕定稿上屏：本句 ${sec}s`
-    + (stage ? `（末段拆分：等待 ${f(stage.wait)}s + 转写 ${f(stage.trans)}s）` : '')
+    + (stage ? `（${capStageParts(stage, f)}）` : '')
     + `\n最近 ${capLatWindow.length} 句：均值 ${f(avg)}s、最慢 ${f(slow)}s`
     + `\n均值里 等待 ${f(avgWait)}s / 转写 ${f(avgTrans)}s —— 等待长就调分段与静音判定，转写长就换引擎`
     + '\n（服务器实测，不含浏览器渲染）';
+}
+/* ★ 2026-10-10（D1）悬浮提示摊开"等在哪一格"——服务器随定稿下发 stage，六块只报**量到的那几块**。
+ * ▎为什么要写在界面里：同一份账本只有复盘工具能读，等于"优化完只有开发者看得见"（守则 11）；
+ *   而"等待 vs 转写"两块的旧文案已经解释不了新的读数（闸等待与整句重转都藏在大块里）。
+ * ▸ 缺失的块**不补 0**，也不写进提示：0 在这里的含义是"这一格真没等"，
+ *   与"这台服务器还没算这一层"是两种事实，前者由服务器写 0、后者由服务器不写字段（坑 155）。 */
+const CAP_STAGE_LABELS = [
+  ['silence', '等静音判定'], ['tail', '等封口'], ['queue', '调度'],
+  ['trans', '转写'], ['refine', '整句重转'], ['gate', '等成句闸'],
+];
+const CAP_WAIT_KEYS = ['silence', 'tail', 'queue'];
+const CAP_REST_KEYS = ['trans', 'refine', 'gate'];
+/* ▸ 三块子等待（静音判定/封口/调度）**齐了才拆**，否则退回整块 `wait`——
+ *   老服务器只发 `{wait, trans}`，硬按六格读会把"等待"整块弄没（把可用功能读成缺失，那也是撒谎）。
+ * ▸ 缺失的块不补 0、也不写进提示：这里的 0 含义是"这一格真没等"，
+ *   与"这台服务器还没算这一层"是两种事实（前者服务器写 0、后者不写字段，坑 155）。 */
+function capStageParts(stage, f) {
+  if (!stage) return '拆分：这台服务器还没算这一层（重启 3001 之后的新会议才有）';
+  const has = (k) => Number(stage[k]) >= 0;
+  const cn = (k) => (CAP_STAGE_LABELS.find((p) => p[0] === k) || [, k])[1];
+  const parts = [];
+  if (CAP_WAIT_KEYS.some(has)) CAP_WAIT_KEYS.filter(has).forEach((k) => parts.push(`${cn(k)} ${f(Number(stage[k]))}s`));
+  else if (has('wait')) parts.push(`等待(静音判定+封口+调度) ${f(Number(stage.wait))}s`);
+  CAP_REST_KEYS.filter(has).forEach((k) => parts.push(`${cn(k)} ${f(Number(stage[k]))}s`));
+  return parts.length ? '拆分：' + parts.join(' + ')
+    : '拆分：这台服务器还没算这一层（重启 3001 之后的新会议才有）';
 }
 function renderCapDiag() {
   if (!capDiagList) return;
@@ -9043,6 +9069,16 @@ function buildSentryReport(all, sentry, voiceLats) {
     latLines.push(`- 其中（末段口径，只用于归因方向）：等静音判定/调度 中位 ${(med(waits) / 1000).toFixed(1)}s`
       + ` · 模型转写 中位 ${(med(trans) / 1000).toFixed(1)}s（样本 ${Math.min(waits.length, trans.length)}）`);
     const w = med(waits), t = med(trans);
+    /* ★ 2026-10-10（D1）日报也摊开六格：只报**量到的**那些，缺的不补 0、也不写进来。
+     *   「等成句闸」与「整句重转」是这次新增的两格——它们加起来常比模型耗时还大，
+     *   而旧的两格文案会把这坨全算进"等待"，于是处方指向分段窗口（错的）。 */
+    const stRows = all.map((e) => e && e.fin === 'silence' && e.stage).filter(Boolean);
+    const six = CAP_STAGE_LABELS.map(([k, cn]) => {
+      const xs = stRows.map((st) => Number(st[k])).filter((v) => Number.isFinite(v) && v >= 0);
+      return xs.length ? `${cn} 中位 ${(med(xs) / 1000).toFixed(1)}s(n=${xs.length})` : null;
+    }).filter(Boolean);
+    if (six.length >= 2) latLines.push(`- 延迟构成（${stRows.length ? 'v' + (stRows[0].v || 1) : '-'}）：${six.join(' · ')}`);
+    else latLines.push('- 延迟构成：这台服务器的账本里不足两格可拆（重启 3001 之后的新会议才有六格）');
     if (w > t * 1.5) latLines.push('  ▸ 大头在**等待**：先调 asrSegmentSec / 静音确认阈值，换模型收益有限');
     else if (t > w * 1.5) latLines.push('  ▸ 大头在**模型**：等静音已经很快，要提速只能换引擎/降档或上 GPU');
     else latLines.push('  ▸ 等待与推理各占一半：两头都有油水，先攻绝对值更大的那个');

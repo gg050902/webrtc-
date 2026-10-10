@@ -1257,10 +1257,29 @@ const emit = (ev, payload) => {
     name: '小张', text: '第八句', latMs: 4200, stage: { wait: 1500, trans: 2700 },
   }));
   ok('延迟拆分：悬浮提示摊开"等待 + 转写"两段（慢在哪一段要能一眼看出）',
-    capLatEl.title.includes('等待 1.5s') && capLatEl.title.includes('转写 2.7s'));
+    capLatEl.title.includes('等待(静音判定+封口+调度) 1.5s') && capLatEl.title.includes('转写 2.7s'));
   guard('延迟拆分：老服务器不带 stage', () => emit('asr-caption', { name: '小张', text: '第九句', latMs: 2000 }));
   ok('延迟拆分：没有 stage 时不编拆分（只显示总数，功能不降级也不虚报）',
-    capLatNum.textContent === '2.0s' && !capLatEl.title.includes('末段拆分'));
+    capLatNum.textContent === '2.0s' && !capLatEl.title.includes('拆分：'));
+  /* ★ 2026-10-10（D1）六格拆分到界面：服务器已经算出六块时，提示必须**逐块报出来**，
+   *   否则这次拆分只有复盘工具读得到，用户侧仍然是"4s 但不知道慢在哪"（守则 11：改好了还要被看到）。 */
+  guard('延迟拆分：v2 服务器带六块', () => emit('asr-caption', {
+    name: '小张', text: '第十句', latMs: 4261,
+    stage: { v: 2, wait: 17, trans: 3162, silence: 1200, tail: 300, queue: 3, refine: 686, gate: 395 },
+  }));
+  ok('延迟拆分：六块齐时逐块摊开（等静音判定/等封口/调度/转写/整句重转/等成句闸）',
+    ['等静音判定 1.2s', '等封口 0.3s', '调度 0.0s', '转写 3.2s', '整句重转 0.7s', '等成句闸 0.4s']
+      .every((s) => capLatEl.title.includes(s)), capLatEl.title.replace(/\n/g, ' | ').slice(0, 220));
+  ok('延迟拆分：三块子等待齐了就不再显示整块 wait（同一段等待不许在提示里数两遍）',
+    !capLatEl.title.includes('等待(静音判定+封口+调度)'));
+  /* 「0 计入、缺失不补」这条值域纪律在界面上也要成立：tail=0 要出现"等封口 0.0s"，
+   * 而缺 refine/gate 时那两句根本不该出现（写了就是编数，坑 155）。 */
+  guard('延迟拆分：只有静音判定与封口（重转被让路、闸没量到）', () => emit('asr-caption', {
+    name: '小张', text: '第十一句', latMs: 1800, stage: { v: 2, wait: 1300, trans: 500, silence: 1200, tail: 0 },
+  }));
+  ok('延迟拆分：量到的 0 要显示（"等封口 0.0s"=抢跑生效），没量的那两格不许冒出来',
+    capLatEl.title.includes('等封口 0.0s') && !capLatEl.title.includes('整句重转') && !capLatEl.title.includes('等成句闸'),
+    capLatEl.title.replace(/\n/g, ' | ').slice(0, 200));
 
   /* ---- ★ 2026-10-03 第 38 步：播报延迟（看到答案 → 听见它开口）----
    * ▎断言的重点与字幕那条一样：**没有锚点就不许编数**。
@@ -1310,7 +1329,12 @@ const emit = (ev, payload) => {
    * ▎为什么要断这个：日报是"早上拿到手的那份东西"，如果它不含链路质量，
    *   这一夜到底快不快就只剩"当时屏幕上瞟过一眼"——**证据必须能过夜**。 */
   ok('字幕定稿把服务器实测的 lat 一起存进本地账本（日报与导出都靠它）',
-    vm.runInContext('cap.log[cap.log.length - 1].lat', ctx) === 2000);
+    /* ▸ 原来写的是 `cap.log[cap.log.length - 1]`（拿"最后一条"当"我刚才发的那条"）——
+     *   本轮在前面插了六块拆分的用例之后它就红了：红的不是功能，是**断言站错了位置**。
+     *   按内容找那一条才是本来想说的事，而且不再依赖用例之间的顺序（坑 44 同族）。 */
+    vm.runInContext(`(cap.log.find((e) => e.text === '第九句') || {}).lat`, ctx) === 2000
+    && vm.runInContext(`(cap.log.find((e) => e.text === '第八句') || {}).lat`, ctx) === 4200,
+    vm.runInContext(`JSON.stringify((cap.log.find((e) => e.text === '第九句') || {}).lat)`, ctx));
   /* ▸ 这里刻意用**区间**而不是 ===2300：ms = Date.now() - (Date.now()-2300)，
    *   两次取时之间只要跨过 1ms 就变成 2301 —— 上一版写成精确相等，
    *   于是一条正确的实现会因为**机器的抖动**偶发判红。
