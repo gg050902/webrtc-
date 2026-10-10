@@ -3909,6 +3909,12 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
       const handleSegment = async (full, baseName) => {
         if (doneSet.has(baseName)) return false;
         doneSet.add(baseName);
+        /* ★ 2026-10-10（D1）"决定要转这一段"的时刻。它与下面 eng.startedAt 之差 = **调度/排队**
+         *   （stat/copy/能量闸/并发闸/池子在途），与 silenceAt 之差 = **等封口**。
+         *   以前只有一个 `wait`，把"静音判定要等 1.2s"与"轮询没捞到段"与"引擎在排队"
+         *   压成同一个数——三者的处方完全相反（分别是 FLUSH_MS、asrSegmentSec/抢跑、worker 池），
+         *   所以拿着总数优化等于掷骰子（10-03b 那条"拆分才是可操作信息"，这次拆到第三层）。 */
+        const pickedAt = Date.now();
         let size = 0;
         try { size = fs.statSync(full).size; } catch (e) { dbg(baseName, 'stat 失败'); return false; }
         dbg(baseName, `size=${size}`);
@@ -4090,6 +4096,26 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
         const grew = merged !== u.text;
         if (grew) u.text = merged.slice(0, 800);
         else dbg(baseName, '句内碎片/重复：只续窗不追加');
+        /* ★ 2026-10-10（D1）文本真的变长了 = "有人在说新内容" = 上一段静音不算数 ⇒ 复位静音时间戳。
+         *   不复位的后果是可测量的那一块被永久冻结：`silenceAt` 会停在**第一次**成立的时刻，
+         *   于是 stage.silence 会随句子越拖越长（假数据看起来比缺失更真，坑 90 那两个时钟同源）。
+         *   ▸ 但**复位之前要先把这一句的读数取走**：本次真跑实测首句的 stage 只报出
+         *     `queue`（调度 3ms），`silence/tail` 两个字段压根没出现——因为下面那几行读的是
+         *     已经被清零的 `u.silenceAt`。"清理动作的作用域比它看起来更大"（坑 66/100 那条纪律）
+         *     在这里的形状是：**同一句代码里既负责读数又负责清零，顺序错了就读不到，而且不报错**。 */
+        const silenceAtWas = u.silenceAt || 0;
+        if (grew) u.silenceAt = 0;
+        /* ★ 2026-10-10（D1 第二半）把"这一段是几点被捞起来的"也记到句子上。
+         *   ▸ 为什么不能只在 append 里算 silence/tail：**封口段被捞起时静音判定往往还没成立**
+         *     （RMS 行本身滞后 ~1s，而段是在转写期间才封口的），于是 append 时刻算不出这两块——
+         *     真跑实测第一次只有 `{wait,trans,queue}`。定稿才是"这一句的账"合上的时刻，
+         *     所以这里把 pickedAt 存下来，由 finalize 补算（见下面 finalizeUtterance 那段）。 */
+        u.pickedAt = pickedAt;
+        /* 这三行是上面那段注释里的判据本体：**静音戳必须落在"这一段的捞起→开转"之前，
+         * 且不早于最后一次有声**——四个时刻任何一处顺序反了，就说明这块账不是这次的，宁可不写。
+         * （`lastVoiceTs ≤ silenceAtWas ≤ pickedAt ≤ eng.startedAt` 就是这条拆分的成立条件。） */
+        const stampUsable = !!(silenceAtWas && lastVoiceTs && pickedAt &&
+          silenceAtWas >= lastVoiceTs && pickedAt >= silenceAtWas && eng.startedAt >= silenceAtWas);
         u.textAt = grew ? nowU : (u.textAt || u.lastAt || nowU);
         u.lastAt = nowU;
         /* ★ 2026-10-03 把延迟**拆开**记账：光有一个总秒数没法指导优化——
@@ -4101,8 +4127,26 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
          *     用末段的拆分去解释总延迟才成立（用首段会把等待算成不存在的量）。
          *   ▸ 后到的段覆盖前一段的记录，所以 u.stage 始终是"最后一段"的账。 */
         u.stage = {
+          /* ★ 2026-10-10（D1）拆分的能力版本。加一格新字段时**旧账本里它压根不存在**，
+           *   而"不存在"有两种原因：① 那批会是旧代码跑的（⇒ 该说"重启 3001 才有"）；
+           *   ② 这一句真的没走到那一步（⇒ 该说"这句没等它"）。只看字段在不在分不开这两种病，
+           *   报错误的处方会让人去改一个本来正确的参数（坑 82/133）。写一个数就能分开：v=2 起有六块。 */
+          v: 2,
           wait: lastVoiceTs && eng.startedAt >= lastVoiceTs ? eng.startedAt - lastVoiceTs : 0,
           trans: transMs,
+          /* ★ 2026-10-10（D1）把上面那个 wait 再拆三块。**只有量到、且这块账真属于本次转写才写**——
+           *   写 0 会被下游读成"这一段没有等待"（坑 155/82：缺省不等于零，读数宁可缺失）。
+           *   ▸ silence：说完 → 静音判定成立（≈ FLUSH_MS，处方是调 asrSegmentSec/FLUSH_MS 之前先看它）
+           *   ▸ tail ：静音成立 → 真的把这一段捞起来转（= 等 ffmpeg 封口 + 轮询节奏，**C2 买的就是这一块**）
+           *   ▸ queue：捞起来 → 引擎真的开始（= stat/copy/并发闸/池子在途，H1a/H5b 的账）
+           *   ▸ ★ 真跑第三次校正（`stampUsable`）：第一次实测出现 `silence=4746ms` 而同一句
+           *     `wait=50ms` —— 静音戳**比引擎启动还晚**，说明那块戳属于**另一轮**（人又开口了、
+           *     但这一段文字没变长所以没复位）。拿它算出来的"等静音判定"是别的地方的等待，
+           *     加进中位数就是把不存在的账报成读数。判据：**戳必须落在这次转写之前**
+           *     （≤ pickedAt ≤ eng.startedAt），否则整块省略——"没量到"由下游如实报"没走到"。 */
+          silence: (stampUsable && lastVoiceTs) ? silenceAtWas - lastVoiceTs : undefined,
+          tail: stampUsable ? pickedAt - silenceAtWas : undefined,
+          queue: (pickedAt && eng.startedAt >= pickedAt) ? eng.startedAt - pickedAt : undefined,
         };
         utterances.set(memberId, u);
         io.to(roomNumber).emit('asr-caption', { name: speakerName, text: u.text.slice(0, 200), interim: true });
@@ -4270,6 +4314,11 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
         const stitched = u.text.slice(0, 500);
         let text = stitched;
         let refined = null;
+        /* ★ 2026-10-10（D1）重转自己那一格的账：真跑量到 `gate=1.1~1.4s`，而日志里
+         *   `整句重转…0.7s` —— 也就是"等成句闸"里有一半以上其实是**第二次推理**在跑。
+         *   混在一起报会让人去调轮询节奏（没用），分开才知道处方是 H5b 让路/多 worker/关掉重转。
+         *   ▸ 计时含排队（从决定发起一直到拿到结果），因为对用户而言那段时间就是没出字。 */
+        let refineMs = 0;
         const canRefine = ASR_REFINE_ON && ua && uttSegmentKinds(ua.chunks) >= REFINE_MIN_CHUNKS;
         /* ★ 2026-10-07 H5b：worker 正在忙别家的段时**让路**（判据在发起之前读，await 之后读到的是自己）。
          *   ▸ `bench:asr-multi` 实测：4 路并发下开重转把分段 p95 从 1.40s 顶到 2.21s、
@@ -4285,7 +4334,9 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
           logEvent('debug', 'asr-refine-yield', { roomNumber, member: memberId, busy: asrEngineBusy });
         } else if (canRefine) {
           COLLAB.refine.n += 1;
+          const tRefine0 = Date.now();
           const r = await refineUtterance(ua.chunks);
+          refineMs = Date.now() - tRefine0;
           COLLAB.refine.ms += r ? r.ms : 0;
           if (r && Asr.preferRefined(stitched, r.text)) {
             refined = r;
@@ -4342,6 +4393,21 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
          *   ▸ 判据只写在这一处，前端与日报都不用再猜（坑 47）。 */
         const latMs = reason === 'silence' && lastVoiceTs && now > lastVoiceTs && now - lastVoiceTs < 120000
           ? now - lastVoiceTs : 0;
+        /* ★ 2026-10-10（D1 第三块：等成句闸）真跑第一次只报出 `{wait,trans,queue}`，
+         *   而 `latMs=3.7s` 里 wait+trans+queue 只占 ~0.8s —— **剩下 2.9s 在谁身上？**
+         *   答案是"文字早就到齐了，成句闸还没开"：`segInFlight===0` 与 `!tailHold` 这两道守卫
+         *   （防"尾巴还在模型里就定稿"= 重复接话）要等下一轮轮询才成立。
+         *   ▸ 这一格以前完全不可见，而它是当前**最大的一块**（比模型耗时大 7 倍）——
+         *     没有它，报告会说"慢在转写"，处方就开错了（10-03b：拆分才是可操作信息）。
+         *   ▸ 只在 `silence` 定稿时写（别的 reason 下 u.lastAt 的语义不是"文字到齐"），
+         *     且不许是负的：现在时刻早于最后追加时刻说明这一句被别的路径改写过，宁缺不假。 */
+        if (reason === 'silence' && u.stage && u.lastAt && now >= u.lastAt) {
+          /* ▸ 重转单独一格，剩下的才是"闸真的开着等轮询"——两块的处方相反
+           *   （前者=H5b 让路/多 worker/关重转，后者=轮询节奏与 segInFlight/tailHold 守卫）。 */
+          if (refineMs > 0) u.stage.refine = refineMs;
+          const gateMs = now - u.lastAt - refineMs;
+          if (gateMs > 0) u.stage.gate = gateMs;
+        }
         bumpCapLat(latMs);
         /* ★ 2026-10-05 定稿打点：latMs 之外把 stage 与文本头一起记下——"这一句到底在多快、
          *   慢在哪一段"要能在 ASR_DEBUG 时间线里一读即明（与上面的「成句」行配对）。 */
@@ -4364,7 +4430,7 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
            *   （是等静音判定，还是模型推理？两者的处方完全相反）。
            *   10-03b 立的纪律是"拆分才是可操作信息"，那时只做到了界面这一层，
            *   账本这一层漏了 = 现场一过就再也查不到（坑 56"内层算出来了、外层没带出来"第四次）。 */
-          stage: u.stage && (u.stage.wait || u.stage.trans) ? u.stage : undefined,
+          stage: u.stage && (u.stage.wait || u.stage.trans || u.stage.silence || u.stage.tail || u.stage.queue) ? u.stage : undefined,
         }]);
         io.to(roomNumber).emit('asr-caption', {
           name: speakerName, text: text.slice(0, 200), latMs,
@@ -4551,6 +4617,15 @@ async function startAiAudioPipe(roomNumber, producer, memberId) {
            *   尾段文字还没归并进来就定稿，等于把同一句话拆成两句（抢跑入口的老病）。 */
           try {
             const now = Date.now();
+            /* ★ 2026-10-10（D1）给"这句的静音 stretch 第一次成立"盖时间戳，供 stage.silence/tail 拆分用。
+             *   ▸ 必须打在**这里**（每轮都过一遍），不能打在下面那个成句块里——
+             *     那个块的进入条件已经要求 `segInFlight===0 && !tailHold`，
+             *     在那儿取到的时刻等于"封口完了"，"等封口多久"这一块的长度就被自己抹成 0，
+             *     而它正是 D1 要量的那块（**观测点的位置决定了它能不能量到这件事**，坑 76 的仪表版）。
+             *   ▸ 只认 false→true 那一跳；文本一变长就复位（见 appendSentence）。 */
+            if (lastVoiceTs && now - lastVoiceTs > FLUSH_MS && utterances.size) {
+              for (const uAny of utterances.values()) if (!uAny.silenceAt) uAny.silenceAt = now;
+            }
             /* ★ 2026-10-07 每轮量一次"还有没有装着这句话尾巴的段没被消费"（判据见
              *   scanTailSegments 上方那段）。两处都要用：调试行要说清为什么慢一拍，
              *   成句闸要据此**先别定稿**。声明放在这里而不是循环体内——
@@ -9058,6 +9133,13 @@ async function runAsrSelfTest() {
      *   别让测试设施自己的痕迹被数成被测对象的产出）。 */
     const isNoopNotice = (m) => /^⚠️ 我发出了/.test(String((m && m.text) || ''));
     if (process.env.TEST_ASR_DEBUG) probe.onAny((ev, ...args) => console.log(`🧪 [probe] ${ev}`, JSON.stringify(args).slice(0, 120)));
+    /* ★ 2026-10-10（D1）定稿那一帧的 `stage` **单独整条打出来**：上面的探针把 JSON 截到 120 字符，
+     *   而我们这次新加的 `silence/tail/gate` 恰好排在被切掉的那一段——
+     *   "机制写了、日志里看不见"和"机制没跑"在同一段输出里长得一模一样（坑 76）。
+     *   ▸ 只打 fin=silence 的定稿帧（半句帧每秒都在刷，会把日志淹掉）。 */
+    if (process.env.TEST_ASR_DEBUG) probe.on('asr-caption', (c) => {
+      if (c && c.fin === 'silence') console.log(`🧪 [probe] 定稿拆分 ${c.fin} lat=${c.latMs}ms stage=${JSON.stringify(c.stage)}`);
+    });
     probe.on('chat-message', (m) => { if (m && m.from === 'ai-bot' && m.text && !isGreeting(m) && !isNoopNotice(m)) botReplies.push(m); });
     /* ★ 2026-10-02 顺手把"嘴"也纳入断言：音频段与失败通知都要有落点。
      *   用户报的"后边它回答没有说话"最难查的地方在于——**它到底有没有试图说话**，

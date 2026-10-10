@@ -125,6 +125,10 @@ function quantile(sorted, q) {
  * @param caps   字幕条目（账本原样）
  * @param events 该房间的结构化事件
  */
+/* 四分构成的中文标签（写在一处，别在拼字符串的地方各写一份） */
+const LABELS = { silence: '等静音判定', seal: '等封口', queue: '调度', trans: '转写', refine: '整句重转', gate: '等成句闸' };
+const SPLIT_KEYS = ['silence', 'seal', 'queue', 'trans', 'refine', 'gate'];
+
 function analyzeRoom(caps, events) {
   const asrCaps = caps.filter((e) => e.asr === true && !e.bot);
   const fin = asrCaps.filter((e) => e.fin);
@@ -190,6 +194,38 @@ function analyzeRoom(caps, events) {
   const lat = fin.filter((e) => e.fin === 'silence' && Number(e.lat) > 0).map((e) => Number(e.lat)).sort((a, b) => a - b);
   const finKinds = {};
   for (const e of fin) finKinds[e.fin] = (finKinds[e.fin] || 0) + 1;
+  /* ★ 2026-10-10（D1）把"等"这一坨拆成三块分别取中位：**等静音判定 / 等封口 / 调度**。
+   *   ▎为什么要拆：以前只有一个 wait，"FLUSH_MS 定太宽"、"ffmpeg 封口慢/轮询没捞到"、
+   *   "引擎在排队（H1a/H5b 那本账）"三种病在报告里长得一模一样，而处方互相冲突。
+   *   C2（尾巴抢跑）做完之后"等封口"这一块才真的会变小——没有这一格，C2 的效果没法在
+   *   **真实会议**的账本上被看见，只能靠自测数字（那正是 10-03 之后反复犯的老账）。
+   *   ▸ 老服务器不会写 stage ⇒ 样本 0 ⇒ 报"未采到"，**绝不补 0**（坑 155：缺省不等于零）。 */
+  const splitOf = (k) => {
+    /* ★ 2026-10-10 校正值域：**负数**排除（乱序/哨兵值，不是等待时长），**0 计入**——
+     *   服务器只在"顺序成立"时才写数，所以 0 的含义是"这一格真的没等"
+     *   （封口段比静音判定先到 = C2 的抢跑生效了）。把 0 当缺失，就等于
+     *   "C2 生效"这件事在真实报告里永远看不见（坑 76 的反面：量到了 0 也是量到了）。 */
+    const xs = fin.filter((e) => e.fin === 'silence' && e.stage && Number.isFinite(Number(e.stage[k])) && Number(e.stage[k]) >= 0)
+      .map((e) => Number(e.stage[k])).sort((a, b) => a - b);
+    return { n: xs.length, med: xs.length ? quantile(xs, 0.5) : null };
+  };
+  /* ★ 2026-10-10 真跑量到的形态：`stage` 里只有 `wait/trans/queue`，**`silence/tail` 根本没有**——
+   *   这不是仪器坏了，是那句话**真的没等这两格**（C2 的抢跑放行绕过了静音判定与封口）。
+   *   ▸ 于是"没采到"必须分成两种说法，因为它们的处方完全相反（坑 82：误导的解释比没有解释更糟）：
+   *     ① 整条 `stage` 都没有 ⇒ 这台服务器还没算这一层 ⇒ **重启 3001**；
+   *     ② 有 `stage` 但缺这一块 ⇒ 这一格对这场会的句子不适用（走了抢跑/别的定稿路径）。
+   *     把 ② 报成 ① 会让人去重启一台已经是新的服务器（坑 107 那句"我改了呀怎么还不行"的反向版本）。 */
+  const stageRows = fin.filter((e) => e.fin === 'silence' && e.stage);
+  /* 能力版本：`stage.v` 从 2 起才有六块。**只看"有没有 stage"分不开两种病**——
+   * ① 这批会是旧代码跑的（该说"重启 3001 才有"）② 这一句真的没走到那一步（该说"这句没等它"）。
+   * 处方完全相反，所以读版本而不是猜字段（坑 82/133：过期声明与机制变更）。 */
+  const stageVersion = stageRows.reduce((a, e) => Math.max(a, Number(e.stage && e.stage.v) || 1), 0);
+  const split = {
+    anyStage: stageRows.length, version: stageVersion,
+    stageTotal: fin.filter((e) => e.fin === 'silence').length,
+    silence: splitOf('silence'), seal: splitOf('tail'), queue: splitOf('queue'),
+    trans: splitOf('trans'), refine: splitOf('refine'), gate: splitOf('gate'),
+  };
 
   /* ④ 幻觉：判据用**生产代码那一个函数**，不另写一份 */
   const noise = asrCaps.filter((e) => Asr.noiseRiffReason(String(e.text || '')));
@@ -368,7 +404,7 @@ function analyzeRoom(caps, events) {
     caps: caps.length, asrCaps: asrCaps.length, finalized: fin.length,
     spanMs: all.length > 1 ? all[all.length - 1] - all[0] : 0,
     stalls, fragCount: frags.length, fragShare: fin.length ? frags.length / fin.length : 0, dups,
-    lat, latN: lat.length, finKinds,
+    lat, latN: lat.length, finKinds, split,
     noise: noise.length, noiseExamples: noise.slice(0, 2).map((e) => String(e.text).slice(0, 40)),
     skipped: skipped.length, bands, aboveGateSkipped,
     gaveUp: gaveUp.length, respawn: respawn.length, crashRespawn: crashRespawn.length,
@@ -442,7 +478,28 @@ function verdictLines(m) {
       + `；定稿原因分布 ${Object.entries(m.finKinds).map(([k, v]) => `${k}=${v}`).join(' ') || '(无)'}`);
   } else {
     add(m.lat[Math.floor(m.latN * 0.9)] > 6000 ? 'bad' : m.latN && quantile(m.lat, 0.5) > 3000 ? 'warn' : 'ok',
-      '定稿延迟', `中位 ${fmtSec(quantile(m.lat, 0.5))} · p90 ${fmtSec(quantile(m.lat, 0.9))} · 最慢 ${fmtSec(m.lat[m.latN - 1])}（n=${m.latN}，只算人真停了嘴的 silence 定稿）`);
+      '定稿延迟', `中位 ${fmtSec(quantile(m.lat, 0.5))} · p90 ${fmtSec(quantile(m.lat, 0.9))} · 最慢 ${fmtSec(m.lat[m.latN - 1])}（n=${m.latN}，只算人真停了嘴的 silence 定稿）`
+      /* ★ D1：延迟不是只有一个数就完了——说清"等在哪一格"，人才知道该动哪个旋钮。 */
+      + (() => {
+        const sp = m.split || {};
+        const got = SPLIT_KEYS.filter((k) => sp[k] && sp[k].n > 0);
+        const miss = SPLIT_KEYS.filter((k) => !sp[k] || !sp[k].n);
+        if (!got.length) return '\n     构成：未采到（这台服务器还没算这一层 ⇒ 重启 3001 之后的新会议才有；"没采到"不等于"没有等待"）';
+        const parts = got.map((k) => `${LABELS[k]} ${fmtSec(sp[k].med)}(n=${sp[k].n})`).join(' · ');
+        /* ★ 2026-10-10 D1 的"对账"那半句：六块之和应当≈latMs。**差了说明有新的等待来源**
+         *   （本次真跑第一次就是这样发现"等成句闸"那 2.9s 的——没有这一句，那 2.9s 只会让
+         *   人以为是模型慢，然后去换引擎）。残差按中位数算，>25% 才说出来，免得噪音。 */
+        const sum = got.reduce((a, k) => a + (sp[k].med || 0), 0);
+        const med = quantile(m.lat, 0.5);
+        const resid = med > 0 ? med - sum : 0;
+        const tailNote = miss.length ? (sp.version >= 2
+          ? ` · 没走到：${miss.map((k) => LABELS[k]).join('/')}（服务器已在算这几格，只是这一句没等它）`
+          : ` · 未采到：${miss.map((k) => LABELS[k]).join('/')}（这批会的服务器还没有这几格 ⇒ **重启 3001**，不是"没等"）`) : '';
+        const residNote = (got.length >= 2 && Math.abs(resid) > med * 0.25)
+          ? `\n     ⚠️ 六块之和 ${fmtSec(sum)} 与总延迟 ${fmtSec(med)} 差 ${fmtSec(resid)}（>25%）`
+            + '——**有新的等待来源没被这几格覆盖**（先查成句闸/保险丝，别去查模型）' : '';
+        return `\n     构成中位：${parts}` + tailNote + residNote;
+      })());
   }
 
   add(m.finalized === 0 ? 'unknown' : (m.fragShare > 0.3 && m.finalized >= 8 ? 'warn' : 'ok'), '断句碎片',
@@ -726,6 +783,165 @@ function selftest() {
   ], []);
   ok('自检 D：非 silence 定稿的读数一律不进延迟统计（哪怕它看起来是个数）', dirty.latN === 0 && dirty.finalized === 2,
     `n=${dirty.latN} fin=${JSON.stringify(dirty.finKinds)}`);
+
+  /* D1. ★ 延迟构成（拆成六块）。这一组存在的理由：报告里只有一个"中位 2.1s"时，
+   *   "FLUSH_MS 定宽了"、"ffmpeg 封口慢/轮询没捞到"、"引擎在排队"三种病长得一模一样，
+   *   而处方互相冲突（调阈值 / 调分段与抢跑 / 加 worker）。拆开的代价很小，
+   *   收益是 C2（尾巴抢跑）做完之后，它省下的那 1s 第一次能出现在**真实会议**的账本上，
+   *   而不是只出现在我自测跑出来的数字里。
+   *   ▸ 反向对照才是重点：老服务器根本不写 stage ⇒ 必须说"未采到"，
+   *     绝不能报 0.0s（那等于把"这台还没算这一层"洗成"这一层没有等待"，坑 155）。 */
+  /* ★ 2026-10-10 校正值域：**负数**排除（乱序/哨兵值不是等待时长），**0 计入**——
+   *   服务器只在"顺序成立"时才写数，所以 0 的含义是"这一格真的没等"
+   *   （封口段比静音判定先到 = C2 的抢跑生效了）。把 0 当缺失，就等于
+   *   "C2 生效"这件事在真实报告里永远看不见（坑 76 的反面：量到了 0 也是量到了）。 */
+  /* 一份**自洽的时间线**（说完 0 → 1200 静音判定成立 → 1500 捞起尾段 → 1520 引擎开转
+   *   → 2120 转完 → 2130 文字进句 → 2400 成句闸开、定稿）：六块之和=2390 ≈ latMs 2400。
+   *   ▸ 为什么强调自洽：第一版我给 fixture 随手填了五个数，于是"六块之和 vs 总延迟"那条
+   *     告警在自己的自检上响了——**夹具不自洽的自检只能证明脚本会跑，不能证明判据对**（坑 117）。 */
+  const withStage = (n) => Array.from({ length: n }, (_, i) => cap(i * 0.5, `这是第${i + 1}句足够长的话`, {
+    fin: 'silence', lat: 2400 + i * 40,
+    stage: { v: 2, wait: 1520, trans: 600 + i * 10, silence: 1200 + i * 10, tail: 300 + i * 5, queue: 20 + i * 3, refine: 70, gate: 210 },
+  }));
+  const mStage = analyzeRoom(withStage(8), []);
+  const lineStage = verdictLines(mStage).find((l) => l.label === '定稿延迟');
+  ok('自检 D1a：账本带 stage 时六块各算出中位，且那一行真的把构成说出来',
+    mStage.split.silence.n === 8 && Math.abs(mStage.split.silence.med - 1235) <= 10
+    && mStage.split.seal.n === 8 && mStage.split.gate.n === 8
+    && /构成中位/.test(lineStage.text)
+    && /等静音判定/.test(lineStage.text) && /等封口/.test(lineStage.text)
+    && /调度/.test(lineStage.text) && /等成句闸/.test(lineStage.text)
+    /* 自洽的时间线**不该**触发对不上账的告警（否则这条告警会变成背景噪音，谁都不看）。 */
+    && !/差 /.test(lineStage.text),
+    lineStage.text.replace(/\n/g, ' | '));
+  /* ★ D1a2 对不上账必须喊出来：把同一份账本的总延迟改成明显大于六块之和 ⇒ 报 ⚠️ 并给出差额。
+   *   这一条就是本次真跑抓出「等成句闸」那 2.9s 的机制——**没有它，那 2.9s 只会被读成"模型慢"**。 */
+  const mGap = analyzeRoom(Array.from({ length: 6 }, (_, i) => cap(i * 0.5, `这是第${i + 1}句足够长的话`, {
+    fin: 'silence', lat: 6000, stage: { v: 2, trans: 600, silence: 1200, tail: 300, queue: 20, refine: 700 },
+  })), []);
+  const lineGap = verdictLines(mGap).find((l) => l.label === '定稿延迟');
+  ok('自检 D1a2：六块之和与总延迟差 >25% ⇒ 报 ⚠️ 并说"有新的等待来源"（别再指模型）',
+    /差 /.test(lineGap.text) && /新的等待来源/.test(lineGap.text) && /没走到：等成句闸/.test(lineGap.text),
+    lineGap.text.replace(/\n/g, ' | '));
+  /* 三块加起来不许超过原来的 wait——这条挡住"同一段等待被数了两遍"（拆分最常见的错）。
+   *   ▸ 但"不超过"是**下界保护**，不是覆盖证明 ⇒ 另有一条正向对照 D1b2：按真实时间线造一份账本，
+   *     六块之和必须**等于** latMs（差一个容差）——少一块、多一块都会红。 */
+  ok('自检 D1b：silence+seal+queue 不超过原来的 wait（同一段等待不许数两遍）',
+    mStage.split.silence.med + mStage.split.seal.med + mStage.split.queue.med <= mStage.lat[Math.floor(mStage.latN * 0.5)]
+    + mStage.split.trans.med,
+    `s=${mStage.split.silence.med}+t=${mStage.split.seal.med}+q=${mStage.split.queue.med} vs 总${quantile(mStage.lat, 0.5)}-转写${mStage.split.trans.med}`);
+  /* ★ D1b2 正向对照：**一条自洽的时间线**（不是随手编的五个数，坑 117 那条"样本是我编的"）。
+   *   说完(0ms) → 1200ms 静音判定成立 → 1500ms 捞起尾段 → 1520ms 引擎开转 → 2120ms 转完 → 2190ms 整句重转完
+   *   → 2130ms 文字进句 → 2400ms 成句闸开、定稿。latMs 从"说完"量到"定稿"= 2400ms。
+   *   ▸ 六块之和必须把这 2400ms **不重不漏**地分完：漏一块（比如忘了 gate）或重一块都会红。 */
+  const TL = { v: 2, silence: 1200, tail: 300, queue: 20, trans: 600, refine: 70, gate: 210 };
+  const tlCaps = Array.from({ length: 6 }, (_, i) => cap(i * 0.5, `这是第${i + 1}句足够长的话`, {
+    fin: 'silence', lat: 2400, stage: Object.assign({}, TL),
+  }));
+  const mTl = analyzeRoom(tlCaps, []);
+  const tlSum = SPLIT_KEYS.reduce((a, k) => a + mTl.split[k].med, 0);
+  ok('自检 D1b2：一条自洽时间线上六块之和 = latMs（不重不漏；漏掉 gate 那一格就藏不住）',
+    SPLIT_KEYS.every((k) => mTl.split[k].n === 6)
+    && Math.abs(tlSum - 2400) <= 20, `sum=${tlSum} vs lat=2400`);
+  const noStage = analyzeRoom([1, 2, 3, 4, 5, 6].map((s, i) =>
+    cap(i * 0.5, `这是第${i + 1}句足够长的话`, { fin: 'silence', lat: s * 1000 })), []);
+  const lineNoStage = verdictLines(noStage).find((l) => l.label === '定稿延迟');
+  ok('自检 D1c：老服务器没写 stage ⇒ 明说"未采到"，一个 0 都不许编（缺省≠零）',
+    noStage.split.silence.n === 0 && /未采到/.test(lineNoStage.text)
+    && !/构成中位/.test(lineNoStage.text) && !/等静音判定 0\.0s/.test(lineNoStage.text),
+    lineNoStage.text.replace(/\n/g, ' | '));
+  /* 只缺其中一块（真实形状：**封口段比静音判定先到** ⇒ tail 被钳成 0；或抢跑路径压根没等）。
+   * 其余各块照常给数——"一整行噤声"会让人以为整个拆分都没上线。
+   * ▸ 措辞是判据的一部分：有 stage 却缺这一格 ⇒ 说"没走到"；整条 stage 都没有 ⇒ 才说"重启 3001"。 */
+  const partial = analyzeRoom(Array.from({ length: 6 }, (_, i) => cap(i * 0.5, `这是第${i + 1}句足够长的话`, {
+    fin: 'silence', lat: 1500 + i * 100,
+    stage: { v: 2, wait: 900, trans: 600, silence: 500 + i, queue: 120 },
+  })), []);
+  const linePartial = verdictLines(partial).find((l) => l.label === '定稿延迟');
+  ok('自检 D1d：只缺一块时其余照常给数，并点名"没走到：等封口"（不说成"服务器旧"）',
+    partial.split.seal.n === 0 && partial.split.silence.n === 6 && partial.split.anyStage === 6
+    && /没走到：等封口/.test(linePartial.text) && /等静音判定/.test(linePartial.text)
+    && !/重启 3001/.test(linePartial.text),
+    linePartial.text.replace(/\n/g, ' | '));
+  /* 非 silence 定稿带的 stage 不许混进来：那几句量的是"人还在说"的时刻，
+   * 与 lat 同一个口径（上面自检 D 立的规矩，拆分也得守）。 */
+  const mixed = analyzeRoom([
+    ...Array.from({ length: 6 }, (_, i) => cap(i * 0.5, `这是第${i + 1}句足够长的话`, { fin: 'silence', lat: 1500, stage: { v: 2, silence: 500, tail: 200, queue: 100, trans: 600 } })),
+    cap(5, '这一句被时长保险丝切断所以读数不可信', { fin: 'max-age', lat: 30, stage: { silence: 90000, tail: 80000, queue: 70000, trans: 60000 } }),
+  ], []);
+  ok('自检 D1e：max-age 定稿的 stage 不进拆分（口径与 lat 同一条纪律，否则中位被假等待拽飞）',
+    mixed.split.silence.n === 6 && mixed.split.silence.med === 500
+    && verdictLines(mixed).find((l) => l.label === '定稿延迟').text.indexOf('90.0s') === -1,
+    `n=${mixed.split.silence.n} med=${mixed.split.silence.med}`);
+  /* ★ 值域这次被真跑纠正过一次，记清楚以免"改回去"：
+   *   ▸ **负值排除**（乱序/哨兵值不是等待时长，比如没有 RMS 信源时写的 -1）；
+   *   ▸ **0 计入**——服务器只在"顺序成立"时才写数，写出来的 0 含义是"这一格真的没等"
+   *     （封口段比静音判定先到 = C2 的抢跑生效了）。把 0 当缺失，
+   *     "C2 生效"这件事在真实报告里就永远看不见（坑 76 的反面：量到 0 也是量到了）。 */
+  const sentinels = analyzeRoom(Array.from({ length: 6 }, (_, i) => cap(i * 0.5, `这是第${i + 1}句足够长的话`, {
+    fin: 'silence', lat: 1500, stage: { v: 2, silence: i % 2 ? -1 : 0, tail: -50, queue: 0, trans: 600 },
+  })), []);
+  ok('自检 D1f：负值排除、0 计入（"真没等"是读数，把 0 当缺失会让抢跑在报告里隐身）',
+    sentinels.split.silence.n === 3 && sentinels.split.silence.med === 0
+    && sentinels.split.seal.n === 0 && sentinels.split.queue.n === 6
+    && sentinels.split.trans.n === 6,
+    `silence n=${sentinels.split.silence.n} seal n=${sentinels.split.seal.n} queue n=${sentinels.split.queue.n}`);
+  /* 0 要能一路走到报告文本里（光统计到不算——界面/报告说没说出来才是"被看到了"，守则 11）。 */
+  const lineZero = verdictLines(sentinels).find((l) => l.label === '定稿延迟');
+  ok('自检 D1f2：量到的 0 要出现在报告文本里（"调度 0.00s"=这一句真没等它）',
+    /调度 0\.00s\(n=6\)/.test(lineZero.text) && /等静音判定 0\.00s\(n=3\)/.test(lineZero.text),
+    lineZero.text.replace(/\n/g, ' | '));
+  /* ★ D1g 接线断言（坑 41/56：模块写对 ≠ 调用方带出来）。上面六条测的都是
+   *   "复盘读得到"，而这个数真正的产地在 sfu/server.js 的成句循环里——
+   *   字段名一边漂（tail↔seal）、或者盖时间戳的位置挪进成句块（那里已经要求封口完成，
+   *   "等封口"就被自己抹成 0），复盘这边照样绿，因为它的判据是"读到的数>0"。
+   *   ▸ 所以直接读生产源码，钉三件事：静音戳在**轮询头**盖 / 文本一变长就复位 /
+   *   三个字段名与复盘读的**同一个**（写进账本的是 tail，读出来叫 seal，映射只此一处）。 */
+  const srvSrcD1 = require('fs').readFileSync(path.join(__dirname, '..', 'sfu', 'server.js'), 'utf8');
+  ok('自检 D1g：服务器真的在轮询头盖 silenceAt、文本变长就复位、并把捞段时刻记进句子（观测点位置决定量不量得到）',
+    /if \(lastVoiceTs && now - lastVoiceTs > FLUSH_MS && utterances\.size\) \{[\s\S]{0,160}uAny\.silenceAt = now/.test(srvSrcD1)
+    && /if \(grew\) u\.silenceAt = 0;/.test(srvSrcD1)
+    && /u\.pickedAt = pickedAt;/.test(srvSrcD1), '三处都在');
+  ok('自检 D1h：stage 的 tail/queue/silence 三个字段名与复盘读的逐字相同（事件名漂移=报告永远"样本不足"）',
+    /silence: \(stampUsable && lastVoiceTs\)/.test(srvSrcD1)
+    && /tail: stampUsable \? pickedAt - silenceAtWas : undefined/.test(srvSrcD1)
+    && /queue: \(pickedAt && eng\.startedAt >= pickedAt\)/.test(srvSrcD1)
+    && /seal: splitOf\('tail'\)/.test(srvSrcD1 + require('fs').readFileSync(path.join(__dirname, 'review-meeting.js'), 'utf8')),
+    '四处名字对得上');
+  /* ★ D1l 真跑第三次校正换来的红线：**静音戳必须属于这一次转写**。
+   *   实测出现过 `silence=4746ms` 而同句 `wait=50ms` —— 戳比引擎启动还晚（人又开口了、
+   *   而这一段文字没变长所以没复位），那块等待是**别的地方的**。把它写进账本，
+   *   中位数就把不存在的账报成读数，而且比缺失更像真的（坑 90/155 的合流）。 */
+  ok('自检 D1l：stampUsable 要求戳落在"捞起→开转"之前（不然那块等待根本不属于这一句）',
+    /const stampUsable = !!\(silenceAtWas && lastVoiceTs && pickedAt &&\s*[\r\n]+\s*silenceAtWas >= lastVoiceTs && pickedAt >= silenceAtWas && eng\.startedAt >= silenceAtWas\)/.test(srvSrcD1),
+    '四条时刻的顺序判据只此一处');
+  /* ★ D1j 这条是**本次真跑逼出来的**：首句的 stage 只报出 queue，silence/tail 压根不存在。
+   *   根因不是判据写错，是**顺序**——`if (grew) u.silenceAt = 0` 复位在同一句函数里，
+   *   而下面那三行读的是已经被清零的 `u.silenceAt`。凡是文本变长（= 我们唯一关心的那种段）
+   *   读数就恒为 undefined，机制"写了"、生产里永远量不到（坑 76），而且不报错。
+   *   ▸ 红线写成**位置判据**：先 `const silenceAtWas = u.silenceAt` 再允许那句复位。 */
+  const iWas = srvSrcD1.indexOf('const silenceAtWas = u.silenceAt');
+  const iReset = srvSrcD1.indexOf('if (grew) u.silenceAt = 0;');
+  ok('自检 D1j：读静音戳必须排在复位**之前**（同一句函数里的顺序错=永远量不到且不报错）',
+    iWas > 0 && iReset > iWas && /stage\.silence|silence: \(/.test(srvSrcD1.slice(iWas, iWas + 2600)),
+    `取读数@${iWas} 复位@${iReset}`);
+  ok('自检 D1i：拆分要**同时**进账本与 asr-caption（只进界面=现场一过就查不到，坑 56）',
+    /stage: u\.stage && \(u\.stage\.wait \|\| u\.stage\.trans \|\| u\.stage\.silence/.test(srvSrcD1)
+    && /stage: u\.stage \|\| null,/.test(srvSrcD1), '两条写入点都在');
+  /* ★ D1k 「等成句闸」这一格是**本次真跑逼出来的最大一块**：第一次只报出 `{wait,trans,queue}`，
+   *   而 `latMs=3.7s` 减掉这三块还剩 ~2.9s 没人认领——答案是"文字早到齐了、成句闸还没开"
+   *   （`segInFlight===0 && !tailHold` 要等下一轮轮询）。**没有这一格，报告会指错方向**
+   *   （把 2.9s 的闸等待算成模型慢，然后去换引擎）。
+   *   ▸ 红线：闸等待只在 `silence` 定稿时算（别的 reason 下 u.lastAt 语义不是"文字到齐"），
+   *     且写在 ingestCaptions **之前**（不然界面有、账本没有，事后查不到 = 坑 56 第三次）。 */
+  const iGate = srvSrcD1.indexOf('u.stage.gate = gateMs;');
+  ok('自检 D1k2：整句重转那一格与"等成句闸"分开（混在一起会让人去调轮询，而真凶是第二次推理）',
+    /refineMs = Date\.now\(\) - tRefine0;/.test(srvSrcD1) && /if \(refineMs > 0\) u\.stage\.refine = refineMs;/.test(srvSrcD1)
+    && /const gateMs = now - u\.lastAt - refineMs;/.test(srvSrcD1), '三处都在');
+  const iLedger = srvSrcD1.indexOf("if (reason === 'silence' && u.stage && u.lastAt && now >= u.lastAt)");
+  ok('自检 D1k：等成句闸这一格真的在算，且写进行账本之前（漏了它=把闸等待误报成模型慢）',
+    iLedger > 0 && iGate > iLedger && iGate < srvSrcD1.indexOf('ingestCaptions(roomNumber,', iLedger),
+    `闸@${iLedger} 赋值@${iGate}`);
 
   /* E. 噪声判据与生产同源：账本里那句求赞话术要被数出来 */
   const noisy = analyzeRoom([
