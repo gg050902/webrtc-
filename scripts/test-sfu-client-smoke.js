@@ -3679,6 +3679,22 @@ const emit = (ev, payload) => {
       lying.length === 0, lying.length ? '声明了却碰浏览器：' + lying.join(',') : declaredStatic.join(',') || '（没有声明者）');
   }
 
+  /* ★ 2026-10-10（D3）：一条"跳过清单必须与挂前提的断言一一对应"的结构红线。
+   *   ▎为什么值得单独钉：check:pill 加了"事件有没有送到页面"这条前提之后，
+   *     依赖它的断言被 `if (hoverTriggered)` 挂住，而 SKIP 名单是**手抄的第二份**——
+   *     我写完就少列了一条（挂住 5 条、名单只有 4 条）。
+   *     少列的那条在前提不成立时**既没有 PASS 也没有 SKIP**，看报告的人会以为它跑了
+   *     （坑 76/123：没跑过不等于通过，而"静默没跑"比红更难发现）。
+   *   ▸ 判据：两份清单的数量必须相等——不靠"下次记得同步"（坑 40：纪律会被忘掉）。 */
+  {
+    const src = fs.readFileSync(path.join(__dirname, 'check-pill-rise.js'), 'utf8');
+    const gated = (src.match(/if \(hoverTriggered\) ok\(/g) || []).length;
+    const skipBlock = /const SKIP = \[([\s\S]*?)\];/.exec(src);
+    const listed = skipBlock ? (skipBlock[1].match(/^\s*['\x27]/gm) || []).length : -1;
+    ok('2026-10-10 check:pill 的 SKIP 名单与"挂了前提的断言"数量一致（少一条就是静默没跑）',
+      gated > 0 && listed === gated, `挂前提 ${gated} 条 · SKIP 名单 ${listed} 条`);
+  }
+
 
   /* ═════ 2026-10-07 第 51 步：共享文件浏览（前端）═════ */
   console.log('\n--- 第 51 步 共享文件浏览（前端）---');

@@ -163,14 +163,69 @@ require('./inject-check.js').assertCompiles(__filename, { GEOM, HOVER_STATE, CLI
   }
   ok('前提：按钮真的占了一块面积，且命中测试说"这块地方的事件归它"（否则 hover 不可能发生）',
     !!geom && geom.w > 4 && geom.hit === true, JSON.stringify(geom));
+  /* ══ ★ 2026-10-10 补上缺的那一格前提：**事件有没有送到页面** ══
+   * ▎上面那条命中测试说"这块地方的事件归这颗按钮"，而全量回归里仍然出现过
+   *   "四条 hover 断言一起 0.00"（10-04b 记为"根因未定论"，本次又出现）。
+   *   两条前提之间少了一环：`Input.dispatchMouseEvent` 是我从 CDP 侧塞进去的，
+   *   机器忙/窗口没有系统焦点时它**可以整批不落地**，而页面几何与命中测试全都照样正确——
+   *   于是红四条，看起来像"升起效果坏了"，实际是**我的触发条件没成立**（坑 63 的原话：
+   *   测试的触发条件本身也要被验证）。
+   * ▸ 做法：在页面里挂一个 pointermove 计数器（捕获阶段，`closest('#pjEnterBtn')` 单独数一份），
+   *   发两轮移动，读回计数。
+   *   ▸ 计数为 0 ⇒ 报**一条**说得清来源的红（"事件没送到页面"），后面四条依赖 hover 的断言
+   *     打成 SKIP（不算 PASS 也不算 FAIL）——一条诊断明确的红，胜过四条互相掩盖的假红；
+   *   ▸ 计数正常而 hover 仍是 0 ⇒ 那才是真产品缺陷，四条断言照常跑、照常红。 */
+  await cdp.evaluate(`(function(){
+    window.__pmAll = 0; window.__pmBtn = 0;
+    window.__pmHit = null;
+    window.addEventListener('pointermove', function (e) {
+      window.__pmAll++;
+      var t = e.target;
+      var btn = document.getElementById('pjEnterBtn');
+      if (btn && t && (t === btn || btn.contains(t))) {
+        window.__pmBtn++;
+        window.__pmHit = { x: Math.round(e.clientX), y: Math.round(e.clientY) };
+      }
+    }, true);
+    return 'armed';
+  })()`);
   await cdp.mouse('mouseMoved', ctr.nx * 0.9, ctr.ny * 0.6);   // 先在附近走一下，模拟真实进场的 pointer 轨迹
   await sleep(80);
+  await cdp.mouse('mouseMoved', ctr.nx, ctr.ny);
+  await sleep(260);
+  let pm = await cdp.evaluate('({ all: window.__pmAll, btn: window.__pmBtn, hit: window.__pmHit })');
+  if (!pm || !pm.btn) {
+    /* 一次没中再来一次（事件丢一轮在负载下是真实存在的；只试一次会把环境问题当成结论） */
+    await cdp.mouse('mouseMoved', Math.max(0.02, ctr.nx - 0.05), ctr.ny);
+    await sleep(60);
+    await cdp.mouse('mouseMoved', ctr.nx, ctr.ny);
+    await sleep(260);
+    pm = await cdp.evaluate('({ all: window.__pmAll, btn: window.__pmBtn, hit: window.__pmHit })');
+  }
+  const hoverTriggered = !!(pm && pm.btn > 0);
+  ok('前提：我发的鼠标事件**真的到了页面**、且落在这颗按钮上（缺这一格时，四条 hover 断言会一起假红）',
+    hoverTriggered, JSON.stringify(pm));
+  if (!hoverTriggered) {
+    console.log('   ⏭  跳过下面 5 条依赖 hover 的断言：触发条件没成立，跑出来的 0.00 什么都不能说明'
+      + '\n      （不是产品缺陷；全量回归负载下偶发，单独复跑 npm run check:pill 会跑到）');
+    /* ▸ 这份清单必须与上面 `if (hoverTriggered)` 挂上的条数**一一对应**：
+     *   少列一条，那条就变成"静默没跑"——报告里既没有 PASS 也没有 SKIP，
+     *   看的人会以为它跑了（坑 76/123：没跑过不等于通过）。下面那条自检就是钉这件事的。 */
+    const SKIP = [
+      '鼠标确实落在按钮上（hover 状态被激活了）',
+      'hover 后圆在**持续涨大**（采到中间态 = 真的是动画，不是瞬切）',
+      '涨到位后**盖得住按钮的顶角与两侧**（液体灌满，不是中间一个圆点）',
+      '两层文字完成交接：原文字被裁出按钮外、克隆层回到原位淡入（轮询到停住，不读过渡中间帧）',
+      '鼠标移开后能退回（且这是在"确实涨起来过"之后测的）',
+    ];
+    SKIP.forEach((s) => console.log(`  SKIP  ${s}`));
+  }
   await cdp.mouse('mouseMoved', ctr.nx, ctr.ny);
   await sleep(260);
   const mid = await cdp.evaluate(HOVER_STATE);
   await sleep(700);
   const after = await cdp.evaluate(HOVER_STATE);
-  ok('鼠标确实落在按钮上（hover 状态被激活了）',
+  if (hoverTriggered) ok('鼠标确实落在按钮上（hover 状态被激活了）',
     after.scale > 0.05 || after.hovOpacity > 0.05, `scale=${after.scale.toFixed(2)} hover=${after.hovOpacity.toFixed(2)}`);
 
   /* ▎这条断言第一版是**假绿**：我把 async IIFE 直接当参数传给 ok()，传进去的是个 Promise
@@ -225,9 +280,9 @@ require('./inject-check.js').assertCompiles(__filename, { GEOM, HOVER_STATE, CLI
   const rising = series.filter((v) => v > 0.05 && v < 1.15).length;
   ok('采样器真的在每帧取样（页面 rAF 没跑起来就是量具坏了，别把它当成效果坏了）',
     series.length >= 3, `样本 ${series.length} 个`);
-  ok('hover 后圆在**持续涨大**（采到中间态 = 真的是动画，不是瞬切）',
+  if (hoverTriggered) ok('hover 后圆在**持续涨大**（采到中间态 = 真的是动画，不是瞬切）',
     rising >= 2, `中间态 ${rising} 个 / 序列 ${series.slice(0, 14).map((v) => v.toFixed(2)).join(' ')}`);
-  ok('涨到位后**盖得住按钮的顶角与两侧**（液体灌满，不是中间一个圆点）',
+  if (hoverTriggered) ok('涨到位后**盖得住按钮的顶角与两侧**（液体灌满，不是中间一个圆点）',
     after.coversTop === true, `scale=${after.scale.toFixed(2)}`);
   /* 原文字是**被 overflow:hidden 裁掉的**（原组件就这么做的），不是靠淡出——
    *   第一版拿 opacity 去断言，红了才发现是我对标错了机制。这里改成量几何：
@@ -241,7 +296,7 @@ require('./inject-check.js').assertCompiles(__filename, { GEOM, HOVER_STATE, CLI
     clip = await cdp.evaluate(CLIP);
   }
   clipTook = Date.now() - (clipDeadline - 2500);
-  ok('两层文字完成交接：原文字被裁出按钮外、克隆层回到原位淡入（轮询到停住，不读过渡中间帧）',
+  if (hoverTriggered) ok('两层文字完成交接：原文字被裁出按钮外、克隆层回到原位淡入（轮询到停住，不读过渡中间帧）',
     clip.baseAboveTop === true && clip.hovInPlace === true && clip.hovOpacity > 0.9,
     `base 已裁出=${clip.baseAboveTop} hover 不透明=${clip.hovOpacity.toFixed(2)}（用了 ${clipTook}ms）`);
   ok('上涨色取自 token（朱砂，不是写死的十六进制字面量）',
@@ -309,7 +364,7 @@ require('./inject-check.js').assertCompiles(__filename, { GEOM, HOVER_STATE, CLI
   }
   /* 这条断言必须**以"它确实涨起来过"为前提**——第一版没有这个前提，
    *   于是鼠标压根没落在按钮上时它也显示 PASS（自我掩护的假绿）。 */
-  ok('鼠标移开后能退回（且这是在"确实涨起来过"之后测的）',
+  if (hoverTriggered) ok('鼠标移开后能退回（且这是在"确实涨起来过"之后测的）',
     after.scale > 0.5 && out.scale < 0.05, `峰值 ${after.scale.toFixed(2)} → 移开 ${out.scale.toFixed(3)}`);
   console.log(`  截图落盘：wb-rd-shots/pill-rise-hover.png`);
 
