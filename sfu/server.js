@@ -325,6 +325,7 @@ async function synthAndEmit(roomNumber, text, ts, seq, total) {
       if (buf) {
         const id = Tts.putAudio(buf, 'mp3');
         io.to(roomNumber).emit('ai-audio', { url: `/ai-tts/${id}.mp3`, ts, seq, total });
+        settleServerSpeech(ts, 'delivered');   // ★ D2：这一轮的承诺有下文了（见 declareServerSpeech 上方）
         logEvent('info', 'ai-tts', { roomNumber, bytes: buf.length, engine: 'edge', seq });
         return true;
       }
@@ -338,6 +339,7 @@ async function synthAndEmit(roomNumber, text, ts, seq, total) {
       if (wav && wav.buf) {
         const id = Tts.putAudio(wav.buf, 'wav');
         io.to(roomNumber).emit('ai-audio', { url: `/ai-tts/${id}.wav`, ts, seq, total });
+        settleServerSpeech(ts, 'delivered');   // ★ D2：同上
         logEvent('info', 'ai-tts', { roomNumber, bytes: wav.buf.length, engine: 'qwen-local', seq });
         return true;
       }
@@ -397,16 +399,85 @@ function aiAnswerMeta(r) {
   };
 }
 
+/* ★ 2026-10-10（D2）播报漏斗从"计数"变成**哨兵**：每一轮"由服务端发声"的承诺都要有下文。
+ * ▎为什么这件事值得一个常驻告警：09-25~10-06 之间这类症状报过四次（坑 66 / 66② / 94 / 0.11 的
+ *   "两头静音"），每一次都是**服务器声明 `tts:'server'` ⇒ 前端让位不念 ⇒ 而音频没来、
+ *   连"我发不出去"的那句道歉也没来**——用户听到的就是"它答应了却不说话"，而日志一片干净。
+ *   10-06 把回落路径修成"有界"之后，测试里有一条红线（声明了就必须给 ai-audio 或 ai-tts-fail），
+ *   但**红线只在自测跑的那一次生效**：真实会议里再漏一条路径（新加的播报口、异常提前 return），
+ *   没有任何东西会喊人。这一格就是把那条红线搬进生产。
+ * ▸ 形状：`declareServerSpeech(ts)` 挂一个 `SPEAK_SETTLE_MS` 的定时器；
+ *   `settleServerSpeech(ts, 'delivered'|'failed')` 在真的发出音频 / 真的道歉时摘掉它。
+ *   定时器到点 ⇒ ①计数 `silent`（进 /metrics 与 watch 告警）②**当场补发 ai-tts-fail 自愈**
+ *   （前端 10-06 那条保险丝本来就等这句话，念得出来总比继续静音好）。
+ * ▸ 为什么按 ts 记账而不是比全局计数：一房多线程应答、两条流水线交错时，全局计数会把
+ *   "A 已交付"算到"B 没下文"头上（与 10-06 那条"看门狗要按「房间|动作」挂账"同一条教训）。 */
+const SPEAK_SETTLE_MS = Number(process.env.SPEAK_SETTLE_MS) || 20000;
+const speakLedger = new Map();   // ts -> { roomNumber, path, timer }
+/**
+ * @param opts.force    只给自测用：验的是**哨兵本身**（到点没下文就计数并代发送话通知）。
+ *                      而 serverVoiceReady() 取决于此刻 Edge 端点可不可达——那与哨兵有没有效是两件事。
+ *                      生产三个调用点（@ai、语音问答、流水线）一律不传它。
+ * @param opts.settleMs 只给自测用：**这一轮**的到期时长。
+ *   ▎为什么时长必须按轮传、不能拿全局 SPEAK_SETTLE_MS 调小了事：第一次自测我就是全局设成 2500，
+ *     结果把一次**完全正常的** Edge 合成判成"无下文"（真实一轮要 3~8s：LLM 出句 + 排队 + 合成 1.4s/段
+ *     + 收尾），恒等式断言当场红在哨兵自己的短时限上。
+ *     ▸ 时长是被测对象的属性，不该由量具全局改写（坑 80：假红的第一个嫌疑人是判据自己）；
+ *       生产默认 20s 是"服务器自己的决定上限 8s + 合成 6s + 排队余量"，本来就比任何正常轮次长。
+ */
+function declareServerSpeech(roomNumber, ts, path, opts = {}) {
+  const { force = false, settleMs = SPEAK_SETTLE_MS } = opts;
+  if ((!force && !serverVoiceReady()) || !ts || speakLedger.has(ts)) return;   // 没承诺服务端语音 / 已记过 ⇒ 不重复挂账
+  COLLAB.speak.declared += 1;
+  /* 一轮一条（应答次数本来就稀疏，不会刷屏）：复盘要能从**账本**算出漏斗，
+   * 而不是只活在服务器内存里——早上那份报告拿不到内存（坑 56 的老账）。 */
+  logEvent('info', 'ai-speech-declared', { roomNumber, ts, path });
+  const timer = setTimeout(() => {
+    const rec = speakLedger.get(ts);
+    if (!rec) return;
+    speakLedger.delete(ts);
+    COLLAB.speak.silent += 1;
+    logEvent('warn', 'ai-speech-silent', {
+      roomNumber, ts, path: rec.path, waitedMs: rec.settleMs,
+      note: '声明了 tts:server 但既没送出音频也没补发失败通知 ⇒ 当场代发送话通知，前端回落浏览器朗读',
+    });
+    console.warn(`⚠️ [播报] 房间 ${roomNumber} 有一轮承诺了服务端语音却${(rec.settleMs / 1000).toFixed(0)}s 无任何下文`
+      + '（"两头静音"形态）——已代发送话通知，这一轮改由浏览器朗读');
+    const room = rooms.get(roomNumber);
+    if (room) io.to(roomNumber).emit('ai-tts-fail', { ts });       // 自愈：让浏览器把这句话念出来
+  }, settleMs);
+  if (typeof timer.unref === 'function') timer.unref();            // 不许为一轮播报把进程吊着不退
+  speakLedger.set(ts, { roomNumber, path, settleMs, timer });
+}
+function settleServerSpeech(ts, kind) {
+  const rec = speakLedger.get(ts);
+  if (!rec) return;
+  clearTimeout(rec.timer);
+  speakLedger.delete(ts);
+  COLLAB.speak[kind] += 1;
+  logEvent(kind === 'delivered' ? 'info' : 'warn', `ai-speech-${kind}`, { roomNumber: rec.roomNumber, ts, path: rec.path });
+}
+
 async function speakAnswerForRoom(roomNumber, text, ts) {
   const clean = String(text || '').replace(/\*\*/g, '').slice(0, 500);
   if (!clean) return false;
+  declareServerSpeech(roomNumber, ts, 'single');
+  /* ★ 2026-10-10（D2）测试接缝：`TEST_SPEAK_SILENT=1` 造一个**漏了收口**的轮次——
+   *   承诺已经记上账，但既不送音频也不补发失败通知（正是坑 66/94 那个形状）。
+   *   ▸ 为什么必须有这条缝：真实链路里 10-06 已把收口修成"有界"，正常跑**永远不会**出现 silent，
+   *     于是"哨兵到底会不会响"这件事只能等网络自己坏一次（坑 83：测不到不等于通过）。
+   *     有了它，`test:sfu` 能确定性地验两件事：① 到点计数 ② **当场代发送话通知把这一轮救回来**。 */
+  if (process.env.TEST_SPEAK_SILENT === '1') {
+    console.log('🧪 [TEST_SPEAK_SILENT] 这一轮故意既不送音频也不补发失败通知（验哨兵与自愈）');
+    return false;
+  }
   const parts = splitForTts(clean);
   let delivered = false;
   for (let i = 0; i < parts.length; i++) {
     if (await synthAndEmit(roomNumber, parts[i], ts, i, parts.length)) delivered = true;
     else break; // 中途失败：已播的保留、剩下的不念（见函数头"诚实的边界"）
   }
-  if (!delivered) io.to(roomNumber).emit('ai-tts-fail', { ts }); // 前端收到后回落浏览器朗读
+  if (!delivered) { settleServerSpeech(ts, 'failed'); io.to(roomNumber).emit('ai-tts-fail', { ts }); } // 前端收到后回落浏览器朗读
   return delivered;
 }
 
@@ -438,6 +509,7 @@ function makeSpeakPipeline(roomNumber, ts) {
    *   ▎不做这一层区分的后果就是"配置写着 true、效果永远是浏览器朗读"，
    *     而界面上没有任何地方会说这件事——正是坑 67 那一类"写了但从来没生效"。 */
   const decideMs = slowEngineOnly ? Math.max(TTS_DECIDE_MS, 60000) : TTS_DECIDE_MS;
+  declareServerSpeech(roomNumber, ts, 'pipeline');   // ★ D2：流水线开始承诺送音频
   let consumed = 0;   // 已经交给 TTS 的字符数（含标点）
   let seq = 0;
   let spokenChars = 0;
@@ -512,7 +584,7 @@ function makeSpeakPipeline(roomNumber, ts) {
        *   真晚到的那一段音频由前端按 ts 丢掉（ai-tts-fail 现在会把 ts 记进 serverTtsDropped
        *   ——配套改动，缺一半就会两个声音抢着念同一句话）。 */
       await Promise.race([Promise.all(jobs), new Promise((r) => setTimeout(r, decideMs))]);
-      if (!deliveredAny) io.to(roomNumber).emit('ai-tts-fail', { ts });
+      if (!deliveredAny) { settleServerSpeech(ts, 'failed'); io.to(roomNumber).emit('ai-tts-fail', { ts }); }
       return { delivered: deliveredAny, sentences: seq, truncated: saidTruncated, decidedByTimeout: !deliveredAny };
     },
   };
@@ -1445,6 +1517,7 @@ async function snapshotRooms() {
       gainApplied: COLLAB.gainApplied,   // ★ 2026-10-09 安静麦克风的增益触发证据（与 /metrics 同一个数）
       capLat: COLLAB.capLat,   // ★ 2026-10-03 字幕延迟：{n, sum, max, last}（面板与 /metrics 同源，不另算一份）
       speakLat: COLLAB.speakLat, // ★ 2026-10-03 播报延迟：同上，客户端实测上报
+      speak: COLLAB.speak,      // ★ 2026-10-10 D2 播报漏斗四本账（declared/delivered/failed/silent）
       /* ★ 2026-10-04 转写并发的触发证据（与 /metrics 同一个对象，不另算一份——坑 47）。
          面板上"转写引擎"那一格讲的是"谁在转写"，这一格讲的是"转写得并行吗"。 */
       seg: COLLAB.seg,
@@ -1557,6 +1630,11 @@ const COLLAB = {
    *   与 capLat 同一条方法论：这条链路的故障全是"它答应了却没声音"，
    *   没有读数时连"到底有没有出声"都要靠人猜（历史上查过三次才查明白）。 */
   speakLat: { n: 0, sum: 0, max: 0, last: 0 },
+  /* ★ 2026-10-10（D2）播报漏斗四本账：declared = 承诺走服务端语音的轮数；
+   *   delivered / failed = 真的送出音频 / 真的补发失败通知（两条都算有下文）；
+   *   silent = 到点还没有下文的轮数（已被当场代发送话通知救回，但那正是要喊人的形状）。
+   *   ▸ 判据：silent 在任何时候都应当是 0——它不是越少越好，而是出现一次就说明有一条路径漏了收口。 */
+  speak: { declared: 0, delivered: 0, failed: 0, silent: 0 },
   /* ★ 2026-10-04 转写并发的**触发证据**（坑 76 的纪律：机制"在"不等于机制"生效"）。
    *   ▎为什么必须量这个：并发化改完之后，从来没有人证明过它真的并行过——
    *     而 GPU 时代单段转写只要 0.3~0.6s、分段窗口却有 2s，
@@ -1783,6 +1861,16 @@ function buildMetrics(snap) {
   };
   latBlock('sfu_ai_asr_caption_latency_ms', COLLAB.capLat, 'end-of-speech to finalized caption');
   latBlock('sfu_ai_speech_latency_ms', COLLAB.speakLat, 'answer shown to first audio actually playing (client reported)');
+  /* ★ 2026-10-10（D2）播报漏斗：把"它答应了却不说话"从人工翻日志变成一条可告警的读数。
+   *   ▎四本账必须一起看：只有 declared 看不出好坏，只有 delivered 分不清"没应答"与"应了没说"。
+   *     `silent` 是唯一一个**不该非零**的数——出现一次就代表有一条播报路径漏了收口（坑 66 家族）。
+   *   ▸ 指标名用 counter 语义（累计），watch 按"两轮增量"判，不按绝对值判（重启即归零）。 */
+  const sp = COLLAB.speak;
+  help('sfu_ai_speech_funnel_total', 'counter', 'server-declared speech rounds by outcome (kind=declared|delivered|failed|silent)');
+  L.push(`sfu_ai_speech_funnel_total{kind="declared"} ${sp.declared}`,
+    `sfu_ai_speech_funnel_total{kind="delivered"} ${sp.delivered}`,
+    `sfu_ai_speech_funnel_total{kind="failed"} ${sp.failed}`,
+    `sfu_ai_speech_funnel_total{kind="silent"} ${sp.silent}`);
   help('sfu_ai_answers_total', 'counter', 'How many times the AI assistant actually replied');
   L.push(`sfu_ai_answers_total ${COLLAB.answers}`);
   /* ★ 2026-10-06 夜二 "为什么答"的两本账。用户规矩是**只有被叫到名字才开口**，
@@ -9471,6 +9559,53 @@ async function runAsrSelfTest() {
       `AI 声明了服务端语音（tts:'server'）却**既没发 ai-audio、也没在 25s 内发 ai-tts-fail** `
       + '—— 前端会两头都不出声（这条等待现在由客户端的 20s 保险丝兜住，见 client.js 的 fallBackToBrowserTts，'
       + '但服务器仍然必须自己说清楚）');
+    /* ★ 2026-10-10（D2）四本账的**恒等式**——上面那条红线只管"这一轮"，这一条管"账要平"：
+     *   declared 必须等于 delivered + failed + silent + 还在跑的（自测跑完都该收口 ⇒ 最后一项 0）。
+     *   ▎为什么要两条都在：红线只看"有没有音频/道歉"，漏了"某条播报口压根没记账"这种情况——
+     *     那种漏口下 declared 会**少记**，账照样"平"得看不出来。恒等式 + 下面的正向对照一起才封住：
+     *     走过服务端语音却 declared 为 0 = 新加的播报口忘了 declare。
+     *   ▸ silent 在这里必须是 0：自测走的是正常收口路径，出现 1 就是真漏口（不是环境问题，
+     *     环境只会让它等满 20s 后走 failed）。 */
+    {
+      const sp = COLLAB.speak;
+      const open = speakLedger.size;
+      console.log(`🧪 [TEST_ASR] 播报漏斗四本账：承诺 ${sp.declared} · 送达 ${sp.delivered} · `
+        + `改浏览器念 ${sp.failed} · 无下文 ${sp.silent} · 还在跑 ${open}`);
+      must(sp.declared === sp.delivered + sp.failed + sp.silent + open,
+        `播报漏斗对不上账：承诺 ${sp.declared} ≠ 送达 ${sp.delivered} + 道歉 ${sp.failed}`
+        + ` + 无下文 ${sp.silent} + 在跑 ${open} —— 有一处 emit 没走 declare/settle 那对函数`);
+      must(sp.silent === 0,
+        `正常路径上出现了 ${sp.silent} 轮"承诺了却毫无下文"（哨兵已自愈代发送话通知，`
+        + ' 但这条断言要红，因为漏口本身就是缺陷：查新加的播报口 / 合成侧既不 resolve 也不 reject 的路径）');
+      must(!botReplies.some((m) => m.tts === 'server') || sp.declared > 0,
+        'AI 声明过 tts:\'server\' 却一次都没记进漏斗 ⇒ 那个播报口绕开了 declareServerSpeech（坑 76）');
+    }
+    /* ★ 2026-10-10（D2）哨兵的**端到端一次真触发**：故意造一轮"承诺了但永不收口"，要求
+     *   ①计数 +1 ②到点真的代发送话通知（客户端那条 20s 保险丝因此永远有下文）。
+     *   ▎为什么必须真触发一次而不是只看代码在不在：坑 76 那条老账——"写了但从来没跑过"的机制
+     *     在这个项目里已经抓到第十几次；而这条自愈路径**在生产正常情况下永远不跑**
+     *     （正常路径都会收口），不主动造一次，它就永远只是代码。
+     *   ▸ 这一轮传 `settleMs: 2500` 而不是把全局 SPEAK_SETTLE_MS 调小：第一次我就是全局调成 2500，
+     *     结果把一次**正常的** Edge 合成判成"无下文"，恒等式当场红在哨兵自己的短时限上
+     *     ——时长是被测对象的属性，不该由量具改写（坑 80）。`force` 只为了让这条路径不依赖
+     *     "此刻 Edge 可不可达"，那与哨兵有没有效是两件事。 */
+    {
+      const sentryTs = Date.now();
+      const before = COLLAB.speak.silent;
+      let sentFailFor = 0;
+      const onFail = (m) => { if (m && Number(m.ts) === sentryTs) sentFailFor = Number(m.ts); };
+      probe.on('ai-tts-fail', onFail);
+      declareServerSpeech('999999', sentryTs, 'selftest', { force: true, settleMs: 2500 });
+      const tSentry0 = Date.now();
+      while (!sentFailFor && Date.now() - tSentry0 < SPEAK_SETTLE_MS + 4000) await sleep(200);
+      probe.off('ai-tts-fail', onFail);
+      must(sentFailFor === sentryTs,
+        `播报哨兵到点没有代发送话通知（等了 ${((Date.now() - tSentry0) / 1000).toFixed(1)}s）`
+        + ' ⇒ "两头静音"仍然没人收尾，自愈那半边是空的');
+      must(COLLAB.speak.silent === before + 1,
+        `播报哨兵计数没涨（前 ${before}，现在 ${COLLAB.speak.silent}）⇒ /metrics 与 watch 告警都拿不到样本`);
+      console.log('🧪 [TEST_ASR] 播报哨兵：造了一轮"承诺后无下文"，到点确实代发送话通知且计数 +1');
+    }
     /* ★ 2026-10-05 夜三 配对要配到**那条答案**，不是 botReplies[0]。
      *   入会致辞也是 chat-message(from=ai-bot)，它比真答案早十几秒——原先拿 [0] 的 ts
      *   当"答案上屏"，打印出来的「答案上屏→听到首段 23.5s」量的其实是"致辞→下一轮音频"，

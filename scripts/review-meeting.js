@@ -437,6 +437,14 @@ function analyzeRoom(caps, events) {
     fileDeleted: events.filter((e) => e.event === 'file-deleted'),
     fileCleanupFailed: events.filter((e) => e.event === 'files-cleanup-failed'),
     tts: ttsEvents.length, engines, ttsFailed: count('ai-tts-failed'), ttsBudget: count('ai-tts-budget'),
+    /* ★ 2026-10-10（D2）播报漏斗四本账（轮次口径，与 /metrics 的 sfu_ai_speech_funnel_total 同源：
+     *   都是数事件，不在这儿另判一次"什么算没下文"——判据只在 sfu/server.js 的 declare/settle 那一处）。
+     *   ▸ silent 是唯一一个**不该非零**的数：它意味着"承诺了服务端语音、既不送音频也不补发失败通知"，
+     *     也就是用户报的"它答应了却不说话"（坑 66/94 的形状）。 */
+    speakFunnel: {
+      declared: count('ai-speech-declared'), delivered: count('ai-speech-delivered'),
+      failed: count('ai-speech-failed'), silent: count('ai-speech-silent'),
+    },
     control: count('room-control'), controlNoop: count('room-control-noop'),
     /* ★ 2026-10-10 C3 回指撤销两本账（与 /metrics 的 sfu_room_undo_total 同一来源：都是事件计数，
      *   不在这里另判一次"什么算回指"——判据只有 roomActions.js 那一个地方，坑 47）。 */
@@ -586,8 +594,20 @@ function verdictLines(m) {
         : '这场会没有跳过记录，判不了阈值版本');
   add(m.answerFailed ? 'warn' : 'ok', '唤醒与应答',
     `唤醒应答 ${m.wake} 次（光叫名字的短应答 ${m.wakeAck}）· 被节流：忙 ${m.busyDrop} · 重复句 ${m.dupDropped} · 自己的回声 ${m.echoDropped} · 应答失败 ${m.answerFailed}`);
-  add(m.ttsFailed > m.tts ? 'bad' : m.ttsFailed ? 'warn' : 'ok', '播报',
-    `合成 ${m.tts} 段（${Object.entries(m.engines).map(([k, v]) => `${k}=${v}`).join(' ') || '无'}）· 失败 ${m.ttsFailed} · 超字数预算 ${m.ttsBudget}`);
+  {
+    const sf = m.speakFunnel || { declared: 0, delivered: 0, failed: 0, silent: 0 };
+    const seg = `合成 ${m.tts} 段（${Object.entries(m.engines).map(([k, v]) => `${k}=${v}`).join(' ') || '无'}）· 失败 ${m.ttsFailed} · 超字数预算 ${m.ttsBudget}`;
+    /* 轮次那一截要**分开说**，因为它答的是另一个问题：段数说的是"送出去多少 audio"，
+     * 轮次说的是"每一次承诺有没有下文"。混着报就会出现"合成 66 段 ✅"而某一轮其实哑了。 */
+    const round = sf.declared
+      ? ` · 播报轮次：承诺 ${sf.declared} → 送达 ${sf.delivered} / 改浏览器念 ${sf.failed}`
+        + ` / **无下文 ${sf.silent}**`
+      : ' · 播报轮次：这台服务器还没记这几本账（D2 之后重启 3001 才有；"没数"不等于"没漏"）';
+    /* 判级顺序有意如此：无下文 > 失败多于成功 > 还没开始记（unknown，不冒充通过，坑 105）。 */
+    add(sf.silent ? 'bad' : m.ttsFailed > m.tts ? 'bad' : m.ttsFailed ? 'warn' : sf.declared ? 'ok' : 'unknown',
+      '播报', seg + round + (sf.silent
+        ? ' —— 有承诺到点仍无任何下文（已当场代发送话通知救回，但那说明**有一条播报路径漏了收口**，要查是哪条）' : ''));
+  }
   add(m.controlNoop ? 'warn' : 'ok', 'AI 操控实体',
     m.control || m.controlNoop
       ? `下达 ${m.control} 次 · 没有任何客户端执行 ${m.controlNoop} 次`
@@ -727,7 +747,11 @@ function verdictLines(m) {
   if (m.noLedger) {
     const vacuous = new Set(['噪声幻觉入账', '唤醒与应答', '播报', 'AI 操控实体', '共享文件']);
     for (const l of L) {
-      if (vacuous.has(l.label) && l.level === 'ok') {
+      /* ★ 2026-10-10（D2）判据扩了一半：原来只把 `ok` 降级。但"播报轮次还没开始记"那一行
+       *   本来就是 unknown（服务器旧，不是没数据），它同样会让读者把"没记录"读成"没发生"——
+       *   所以凡是**纯零计数的 unknown** 也要补上那句前缀，两种原因并排说清。 */
+      if (!vacuous.has(l.label)) continue;
+      if (l.level === 'ok' || (l.level === 'unknown' && !/没记录/.test(l.text))) {
         l.level = 'unknown';
         l.text = '这场没有字幕账本，0 条/0 次只说明"没记录"，不说明"没发生" · ' + l.text;
       }
@@ -915,6 +939,52 @@ function selftest() {
   ok('自检 D1l：stampUsable 要求戳落在"捞起→开转"之前（不然那块等待根本不属于这一句）',
     /const stampUsable = !!\(silenceAtWas && lastVoiceTs && pickedAt &&\s*[\r\n]+\s*silenceAtWas >= lastVoiceTs && pickedAt >= silenceAtWas && eng\.startedAt >= silenceAtWas\)/.test(srvSrcD1),
     '四条时刻的顺序判据只此一处');
+  /* ★ D1m 能力版本：同一份"缺 gate"的账本，v=2 与没有 v 要说**相反**的两句话——
+   *   有 v=2 ⇒ "这一句没等它"（去看「尾巴抢跑」那行）；没 v ⇒ "这批会是旧服务器跑的"（去重启 3001）。
+   *   ▸ 只看字段在不在**分不开**这两种病，而它们的处方相反（坑 82/133）。
+   *   ▸ 两条断言互为反向对照：任何一边写死，另一边就会红。 */
+  const mkVRows = (withV) => Array.from({ length: 6 }, (_, i) => cap(i * 0.5, `这是第${i + 1}句足够长的话`, {
+    fin: 'silence', lat: 1500,
+    stage: withV ? { v: 2, trans: 600, silence: 500, queue: 20 } : { trans: 600, silence: 500, queue: 20 },
+  }));
+  const vNewLine = verdictLines(analyzeRoom(mkVRows(true), [])).find((l) => l.label === '定稿延迟');
+  const vOldLine = verdictLines(analyzeRoom(mkVRows(false), [])).find((l) => l.label === '定稿延迟');
+  ok('自检 D1m：同样缺 gate，v=2 说"没走到"、没有 v 说"重启 3001"（两种病分开，处方相反）',
+    /没走到/.test(vNewLine.text) && !/重启 3001/.test(vNewLine.text)
+    && /未采到/.test(vOldLine.text) && /重启 3001/.test(vOldLine.text) && !/没走到/.test(vOldLine.text),
+    `新：${vNewLine.text.slice(-44)} / 旧：${vOldLine.text.slice(-40)}`);
+  ok('自检 D1m2：能力版本两侧都在（服务器写 v、复盘读 v）——不写就永远读成"旧服务器"',
+    srvSrcD1.includes('v: 2,')
+    && require('fs').readFileSync(path.join(__dirname, 'review-meeting.js'), 'utf8').includes('e.stage.v'),
+    '写入点（服务器）与读取点（复盘）都在');
+  /* ★ D2 播报漏斗的三态（同一行报三种病，处方各不同）。
+   *   ▸ 为什么必须单独一级：`ai-tts`（段）与 `ai-tts-failed`（合成失败）两本账都看得见，
+   *     而"承诺了却整条路没走到收口"在两本账里都是 0 —— 它只有**轮次对账**才现形（坑 66/94）。 */
+  const spEv = (n2, kind) => Array.from({ length: n2 }, (_, i) => ({
+    ts: new Date(t0 + i * 4000).toISOString(), event: 'ai-speech-' + kind, roomNumber: '1',
+  }));
+  const spCap = [cap(0, '一句足够长的正常字幕内容', { fin: 'silence', lat: 1500 })];
+  const lineSpOk = verdictLines(analyzeRoom(spCap, [
+    ...spEv(3, 'declared'), ...spEv(2, 'delivered'), ...spEv(1, 'failed'),
+  ])).find((l) => l.label === '播报');
+  ok('自检 D2a：承诺/送达/道歉三本账齐、无下文 0 ⇒ ok，且四个数都写在文本里',
+    lineSpOk.level === 'ok' && /承诺 3/.test(lineSpOk.text) && /送达 2/.test(lineSpOk.text)
+    && /改浏览器念 1/.test(lineSpOk.text) && /无下文 0/.test(lineSpOk.text), lineSpOk.text);
+  const lineSpBad = verdictLines(analyzeRoom(spCap, [
+    ...spEv(3, 'declared'), ...spEv(1, 'delivered'), ...spEv(1, 'failed'), ...spEv(1, 'silent'),
+  ])).find((l) => l.label === '播报');
+  ok('自检 D2b：出现"无下文"必须 bad 并说清"有一条路径漏了收口"（自愈救回 ≠ 不用查）',
+    lineSpBad.level === 'bad' && /无下文 1/.test(lineSpBad.text) && /漏了收口/.test(lineSpBad.text), lineSpBad.text);
+  const lineSpNone = verdictLines(analyzeRoom(spCap, [{
+    ts: new Date(t0).toISOString(), event: 'ai-tts', roomNumber: '1', bytes: 20000, engine: 'edge',
+  }])).find((l) => l.label === '播报');
+  ok('自检 D2c：这场一条 declared 都没有 ⇒ 说"还没记这几本账"，不许把 0 报成 ok（坑 105/155）',
+    lineSpNone.level === 'unknown' && /还没记这几本账/.test(lineSpNone.text)
+    && !/承诺 0/.test(lineSpNone.text), lineSpNone.text);
+  ok('自检 D2d：服务器真的在记这四本账（事件名与复盘读的逐字相同；不写就永远报"还没开始记"）',
+    srvSrcD1.includes('speak: { declared: 0, delivered: 0, failed: 0, silent: 0 }')
+    && srvSrcD1.includes("logEvent('info', 'ai-speech-declared'")
+    && srvSrcD1.includes('ai-speech-${kind}'), '四本账与两个事件名都在');
   /* ★ D1j 这条是**本次真跑逼出来的**：首句的 stage 只报出 queue，silence/tail 压根不存在。
    *   根因不是判据写错，是**顺序**——`if (grew) u.silenceAt = 0` 复位在同一句函数里，
    *   而下面那三行读的是已经被清零的 `u.silenceAt`。凡是文本变长（= 我们唯一关心的那种段）

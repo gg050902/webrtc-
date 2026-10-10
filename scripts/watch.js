@@ -307,6 +307,39 @@ function diagnoseVoiceAndCollab(metricsText, collab, prev, state) {
     state.unprompted = 0;   // 对话模式 / 老服务器没有这几行：不下结论，也不留着旧账
   }
 
+  /* ⑧ ★ 2026-10-10（D2）播报漏斗的"两头静音"哨兵。
+   * ▎为什么这一条必须常驻：09-25~10-06 之间用户报了四次"它答应了却不说话"（坑 66 / 66② / 94 / 0.11），
+   *   每一次的调查都是"翻一小时日志 + 猜三次方向"。10-06 把回落修成有界之后，自测里多了一条
+   *   红线（声明 tts:'server' 必须给出 ai-audio 或 ai-tts-fail）——**但那条红线只在自测跑的那一次生效**。
+   *   真实会议里再来一条路径漏收口，没有任何东西会喊人，而这一格的形状恰恰是全静默、零报错。
+   * ▎判据：四本账里 `silent` 是唯一一个**不该非零**的数（declared 有、delivered/failed 都没有 = 漏口）。
+   *   所以它涨一点就报，不必像"没人叫它却开口"那样攒到 2 次——那一条有合法形态要容忍，这一条没有。
+   * ▸ 两条不下结论的边界：
+   *     ① **第一观测只记基线**（服务器重启后计数带着历史值，直接当"本轮新增"报出来就是冤枉人）；
+   *     ② 老服务器根本没记这四行 ⇒ labeledCounter 返回 null ⇒ 一声不吭（"读不到"≠"读到 0"，坑 71/155）。 */
+  {
+    const base = prev.speakFunnel || (prev.speakFunnel = {});
+    const dOf = (key) => {
+      const v = labeledCounter('sfu_ai_speech_funnel_total', `kind="${key}"`);
+      if (v === null) return null;
+      const had = Object.prototype.hasOwnProperty.call(base, key);
+      const d = had ? v - base[key] : null;      // null = 第一观测，不下结论
+      base[key] = v;
+      return d;
+    };
+    const dSilent = dOf('silent');
+    const dDeclared = dOf('declared');
+    const dDeliv = dOf('delivered');
+    const dFail = dOf('failed');
+    if (dSilent !== null && dSilent > 0) {
+      out.push({ key: 'ai-speech-silent', text: `AI 播报有 ${dSilent} 轮**承诺了服务端语音却毫无下文**`
+        + `（本轮承诺 ${dDeclared || 0}、送达 ${dDeliv || 0}、改浏览器念 ${dFail || 0}）`
+        + ' —— 服务器已当场代发送话通知把声音救回来，但这说明**有一条播报路径漏了收口**：'
+        + '查 ①新加的播报口有没有走 declare/settle 那对函数'
+        + ' ②合成侧是否既不 resolve 也不 reject（sfu/ai/tts.js 的超时预算）③房间是否在承诺之后被销毁' });
+    }
+  }
+
   /* ⑦ ★ 2026-10-10（B1 / H2）RMS 行的**到达节奏**——把一条挂在路线图上三天的口头结论
    *   （"ametadata 打到管道上按 ~4KB 成块交付 ⇒ 第一行 RMS 约 5s 才到"）变成会自己喊的哨兵。
    *   ▸ 为什么值得常驻：静音判定（`silenceConfirmed`）与 ⏱ 延迟读数全挂在 `lastVoiceTs` 上，

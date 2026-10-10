@@ -1169,6 +1169,26 @@ const request = (s, ev, payload) => new Promise((resolve, reject) => {
      && /sfu_ai_speech_latency_ms\{kind="avg"\} \d+/.test(met.text)
      && /sfu_ai_speech_latency_ms\{kind="max"\} \d+/.test(met.text)
      && /sfu_ai_speech_latency_ms\{kind="last"\} \d+/.test(met.text));
+  /* ★ 2026-10-10（D2）播报漏斗四本账：把"它答应了却不说话"变成可告警的读数。
+   *   ▸ 断言形状照抄上面那组（同名同形是"口径一致"的证据），另外多钉两件事：
+   *     ① **锚行首**——# HELP 那句里就含 `kind="silent"`，不锚会把帮助文本读成一个样本（坑 74）；
+   *     ② 四本账的恒等式要在 /api/rooms 与 /metrics 同源（同一份 COLLAB.speak，不各算一份，坑 47）。 */
+  ok('2026-10-10 /metrics 有播报漏斗四本账（declared/delivered/failed/silent），锚行首不被 HELP 行骗',
+     /^sfu_ai_speech_funnel_total\{kind="declared"\} \d+$/m.test(met.text)
+     && /^sfu_ai_speech_funnel_total\{kind="silent"\} \d+$/m.test(met.text)
+     && /^sfu_ai_speech_funnel_total\{kind="delivered"\} \d+$/m.test(met.text)
+     && /^sfu_ai_speech_funnel_total\{kind="failed"\} \d+$/m.test(met.text));
+  {
+    const spMet = (re) => { const m = re.exec(met.text); return m ? Number(m[1]) : null; };
+    const spSnap = ((await snapRooms()) || {}).collab || {};
+    const sp = spSnap.speak;
+    ok('2026-10-10 /api/rooms 的 collab.speak 与 /metrics 逐本对得上（一处算、两处读；面板与告警不同源就会各说各话）',
+       !!sp && sp.declared === spMet(/^sfu_ai_speech_funnel_total\{kind="declared"\} (\d+)$/m)
+       && sp.delivered === spMet(/^sfu_ai_speech_funnel_total\{kind="delivered"\} (\d+)$/m)
+       && sp.failed === spMet(/^sfu_ai_speech_funnel_total\{kind="failed"\} (\d+)$/m)
+       && sp.silent === spMet(/^sfu_ai_speech_funnel_total\{kind="silent"\} (\d+)$/m),
+       JSON.stringify(sp || null) + ' vs ' + met.text.split(String.fromCharCode(10)).filter((x) => x.startsWith('sfu_ai_speech_funnel')).join(' | '));
+  }
   /* ★ 2026-10-09 安静麦克风的峰值增益：这条机制 10-05 上线时**没有任何一处能证明它跑过**，
    *   于是"坐得远的人字幕变清楚了"这件事只能靠体感。现在它有一本触发账——
    *   分母用已有的 input_voiced_total（过了能量闸的段数），分子恒 0 而分母在涨

@@ -377,6 +377,10 @@ module.exports = {
   AI_STATE: 'ai-state',   // S→C 广播 { state:'idle|listening|thinking|speaking|happy', text? }（speaking 帧带全文给逐字字幕）
   AI_AUDIO: 'ai-audio',   // S→C 广播 { url, ts, seq, total }（服务端神经语音分片；顺序播放、onplaying 才销回落账）
   AI_TTS_FAIL: 'ai-tts-fail', // S→C 广播 { ts }（声明了 tts:'server' 却没给出音频 → 前端回落浏览器朗读；两者都不发=无头静音，已被 test:asr-live 断言禁止）
+                              //   ★ 2026-10-10 D2：这一句现在还有**第二个发送者**——播报哨兵。每一轮承诺都记在
+                              //   `speakLedger` 上，到 `SPEAK_SETTLE_MS`（生产默认 20s）仍没有任何下文时，
+                              //   服务器自己补发这条 fail 把声音救回来，并给 `sfu_ai_speech_funnel_total{kind="silent"}`
+                              //   记一笔（watch 规则⑧据此告警）。也就是说：**"两头静音"从"只能靠人发现"变成"会自己喊"**。
   AI_TTS_STATE: 'ai-tts-state', // S→C 广播 { enabled, engine }（能力开关会漂：端点可达性随网络出口变化，翻转必须重新下发）
   BOARD_STATE: 'board-state', // S→单个成员 { strokes:[...] }（晚到的人/刷新后补画白板账本；实时仍走 SCTP 'board' 频道）
   BOARD_RECORD: 'board-record', // C→S { op:'end'|'undo'|'clear', stroke? }（只上报"整笔"，实时通道不留给持久化——见 client 注释）

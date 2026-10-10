@@ -233,6 +233,51 @@ console.log('\n--- watch：语音与协作退化诊断（纯函数，合成输�
   ok(run(m({ 'qwen-local': 1 }), { asrEngine: 'none' }, st.counters, st).length === 0, '引擎=none → 不做引擎判定（没配就不该报）');
 }
 
+/* ⑧ ★ 2026-10-10（D2）播报漏斗的"两头静音"哨兵。
+ *   ▎这一格的失效形状是"全静默零报错"：AI 声明 tts:'server' → 前端让位不念 →
+ *     音频没来、连"我发不出去"那句道歉也没来。四本账里只有 `silent` 不该非零。
+ *   ▎三条边界各一条：涨一点就报（这条没有需要容忍的合法形态）、
+ *     **第一观测只记基线**（重启后带着历史值就报 = 冤枉人）、
+ *     老服务器没这几行就一声不吭（"读不到"≠"读到 0"）。 */
+{
+  const funnel = (declared, delivered, failed, silent) => m({ 'qwen-local': 1 }) + '\n' + [
+    `sfu_ai_speech_funnel_total{kind="declared"} ${declared}`,
+    `sfu_ai_speech_funnel_total{kind="delivered"} ${delivered}`,
+    `sfu_ai_speech_funnel_total{kind="failed"} ${failed}`,
+    `sfu_ai_speech_funnel_total{kind="silent"} ${silent}`,
+  ].join('\n');
+
+  const st = fresh();
+  const first = run(funnel(3, 2, 1, 1), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(first.length === 0, 'D2：第一观测只记基线（重启后带着一段历史 silent 也不报，那不是"刚刚发生"）',
+    JSON.stringify(first.map((x) => x.key)));
+  const second = run(funnel(5, 3, 1, 2), { asrEngine: 'qwen-local' }, st.counters, st);
+  ok(has(second, 'ai-speech-silent'), 'D2：本轮 silent 涨了 1 ⇒ 立刻报（这一条没有要容忍的合法形态）',
+    JSON.stringify(second.map((x) => x.key)));
+  ok(/承诺 2、送达 1/.test((second[0] || {}).text || '') && /改浏览器念 0/.test((second[0] || {}).text || ''),
+    'D2：告警文案带本轮四本账的增量（只喊"有问题"等于让人再翻一遍日志）', (second[0] || {}).text || '');
+  ok(/declare\/settle/.test((second[0] || {}).text || '') && /tts\.js/.test((second[0] || {}).text || ''),
+    'D2：告警要指路到"漏收口"该查的地方（播报口 / 合成超时 / 房间销毁）');
+
+  const st2 = fresh();
+  run(funnel(4, 3, 1, 0), { asrEngine: 'qwen-local' }, st2.counters, st2);
+  const calm = run(funnel(6, 5, 1, 0), { asrEngine: 'qwen-local' }, st2.counters, st2);
+  ok(calm.length === 0, 'D2：承诺与下文对得上（declared 涨、delivered 同涨、silent 恒 0）⇒ 不报',
+    JSON.stringify(calm.map((x) => x.key)));
+
+  const st3 = fresh();
+  const old = run(m({ 'qwen-local': 2 }), { asrEngine: 'qwen-local' }, st3.counters, st3);
+  ok(old.length === 0 && st3.speakFunnel === undefined,
+    'D2：老服务器根本没记这四行 ⇒ 不报也不猜（"读不到"≠"读到 0"，坑 71/155）',
+    JSON.stringify({ keys: old.map((x) => x.key), base: st3.speakFunnel }));
+
+  const st4 = fresh();
+  const trap = run(m({ 'qwen-local': 2 }) + '\n# HELP sfu_ai_speech_funnel_total counter rounds by outcome: kind="silent" x 99',
+    { asrEngine: 'qwen-local' }, st4.counters, st4);
+  ok(trap.length === 0, 'D2：# HELP 行里含 kind="silent" 与数字，也不能被当成样本（锚行首，坑 74）',
+    JSON.stringify(trap.map((x) => x.key)));
+}
+
 /* ⑨ ★ 2026-10-06 夜二「没人叫它，它却开口了」——这条产品规矩的生产端哨兵。
  *   ▎判据不是"有 follow-up 就报"：合法形态（被 2s 分段切断的半句）每次前面必有一次
  *     name-only，所以违规量 = tail − nameOnly；而且只在**纯唤醒模式**下判。
